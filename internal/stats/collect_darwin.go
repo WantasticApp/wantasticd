@@ -8,8 +8,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+var loggedLocationWarning sync.Once
 
 // collectWiFiStatistics - implementation for macOS using system_profiler
 func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
@@ -118,6 +121,13 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 						if realSSID, err := getSSIDFromAirport(); err == nil && realSSID != "" {
 							ssid = realSSID
 						}
+					}
+					// If still redacted, suppress it and warn user
+					if ssid == "<redacted>" {
+						ssid = ""
+						loggedLocationWarning.Do(func() {
+							log.Println("WARNING: SSID is redacted. To view SSID on macOS, enable Location Services for this application (System Settings > Privacy & Security > Location Services).")
+						})
 					}
 					currentIface.SSID = ssid
 					i++ // Skip SSID line

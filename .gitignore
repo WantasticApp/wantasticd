@@ -1,0 +1,12 @@
+bin/
+traditional_wg.conf
+.DS_Store
+wantasticd
+.modcache/
+.cache/
+wantastic.conf
+tmp/wantastic_install/wantasticd.tar.gz
+vendor/
+gobuild/
+.gocache/
+.gotmp/

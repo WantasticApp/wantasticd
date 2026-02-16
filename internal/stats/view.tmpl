@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>wantasticd device monitor</title>
+    <script src="/lib/htmx.js"></script>
+    <script src="/lib/dashboard.js" defer></script>
+    <style>
+        /* Mobile-First Design System - Clean & Solid */
+        :root {
+            --primary-color: #0078d4;
+            --primary-gradient: linear-gradient(135deg, #0078d4 0%, #106ebe 100%);
+            --bg-color: #0a0a0a;
+            --card-bg: #161616;
+            --accent-bg: #1e1e1e;
+            --text-color: #f5f5f7;
+            --text-secondary: #a1a1a6;
+            --border-color: #2c2c2e;
+            --success-color: #30d158;
+            --success-bg: rgba(48, 209, 88, 0.15);
+            --warning-color: #ff9f0a;
+            --warning-bg: rgba(255, 159, 10, 0.15);
+            --icon-bg: #2d2d2d;
+            --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: var(--font-family);
+            background-color: var(--bg-color);
+            min-height: 100vh;
+            color: var(--text-color);
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 32px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+
+        .header-content h1 {
+            font-size: 28px;
+            font-weight: 800;
+            margin-bottom: 4px;
+            letter-spacing: -0.02em;
+            background: linear-gradient(to right, #0078d4, #63b3ed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success-color);
+            border-radius: 50%;
+            display: inline-block;
+            box-shadow: 0 0 8px var(--success-color);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 24px;
+        }
+
+        /* Glass Cards */
+        .card {
+            background: var(--card-bg);
+            border-radius: 20px;
+            padding: 24px;
+            border: 1px solid var(--border-color);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            border-color: #444;
+            box-shadow: 0 12px 24px rgba(0,0,0,0.3);
+        }
+        
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: var(--primary-gradient);
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .card:hover::before {
+            opacity: 1;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .card-icon {
+            width: 48px;
+            height: 48px;
+            background: var(--icon-bg);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 16px;
+            color: var(--primary-color);
+            border: 1px solid var(--border-color);
+        }
+        
+        .card-icon svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        .card-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: var(--text-color);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        .stat-item {
+            background: rgba(255,255,255,0.03);
+            padding: 16px;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+        }
+
+        .stat-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+
+        .stat-value {
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--text-color);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .stat-unit {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            margin-left: 4px;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+
+        .badge-success { background: var(--success-bg); color: var(--success-color); }
+        .badge-warning { background: var(--warning-bg); color: var(--warning-color); }
+
+        .table-container {
+            margin-top: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .table th {
+            text-align: left;
+            padding: 14px 20px;
+            background: #1c1c1e;
+            color: var(--text-secondary);
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .table td {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 14px;
+        }
+
+        .nearby-list {
+            margin-top: 24px;
+            border-top: 1px solid var(--border-color);
+            padding-top: 20px;
+        }
+
+        .nearby-title {
+            font-size: 13px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            color: var(--text-secondary);
+        }
+
+        .nearby-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+        }
+
+        .nearby-ssid {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .footer {
+            margin-top: 48px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 13px;
+            padding-bottom: 48px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <h1>wantasticd</h1>
+                <div class="subtitle">
+                    <span class="status-dot"></span>
+                    <span>{{.Hostname}} • {{.Platform}}/{{.CPU.Arch}}</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <span class="badge badge-success">v{{.Agent.Version}}</span>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- System -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                        </svg>
+                    </div>
+                    <div class="card-title">System Status</div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Uptime</div>
+                        <div class="stat-value" id="agent-uptime">{{.Agent.Uptime}}</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Cores</div>
+                        <div class="stat-value" id="cpu-cores">{{.CPU.Cores}}</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Memory -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="2" y="2" width="20" height="8" rx="2"/>
+                            <rect x="2" y="14" width="20" height="8" rx="2"/>
+                            <line x1="6" y1="6" x2="6" y2="6.01"/>
+                            <line x1="6" y1="18" x2="6" y2="18.01"/>
+                        </svg>
+                    </div>
+                    <div class="card-title">Memory Allocation</div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Used</div>
+                        <div class="stat-value"><span id="mem-used">{{printf "%.1f" (div .Memory.Allocated 1048576.0)}}</span><span class="stat-unit">MB</span></div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Total</div>
+                        <div class="stat-value"><span id="mem-total">{{printf "%.1f" (div .Memory.Total 1048576.0)}}</span><span class="stat-unit">MB</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- WireGuard -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                        </svg>
+                    </div>
+                    <div class="card-title">WireGuard Tunnel</div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Peers</div>
+                        <div class="stat-value" id="wg-peers">{{.WireGuard.Peers}}</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Status</div>
+                        <div class="stat-value" id="wg-status">
+                            {{if .WireGuard.Connected}}
+                            <span class="badge badge-success">Encrypted</span>
+                            {{else}}
+                            <span class="badge badge-warning">Inactive</span>
+                            {{end}}
+                        </div>
+                    </div>
+                </div>
+                 <div id="wg-peers-list" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
+                    <div class="nearby-title">Discovered Neighbors</div>
+                    <div id="wg-peers-items" style="max-height: 100px; overflow-y: auto;">
+                        {{range .WireGuard.PeersList}}
+                        <div class="nearby-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+                            <div style="display: flex; width: 100%; justify-content: space-between; align-items: center;">
+                                <span class="nearby-ssid" style="font-weight: 600;">{{.IP}}</span>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    {{if .LatencyMs}}<span style="font-size: 10px; color: var(--text-secondary);">{{.LatencyMs}}ms</span>{{end}}
+                                    <span class="badge badge-success" style="font-size: 9px; padding: 2px 6px;">Active</span>
+                                </div>
+                            </div>
+                            <div style="font-size: 10px; color: var(--text-secondary); display: flex; gap: 8px;">
+                                <span>{{if .Hostname}}{{.Hostname}}{{else}}unknown{{end}}</span>
+                                <span style="opacity: 0.5;">|</span>
+                                <span>{{if .OS}}{{.OS}}{{else}}unknown{{end}}</span>
+                            </div>
+                        </div>
+                        {{else}}
+                        <div style="font-size: 11px; color: var(--text-secondary); text-align: center; padding: 8px;">No neighbors detected</div>
+                        {{end}}
+                    </div>
+                </div>
+                 <div style="margin-top: 16px; font-size: 11px; font-family: monospace; word-break: break-all; color: var(--text-secondary); background: rgba(0,0,0,0.2); padding: 12px; border-radius: 12px; border: 1px solid var(--border-color);">
+                    <strong style="color: var(--primary-color);">PUBLIC KEY:</strong><br/>{{.WireGuard.PublicKey}}
+                </div>
+            </div>
+
+            <!-- WiFi Interfaces -->
+            <div id="wifi-container" style="display: contents;">
+            {{range .WiFi.Interfaces}}
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+                            <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+                            <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+                            <line x1="12" y1="20" x2="12.01" y2="20"/>
+                        </svg>
+                    </div>
+                    <div class="card-title">WiFi: {{.Name}}</div>
+                    {{if .Connected}}
+                    <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                        <span class="badge badge-success">Online</span>
+                    </div>
+                    {{else}}
+                    <span class="badge badge-warning" style="margin-left: auto;">Offline</span>
+                    {{end}}
+                </div>
+
+                {{if .Connected}}
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Signal Strength</div>
+                        <div class="stat-value">{{.Signal}}<span class="stat-unit">dBm</span></div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Bitrate</div>
+                        <div class="stat-value">{{.Bitrate}}<span class="stat-unit">Mbps</span></div>
+                    </div>
+                </div>
+                <div style="margin-top: 16px; font-size: 11px; color: var(--text-secondary); background: var(--accent-bg); padding: 8px; border-radius: 8px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                        <span>SSID: <strong style="color: var(--text-color);">{{.SSID}}</strong></span>
+                        <span>Channel: <strong>{{.Channel}}</strong></span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Mode: <strong>{{.PHYMode}}</strong></span>
+                        <span>MAC: <strong>{{.MAC}}</strong></span>
+                    </div>
+                </div>
+                {{end}}
+
+                {{if .Nearby}}
+                <div class="nearby-list">
+                    <div class="nearby-title">Nearby Access Points</div>
+                    <div style="max-height: 200px; overflow-y: auto;">
+                        {{range .Nearby}}
+                        <div class="nearby-item">
+                            <span class="nearby-ssid">{{.SSID}}</span>
+                            <span class="badge {{if ge .Signal -70}}badge-success{{else}}badge-warning{{end}}" style="font-size: 9px; padding: 2px 6px;">{{.Signal}} dBm</span>
+                        </div>
+                        {{end}}
+                    </div>
+                </div>
+                {{end}}
+            </div>
+            {{end}}
+            </div>
+
+            <!-- Network Interfaces -->
+            <div class="card" style="grid-column: 1 / -1;">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="2" y="2" width="20" height="8" rx="2"/>
+                            <rect x="2" y="14" width="20" height="8" rx="2"/>
+                            <line x1="6" y1="6" x2="6" y2="6.01"/>
+                            <line x1="6" y1="18" x2="6" y2="18.01"/>
+                        </svg>
+                    </div>
+                    <div class="card-title">Network Interfaces</div>
+                </div>
+                <div class="table-container">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Interface</th>
+                                <th>IP Addresses</th>
+                                <th>RX Rate</th>
+                                <th>TX Rate</th>
+                                <th>State</th>
+                            </tr>
+                        </thead>
+                        <tbody id="interfaces-list">
+                            {{range .Network.Interfaces}}
+                            <tr>
+                                <td><strong>{{.Name}}</strong></td>
+                                <td>
+                                    {{range .IPs}}
+                                    <div style="font-family: monospace; font-size: 11px;">{{.}}</div>
+                                    {{end}}
+                                </td>
+                                <td>{{printf "%.1f" (div .RxBytes 1048576.0)}} MB</td>
+                                <td>{{printf "%.1f" (div .TxBytes 1048576.0)}} MB</td>
+                                <td>
+                                    {{if .Up}}
+                                    <div class="status-dot"></div>
+                                    {{else}}
+                                    <span style="color: var(--text-secondary);">Offline</span>
+                                    {{end}}
+                                </td>
+                            </tr>
+                            {{end}}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>System sync <span id="footer-timestamp">{{.Timestamp}}</span> • Build v{{.Agent.Version}}</p>
+        </div>
+    </div>
+</body>
+</html>

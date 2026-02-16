@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view ${{ github.ref_name }} || gh release create ${{ github.ref_name }} --title "${{ github.ref_name }}" --generate-notes --verify-tag
+
+  release:
+    needs: create-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+        include:
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: loong64
+          - goos: linux
+            goarch: mips
+          - goos: linux
+            goarch: mips64
+          - goos: linux
+            goarch: mips64le
+          - goos: linux
+            goarch: mipsle
+          - goos: linux
+            goarch: ppc64
+          - goos: linux
+            goarch: ppc64le
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: s390x 
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.5'
+
+    - name: Build
+      run: |
+        export GOOS=${{ matrix.goos }}
+        export GOARCH=${{ matrix.goarch }}
+        export CGO_ENABLED=0
+        go build -v -trimpath -ldflags="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" -o wantasticd-${{ matrix.goarch }} ./cmd/wantasticd
+
+    - name: Package
+      run: |
+        export GOARCH=${{ matrix.goarch }}
+        BINARY_NAME="wantasticd-${GOARCH}"
+        # Rename to a generic name for the archive
+        mv "${BINARY_NAME}" wantasticd
+        tar -czvf "wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" wantasticd README.md
+
+
+    - name: Create Version File
+      run: echo "${{ github.ref_name }}+$(git rev-parse --short HEAD)" > latest
+
+    - name: Upload Release Asset
+      run: |
+        gh release upload ${{ github.ref_name }} wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz --clobber
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Prepare R2 Upload
+      run: |
+        mkdir -p r2_upload
+        cp wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz r2_upload/
+        cp latest r2_upload/
+
+    - name: Upload to R2 (Versioned)
+      uses: ryand56/r2-upload-action@latest
+      with:
+        r2-account-id: ${{ secrets.R2_ACCOUNT }}
+        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+        r2-secret-access-key: ${{ secrets.R2_SECRET }}
+        r2-bucket: ${{ secrets.R2_BUCKET }}
+        source-dir: r2_upload
+        destination-dir: ${{ github.ref_name }}
+
+    - name: Upload to R2 (Latest)
+      uses: ryand56/r2-upload-action@latest
+      with:
+        r2-account-id: ${{ secrets.R2_ACCOUNT }}
+        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+        r2-secret-access-key: ${{ secrets.R2_SECRET }}
+        r2-bucket: ${{ secrets.R2_BUCKET }}
+        source-dir: r2_upload
+        destination-dir: latest
+
+  upload-utils:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Prepare Root Upload
+      run: |
+        mkdir -p root_upload
+        cp install.sh root_upload/
+        echo "${{ github.ref_name }}+$(git rev-parse --short HEAD)" > root_upload/latest
+
+    - name: Upload Root Artifacts to R2
+      uses: ryand56/r2-upload-action@latest
+      with:
+        r2-account-id: ${{ secrets.R2_ACCOUNT }}
+        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+        r2-secret-access-key: ${{ secrets.R2_SECRET }}
+        r2-bucket: ${{ secrets.R2_BUCKET }}
+        source-dir: root_upload
+        destination-dir: ./
+

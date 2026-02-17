@@ -68,14 +68,10 @@ type Metrics struct {
 
 	// WireGuard device metrics
 	WireGuard struct {
-		Connected  bool                      `json:"connected"`
-		PublicKey  string                    `json:"public_key"`
-		Peers      int                       `json:"peers"`
-		PeersList  []agent_netstack.PeerInfo `json:"peers_list"`
-		Throughput struct {
-			TxBytes uint64 `json:"tx_bytes"`
-			RxBytes uint64 `json:"rx_bytes"`
-		} `json:"throughput"`
+		Connected bool                      `json:"connected"`
+		PublicKey string                    `json:"public_key"`
+		Peers     int                       `json:"peers"`
+		PeersList []agent_netstack.PeerInfo `json:"peers_list"`
 	} `json:"wireguard"`
 
 	// Agent metrics
@@ -432,14 +428,17 @@ func (s *Server) collectMetrics() Metrics {
 	m.CPU.Arch = runtime.GOARCH
 	m.CPU.Usage = collectCPUUsage()
 
-	// Memory metrics (simplified)
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	m.Memory.Allocated = memStats.Alloc
-	m.Memory.Total = collectMemoryTotal()
+	// System Memory metrics
+	used, total := collectSystemMemory()
+	m.Memory.Allocated = used
+	m.Memory.Total = total
 
 	// Network interfaces - collect from host device statistics
-	m.Network.Interfaces = collectNetworkInterfaceStatistics()
+	var totalTx, totalRx uint64
+	m.Network.Interfaces, totalTx, totalRx = collectNetworkInterfaceStatistics()
+
+	m.Network.Traffic.TotalTx = totalTx
+	m.Network.Traffic.TotalRx = totalRx
 
 	// WiFi statistics - collect from host device
 	wifiInterfaces, wifiConnected := collectWiFiStatistics()
@@ -465,10 +464,6 @@ func (s *Server) collectMetrics() Metrics {
 	peers := s.netstack.DiscoverPeersDetail()
 	m.WireGuard.Peers = len(peers)
 	m.WireGuard.PeersList = peers
-
-	rx, tx, _ := s.device.GetTransferStats()
-	m.WireGuard.Throughput.RxBytes = rx
-	m.WireGuard.Throughput.TxBytes = tx
 
 	// Agent metrics
 	// Agent metrics (Host Uptime)

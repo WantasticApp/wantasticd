@@ -47,9 +47,6 @@ func createTestMetrics() *stats.Metrics {
 	m.WireGuard.Connected = true
 	m.WireGuard.PublicKey = "ZdR8/3+..."
 	m.WireGuard.Peers = 20
-	m.WireGuard.Throughput.TxBytes = 50000
-	m.WireGuard.Throughput.RxBytes = 60000
-
 	m.Agent.Uptime = "5d 10h"
 	m.Agent.Version = "v1.0.0"
 	m.Agent.Status = "running"

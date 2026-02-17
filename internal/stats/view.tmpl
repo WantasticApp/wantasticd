@@ -457,6 +457,29 @@
             {{end}}
             </div>
 
+            <!-- Network Traffic -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                            <path d="M22 6l-10 7L2 6"/>
+                        </svg>
+                    </div>
+                    <div class="card-title">Total Traffic</div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Total Rx</div>
+                        <div class="stat-value"><span id="total-rx">{{printf "%.1f" (div .Network.Traffic.TotalRx 1048576.0)}}</span><span class="stat-unit">MB</span></div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Total Tx</div>
+                        <div class="stat-value"><span id="total-tx">{{printf "%.1f" (div .Network.Traffic.TotalTx 1048576.0)}}</span><span class="stat-unit">MB</span></div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Network Interfaces -->
             <div class="card" style="grid-column: 1 / -1;">
                 <div class="card-header">

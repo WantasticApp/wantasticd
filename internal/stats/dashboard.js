@@ -59,6 +59,12 @@
             if (netContainer && data.network && data.network.interfaces) {
                 netContainer.innerHTML = data.network.interfaces.map(iface => renderNetRow(iface)).join('');
             }
+            
+            // Total Traffic
+            if (data.network && data.network.traffic) {
+                updateText('total-rx', (data.network.traffic.total_rx / 1048576.0).toFixed(1));
+                updateText('total-tx', (data.network.traffic.total_tx / 1048576.0).toFixed(1));
+            }
 
             // Footer
             updateText('footer-timestamp', new Date(data.timestamp).toLocaleString());

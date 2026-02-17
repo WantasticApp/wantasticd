@@ -192,29 +192,40 @@ func collectNearbyNetworks(iface string) ([]NearbyNetwork, error) {
 }
 
 // collectNetworkInterfaceStatistics collects network interface statistics from /sys/class/net
-func collectNetworkInterfaceStatistics() []InterfaceInfo {
+func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 	var interfaces []InterfaceInfo
+	var totalTx, totalRx uint64
 
 	// Read network interfaces from /sys/class/net
 	netDir := "/sys/class/net"
 	entries, err := os.ReadDir(netDir)
 	if err != nil {
 		log.Printf("Failed to read network interfaces: %v", err)
-		return interfaces
+		return interfaces, 0, 0
 	}
 
 	for _, entry := range entries {
 		ifaceName := entry.Name()
 
-		// Skip loopback and virtual interfaces
+		// Get interface statistics from /sys/class/net
+		rxBytes, _ := readUint64FromFile(filepath.Join(netDir, ifaceName, "statistics", "rx_bytes"))
+		txBytes, _ := readUint64FromFile(filepath.Join(netDir, ifaceName, "statistics", "tx_bytes"))
+
+		// Always add to totals
+		totalRx += rxBytes
+		totalTx += txBytes
+
+		// Skip filtered interfaces for the detailed list
 		if ifaceName == "lo" || strings.HasPrefix(ifaceName, "veth") ||
 			strings.HasPrefix(ifaceName, "docker") || strings.HasPrefix(ifaceName, "br-") {
 			continue
 		}
 
 		iface := InterfaceInfo{
-			Name: ifaceName,
-			Up:   isInterfaceUp(ifaceName),
+			Name:    ifaceName,
+			Up:      isInterfaceUp(ifaceName),
+			RxBytes: rxBytes, // Use the value read above
+			TxBytes: txBytes, // Use the value read above
 		}
 
 		// Get MAC address
@@ -227,19 +238,10 @@ func collectNetworkInterfaceStatistics() []InterfaceInfo {
 			iface.IPs = ips
 		}
 
-		// Get interface statistics from /sys/class/net
-		if rxBytes, err := readUint64FromFile(filepath.Join(netDir, ifaceName, "statistics", "rx_bytes")); err == nil {
-			iface.RxBytes = rxBytes
-		}
-
-		if txBytes, err := readUint64FromFile(filepath.Join(netDir, ifaceName, "statistics", "tx_bytes")); err == nil {
-			iface.TxBytes = txBytes
-		}
-
 		interfaces = append(interfaces, iface)
 	}
 
-	return interfaces
+	return interfaces, totalTx, totalRx
 }
 
 // isInterfaceUp checks if a network interface is up
@@ -693,20 +695,43 @@ func collectCPUUsage() string {
 	return "0%"
 }
 
-func collectMemoryTotal() uint64 {
+func collectSystemMemory() (uint64, uint64) {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return 1024 * 1024 * 1024
+		return 0, 0
 	}
+
+	var total, available, free, buffers, cached uint64
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
-		if strings.HasPrefix(line, "MemTotal:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				val, _ := strconv.ParseUint(fields[1], 10, 64)
-				return val * 1024 // kB to B
-			}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		val, _ := strconv.ParseUint(fields[1], 10, 64)
+		val *= 1024 // kB to Bytes
+
+		switch {
+		case strings.HasPrefix(line, "MemTotal:"):
+			total = val
+		case strings.HasPrefix(line, "MemAvailable:"):
+			available = val
+		case strings.HasPrefix(line, "MemFree:"):
+			free = val
+		case strings.HasPrefix(line, "Buffers:"):
+			buffers = val
+		case strings.HasPrefix(line, "Cached:"):
+			cached = val
 		}
 	}
-	return 1024 * 1024 * 1024
+
+	// MemAvailable is the most accurate metric for "available" memory on modern Linux
+	// If MemAvailable is present (kernel >= 3.14), Used = Total - Available
+	if available > 0 {
+		return total - available, total
+	}
+
+	// Fallback for older kernels
+	return total - (free + buffers + cached), total
 }

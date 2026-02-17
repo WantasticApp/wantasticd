@@ -8,8 +8,8 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 }
 
 // collectNetworkInterfaceStatistics - stub for unsupported platforms
-func collectNetworkInterfaceStatistics() []InterfaceInfo {
-	return []InterfaceInfo{}
+func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
+	return []InterfaceInfo{}, 0, 0
 }
 
 // collectMeshStatistics - stub for unsupported platforms
@@ -26,6 +26,6 @@ func collectCPUUsage() string {
 	return "0%"
 }
 
-func collectMemoryTotal() uint64 {
-	return 1024 * 1024 * 1024
+func collectSystemMemory() (uint64, uint64) {
+	return 0, 0
 }

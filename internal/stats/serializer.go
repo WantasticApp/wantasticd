@@ -100,8 +100,6 @@ func SerializeMetrics(m *Metrics) []byte {
 	}
 	putString(m.WireGuard.PublicKey)
 	putUvarint(uint64(m.WireGuard.Peers))
-	putUvarint(m.WireGuard.Throughput.TxBytes)
-	putUvarint(m.WireGuard.Throughput.RxBytes)
 
 	// 8. Agent
 	putString(m.Agent.Uptime)

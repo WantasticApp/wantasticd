@@ -253,25 +253,33 @@ func getHostUptime() float64 {
 }
 
 // collectNetworkInterfaceStatistics collects network interface statistics using net package and netstat
-func collectNetworkInterfaceStatistics() []InterfaceInfo {
+func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 	var interfaces []InterfaceInfo
+	var totalTx, totalRx uint64
 
 	netIfaces, err := net.Interfaces()
 	if err != nil {
 		log.Printf("Failed to get network interfaces: %v", err)
-		return interfaces
+		return interfaces, 0, 0
 	}
 
 	for _, netIface := range netIfaces {
+		// Stats via netstat
+		rx, tx, _ := getInterfaceStats(netIface.Name)
+		totalRx += rx
+		totalTx += tx
+
 		if netIface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 
 		// Basic info
 		iface := InterfaceInfo{
-			Name: netIface.Name,
-			MAC:  netIface.HardwareAddr.String(),
-			Up:   netIface.Flags&net.FlagUp != 0,
+			Name:    netIface.Name,
+			MAC:     netIface.HardwareAddr.String(),
+			Up:      netIface.Flags&net.FlagUp != 0,
+			RxBytes: rx,
+			TxBytes: tx,
 		}
 
 		// IPs
@@ -279,17 +287,10 @@ func collectNetworkInterfaceStatistics() []InterfaceInfo {
 			iface.IPs = ips
 		}
 
-		// Stats via netstat
-		rx, tx, err := getInterfaceStats(netIface.Name)
-		if err == nil {
-			iface.RxBytes = rx
-			iface.TxBytes = tx
-		}
-
 		interfaces = append(interfaces, iface)
 	}
 
-	return interfaces
+	return interfaces, totalTx, totalRx
 }
 
 func getInterfaceStats(name string) (uint64, uint64, error) {
@@ -339,13 +340,63 @@ func collectCPUUsage() string {
 	return "0%"
 }
 
-func collectMemoryTotal() uint64 {
-	out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+func collectSystemMemory() (uint64, uint64) {
+	// Total Memory
+	totalOut, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
 	if err != nil {
-		return 1024 * 1024 * 1024
+		return 0, 0
 	}
-	size, _ := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
-	return size
+	total, _ := strconv.ParseUint(strings.TrimSpace(string(totalOut)), 10, 64)
+
+	// Used Memory via vm_stat
+	// Pages free:                               284145.
+	// Pages active:                            1385685.
+	// Pages inactive:                           773954.
+	// Pages speculative:                         11075.
+	// Pages throttled:                               0.
+	// Pages wired down:                         372861.
+	// Pages purgeable:                           32942.
+	// "Translation faults":                  197587849.
+
+	vmOut, err := exec.Command("vm_stat").Output()
+	if err != nil {
+		return 0, total
+	}
+
+	var pagesActive, pagesWired, pagesCompressed uint64
+	lines := strings.Split(string(vmOut), "\n")
+	for _, line := range lines {
+		fields := strings.Split(line, ":")
+		if len(fields) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(fields[0])
+		valStr := strings.TrimSpace(strings.TrimSuffix(fields[1], "."))
+		val, _ := strconv.ParseUint(valStr, 10, 64)
+
+		switch key {
+		case "Pages active":
+			pagesActive = val
+		case "Pages wired down":
+			pagesWired = val
+		case "Pages occupied by compressor":
+			pagesCompressed = val
+		}
+	}
+
+	// Page size is typically 4096 bytes on macOS (arm64/amd64)
+	// We could use `pagesize` command to be sure, but 4096 is safe assumption or we can query it.
+	// Let's rely on standard page size (4096).
+	pageSize := uint64(4096)
+
+	// App Memory = (Anonymous + Purgeable) ... simplified: Wired + Active + Compressed
+	used := (pagesActive + pagesWired + pagesCompressed) * pageSize
+
+	if used > total {
+		used = total // clamping just in case
+	}
+
+	return used, total
 }
 
 // collectMeshStatistics - stub for macOS

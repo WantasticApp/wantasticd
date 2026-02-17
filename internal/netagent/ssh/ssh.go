@@ -121,13 +121,20 @@ func Run(ctx context.Context, dial DialContext, user, host, port string) error {
 	}
 	defer session.Close()
 
+	// Put terminal in raw mode
 	fd := int(os.Stdin.Fd())
 	state, err := term.MakeRaw(fd)
-	if err == nil {
-		defer term.Restore(fd, state)
+	if err != nil {
+		return fmt.Errorf("failed to put terminal in raw mode: %w", err)
+	}
+	defer term.Restore(fd, state)
+
+	// Get current terminal size
+	w, h, err := term.GetSize(fd)
+	if err != nil {
+		return fmt.Errorf("failed to get terminal size: %w", err)
 	}
 
-	w, h, _ := term.GetSize(fd)
 	if err := session.RequestPty("xterm-256color", h, w, ssh.TerminalModes{
 		ssh.ECHO:          1,
 		ssh.TTY_OP_ISPEED: 14400,
@@ -135,6 +142,11 @@ func Run(ctx context.Context, dial DialContext, user, host, port string) error {
 	}); err != nil {
 		return fmt.Errorf("request for PTY failed: %w", err)
 	}
+
+	// Handle window resize
+	monitorCtx, monitorCancel := context.WithCancel(ctx)
+	defer monitorCancel()
+	go monitorWindowResize(monitorCtx, fd, session)
 
 	session.Stdout = os.Stdout
 	session.Stderr = os.Stderr

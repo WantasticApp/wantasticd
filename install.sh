@@ -199,7 +199,7 @@ Address = 10.x.x.x/32
 
 [Peer]
 # Server Public Key
-PublicKey = O9l0CxzEiIPTI2g40feX+Wo8ZQE9P9ndft+UxfEAEEM=
+PublicKey = <YOUR_PUBLIC_KEY>
 # Server Endpoint
 Endpoint = wg.wantastic.app:51820
 # Allowed IPs for the overlay network

@@ -62,6 +62,12 @@ jobs:
         export CGO_ENABLED=0
         go build -v -trimpath -ldflags="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" -o wantasticd-${{ matrix.goarch }} ./cmd/wantasticd
 
+    - name: Compress Binary
+      if: matrix.goos != 'darwin'
+      run: |
+        sudo apt-get update && sudo apt-get install -y upx-ucl
+        upx -9 --best wantasticd-${{ matrix.goarch }} || echo "UPX compression failed for ${{ matrix.goarch }}, continuing without compression"
+
     - name: Package
       run: |
         export GOARCH=${{ matrix.goarch }}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,7 +84,7 @@ func (d *Device) Start() error {
 
 	// 4. Start WireGuard
 	logger := wgdevice.NewLogger(wgdevice.LogLevelError, fmt.Sprintf("(%s) ", d.config.DeviceID))
-	if d.config.Verbose {
+	if os.Getenv("LOG_LEVEL") == "debug" {
 		logger = wgdevice.NewLogger(wgdevice.LogLevelVerbose, fmt.Sprintf("(%s) ", d.config.DeviceID))
 	}
 
@@ -174,6 +175,24 @@ func (d *Device) applyConfig() error {
 		return fmt.Errorf("invalid private key: %w", err)
 	}
 
+	// Resolve endpoint hostname to IP if needed.
+	// WireGuard's ParseEndpoint uses netip.ParseAddrPort which only accepts literal ip:port.
+	endpointHost := d.config.Server.Endpoint
+	if endpointHost != "" {
+		if _, err := netip.ParseAddr(endpointHost); err != nil {
+			// Not a literal IP — resolve DNS
+			ips, err := net.LookupHost(endpointHost)
+			if err != nil {
+				return fmt.Errorf("resolve endpoint %q: %w", endpointHost, err)
+			}
+			if len(ips) == 0 {
+				return fmt.Errorf("no addresses found for endpoint %q", endpointHost)
+			}
+			log.Printf("Resolved endpoint %s -> %s", endpointHost, ips[0])
+			endpointHost = ips[0]
+		}
+	}
+
 	// Helper to generate the full configuration string for a given port
 	genConfig := func(port int) (string, error) {
 		var conf strings.Builder
@@ -184,7 +203,7 @@ func (d *Device) applyConfig() error {
 			if err != nil {
 				return "", fmt.Errorf("invalid public key: %w", err)
 			}
-			fmt.Fprintf(&conf, "public_key=%s\nendpoint=%s:%d\n", pubHex, d.config.Server.Endpoint, d.config.Server.Port)
+			fmt.Fprintf(&conf, "public_key=%s\nendpoint=%s:%d\n", pubHex, endpointHost, d.config.Server.Port)
 			if len(d.config.Server.AllowedIPs) > 0 {
 				for _, ip := range d.config.Server.AllowedIPs {
 					fmt.Fprintf(&conf, "allowed_ip=%s\n", ip)

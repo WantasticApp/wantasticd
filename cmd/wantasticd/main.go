@@ -1,0 +1,614 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+	"wantastic-agent/internal/config"
+	"wantastic-agent/internal/daemon"
+	"wantastic-agent/internal/ipc"
+	"wantastic-agent/internal/netagent/curl"
+	"wantastic-agent/internal/netagent/ping"
+	"wantastic-agent/internal/netagent/scanner"
+	"wantastic-agent/internal/netagent/ssh"
+	"wantastic-agent/internal/netagent/telnet"
+	"wantastic-agent/internal/update"
+
+	"wantastic-agent/internal/agent"
+	"wantastic-agent/pkg/version"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "login":
+		handleLogin()
+	case "connect":
+		handleConnect()
+	case "update":
+		handleUpdate()
+	case "version":
+		printVersion()
+	case "ping":
+		handlePing()
+	case "curl":
+		handleCurl()
+	case "ssh":
+		handleSSH()
+	case "telnet":
+		handleTelnet()
+	case "bind":
+		handleBind()
+	case "neighbors":
+		handleNeighbors()
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func handleLogin() {
+	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
+	token := loginCmd.String("token", "", "Direct authentication token")
+	serverURL := loginCmd.String("server-url", "auth.wantastic.app:443", "Authentication server URL")
+	installService := loginCmd.Bool("d", false, "Install and run as system service (daemon)")
+	loginCmd.Parse(os.Args[2:])
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cfg *config.Config
+	var err error
+
+	if *token != "" {
+		cfg, err = config.LoadFromToken(ctx, *serverURL, *token)
+	} else {
+		cfg, err = config.LoadFromDeviceFlow(ctx, *serverURL)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to configure agent: %v", err)
+	}
+
+	// Default to new standard path
+	configPath := "/etc/wantastic/config.conf"
+	configDir := "/etc/wantastic"
+
+	// If running as non-root/daemon setup request validation
+	if *installService && os.Geteuid() != 0 {
+		log.Printf("Warning: Service installation (-d) requires root privileges.")
+	}
+
+	// Ensure directory exists
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		log.Printf("Warning: failed to create config directory %s: %v", configDir, err)
+		// Fallback to local directory if system directory fails (e.g. non-root)
+		configPath = "wantastic.conf"
+		log.Printf("Falling back to local file: %s", configPath)
+	}
+
+	if err := cfg.SaveToFile(configPath); err != nil {
+		log.Printf("Warning: could not save configuration file: %v", err)
+		if *installService {
+			log.Fatalf("Error: Cannot install service without saving configuration file.")
+		}
+		log.Println("Running with in-memory configuration only.")
+		runAgentWithConfig(cfg)
+	} else {
+		log.Println("Login successful. Configuration saved to", configPath)
+
+		if *installService {
+			log.Println("Setting up system service...")
+			if err := daemon.SetupService(configPath); err != nil {
+				log.Fatalf("Failed to setup service: %v", err)
+			}
+			log.Println("Service installed and started successfully.")
+			return
+		}
+
+		log.Println("Connecting...")
+		runAgent(configPath, false, false)
+	}
+}
+
+func runAgentWithConfig(cfg *config.Config) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	agt, err := startAgentWithRetry(ctx, cfg)
+	if err != nil {
+		log.Fatalf("Failed to start agent: %v", err)
+	}
+
+	log.Printf("Wantastic agent started successfully")
+
+	select {
+	case <-sigCh:
+		log.Println("Received shutdown signal")
+	case <-ctx.Done():
+		log.Println("Context cancelled")
+	}
+
+	if err := agt.Stop(); err != nil {
+		log.Fatalf("Failed to stop agent: %v", err)
+	}
+
+	log.Println("Agent stopped successfully")
+}
+
+func handleConnect() {
+	connectCmd := flag.NewFlagSet("connect", flag.ExitOnError)
+	configPath := connectCmd.String("config", "", "Path to configuration file")
+	verbose := connectCmd.Bool("v", false, "Enable verbose logging and debug output")
+	installService := connectCmd.Bool("d", false, "Install and run as system service (daemon)")
+	autoUpdate := connectCmd.Bool("auto-update", false, "Enable automatic self-updates")
+	connectCmd.Parse(os.Args[2:])
+
+	if *configPath == "" {
+		// If positional argument provided, use it as config path
+		if connectCmd.NArg() > 0 {
+			*configPath = connectCmd.Arg(0)
+		} else {
+			// Use default if not specified
+			*configPath = "/etc/wantastic/config.conf"
+			if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+				// Check for old default for backward compatibility or local fallback
+				altPath := "wantastic.conf"
+				if _, err := os.Stat(altPath); err == nil {
+					*configPath = altPath
+				} else {
+					// If neither exists, and no flag provided, we can't proceed but let's try to load default anyway
+					// and let LoadFromFile error out with a nice message if it fails
+				}
+			}
+		}
+	}
+
+	if *installService {
+		log.Println("Setting up system service...")
+		if err := daemon.SetupService(*configPath); err != nil {
+			log.Fatalf("Failed to setup service: %v", err)
+		}
+		log.Println("Service installed and started successfully.")
+		return
+	}
+
+	runAgent(*configPath, *verbose, *autoUpdate)
+}
+
+func runAgent(configPath string, verbose bool, autoUpdate bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	cfg, err := config.LoadFromFile(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	if verbose || os.Getenv("DEBUG_LEVEL") == "debug" {
+		cfg.Verbose = true
+	}
+
+	cfg.AutoUpdate = autoUpdate
+
+	agt, err := startAgentWithRetry(ctx, cfg)
+	if err != nil {
+		log.Fatalf("Failed to start agent: %v", err)
+	}
+
+	log.Printf("Wantastic agent started successfully")
+	log.Println("Mode: Userspace Netstack (Passthrough active for common ports)")
+
+	select {
+	case <-sigCh:
+		log.Println("Received shutdown signal")
+	case <-ctx.Done():
+		log.Println("Context cancelled")
+	}
+
+	if err := agt.Stop(); err != nil {
+		log.Fatalf("Failed to stop agent: %v", err)
+	}
+
+	log.Println("Agent stopped successfully")
+}
+
+func printVersion() {
+	fmt.Printf("wantasticd version %s\n", version.Version)
+	fmt.Printf("commit: %s\n", version.Commit)
+	fmt.Printf("build date: %s\n", version.BuildDate)
+}
+
+func handleUpdate() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	mgr := update.NewManager(version.Version)
+	latest, err := mgr.FetchLatestVersion(ctx)
+	if err != nil {
+		log.Fatalf("Failed to fetch latest version: %v", err)
+	}
+
+	if latest == version.Version {
+		fmt.Printf("Already running latest version: %s\n", version.Version)
+		return
+	}
+
+	fmt.Printf("Updating from %s to %s...\n", version.Version, latest)
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("Failed to determine executable path: %v", err)
+	}
+	if err := mgr.RunUpdateScript(ctx, latest, execPath); err != nil {
+		log.Fatalf("Update failed: %v", err)
+	}
+}
+
+func handlePeers() {
+	resp, err := http.Get("http://127.0.0.1:9034/peers")
+	if err != nil {
+		log.Fatalf("Failed to reach daemon: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Peers []struct {
+			IP       string `json:"ip"`
+			Hostname string `json:"hostname"`
+			OS       string `json:"os"`
+			Alive    bool   `json:"alive"`
+		} `json:"peers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Fatalf("Failed to decode discovery results: %v", err)
+	}
+
+	fmt.Printf("%-18s %-20s %-25s\n", "IP ADDRESS", "HOSTNAME", "OS / DEVICE TYPE")
+	fmt.Println(strings.Repeat("-", 65))
+	for _, p := range data.Peers {
+		hostname := p.Hostname
+		if hostname == "" {
+			hostname = "unknown"
+		}
+		osInfo := p.OS
+		if osInfo == "" {
+			osInfo = "unknown"
+		}
+		fmt.Printf("%-18s %-20s %-25s\n", p.IP, hostname, osInfo)
+	}
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, "Usage: %s <command> [arguments]\n", os.Args[0])
+	fmt.Fprintln(os.Stderr, "\nAvailable commands:")
+	fmt.Fprintln(os.Stderr, "  login      Authenticate and configure client")
+	fmt.Fprintln(os.Stderr, "  connect    Connect using a configuration file (use --auto-update to enable self-updates)")
+	fmt.Fprintln(os.Stderr, "  update     Self-update to the latest version")
+	fmt.Fprintln(os.Stderr, "  ping       Ping a host")
+	fmt.Fprintln(os.Stderr, "  curl       Run curl")
+	fmt.Fprintln(os.Stderr, "  ssh        Run ssh")
+	fmt.Fprintln(os.Stderr, "  telnet     Run telnet")
+	fmt.Fprintln(os.Stderr, "  bind       Bind a local port to a remote endpoint")
+	fmt.Fprintln(os.Stderr, "  neighbors  Interact with neighbors (ls to list, sp to scan ports)")
+	fmt.Fprintln(os.Stderr, "  version    Show version information")
+}
+
+// Session encapsulates a connection to the network, either via IPC or Ephemeral Agent
+type Session struct {
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	PingFunc    func(ctx context.Context, host string) (time.Duration, error)
+	Close       func()
+}
+
+func (s *Session) Ping(ctx context.Context, host string) (time.Duration, error) {
+	if s.PingFunc != nil {
+		return s.PingFunc(ctx, host)
+	}
+	return 0, fmt.Errorf("ping not supported")
+}
+
+func getSession(ctx context.Context) (*Session, error) {
+	// 1. Try IPC (fast path, reuses existing tunnel)
+	socketPath := ipc.GetSocketPath()
+
+	// Probe if daemon is alive
+	conn, err := net.DialTimeout("unix", socketPath, 1*time.Second)
+	if err == nil {
+		conn.Close()
+		// Daemon is running
+		return &Session{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return ipc.Dial(network, addr)
+			},
+			PingFunc: func(ctx context.Context, host string) (time.Duration, error) {
+				return ipc.Ping(ctx, host)
+			},
+			Close: func() {},
+		}, nil
+	}
+
+	// 2. Fallback: Ephemeral Agent (if config exists)
+	configPath := "/etc/wantasticd.json"
+	if _, err := os.Stat(configPath); err == nil {
+		cfg, err := config.LoadFromFile(configPath)
+		if err == nil {
+			cfg.Verbose = false
+			agt, err := startAgentWithRetry(ctx, cfg)
+			if err == nil {
+				// Wait briefly for handshake
+				time.Sleep(1 * time.Second)
+
+				return &Session{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return agt.GetNetstack().DialContext(ctx, network, addr)
+					},
+					PingFunc: func(ctx context.Context, host string) (time.Duration, error) {
+						return agt.GetNetstack().Ping(ctx, host)
+					},
+					Close: func() {
+						agt.Stop()
+					},
+				}, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("daemon not running at %s and no %s found for ephemeral session", socketPath, configPath)
+}
+
+func handleNeighbors() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: wantasticd neighbors <ls|sp> [args]")
+		os.Exit(1)
+	}
+	command := os.Args[2]
+
+	switch command {
+	case "ls":
+		handlePeers()
+	case "sp":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: wantasticd neighbors sp <ip>")
+			os.Exit(1)
+		}
+		targetIP := os.Args[3]
+		ctx := context.Background()
+		sess, err := getSession(ctx)
+		if err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		defer sess.Close()
+		scanner.RunPortScan(ctx, sess.DialContext, targetIP)
+	default:
+		fmt.Println("Unknown neighbor command")
+	}
+}
+
+func handleCurl() {
+	curlCmd := flag.NewFlagSet("curl", flag.ExitOnError)
+	method := curlCmd.String("X", "GET", "HTTP method")
+	data := curlCmd.String("d", "", "HTTP data")
+	verbose := curlCmd.Bool("v", false, "Verbose")
+	var headers []string
+	curlCmd.Func("H", "Header", func(s string) error {
+		headers = append(headers, s)
+		return nil
+	})
+	curlCmd.Parse(os.Args[2:])
+
+	if len(curlCmd.Args()) < 1 {
+		fmt.Println("Usage: wantasticd curl [options] <url>")
+		os.Exit(1)
+	}
+	u := curlCmd.Args()[0]
+
+	ctx := context.Background()
+	sess, err := getSession(ctx)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer sess.Close()
+
+	if err := curl.Run(ctx, sess.DialContext, *method, u, *data, headers, *verbose); err != nil {
+		log.Fatalf("Curl failed: %v", err)
+	}
+}
+func handleSSH() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: wantasticd ssh <user@host>")
+		os.Exit(1)
+	}
+	target := os.Args[2]
+	user := "root"
+	host := target
+	if strings.Contains(target, "@") {
+		parts := strings.SplitN(target, "@", 2)
+		user = parts[0]
+		host = parts[1]
+	}
+
+	sshPort := "22"
+	if strings.Contains(host, ":") {
+		h, p, err := net.SplitHostPort(host)
+		if err == nil {
+			host = h
+			sshPort = p
+		}
+	}
+
+	ctx := context.Background()
+	sess, err := getSession(ctx)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer sess.Close()
+
+	if err := ssh.Run(ctx, sess.DialContext, user, host, sshPort); err != nil {
+		log.Fatalf("SSH session failed: %v", err)
+	}
+}
+
+func handleTelnet() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: wantasticd telnet <host> [port]")
+		os.Exit(1)
+	}
+	host := os.Args[2]
+	port := "23"
+	if len(os.Args) > 3 {
+		port = os.Args[3]
+	}
+
+	ctx := context.Background()
+	sess, err := getSession(ctx)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer sess.Close()
+
+	if err := telnet.Run(ctx, sess.DialContext, host, port); err != nil {
+		log.Fatalf("Telnet failed: %v", err)
+	}
+}
+
+func handleBind() {
+	bindCmd := flag.NewFlagSet("bind", flag.ExitOnError)
+	verbose := bindCmd.Bool("v", false, "Log connections")
+	bindCmd.Parse(os.Args[2:])
+
+	args := bindCmd.Args()
+	if len(args) < 2 {
+		fmt.Println("Usage: wantasticd bind [-v] <local-port> <remote-host>:<remote-port>")
+		os.Exit(1)
+	}
+	localPort := args[0]
+	remoteTarget := args[1]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := getSession(ctx)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer sess.Close()
+
+	l, err := net.Listen("tcp", ":"+localPort)
+	if err != nil {
+		log.Fatalf("Listen failed: %v", err)
+	}
+	log.Printf("Listening on :%s, forwarding to %s", localPort, remoteTarget)
+
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			log.Printf("Accept error: %v", err)
+			continue
+		}
+		go func(local net.Conn) {
+			defer local.Close()
+			if *verbose {
+				log.Printf("New connection from %s", local.RemoteAddr())
+			}
+
+			remote, err := sess.DialContext(ctx, "tcp", remoteTarget)
+			if err != nil {
+				if *verbose {
+					log.Printf("Dial failed to %s: %v", remoteTarget, err)
+				}
+				return
+			}
+			defer remote.Close()
+
+			go io.Copy(local, remote)
+			io.Copy(remote, local)
+
+			if *verbose {
+				log.Printf("Connection closed from %s", local.RemoteAddr())
+			}
+		}(c)
+	}
+}
+
+func handlePing() {
+	pingCmd := flag.NewFlagSet("ping", flag.ExitOnError)
+	count := pingCmd.Int("c", -1, "Count")
+	interval := pingCmd.Duration("i", time.Second, "Interval")
+	pingCmd.Parse(os.Args[2:])
+
+	if len(pingCmd.Args()) < 1 {
+		fmt.Println("Usage: wantasticd ping [options] <host>")
+		os.Exit(1)
+	}
+	host := pingCmd.Args()[0]
+
+	// Create a context that is cancelled on SIGINT (Ctrl+C)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	sess, err := getSession(ctx)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer sess.Close()
+
+	if err := ping.Run(ctx, sess.DialContext, sess, host, *count, *interval); err != nil {
+		// If cancelled by user, exit cleanly
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		log.Fatalf("Ping failed: %v", err)
+	}
+}
+
+func startAgentWithRetry(ctx context.Context, cfg *config.Config) (*agent.Agent, error) {
+	maxRetries := 10
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			log.Printf("Port %d in use, retrying with port %d...", cfg.Interface.ListenPort-1, cfg.Interface.ListenPort)
+		}
+
+		agt, err := agent.New(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create agent: %w", err)
+		}
+
+		if err := agt.Start(ctx); err != nil {
+			lastErr = err
+			// Check for "address already in use"
+			if strings.Contains(err.Error(), "bind: address already in use") || strings.Contains(err.Error(), "address already in use") {
+				agt.Stop()
+				cfg.Interface.ListenPort++
+				continue
+			}
+			return nil, err
+		}
+
+		return agt, nil
+	}
+
+	return nil, fmt.Errorf("failed to start agent after %d attempts: %w", maxRetries, lastErr)
+}

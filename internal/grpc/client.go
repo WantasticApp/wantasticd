@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -20,14 +21,14 @@ import (
 	pb "wantastic-agent/internal/grpc/proto"
 )
 
-// resolveServerURL ensures the server URL has a port, defaulting to 50051 if missing.
+// resolveServerURL ensures the server URL has a port, defaulting to 443 if missing.
 // It does NOT perform DNS resolution, leaving that to the gRPC client.
 func resolveServerURL(serverURL string) (string, error) {
 	host, port, err := net.SplitHostPort(serverURL)
 	if err != nil {
-		// No port — treat entire string as host and use default port 50051
+		// No port — treat entire string as host and use default port 443
 		host = serverURL
-		port = "50051"
+		port = "443"
 	}
 
 	return net.JoinHostPort(host, port), nil
@@ -92,9 +93,10 @@ func (c *Client) connect() error {
 	// Determine transport security based on port
 	var transportCreds credentials.TransportCredentials
 	if strings.HasSuffix(serverAddr, ":443") {
-		// Use TLS for port 443 (Cloudflare/HTTPS)
-		transportCreds = credentials.NewTLS(nil) // Uses system cert pool
-		log.Printf("Using TLS for connection to %s", serverAddr)
+		// Use TLS for port 443 — skip cert verification for compatibility
+		// with self-signed certs on embedded/local environments
+		transportCreds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
+		log.Printf("Using TLS (skip verify) for connection to %s", serverAddr)
 	} else {
 		// Use insecure (plaintext) for other ports (e.g. 50051)
 		transportCreds = insecure.NewCredentials()

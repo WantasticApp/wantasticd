@@ -111,6 +111,18 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 			}
 		}
 
+		// Fallback 2: QSDK/Atheros specific 'wlanconfig'
+		if wifiInfo.Bitrate == 0 {
+			if station, err := getStationInfoFromWlanconfig(iface.Name); err == nil {
+				// Prefer wlanconfig signal/rate if available and current is 0
+				if wifiInfo.Signal == 0 {
+					wifiInfo.Signal = station.Signal
+				}
+				wifiInfo.Bitrate = station.Bitrate
+				// wlanconfig might not give bytes, but gives better rates
+			}
+		}
+
 		// Collect nearby networks via 'iw scan dump'
 		// This uses the kernel scan cache and doesn't trigger an active scan
 		if nearby, err := collectNearbyNetworks(iface.Name); err == nil {
@@ -419,6 +431,84 @@ func getStationInfoFromIW(iface string) (*stationInfo, error) {
 
 	if !foundStation {
 		return nil, fmt.Errorf("no stations found")
+	}
+
+	return info, nil
+}
+
+// getStationInfoFromWlanconfig parses 'wlanconfig <iface> list sta' (QSDK/Atheros)
+func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Output format of 'wlanconfig ath0 list sta':
+	// ADDR               AID   CHAN   TXRATE  RXRATE  RSSI  IDLE  TXSEQ  RXSEQ  CAPS  ACAPS  ERP   STATE     MAXRATE(DOT11)
+	// 00:11:22:33:44:55  1     36     120M    6M      30    0     0      0      EP    EPS    0     1         0
+	out, err := exec.CommandContext(ctx, "wlanconfig", iface, "list", "sta").Output()
+	if err != nil {
+		return nil, err
+	}
+
+	info := &stationInfo{}
+	lines := strings.Split(string(out), "\n")
+
+	// Headers are usually first line. We look for data lines (MAC address at start)
+
+	// Find column indices
+	var txRateIdx, rssiIdx int = -1, -1
+
+	for i, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		if i == 0 && strings.Contains(line, "ADDR") {
+			// header line, try to find dynamic indices if possible, or just hardcode based on standard output
+			for idx, f := range fields {
+				f = strings.ToLower(f)
+				if f == "txrate" {
+					txRateIdx = idx
+				}
+				if f == "rssi" {
+					rssiIdx = idx
+				}
+			}
+			continue
+		}
+
+		// Data line: explicit MAC check (cols 0)
+		if len(fields[0]) == 17 && strings.Contains(fields[0], ":") {
+			// Hardcoded fallback indices if header parsing failed (common QSDK format)
+			// ADDR(0) AID(1) CHAN(2) TXRATE(3) RXRATE(4) RSSI(5) ...
+			if txRateIdx == -1 {
+				txRateIdx = 3
+			}
+			if rssiIdx == -1 {
+				rssiIdx = 5
+			}
+
+			if len(fields) > rssiIdx {
+				if val, err := strconv.Atoi(fields[rssiIdx]); err == nil {
+					info.Signal = val
+				}
+			}
+
+			if len(fields) > txRateIdx {
+				// Rate is often "120M" or "6.5M"
+				valStr := strings.TrimSuffix(strings.ToUpper(fields[txRateIdx]), "M")
+				if val, err := strconv.ParseFloat(valStr, 64); err == nil {
+					info.Bitrate = int(val)
+				}
+			}
+
+			// Found one, break (similar to existing logic)
+			break
+		}
+	}
+
+	if info.Bitrate == 0 && info.Signal == 0 {
+		return nil, fmt.Errorf("no info found")
 	}
 
 	return info, nil

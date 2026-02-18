@@ -436,15 +436,16 @@ func getStationInfoFromIW(iface string) (*stationInfo, error) {
 	return info, nil
 }
 
-// getStationInfoFromWlanconfig parses 'wlanconfig <iface> list sta' (QSDK/Atheros)
+// getStationInfoFromWlanconfig parses 'wlanconfig <iface> list' (QSDK/Atheros)
+// Note: 'list' usually defaults to 'list sta' for AP interfaces
 func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Output format of 'wlanconfig ath0 list sta':
-	// ADDR               AID   CHAN   TXRATE  RXRATE  RSSI  IDLE  TXSEQ  RXSEQ  CAPS  ACAPS  ERP   STATE     MAXRATE(DOT11)
-	// 00:11:22:33:44:55  1     36     120M    6M      30    0     0      0      EP    EPS    0     1         0
-	out, err := exec.CommandContext(ctx, "wlanconfig", iface, "list", "sta").Output()
+	// Output format of 'wlanconfig ath3 list':
+	// ADDR               AID CHAN TXRATE RXRATE RSSI MINRSSI MAXRSSI IDLE  TXSEQ  RXSEQ  CAPS XCAPS ACAPS     ERP    STATE MAXRATE(DOT11) ...
+	// e0:5d:54:4b:e9:31    4    9 1152M    864M  -76     -81     -64    0      0   65535  EPsR  ETWt NULL    0          3        5764800 ...
+	out, err := exec.CommandContext(ctx, "wlanconfig", iface, "list").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -452,10 +453,14 @@ func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
 	info := &stationInfo{}
 	lines := strings.Split(string(out), "\n")
 
-	// Headers are usually first line. We look for data lines (MAC address at start)
+	var txRateIdx, rxRateIdx, rssiIdx int = -1, -1, -1
 
-	// Find column indices
-	var txRateIdx, rssiIdx int = -1, -1
+	// We want to average the stats across all connected stations to give a high-level "interface health"
+	// or just pick the best/worst? Existing logic takes the first one.
+	// The user's output shows multiple stations.
+	// Let's take the first associated station for consistency with existing logic.
+
+	found := false
 
 	for i, line := range lines {
 		fields := strings.Fields(line)
@@ -464,11 +469,14 @@ func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
 		}
 
 		if i == 0 && strings.Contains(line, "ADDR") {
-			// header line, try to find dynamic indices if possible, or just hardcode based on standard output
+			// header line, find indices
 			for idx, f := range fields {
 				f = strings.ToLower(f)
 				if f == "txrate" {
 					txRateIdx = idx
+				}
+				if f == "rxrate" {
+					rxRateIdx = idx
 				}
 				if f == "rssi" {
 					rssiIdx = idx
@@ -479,10 +487,13 @@ func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
 
 		// Data line: explicit MAC check (cols 0)
 		if len(fields[0]) == 17 && strings.Contains(fields[0], ":") {
-			// Hardcoded fallback indices if header parsing failed (common QSDK format)
-			// ADDR(0) AID(1) CHAN(2) TXRATE(3) RXRATE(4) RSSI(5) ...
+			// Use found indices or defaults
+			// Default from example: ADDR(0) ... TXRATE(3) RXRATE(4) RSSI(5)
 			if txRateIdx == -1 {
 				txRateIdx = 3
+			}
+			if rxRateIdx == -1 {
+				rxRateIdx = 4
 			}
 			if rssiIdx == -1 {
 				rssiIdx = 5
@@ -495,19 +506,20 @@ func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
 			}
 
 			if len(fields) > txRateIdx {
-				// Rate is often "120M" or "6.5M"
+				// Rate is often "1152M"
 				valStr := strings.TrimSuffix(strings.ToUpper(fields[txRateIdx]), "M")
 				if val, err := strconv.ParseFloat(valStr, 64); err == nil {
 					info.Bitrate = int(val)
 				}
 			}
 
-			// Found one, break (similar to existing logic)
+			// Capture this station's info and stop (first station logic)
+			found = true
 			break
 		}
 	}
 
-	if info.Bitrate == 0 && info.Signal == 0 {
+	if !found || (info.Bitrate == 0 && info.Signal == 0) {
 		return nil, fmt.Errorf("no info found")
 	}
 

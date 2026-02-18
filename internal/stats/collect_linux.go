@@ -96,6 +96,21 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 			}
 		}
 
+		// Fallback: If Signal/Bitrate is still 0 (mdlayher/wifi failed to get station info), try 'iw station dump'
+		if wifiInfo.Signal == 0 && wifiInfo.Bitrate == 0 {
+			if station, err := getStationInfoFromIW(iface.Name); err == nil {
+				wifiInfo.Signal = station.Signal
+				if wifiInfo.Noise != 0 {
+					wifiInfo.SNR = wifiInfo.Signal - wifiInfo.Noise
+				}
+				wifiInfo.Bitrate = station.Bitrate
+				wifiInfo.RxBytes = station.RxBytes
+				wifiInfo.TxBytes = station.TxBytes
+				wifiInfo.RxPackets = station.RxPackets
+				wifiInfo.TxPackets = station.TxPackets
+			}
+		}
+
 		// Collect nearby networks via 'iw scan dump'
 		// This uses the kernel scan cache and doesn't trigger an active scan
 		if nearby, err := collectNearbyNetworks(iface.Name); err == nil {
@@ -277,6 +292,133 @@ func getWiFiInfoFromIW(iface string) (*iwInfo, error) {
 		// Approx mapping not implemented backwards here easily, but usually both present
 	} else if info.Frequency != 0 && info.Channel == 0 {
 		info.Channel = frequencyToChannel(info.Frequency)
+	}
+
+	return info, nil
+}
+
+// Simple struct to hold parsed station info
+type stationInfo struct {
+	Signal    int
+	Bitrate   int
+	RxBytes   uint64
+	TxBytes   uint64
+	RxPackets uint64
+	TxPackets uint64
+}
+
+// getStationInfoFromIW parses 'iw dev <iface> station dump' to get signal/bitrate
+func getStationInfoFromIW(iface string) (*stationInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Output format of 'iw dev <iface> station dump':
+	// Station 00:11:22:33:44:55 (on wlan0)
+	// 	inactive time:	30 ms
+	// 	rx bytes:	12345
+	// 	rx packets:	123
+	// 	tx bytes:	67890
+	// 	tx packets:	456
+	// 	tx retries:	0
+	// 	tx failed:	0
+	// 	signal:  	-60 dBm
+	// 	signal avg:	-61 dBm
+	// 	tx bitrate:	866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2
+	// 	rx bitrate:	866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2
+	// 	authorized:	yes
+	// 	authenticated:	yes
+	// 	associated:	yes
+	// 	preamble:	long
+	// 	WMM/WME:	yes
+	// 	MFP:		no
+	// 	TDLS peer:	no
+	// 	DTIM period:	2
+	// 	beacon interval:100
+	// 	short preamble:	yes
+	// 	short slot time:yes
+	// 	connected time:	123 seconds
+	out, err := exec.CommandContext(ctx, "iw", "dev", iface, "station", "dump").Output()
+	if err != nil {
+		return nil, err
+	}
+
+	info := &stationInfo{}
+	lines := strings.Split(string(out), "\n")
+	foundStation := false
+
+	// We'll just take the first associated station for now to represent the link quality
+	// Or maybe average them? For now, stick to "first found" logic to match existing code.
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Station ") {
+			if foundStation {
+				break // We only want the first one
+			}
+			foundStation = true
+			continue
+		}
+
+		if !foundStation {
+			continue
+		}
+
+		if strings.HasPrefix(line, "signal:") {
+			// signal:  	-60 dBm
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				val := strings.TrimSpace(strings.TrimSuffix(fields[1], " dBm"))
+				if sig, err := strconv.Atoi(val); err == nil {
+					info.Signal = sig
+				}
+			}
+		} else if strings.HasPrefix(line, "tx bitrate:") {
+			// tx bitrate:	866.7 MBit/s ...
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				valStr := fields[2]
+				val, err := strconv.ParseFloat(valStr, 64)
+				if err == nil {
+					// Convert to Mbps (int)
+					if strings.Contains(fields[3], "MBit/s") {
+						info.Bitrate = int(val)
+					} else if strings.Contains(fields[3], "Bit/s") {
+						info.Bitrate = int(val / 1000000)
+					}
+				}
+			}
+		} else if strings.HasPrefix(line, "rx bytes:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
+					info.RxBytes = val
+				}
+			}
+		} else if strings.HasPrefix(line, "tx bytes:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
+					info.TxBytes = val
+				}
+			}
+		} else if strings.HasPrefix(line, "rx packets:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
+					info.RxPackets = val
+				}
+			}
+		} else if strings.HasPrefix(line, "tx packets:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
+					info.TxPackets = val
+				}
+			}
+		}
+	}
+
+	if !foundStation {
+		return nil, fmt.Errorf("no stations found")
 	}
 
 	return info, nil

@@ -66,6 +66,18 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 			}
 		}
 
+		// Fallback: If SSID is empty (likely AP mode or BSS failed), try 'iw' command
+		if wifiInfo.SSID == "" {
+			if info, err := getWiFiInfoFromIW(iface.Name); err == nil {
+				wifiInfo.SSID = info.SSID
+				wifiInfo.Frequency = info.Frequency
+				wifiInfo.Channel = info.Channel
+				wifiInfo.TxPower = info.TxPower
+				wifiInfo.Connected = true // If we have an SSID in AP mode, we are "connected"/active
+				connected = true
+			}
+		}
+
 		// Get detailed station info
 		stationInfos, err := client.StationInfo(iface)
 		if err == nil {
@@ -191,6 +203,85 @@ func collectNearbyNetworks(iface string) ([]NearbyNetwork, error) {
 	return networks, nil
 }
 
+// Simple struct to hold parsed iw info
+type iwInfo struct {
+	SSID      string
+	Frequency int
+	Channel   int
+	TxPower   int
+}
+
+// getWiFiInfoFromIW parses 'iw dev <iface> info' to get SSID, freq, txpower
+// Useful for AP mode where mdlayher/wifi BSS() might not return the hosted SSID.
+func getWiFiInfoFromIW(iface string) (*iwInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Output format of 'iw dev <iface> info':
+	// Interface wlan0
+	// 	ifindex 4
+	// 	wdev 0x1
+	// 	addr 00:11:22:33:44:55
+	// 	ssid MyNetwork
+	// 	type AP
+	// 	wiphy 0
+	// 	channel 36 (5180 MHz), width: 20 MHz, center1: 5180 MHz
+	// 	txpower 23.00 dBm
+	out, err := exec.CommandContext(ctx, "iw", "dev", iface, "info").Output()
+	if err != nil {
+		return nil, err
+	}
+
+	info := &iwInfo{}
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ssid ") {
+			info.SSID = strings.TrimPrefix(line, "ssid ")
+		} else if strings.HasPrefix(line, "channel ") {
+			// channel 36 (5180 MHz), ...
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if ch, err := strconv.Atoi(fields[1]); err == nil {
+					info.Channel = ch
+				}
+			}
+			if strings.Contains(line, "(") && strings.Contains(line, "MHz)") {
+				// Extract frequency
+				start := strings.Index(line, "(") + 1
+				end := strings.Index(line, " MHz)")
+				if start > 0 && end > start {
+					if freq, err := strconv.Atoi(line[start:end]); err == nil {
+						info.Frequency = freq
+					}
+				}
+			}
+		} else if strings.HasPrefix(line, "txpower ") {
+			// txpower 23.00 dBm
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				val := strings.TrimSuffix(fields[1], ".00")
+				if pwr, err := strconv.Atoi(val); err == nil {
+					info.TxPower = pwr
+				}
+			}
+		}
+	}
+
+	if info.SSID == "" {
+		return nil, fmt.Errorf("no SSID found")
+	}
+
+	// If channel/freq missing but we have one, map the other
+	if info.Channel != 0 && info.Frequency == 0 {
+		// Approx mapping not implemented backwards here easily, but usually both present
+	} else if info.Frequency != 0 && info.Channel == 0 {
+		info.Channel = frequencyToChannel(info.Frequency)
+	}
+
+	return info, nil
+}
+
 // collectNetworkInterfaceStatistics collects network interface statistics from /sys/class/net
 func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 	var interfaces []InterfaceInfo
@@ -268,6 +359,11 @@ func getInterfaceMAC(ifaceName string) (string, error) {
 func collectMeshStatistics() *MeshInfo {
 	// 1. Try EasyMesh (IEEE 1905.1) - usually primary if it exists
 	if mesh := collectEasyMeshLowLevel(); mesh != nil {
+		return mesh
+	}
+
+	// 1b. Try QSDK EasyMesh (via device.getRealTopo) - specific to Qualcomm SDK
+	if mesh := collectQSDKMesh(); mesh != nil {
 		return mesh
 	}
 
@@ -536,6 +632,108 @@ func collectEasyMesh() *MeshInfo {
 				}
 			}
 		}
+	}
+
+	return mesh
+}
+
+func collectQSDKMesh() *MeshInfo {
+	// Check if ubus is available
+	if _, err := exec.LookPath("ubus"); err != nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// QSDK specific command: ubus call device getRealTopo
+	out, err := exec.CommandContext(ctx, "ubus", "call", "device", "getRealTopo").Output()
+	if err != nil {
+		return nil
+	}
+
+	// Structure based on user provided JSON
+	var data struct {
+		Topo []struct {
+			MAC      string `json:"mac"`
+			PMAC     string `json:"pMac"` // Parent MAC
+			Hops     int    `json:"hops"`
+			IP       string `json:"ip"`
+			Backhaul string `json:"backhaul"`
+			Name     string `json:"name"`
+		} `json:"topo"`
+	}
+
+	if err := json.Unmarshal(out, &data); err != nil {
+		return nil
+	}
+
+	if len(data.Topo) == 0 {
+		return nil
+	}
+
+	mesh := &MeshInfo{
+		Protocol: "easymesh-qsdk",
+		Role:     "controller", // Assumption: if we can see the full topo, we are likely the controller
+		IsCenter: true,
+	}
+
+	// Build the tree
+	// 1. Create all nodes and put them in a map
+	nodeMap := make(map[string]*MeshNode)
+	var root *MeshNode
+
+	for _, n := range data.Topo {
+		node := &MeshNode{
+			Name: n.Name,
+			MAC:  n.MAC,
+			IP:   n.IP,
+			Role: "agent", // Default role
+		}
+		if n.Hops == 0 {
+			node.Role = "controller" // 0 hops usually means self/controller
+			root = node
+		}
+		nodeMap[n.MAC] = node
+	}
+
+	// 2. Link children to parents
+	for _, n := range data.Topo {
+		if n.PMAC == "" {
+			continue // Root or detached
+		}
+
+		child := nodeMap[n.MAC]
+		parent, ok := nodeMap[n.PMAC]
+		if ok {
+			parent.Children = append(parent.Children, child)
+		}
+	}
+
+	// If we found a root (hop 0), use it. Otherwise, create a synthetic root if possible?
+	// The provided JSON shows hop 0 for the device itself.
+	if root != nil {
+		mesh.Topology = root
+	} else if len(nodeMap) > 0 {
+		// Fallback: if no hop 0 found, just attach everything to a dummy root?
+		// Or maybe pick one with lowest hops?
+		// For now, if no root is identified, return nil or maybe just the list attached to a dummy?
+		// Let's return the first one found as root or nil?
+		// Actually, if we have data but no clear root, we might want to show something.
+		// But usually one node has hops=0.
+		// Let's check if we have any nodes at all.
+		// If no hops=0 node, maybe we are an agent seeing the topology?
+		// But getRealTopo usually runs on the controller.
+		// Let's leave Topology nil if no root found, but still return mesh info?
+		// If Topology is nil, UI might not show graph.
+		// Let's try to find a node with empty pMac as root if hops=0 didn't catch it.
+		for _, n := range data.Topo {
+			if n.PMAC == "" {
+				root = nodeMap[n.MAC]
+				break
+			}
+		}
+		mesh.Topology = root
 	}
 
 	return mesh

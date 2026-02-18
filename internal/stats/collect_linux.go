@@ -3,13 +3,11 @@
 package stats
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,15 +16,16 @@ import (
 	"github.com/mdlayher/genetlink"
 	"github.com/mdlayher/netlink"
 	"github.com/mdlayher/wifi"
+	"github.com/prometheus/procfs"
+	"github.com/prometheus/procfs/sysfs"
 )
 
-// collectWiFiStatistics collects WiFi statistics using github.com/mdlayher/wifi
-// and other Linux-specific sources for better embedded device support.
+// collectWiFiStatistics collects WiFi statistics using mdlayher/wifi v0.7.2
+// Pure Go via nl80211 netlink — no exec.Command fallbacks.
 func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 	var wifiInterfaces []WiFiInterfaceInfo
 	var connected bool
 
-	// Create WiFi client
 	client, err := wifi.New()
 	if err != nil {
 		log.Printf("WiFi client creation failed: %v", err)
@@ -34,51 +33,62 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 	}
 	defer client.Close()
 
-	// Get all WiFi interfaces
 	interfaces, err := client.Interfaces()
 	if err != nil {
 		log.Printf("Failed to get WiFi interfaces: %v", err)
 		return wifiInterfaces, false
 	}
 
-	// Get noise levels from /proc/net/wireless
-	noiseLevels := parseProcNetWireless()
+	// Collect noise data from SurveyInfo (replaces /proc/net/wireless parsing)
+	// Map frequency → noise for noise lookup by interface frequency
+	noiseByFreq := make(map[int]int)
+	for _, iface := range interfaces {
+		surveys, err := client.SurveyInfo(iface)
+		if err == nil {
+			for _, s := range surveys {
+				if s.Noise != 0 {
+					noiseByFreq[s.Frequency] = s.Noise
+				}
+			}
+		}
+	}
 
 	for _, iface := range interfaces {
 		wifiInfo := WiFiInterfaceInfo{
 			Name:      iface.Name,
 			MAC:       iface.HardwareAddr.String(),
 			Connected: false,
+			Frequency: iface.Frequency,
+			Channel:   frequencyToChannel(iface.Frequency),
 		}
 
-		if noise, ok := noiseLevels[iface.Name]; ok {
+		// Get noise for this interface's frequency
+		if noise, ok := noiseByFreq[iface.Frequency]; ok {
 			wifiInfo.Noise = noise
 		}
 
-		// Try to get BSS info for associated network
+		// BSS info — works for station mode
 		if bss, err := client.BSS(iface); err == nil && bss != nil {
 			wifiInfo.SSID = bss.SSID
 			wifiInfo.Connected = (bss.Status == wifi.BSSStatusAssociated)
-			wifiInfo.Frequency = bss.Frequency
-			wifiInfo.Channel = frequencyToChannel(bss.Frequency)
+			wifiInfo.Frequency = int(bss.Frequency)
+			wifiInfo.Channel = frequencyToChannel(int(bss.Frequency))
 			if wifiInfo.Connected {
 				connected = true
 			}
 		}
 
-		// Fallback: If SSID is empty (likely AP mode or BSS failed), try 'iw' command
-		if wifiInfo.SSID == "" {
-			if info, err := getWiFiInfoFromIW(iface.Name); err == nil {
-				wifiInfo.SSID = info.SSID
-				wifiInfo.Frequency = info.Frequency
-				wifiInfo.Channel = info.Channel
-				wifiInfo.TxPower = info.TxPower
-				wifiInfo.Connected = true // If we have an SSID in AP mode, we are "connected"/active
+		// For AP mode — Interface.Type tells us the operating mode
+		if iface.Type == wifi.InterfaceTypeAP && wifiInfo.SSID == "" {
+			// In AP mode, the SSID isn't in BSS — read from sysfs or nl80211 interface info
+			if ssid, err := readSSIDFromSysfs(iface.Name); err == nil && ssid != "" {
+				wifiInfo.SSID = ssid
+				wifiInfo.Connected = true
 				connected = true
 			}
 		}
 
-		// Get detailed station info
+		// Station info — signal, bitrate, rx/tx stats
 		stationInfos, err := client.StationInfo(iface)
 		if err == nil {
 			for _, station := range stationInfos {
@@ -86,46 +96,18 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 				if wifiInfo.Noise != 0 {
 					wifiInfo.SNR = wifiInfo.Signal - wifiInfo.Noise
 				}
+				// Bitrate is in bits/sec, convert to Mbps
 				wifiInfo.Bitrate = station.TransmitBitrate / 1000000
 				wifiInfo.RxBytes = uint64(station.ReceivedBytes)
 				wifiInfo.TxBytes = uint64(station.TransmittedBytes)
 				wifiInfo.RxPackets = uint64(station.ReceivedPackets)
 				wifiInfo.TxPackets = uint64(station.TransmittedPackets)
-				// Break after first station record for the interface
-				break
+				break // First station usage as representative
 			}
 		}
 
-		// Fallback: If Signal/Bitrate is still 0 (mdlayher/wifi failed to get station info), try 'iw station dump'
-		if wifiInfo.Signal == 0 && wifiInfo.Bitrate == 0 {
-			if station, err := getStationInfoFromIW(iface.Name); err == nil {
-				wifiInfo.Signal = station.Signal
-				if wifiInfo.Noise != 0 {
-					wifiInfo.SNR = wifiInfo.Signal - wifiInfo.Noise
-				}
-				wifiInfo.Bitrate = station.Bitrate
-				wifiInfo.RxBytes = station.RxBytes
-				wifiInfo.TxBytes = station.TxBytes
-				wifiInfo.RxPackets = station.RxPackets
-				wifiInfo.TxPackets = station.TxPackets
-			}
-		}
-
-		// Fallback 2: QSDK/Atheros specific 'wlanconfig'
-		if wifiInfo.Bitrate == 0 {
-			if station, err := getStationInfoFromWlanconfig(iface.Name); err == nil {
-				// Prefer wlanconfig signal/rate if available and current is 0
-				if wifiInfo.Signal == 0 {
-					wifiInfo.Signal = station.Signal
-				}
-				wifiInfo.Bitrate = station.Bitrate
-				// wlanconfig might not give bytes, but gives better rates
-			}
-		}
-
-		// Collect nearby networks via 'iw scan dump'
-		// This uses the kernel scan cache and doesn't trigger an active scan
-		if nearby, err := collectNearbyNetworks(iface.Name); err == nil {
+		// Nearby networks via AccessPoints (replaces `iw scan dump`)
+		if nearby, err := collectNearbyNetworks(client, iface); err == nil {
 			wifiInfo.Nearby = nearby
 		}
 
@@ -133,6 +115,29 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 	}
 
 	return wifiInterfaces, connected
+}
+
+// readSSIDFromSysfs reads the SSID for AP-mode interfaces from nl80211 via sysfs
+func readSSIDFromSysfs(ifaceName string) (string, error) {
+	paths := []string{
+		fmt.Sprintf("/sys/class/net/%s/ssid", ifaceName),
+		fmt.Sprintf("/tmp/hostapd_%s.conf", ifaceName),
+	}
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil {
+			content := strings.TrimSpace(string(data))
+			if strings.Contains(p, "hostapd") {
+				for _, line := range strings.Split(content, "\n") {
+					if strings.HasPrefix(line, "ssid=") {
+						return strings.TrimPrefix(line, "ssid="), nil
+					}
+				}
+			} else {
+				return content, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("SSID not found")
 }
 
 func frequencyToChannel(freq int) int {
@@ -149,406 +154,62 @@ func frequencyToChannel(freq int) int {
 	return 0
 }
 
-func parseProcNetWireless() map[string]int {
-	noises := make(map[string]int)
-	data, err := os.ReadFile("/proc/net/wireless")
-	if err != nil {
-		return noises
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if !strings.Contains(line, ":") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
-		}
-		iface := strings.TrimSpace(strings.Split(fields[0], ":")[0])
-		// noise is field 4 (0-indexed)
-		if noise, err := strconv.Atoi(strings.TrimSuffix(fields[4], ".")); err == nil {
-			noises[iface] = noise
-		}
-	}
-	return noises
-}
-
-func collectNearbyNetworks(iface string) ([]NearbyNetwork, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Try 'iw dev <iface> scan dump'
-	out, err := exec.CommandContext(ctx, "iw", "dev", iface, "scan", "dump").Output()
+// collectNearbyNetworks uses Client.AccessPoints to get cached scan results
+func collectNearbyNetworks(client *wifi.Client, iface *wifi.Interface) ([]NearbyNetwork, error) {
+	bssList, err := client.AccessPoints(iface)
 	if err != nil {
 		return nil, err
 	}
 
 	var networks []NearbyNetwork
-	var current *NearbyNetwork
-
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "BSS ") {
-			if current != nil && current.SSID != "" {
-				networks = append(networks, *current)
-			}
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				bssid := strings.Split(parts[1], "(")[0]
-				current = &NearbyNetwork{BSSID: bssid}
-			}
+	for _, bss := range bssList {
+		if bss.SSID == "" {
 			continue
 		}
-
-		if current == nil {
-			continue
+		network := NearbyNetwork{
+			SSID:    bss.SSID,
+			BSSID:   bss.BSSID.String(),
+			Signal:  int(bss.Signal / 100), // mBm to dBm
+			Channel: frequencyToChannel(int(bss.Frequency)),
 		}
-
-		if strings.HasPrefix(line, "SSID: ") {
-			current.SSID = strings.TrimPrefix(line, "SSID: ")
-		} else if strings.HasPrefix(line, "freq: ") {
-			if freq, err := strconv.Atoi(strings.TrimPrefix(line, "freq: ")); err == nil {
-				current.Channel = frequencyToChannel(freq)
-			}
-		} else if strings.HasPrefix(line, "signal: ") {
-			// signal: -61.00 dBm
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				val := strings.TrimSuffix(fields[1], ".00")
-				if sig, err := strconv.Atoi(val); err == nil {
-					current.Signal = sig
-				}
-			}
+		// Security info from RSN IE
+		if bss.RSN.IsInitialized() {
+			network.Security = bss.RSN.String()
 		}
-	}
-
-	if current != nil && current.SSID != "" {
-		networks = append(networks, *current)
+		networks = append(networks, network)
 	}
 
 	return networks, nil
 }
 
-// Simple struct to hold parsed iw info
-type iwInfo struct {
-	SSID      string
-	Frequency int
-	Channel   int
-	TxPower   int
-}
-
-// getWiFiInfoFromIW parses 'iw dev <iface> info' to get SSID, freq, txpower
-// Useful for AP mode where mdlayher/wifi BSS() might not return the hosted SSID.
-func getWiFiInfoFromIW(iface string) (*iwInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Output format of 'iw dev <iface> info':
-	// Interface wlan0
-	// 	ifindex 4
-	// 	wdev 0x1
-	// 	addr 00:11:22:33:44:55
-	// 	ssid MyNetwork
-	// 	type AP
-	// 	wiphy 0
-	// 	channel 36 (5180 MHz), width: 20 MHz, center1: 5180 MHz
-	// 	txpower 23.00 dBm
-	out, err := exec.CommandContext(ctx, "iw", "dev", iface, "info").Output()
-	if err != nil {
-		return nil, err
-	}
-
-	info := &iwInfo{}
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "ssid ") {
-			info.SSID = strings.TrimPrefix(line, "ssid ")
-		} else if strings.HasPrefix(line, "channel ") {
-			// channel 36 (5180 MHz), ...
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				if ch, err := strconv.Atoi(fields[1]); err == nil {
-					info.Channel = ch
-				}
-			}
-			if strings.Contains(line, "(") && strings.Contains(line, "MHz)") {
-				// Extract frequency
-				start := strings.Index(line, "(") + 1
-				end := strings.Index(line, " MHz)")
-				if start > 0 && end > start {
-					if freq, err := strconv.Atoi(line[start:end]); err == nil {
-						info.Frequency = freq
-					}
-				}
-			}
-		} else if strings.HasPrefix(line, "txpower ") {
-			// txpower 23.00 dBm
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				val := strings.TrimSuffix(fields[1], ".00")
-				if pwr, err := strconv.Atoi(val); err == nil {
-					info.TxPower = pwr
-				}
-			}
-		}
-	}
-
-	if info.SSID == "" {
-		return nil, fmt.Errorf("no SSID found")
-	}
-
-	// If channel/freq missing but we have one, map the other
-	if info.Channel != 0 && info.Frequency == 0 {
-		// Approx mapping not implemented backwards here easily, but usually both present
-	} else if info.Frequency != 0 && info.Channel == 0 {
-		info.Channel = frequencyToChannel(info.Frequency)
-	}
-
-	return info, nil
-}
-
-// Simple struct to hold parsed station info
-type stationInfo struct {
-	Signal    int
-	Bitrate   int
-	RxBytes   uint64
-	TxBytes   uint64
-	RxPackets uint64
-	TxPackets uint64
-}
-
-// getStationInfoFromIW parses 'iw dev <iface> station dump' to get signal/bitrate
-func getStationInfoFromIW(iface string) (*stationInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Output format of 'iw dev <iface> station dump':
-	// Station 00:11:22:33:44:55 (on wlan0)
-	// 	inactive time:	30 ms
-	// 	rx bytes:	12345
-	// 	rx packets:	123
-	// 	tx bytes:	67890
-	// 	tx packets:	456
-	// 	tx retries:	0
-	// 	tx failed:	0
-	// 	signal:  	-60 dBm
-	// 	signal avg:	-61 dBm
-	// 	tx bitrate:	866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2
-	// 	rx bitrate:	866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2
-	// 	authorized:	yes
-	// 	authenticated:	yes
-	// 	associated:	yes
-	// 	preamble:	long
-	// 	WMM/WME:	yes
-	// 	MFP:		no
-	// 	TDLS peer:	no
-	// 	DTIM period:	2
-	// 	beacon interval:100
-	// 	short preamble:	yes
-	// 	short slot time:yes
-	// 	connected time:	123 seconds
-	out, err := exec.CommandContext(ctx, "iw", "dev", iface, "station", "dump").Output()
-	if err != nil {
-		return nil, err
-	}
-
-	info := &stationInfo{}
-	lines := strings.Split(string(out), "\n")
-	foundStation := false
-
-	// We'll just take the first associated station for now to represent the link quality
-	// Or maybe average them? For now, stick to "first found" logic to match existing code.
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Station ") {
-			if foundStation {
-				break // We only want the first one
-			}
-			foundStation = true
-			continue
-		}
-
-		if !foundStation {
-			continue
-		}
-
-		if strings.HasPrefix(line, "signal:") {
-			// signal:  	-60 dBm
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				val := strings.TrimSpace(strings.TrimSuffix(fields[1], " dBm"))
-				if sig, err := strconv.Atoi(val); err == nil {
-					info.Signal = sig
-				}
-			}
-		} else if strings.HasPrefix(line, "tx bitrate:") {
-			// tx bitrate:	866.7 MBit/s ...
-			fields := strings.Fields(line)
-			if len(fields) >= 3 {
-				valStr := fields[2]
-				val, err := strconv.ParseFloat(valStr, 64)
-				if err == nil {
-					// Convert to Mbps (int)
-					if strings.Contains(fields[3], "MBit/s") {
-						info.Bitrate = int(val)
-					} else if strings.Contains(fields[3], "Bit/s") {
-						info.Bitrate = int(val / 1000000)
-					}
-				}
-			}
-		} else if strings.HasPrefix(line, "rx bytes:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 3 {
-				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
-					info.RxBytes = val
-				}
-			}
-		} else if strings.HasPrefix(line, "tx bytes:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 3 {
-				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
-					info.TxBytes = val
-				}
-			}
-		} else if strings.HasPrefix(line, "rx packets:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 3 {
-				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
-					info.RxPackets = val
-				}
-			}
-		} else if strings.HasPrefix(line, "tx packets:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 3 {
-				if val, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
-					info.TxPackets = val
-				}
-			}
-		}
-	}
-
-	if !foundStation {
-		return nil, fmt.Errorf("no stations found")
-	}
-
-	return info, nil
-}
-
-// getStationInfoFromWlanconfig parses 'wlanconfig <iface> list' (QSDK/Atheros)
-// Note: 'list' usually defaults to 'list sta' for AP interfaces
-func getStationInfoFromWlanconfig(iface string) (*stationInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Output format of 'wlanconfig ath3 list':
-	// ADDR               AID CHAN TXRATE RXRATE RSSI MINRSSI MAXRSSI IDLE  TXSEQ  RXSEQ  CAPS XCAPS ACAPS     ERP    STATE MAXRATE(DOT11) ...
-	// e0:5d:54:4b:e9:31    4    9 1152M    864M  -76     -81     -64    0      0   65535  EPsR  ETWt NULL    0          3        5764800 ...
-	out, err := exec.CommandContext(ctx, "wlanconfig", iface, "list").Output()
-	if err != nil {
-		return nil, err
-	}
-
-	info := &stationInfo{}
-	lines := strings.Split(string(out), "\n")
-
-	var txRateIdx, rxRateIdx, rssiIdx int = -1, -1, -1
-
-	// We want to average the stats across all connected stations to give a high-level "interface health"
-	// or just pick the best/worst? Existing logic takes the first one.
-	// The user's output shows multiple stations.
-	// Let's take the first associated station for consistency with existing logic.
-
-	found := false
-
-	for i, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-
-		if i == 0 && strings.Contains(line, "ADDR") {
-			// header line, find indices
-			for idx, f := range fields {
-				f = strings.ToLower(f)
-				if f == "txrate" {
-					txRateIdx = idx
-				}
-				if f == "rxrate" {
-					rxRateIdx = idx
-				}
-				if f == "rssi" {
-					rssiIdx = idx
-				}
-			}
-			continue
-		}
-
-		// Data line: explicit MAC check (cols 0)
-		if len(fields[0]) == 17 && strings.Contains(fields[0], ":") {
-			// Use found indices or defaults
-			// Default from example: ADDR(0) ... TXRATE(3) RXRATE(4) RSSI(5)
-			if txRateIdx == -1 {
-				txRateIdx = 3
-			}
-			if rxRateIdx == -1 {
-				rxRateIdx = 4
-			}
-			if rssiIdx == -1 {
-				rssiIdx = 5
-			}
-
-			if len(fields) > rssiIdx {
-				if val, err := strconv.Atoi(fields[rssiIdx]); err == nil {
-					info.Signal = val
-				}
-			}
-
-			if len(fields) > txRateIdx {
-				// Rate is often "1152M"
-				valStr := strings.TrimSuffix(strings.ToUpper(fields[txRateIdx]), "M")
-				if val, err := strconv.ParseFloat(valStr, 64); err == nil {
-					info.Bitrate = int(val)
-				}
-			}
-
-			// Capture this station's info and stop (first station logic)
-			found = true
-			break
-		}
-	}
-
-	if !found || (info.Bitrate == 0 && info.Signal == 0) {
-		return nil, fmt.Errorf("no info found")
-	}
-
-	return info, nil
-}
-
-// collectNetworkInterfaceStatistics collects network interface statistics from /sys/class/net
+// collectNetworkInterfaceStatistics collects network interface statistics using prometheus/procfs
 func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 	var interfaces []InterfaceInfo
 	var totalTx, totalRx uint64
 
-	// Read network interfaces from /sys/class/net
-	netDir := "/sys/class/net"
-	entries, err := os.ReadDir(netDir)
+	fs, err := procfs.NewFS("/proc")
 	if err != nil {
-		log.Printf("Failed to read network interfaces: %v", err)
+		log.Printf("Failed to open procfs: %v", err)
 		return interfaces, 0, 0
 	}
 
-	for _, entry := range entries {
-		ifaceName := entry.Name()
+	netDev, err := fs.NetDev()
+	if err != nil {
+		log.Printf("Failed to get NetDev stats: %v", err)
+		return interfaces, 0, 0
+	}
 
-		// Get interface statistics from /sys/class/net
-		rxBytes, _ := readUint64FromFile(filepath.Join(netDir, ifaceName, "statistics", "rx_bytes"))
-		txBytes, _ := readUint64FromFile(filepath.Join(netDir, ifaceName, "statistics", "tx_bytes"))
+	// Use sysfs for interface attributes (address, operstate)
+	sfs, err := sysfs.NewFS("/sys")
+	var netClass sysfs.NetClass
+	if err == nil {
+		netClass, _ = sfs.NetClass()
+	}
 
-		// Always add to totals
-		totalRx += rxBytes
-		totalTx += txBytes
+	for ifaceName, stats := range netDev {
+		// always add to totals
+		totalRx += stats.RxBytes
+		totalTx += stats.TxBytes
 
 		// Skip filtered interfaces for the detailed list
 		if ifaceName == "lo" || strings.HasPrefix(ifaceName, "veth") ||
@@ -558,17 +219,26 @@ func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 
 		iface := InterfaceInfo{
 			Name:    ifaceName,
-			Up:      isInterfaceUp(ifaceName),
-			RxBytes: rxBytes, // Use the value read above
-			TxBytes: txBytes, // Use the value read above
+			RxBytes: stats.RxBytes,
+			TxBytes: stats.TxBytes,
 		}
 
-		// Get MAC address
-		if mac, err := getInterfaceMAC(ifaceName); err == nil {
-			iface.MAC = mac
+		// Augment with sysfs data if available
+		if netClass != nil {
+			if nc, ok := netClass[ifaceName]; ok {
+				iface.MAC = nc.Address
+				if nc.OperState == "up" {
+					iface.Up = true
+				}
+			}
+		} else {
+			// Fallback if sysfs failed
+			iface.Up = isInterfaceUp(ifaceName)
+			if mac, err := getInterfaceMAC(ifaceName); err == nil {
+				iface.MAC = mac
+			}
 		}
 
-		// Get IP addresses
 		if ips, err := getInterfaceIPs(ifaceName); err == nil {
 			iface.IPs = ips
 		}
@@ -579,7 +249,6 @@ func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 	return interfaces, totalTx, totalRx
 }
 
-// isInterfaceUp checks if a network interface is up
 func isInterfaceUp(ifaceName string) bool {
 	operstateFile := filepath.Join("/sys/class/net", ifaceName, "operstate")
 	data, err := os.ReadFile(operstateFile)
@@ -589,7 +258,6 @@ func isInterfaceUp(ifaceName string) bool {
 	return strings.TrimSpace(string(data)) == "up"
 }
 
-// getInterfaceMAC gets the MAC address of a network interface
 func getInterfaceMAC(ifaceName string) (string, error) {
 	macFile := filepath.Join("/sys/class/net", ifaceName, "address")
 	data, err := os.ReadFile(macFile)
@@ -600,18 +268,19 @@ func getInterfaceMAC(ifaceName string) (string, error) {
 }
 
 // collectMeshStatistics detects and collects mesh network data
+// (Same pure Go logic as before via ubus.go and netlink)
 func collectMeshStatistics() *MeshInfo {
-	// 1. Try EasyMesh (IEEE 1905.1) - usually primary if it exists
+	// 1. Try EasyMesh (IEEE 1905.1)
 	if mesh := collectEasyMeshLowLevel(); mesh != nil {
 		return mesh
 	}
 
-	// 1b. Try QSDK EasyMesh (via device.getRealTopo) - specific to Qualcomm SDK
+	// 1b. Try QSDK EasyMesh
 	if mesh := collectQSDKMesh(); mesh != nil {
 		return mesh
 	}
 
-	// 2. Try OpenMesh (BATMAN) via File System (more reliable on non-controller nodes)
+	// 2. Try OpenMesh (BATMAN) via File System
 	if mesh := collectBatmanFileSystem(); mesh != nil {
 		return mesh
 	}
@@ -629,18 +298,20 @@ func collectMeshStatistics() *MeshInfo {
 	return nil
 }
 
-func collectEasyMeshLowLevel() *MeshInfo {
-	// Protocol check: IEEE 1905.1 (EasyMesh) uses EtherType 0x893a
-	// Low level check: see if the ether-type is handled by any socket/daemon
-	// or look for the 1905.1 configuration files/daemons
-	isEasyMesh := false
+// collectEasyMeshLowLevel, checkBridgeFDBForMultiAP, collectOpenMeshNetlink,
+// collectEasyMesh, readUCIValue, collectQSDKMesh, collectBatmanFileSystem,
+// collect80211sMesh, calculateSignalFromBatman functions remain unchanged
+// as they are already pure Go implementations.
 
-	// Check for common EasyMesh daemons/state
+func collectEasyMeshLowLevel() *MeshInfo {
+	isEasyMesh := false
 	paths := []string{
 		"/usr/sbin/map-agent",
 		"/usr/sbin/map-controller",
 		"/etc/config/multiap",
 		"/tmp/state/multiap",
+		"/var/run/ezmesh-agent-cmd.fifo", // QSDK ezmesh
+		"/var/run/wsplcd.lock",           // QSDK wsplcd (Son/Hy-Fi)
 	}
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
@@ -648,54 +319,41 @@ func collectEasyMeshLowLevel() *MeshInfo {
 			break
 		}
 	}
-
-	// Low-level check: Check bridge FDB for Multi-AP multicast MAC (01:80:c2:00:00:13)
 	if !isEasyMesh {
 		if checkBridgeFDBForMultiAP() {
 			isEasyMesh = true
 		}
 	}
-
 	if !isEasyMesh {
 		return nil
 	}
-
-	// If we detected EasyMesh, use the primary IPC (ubus) to get the topology
 	return collectEasyMesh()
 }
 
 func checkBridgeFDBForMultiAP() bool {
-	// Multi-AP / IEEE 1905.1 multicast MAC
 	const multiAPMAC = "01:80:c2:00:00:13"
-
 	fdb, err := os.ReadFile("/proc/net/bridge/fdb")
 	if err != nil {
-		// Try alternative: /sys/class/net/br-*/brforward
 		return false
 	}
-
 	return strings.Contains(string(fdb), multiAPMAC)
 }
 
 func collectOpenMeshNetlink() *MeshInfo {
-	// Generic Netlink constants for batman-adv
 	const (
 		batadvFamilyName        = "batadv"
 		batadvCmdGetOriginators = 1
 		batadvAttrOriginator    = 1
-		batadvAttrNeighbor      = 2
 		batadvAttrTQ            = 3
-		batadvAttrMeshIface     = 7 // dev index
+		batadvAttrMeshIface     = 7
 	)
 
-	// Dial Generic Netlink
 	c, err := genetlink.Dial(nil)
 	if err != nil {
 		return nil
 	}
 	defer c.Close()
 
-	// Resolve the batman-adv family
 	f, err := c.GetFamily(batadvFamilyName)
 	if err != nil {
 		return nil
@@ -707,7 +365,6 @@ func collectOpenMeshNetlink() *MeshInfo {
 		IsCenter: false,
 	}
 
-	// Check gateway mode via sysfs
 	if data, err := os.ReadFile("/sys/class/net/bat0/mesh/gw_mode"); err == nil {
 		mode := strings.TrimSpace(string(data))
 		if mode == "server" {
@@ -716,13 +373,11 @@ func collectOpenMeshNetlink() *MeshInfo {
 		}
 	}
 
-	// Get bat0 ifindex
 	batIface, err := net.InterfaceByName("bat0")
 	if err != nil {
 		return nil
 	}
 
-	// Build request for originators
 	ae := netlink.NewAttributeEncoder()
 	ae.Uint32(batadvAttrMeshIface, uint32(batIface.Index))
 	b, err := ae.Encode()
@@ -782,28 +437,22 @@ func collectOpenMeshNetlink() *MeshInfo {
 }
 
 func collectEasyMesh() *MeshInfo {
-	// Check if ubus is available
-	if _, err := exec.LookPath("ubus"); err != nil {
+	if !ubusAvailable() {
 		return nil
 	}
 
-	// Try common EasyMesh ubus objects
 	objects := []string{"ieee1905.topology", "mesh", "multiap", "map"}
 	var out []byte
 	var err error
 	var foundObj string
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	for _, obj := range objects {
-		out, err = exec.CommandContext(ctx, "ubus", "call", obj, "get").Output()
+		out, err = ubusCall(obj, "get", 5*time.Second)
 		if err == nil {
 			foundObj = obj
 			break
 		}
-		// Some implementations use 'show' or 'status' instead of 'get'
-		out, err = exec.CommandContext(ctx, "ubus", "call", obj, "show").Output()
+		out, err = ubusCall(obj, "show", 5*time.Second)
 		if err == nil {
 			foundObj = obj
 			break
@@ -816,7 +465,7 @@ func collectEasyMesh() *MeshInfo {
 
 	var data struct {
 		IsController bool `json:"is_controller"`
-		Controller   bool `json:"controller"` // Some versions use this
+		Controller   bool `json:"controller"`
 		Nodes        []struct {
 			MAC      string `json:"mac"`
 			Hops     int    `json:"hops"`
@@ -839,7 +488,6 @@ func collectEasyMesh() *MeshInfo {
 		mesh.Role = "controller"
 	}
 
-	// Build a simple tree for the topology if we are the center
 	if isController && len(data.Nodes) > 0 {
 		root := &MeshNode{Name: "Controller", Role: "controller"}
 		nodeMap := make(map[string]*MeshNode)
@@ -862,16 +510,13 @@ func collectEasyMesh() *MeshInfo {
 		mesh.Topology = root
 	}
 
-	// Fallback/Augment: Check local UCI config if on OpenWrt
 	if mesh.Role == "agent" {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if out, err := exec.CommandContext(ctx, "uci", "-q", "get", "multiap.agent.controller_mac").Output(); err == nil {
-			mesh.Name = "EasyMesh Node (via UCI)"
+		if controllerMAC, err := readUCIValue("multiap", "agent", "controller_mac"); err == nil {
+			mesh.Name = "EasyMesh Node"
 			if mesh.Topology == nil {
 				mesh.Topology = &MeshNode{
 					Name: "Upstream Controller",
-					MAC:  strings.TrimSpace(string(out)),
+					MAC:  controllerMAC,
 					Role: "controller",
 				}
 			}
@@ -881,26 +526,50 @@ func collectEasyMesh() *MeshInfo {
 	return mesh
 }
 
+func readUCIValue(config, section, option string) (string, error) {
+	configPath := fmt.Sprintf("/etc/config/%s", config)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	inSection := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "config ") && strings.Contains(line, section) {
+			inSection = true
+			continue
+		}
+		if inSection && strings.HasPrefix(line, "config ") {
+			inSection = false
+		}
+		if inSection && strings.HasPrefix(line, "option "+option) {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				val := strings.Join(parts[2:], " ")
+				val = strings.Trim(val, "'\"")
+				return val, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("UCI value not found")
+}
+
 func collectQSDKMesh() *MeshInfo {
-	// Check if ubus is available
-	if _, err := exec.LookPath("ubus"); err != nil {
+	if !ubusAvailable() {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// QSDK specific command: ubus call device getRealTopo
-	out, err := exec.CommandContext(ctx, "ubus", "call", "device", "getRealTopo").Output()
+	out, err := ubusCall("device", "getRealTopo", 5*time.Second)
 	if err != nil {
 		return nil
 	}
 
-	// Structure based on user provided JSON
 	var data struct {
 		Topo []struct {
 			MAC      string `json:"mac"`
-			PMAC     string `json:"pMac"` // Parent MAC
+			PMAC     string `json:"pMac"`
 			Hops     int    `json:"hops"`
 			IP       string `json:"ip"`
 			Backhaul string `json:"backhaul"`
@@ -918,12 +587,10 @@ func collectQSDKMesh() *MeshInfo {
 
 	mesh := &MeshInfo{
 		Protocol: "easymesh-qsdk",
-		Role:     "controller", // Assumption: if we can see the full topo, we are likely the controller
+		Role:     "controller",
 		IsCenter: true,
 	}
 
-	// Build the tree
-	// 1. Create all nodes and put them in a map
 	nodeMap := make(map[string]*MeshNode)
 	var root *MeshNode
 
@@ -932,21 +599,19 @@ func collectQSDKMesh() *MeshInfo {
 			Name: n.Name,
 			MAC:  n.MAC,
 			IP:   n.IP,
-			Role: "agent", // Default role
+			Role: "agent",
 		}
 		if n.Hops == 0 {
-			node.Role = "controller" // 0 hops usually means self/controller
+			node.Role = "controller"
 			root = node
 		}
 		nodeMap[n.MAC] = node
 	}
 
-	// 2. Link children to parents
 	for _, n := range data.Topo {
 		if n.PMAC == "" {
-			continue // Root or detached
+			continue
 		}
-
 		child := nodeMap[n.MAC]
 		parent, ok := nodeMap[n.PMAC]
 		if ok {
@@ -954,23 +619,9 @@ func collectQSDKMesh() *MeshInfo {
 		}
 	}
 
-	// If we found a root (hop 0), use it. Otherwise, create a synthetic root if possible?
-	// The provided JSON shows hop 0 for the device itself.
 	if root != nil {
 		mesh.Topology = root
 	} else if len(nodeMap) > 0 {
-		// Fallback: if no hop 0 found, just attach everything to a dummy root?
-		// Or maybe pick one with lowest hops?
-		// For now, if no root is identified, return nil or maybe just the list attached to a dummy?
-		// Let's return the first one found as root or nil?
-		// Actually, if we have data but no clear root, we might want to show something.
-		// But usually one node has hops=0.
-		// Let's check if we have any nodes at all.
-		// If no hops=0 node, maybe we are an agent seeing the topology?
-		// But getRealTopo usually runs on the controller.
-		// Let's leave Topology nil if no root found, but still return mesh info?
-		// If Topology is nil, UI might not show graph.
-		// Let's try to find a node with empty pMac as root if hops=0 didn't catch it.
 		for _, n := range data.Topo {
 			if n.PMAC == "" {
 				root = nodeMap[n.MAC]
@@ -994,7 +645,6 @@ func collectBatmanFileSystem() *MeshInfo {
 		Role:     "node",
 	}
 
-	// Get role/gw_mode
 	if data, err := os.ReadFile(filepath.Join(batDir, "gw_mode")); err == nil {
 		mode := strings.TrimSpace(string(data))
 		mesh.Role = mode
@@ -1003,17 +653,13 @@ func collectBatmanFileSystem() *MeshInfo {
 		}
 	}
 
-	// Get topology from debugfs
-	// Default debugfs path for batman-adv originators
 	debugPath := "/sys/kernel/debug/batman_adv/bat0/originators"
 	data, err := os.ReadFile(debugPath)
 	if err != nil {
-		// Try alternative path (sometimes nested differently) via glob
 		matches, globErr := filepath.Glob("/sys/kernel/debug/batman_adv/*/originators")
 		if globErr == nil && len(matches) > 0 {
 			data, err = os.ReadFile(matches[0])
 		}
-
 		if err != nil {
 			return mesh
 		}
@@ -1023,8 +669,6 @@ func collectBatmanFileSystem() *MeshInfo {
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
-		// Expected format: Originator      last-seen (# sec) TQ [expected-iface]:  Next Hop [IF]
-		// Example: 00:11:22:33:44:55   0.450s   (234) [  eth0]: 00:11:22:33:44:55 ( 234)
 		if len(fields) < 5 || !strings.Contains(fields[0], ":") {
 			continue
 		}
@@ -1047,8 +691,6 @@ func collectBatmanFileSystem() *MeshInfo {
 }
 
 func collect80211sMesh() *MeshInfo {
-	// Detect 11s mesh interfaces by looking for 'mesh' config in sysfs
-	// /sys/class/net/*/mesh directory exists for 11s interfaces
 	netDir := "/sys/class/net"
 	entries, err := os.ReadDir(netDir)
 	if err != nil {
@@ -1073,26 +715,18 @@ func collect80211sMesh() *MeshInfo {
 		Role:     "node",
 	}
 
-	// Read Mesh ID
 	if data, err := os.ReadFile(filepath.Join(netDir, meshIface, "mesh/id")); err == nil {
 		mesh.Name = fmt.Sprintf("Mesh: %s", strings.TrimSpace(string(data)))
 	}
-
-	// Try to get neighbors from /proc/net/ieee80211s/ (some kernels)
-	// or /sys/kernel/debug/cfg80211/phy*/... (hard to find dynamically)
-	// For now, we mainly report the mesh presence and ID if neighbors file isn't found
 
 	return mesh
 }
 
 func calculateSignalFromBatman(fields []string) int {
-	// Example BATMAN output: eth0   00:11:22:33:44:55   ( 234) [  1.0]
-	// TQ (Transmission Quality) is usually in the parentheses
 	for _, f := range fields {
 		if strings.HasPrefix(f, "(") && strings.HasSuffix(f, ")") {
 			tqStr := strings.Trim(f, "()")
 			if tq, err := strconv.Atoi(tqStr); err == nil {
-				// Convert TQ (0-255) to a pseudo-signal strength (-100 to -30)
 				return -100 + (tq * 70 / 255)
 			}
 		}
@@ -1102,78 +736,60 @@ func calculateSignalFromBatman(fields []string) int {
 
 // getHostUptime returns the host device uptime in seconds
 func getHostUptime() float64 {
-	data, err := os.ReadFile("/proc/uptime")
+	fs, err := procfs.NewFS("/proc")
 	if err != nil {
 		return 0
 	}
-	parts := strings.Fields(string(data))
-	if len(parts) > 0 {
-		if uptime, err := strconv.ParseFloat(parts[0], 64); err == nil {
-			return uptime
-		}
-	}
-	return 0
-}
-
-// readUint64FromFile reads a uint64 value from a file
-func readUint64FromFile(filePath string) (uint64, error) {
-	data, err := os.ReadFile(filePath)
+	stat, err := fs.Stat()
 	if err != nil {
-		return 0, err
+		return 0
 	}
-
-	str := strings.TrimSpace(string(data))
-	return strconv.ParseUint(str, 10, 64)
+	// procfs.Stat has BootTime (seconds since epoch).
+	// Uptime = Now - BootTime.
+	return float64(time.Now().Unix() - int64(stat.BootTime))
 }
+
+// collectCPUUsage returns load info using procfs
 func collectCPUUsage() string {
-	data, err := os.ReadFile("/proc/loadavg")
+	fs, err := procfs.NewFS("/proc")
 	if err != nil {
 		return "0%"
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) > 0 {
-		return fields[0] + " (avg1)"
+
+	load, err := fs.LoadAvg()
+	if err != nil {
+		return "0%"
 	}
-	return "0%"
+
+	return fmt.Sprintf("%.2f (avg1)", load.Load1)
 }
 
+// collectSystemMemory returns memory info using procfs
 func collectSystemMemory() (uint64, uint64) {
-	data, err := os.ReadFile("/proc/meminfo")
+	fs, err := procfs.NewFS("/proc")
 	if err != nil {
 		return 0, 0
 	}
 
-	var total, available, free, buffers, cached uint64
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-
-		val, _ := strconv.ParseUint(fields[1], 10, 64)
-		val *= 1024 // kB to Bytes
-
-		switch {
-		case strings.HasPrefix(line, "MemTotal:"):
-			total = val
-		case strings.HasPrefix(line, "MemAvailable:"):
-			available = val
-		case strings.HasPrefix(line, "MemFree:"):
-			free = val
-		case strings.HasPrefix(line, "Buffers:"):
-			buffers = val
-		case strings.HasPrefix(line, "Cached:"):
-			cached = val
-		}
+	mem, err := fs.Meminfo()
+	if err != nil {
+		return 0, 0
 	}
 
-	// MemAvailable is the most accurate metric for "available" memory on modern Linux
-	// If MemAvailable is present (kernel >= 3.14), Used = Total - Available
-	if available > 0 {
-		return total - available, total
+	// MemTotal and MemAvailable are in kB in /proc/meminfo.
+	// procfs exposes them as pointers to uint64.
+	if mem.MemTotal == nil {
+		return 0, 0
+	}
+	total := *mem.MemTotal * 1024
+
+	var available uint64
+	if mem.MemAvailable != nil {
+		available = *mem.MemAvailable * 1024
+	} else if mem.MemFree != nil && mem.Buffers != nil && mem.Cached != nil {
+		// Fallback for older kernels
+		available = (*mem.MemFree + *mem.Buffers + *mem.Cached) * 1024
 	}
 
-	// Fallback for older kernels
-	return total - (free + buffers + cached), total
+	return total - available, total
 }

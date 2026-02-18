@@ -1,135 +1,133 @@
 package stats
 
 import (
-	"bufio"
-	"io"
-	"net"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/adrianmo/go-nmea"
+	"github.com/stratoberry/go-gpsd"
 )
 
-// collectGPSStatistics tries to find and query a GPS module
+// collectGPSStatistics connects to local gpsd or reads /tmp/gps_info.txt
 func collectGPSStatistics() *GPSInfo {
-	// Try common GPS ports/sockets
-	paths := []struct {
-		network string
-		address string
-	}{
-		{"unix", "/tmp/gps-port"},
-		{"unix", "/var/run/gpsd.sock"},
+	// 1. Try gpsd first
+	if info := collectGPSFromGPSD(); info != nil {
+		return info
 	}
 
-	// Dynamic serial port scanning
-	serialPorts := getSerialPorts()
-
-	for _, p := range paths {
-		if _, err := os.Stat(p.address); err == nil {
-			if info := queryGPS(p.network, p.address); info != nil {
-				return info
-			}
-		}
-	}
-
-	for _, p := range serialPorts {
-		if _, err := os.Stat(p); err == nil {
-			if info := queryGPSSerial(p); info != nil {
-				return info
-			}
-		}
-	}
-
-	return nil
+	// 2. Fallback to file
+	return collectGPSFromFile()
 }
 
-func queryGPS(network, address string) *GPSInfo {
-	conn, err := net.DialTimeout(network, address, 2*time.Second)
+func collectGPSFromGPSD() *GPSInfo {
+	// connect to gpsd
+	gps, err := gpsd.Dial("localhost:2947")
 	if err != nil {
+		// Log debug only if needed, otherwise silent fail is typical for optional stats
 		return nil
 	}
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer gps.Close()
 
-	return parseNMEA(conn)
-}
-
-func queryGPSSerial(path string) *GPSInfo {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return nil
+	// data channels
+	tpvFilter := func(r interface{}) {
+		// We only need one TPV and one SKY, so we don't need a complex filter here
+		// But the library is event-driven.
 	}
-	defer f.Close()
+	_ = tpvFilter // unused
 
-	return parseNMEA(f)
-}
-
-func parseNMEA(r io.Reader) *GPSInfo {
-	scanner := bufio.NewScanner(r)
+	// We need to capture data from the callbacks
 	info := &GPSInfo{
 		Fix: "none",
 	}
 
-	// Read for up to 2 seconds to gather enough sentences
-	timeout := time.After(2 * time.Second)
-	foundAny := false
+	// Register handlers
+	gps.AddFilter("TPV", func(r interface{}) {
+		tpv, ok := r.(*gpsd.TPVReport)
+		if !ok {
+			return
+		}
+		info.Lat = tpv.Lat
+		info.Lon = tpv.Lon
+		info.Alt = tpv.Alt
+		info.Speed = tpv.Speed * 3.6 // m/s to km/h
+		info.Timestamp = tpv.Time
 
-	for {
-		select {
-		case <-timeout:
-			if foundAny {
-				return info
-			}
-			return nil
+		switch tpv.Mode {
+		case 2:
+			info.Fix = "2D"
+		case 3:
+			info.Fix = "3D"
 		default:
-			if !scanner.Scan() {
-				if foundAny {
-					return info
-				}
-				return nil
-			}
-			line := strings.TrimSpace(scanner.Text())
-			if !strings.HasPrefix(line, "$") {
-				continue
-			}
+			info.Fix = "none"
+		}
+	})
 
-			foundAny = true
-			s, err := nmea.Parse(line)
-			if err != nil {
-				continue
+	gps.AddFilter("SKY", func(r interface{}) {
+		sky, ok := r.(*gpsd.SKYReport)
+		if !ok {
+			return
+		}
+		// Count used satellites
+		count := 0
+		for _, sat := range sky.Satellites {
+			if sat.Used {
+				count++
 			}
+		}
+		info.Satellites = count
 
-			switch m := s.(type) {
-			case nmea.GGA:
-				info.Lat = m.Latitude
-				info.Lon = m.Longitude
-				info.Alt = m.Altitude
-				info.Satellites = int(m.NumSatellites)
-				if m.FixQuality != nmea.Invalid {
-					info.Fix = "3D"
-					if m.FixQuality == nmea.GPS {
-						info.Fix = "2D"
-					}
-				}
-				info.Timestamp = nmea.DateTime(0, nmea.Date{Valid: true, DD: time.Now().Day(), MM: int(time.Now().Month()), YY: time.Now().Year() % 100}, m.Time)
-			case nmea.RMC:
-				info.Lat = m.Latitude
-				info.Lon = m.Longitude
-				info.Speed = m.Speed
-				if m.Validity == "A" {
-					if info.Fix == "none" {
-						info.Fix = "2D"
-					}
-				}
-				info.Timestamp = nmea.DateTime(0, m.Date, m.Time)
-			case nmea.GSA:
-				if m.FixType == "3" {
-					info.Fix = "3D"
-				} else if m.FixType == "2" {
-					info.Fix = "2D"
-				}
+		// If we have both TPV and SKY (or sufficient time passed), we could signal done
+		// But TPV is the critical one for location.
+	})
+
+	// Watch starts the stream and returns a done channel
+	done := gps.Watch()
+
+	// Wait for a short period to gather data
+	time.Sleep(500 * time.Millisecond)
+
+	// Close connection to stop the watch loop
+	gps.Close()
+
+	// Wait for watch loop to exit
+	<-done
+
+	if info.Lat == 0 && info.Lon == 0 {
+		return nil
+	}
+
+	return info
+}
+
+func collectGPSFromFile() *GPSInfo {
+	data, err := os.ReadFile("/tmp/gps_info.txt")
+	if err != nil {
+		return nil
+	}
+
+	info := &GPSInfo{
+		Fix: "2D", // Assume fix if file exists and has data
+	}
+
+	lines := strings.SplitSeq(string(data), "\n")
+	for line := range lines {
+		// Look for "latitude=42.228963, longitude=- 76.668428, altitude=465.7"
+		if strings.HasPrefix(line, "latitude=") {
+			// clean up spaces around minus signs if any, e.g. "- 76" -> "-76"
+			line = strings.ReplaceAll(line, "- ", "-")
+
+			var lat, lon, alt float64
+			// Sscanf is simple enough for this format
+			_, err := fmt.Sscanf(line, "latitude=%f, longitude=%f, altitude=%f", &lat, &lon, &alt)
+			if err == nil {
+				info.Lat = lat
+				info.Lon = lon
+				info.Alt = alt
+				info.Timestamp = time.Now() // File doesn't have clear ISO timestamp in that line, use now
+				return info
 			}
 		}
 	}
+	return nil
 }

@@ -92,21 +92,12 @@ func SerializeMetrics(m *Metrics) []byte {
 	putVarint(int64(m.WiFi.Noise))
 	putUvarint(uint64(m.WiFi.Bitrate))
 
-	// 7. WireGuard
-	if m.WireGuard.Connected {
-		putUvarint(1)
-	} else {
-		putUvarint(0)
-	}
-	putString(m.WireGuard.PublicKey)
-	putUvarint(uint64(m.WireGuard.Peers))
-
-	// 8. Agent
+	// 7. Agent
 	putString(m.Agent.Uptime)
 	putString(m.Agent.Version)
 	putString(m.Agent.Status)
 
-	// 9. Modem (Optional)
+	// 8. Modem (Optional)
 	if m.Modem != nil {
 		putUvarint(1) // Present
 		putString(m.Modem.Model)
@@ -117,13 +108,49 @@ func SerializeMetrics(m *Metrics) []byte {
 		putUvarint(0) // Not Present
 	}
 
-	// 10. GPS (Optional)
+	// 9. GPS (Optional)
 	if m.GPS != nil {
 		putUvarint(1)
 		// Float64 is 8 bytes. write as LittleEndian
 		binary.Write(buf, binary.LittleEndian, m.GPS.Lat)
 		binary.Write(buf, binary.LittleEndian, m.GPS.Lon)
 		binary.Write(buf, binary.LittleEndian, m.GPS.Speed)
+	} else {
+		putUvarint(0)
+	}
+
+	// 10. Mesh (Optional)
+	if m.Mesh != nil {
+		putUvarint(1)
+		putString(m.Mesh.Name)
+		putString(m.Mesh.Protocol)
+		putString(m.Mesh.Role)
+		if m.Mesh.IsCenter {
+			putUvarint(1)
+		} else {
+			putUvarint(0)
+		}
+
+		// Helper for Topology
+		var putTopology func(*MeshNode)
+		putTopology = func(node *MeshNode) {
+			if node == nil {
+				putUvarint(0)
+				return
+			}
+			putUvarint(1)
+			putString(node.Name)
+			putString(node.MAC)
+			putString(node.IP)
+			putVarint(int64(node.Signal))
+			putString(node.Role)
+
+			putUvarint(uint64(len(node.Children)))
+			for _, child := range node.Children {
+				putTopology(child)
+			}
+		}
+		putTopology(m.Mesh.Topology)
 	} else {
 		putUvarint(0)
 	}

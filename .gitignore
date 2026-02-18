@@ -10,3 +10,7 @@ gobuild/
 .gocache/
 .gotmp/
 tmp/
+
+cmd/puppeteer
+hosts.txt
+puppeteer

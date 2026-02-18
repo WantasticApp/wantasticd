@@ -9,8 +9,8 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/kardianos/service v1.2.4
 	github.com/mdlayher/genetlink v1.3.2
-	github.com/mdlayher/netlink v1.7.2
-	github.com/mdlayher/wifi v0.3.0
+	github.com/mdlayher/netlink v1.8.0
+	github.com/mdlayher/wifi v0.7.2
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.48.0
 	golang.org/x/sys v0.40.0
@@ -24,8 +24,9 @@ require (
 require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/josharian/native v1.1.0 // indirect
-	github.com/mdlayher/socket v0.4.1 // indirect
+	github.com/mdlayher/socket v0.5.1 // indirect
+	github.com/prometheus/procfs v0.19.2 // indirect
+	github.com/stratoberry/go-gpsd v1.3.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.7.0 // indirect

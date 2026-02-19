@@ -429,7 +429,8 @@ func (c *Config) GenerateDeviceID() {
 	// Generate a stable, anonymous device ID.
 	id, err := machineid.ProtectedID("wantastic")
 	if err != nil {
-		log.Printf("Warning: could not read system machine-id: %v", err)
+		// usage of machine-id is optional, don't scare the user
+		log.Printf("System machine-id not available (%v); falling back to MAC address for device ID.", err)
 
 		// Fallback: Try to find a stable MAC address (common for embedded devices)
 		useMac := false

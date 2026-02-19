@@ -59,6 +59,7 @@ const (
 	MessageCookieReplyType = 3
 	MessageTransportType   = 4
 	MessageStatsType       = 5
+	MessagePunchType       = 6
 )
 
 const (
@@ -66,6 +67,7 @@ const (
 	MessageResponseSize        = 92                                            // size of response message
 	MessageCookieReplySize     = 64                                            // size of cookie reply message
 	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
+	MessagePunchSize           = 56                                            // size of punch message
 	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
 	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
 	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
@@ -122,6 +124,15 @@ type MessageCookieReply struct {
 	Receiver uint32
 	Nonce    [chacha20poly1305.NonceSizeX]byte
 	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+}
+
+type MessagePunch struct {
+	Type      uint32
+	Receiver  uint32 // Index of the receiver (us) if known, or Sender index?
+	Sender    uint32 // Index of the sender
+	Timestamp [tai64n.TimestampSize]byte
+	MAC1      [blake2s.Size128]byte
+	MAC2      [blake2s.Size128]byte
 }
 
 var errMessageLengthMismatch = errors.New("message length mismatch")
@@ -240,6 +251,36 @@ func (msg *MessageStats) marshal(b []byte) error {
 	if len(msg.Stats) > 0 {
 		copy(b[16:], msg.Stats)
 	}
+
+	return nil
+}
+
+func (msg *MessagePunch) unmarshal(b []byte) error {
+	if len(b) != MessagePunchSize {
+		return errMessageLengthMismatch
+	}
+
+	msg.Type = binary.LittleEndian.Uint32(b)
+	msg.Receiver = binary.LittleEndian.Uint32(b[4:])
+	msg.Sender = binary.LittleEndian.Uint32(b[8:])
+	copy(msg.Timestamp[:], b[12:])
+	copy(msg.MAC1[:], b[12+len(msg.Timestamp):])
+	copy(msg.MAC2[:], b[12+len(msg.Timestamp)+len(msg.MAC1):])
+
+	return nil
+}
+
+func (msg *MessagePunch) marshal(b []byte) error {
+	if len(b) != MessagePunchSize {
+		return errMessageLengthMismatch
+	}
+
+	binary.LittleEndian.PutUint32(b, msg.Type)
+	binary.LittleEndian.PutUint32(b[4:], msg.Receiver)
+	binary.LittleEndian.PutUint32(b[8:], msg.Sender)
+	copy(b[12:], msg.Timestamp[:])
+	copy(b[12+len(msg.Timestamp):], msg.MAC1[:])
+	copy(b[12+len(msg.Timestamp)+len(msg.MAC1):], msg.MAC2[:])
 
 	return nil
 }

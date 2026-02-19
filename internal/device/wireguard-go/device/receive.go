@@ -205,6 +205,11 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
+			case MessagePunchType:
+				if len(packet) != MessagePunchSize {
+					continue
+				}
+
 			default:
 				device.log.Verbosef("Received message with unknown type")
 				continue
@@ -423,6 +428,32 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.timersSessionDerived()
 			peer.timersHandshakeComplete()
 			peer.SendKeepalive()
+
+		case MessagePunchType:
+			// unmarshal
+			var msg MessagePunch
+			err := msg.unmarshal(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode punch message")
+				goto skip
+			}
+
+			// Lookup entry
+			entry := device.indexTable.Lookup(msg.Receiver)
+			if entry.peer == nil {
+				device.log.Verbosef("Received punch message for unknown receiver index %d from %s", msg.Receiver, elem.endpoint.DstToString())
+				goto skip
+			}
+			peer := entry.peer
+
+			// Update endpoint (This is the hole punching magic!)
+			device.log.Verbosef("%v - Received punch message from %s", peer, elem.endpoint.DstToString())
+			peer.SetEndpointFromPacket(elem.endpoint)
+
+			// Notify handler
+			if device.punchHandler != nil {
+				device.punchHandler(peer, elem.packet)
+			}
 		}
 	skip:
 		device.PutMessageBuffer(elem.buffer)

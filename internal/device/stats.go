@@ -228,3 +228,8 @@ func (d *Device) handleStats(peer *wgdevice.Peer, data []byte) {
 		metrics.Memory.Allocated/1024/1024, metrics.Memory.Total/1024/1024,
 		metrics.WiFi.Connected, metrics.WiFi.Signal)
 }
+
+func (d *Device) handlePunch(peer *wgdevice.Peer, data []byte) {
+	// Just log it for now as the endpoint update is already handled by receive.go
+	log.Printf("[P2P] Received HOLE PUNCH from %v (Internal Endpoint Updated)", peer)
+}

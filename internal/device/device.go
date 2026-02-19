@@ -91,6 +91,7 @@ func (d *Device) Start() error {
 	wd := wgdevice.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 	wd.DisableSomeRoamingForBrokenMobileSemantics()
 	wd.SetStatsHandler(d.handleStats)
+	wd.SetPunchHandler(d.handlePunch)
 	if d.statsProvider != nil {
 		wd.SetStatsProvider(d.statsProvider)
 	}
@@ -283,6 +284,10 @@ func (d *Device) GetPublicKey() string {
 
 func (d *Device) SetStatsHandler(handler func(*wgdevice.Peer, []byte)) {
 	d.device.SetStatsHandler(handler)
+}
+
+func (d *Device) SetPunchHandler(handler func(*wgdevice.Peer, []byte)) {
+	d.device.SetPunchHandler(handler)
 }
 
 func (d *Device) SetStatsProvider(provider func() []byte) {

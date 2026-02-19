@@ -90,11 +90,16 @@ type Device struct {
 	closed        chan struct{}
 	log           *Logger
 	statsHandler  func(*Peer, []byte)
+	punchHandler  func(*Peer, []byte)
 	statsProvider func() []byte
 }
 
 func (device *Device) SetStatsHandler(handler func(*Peer, []byte)) {
 	device.statsHandler = handler
+}
+
+func (device *Device) SetPunchHandler(handler func(*Peer, []byte)) {
+	device.punchHandler = handler
 }
 
 func (device *Device) SetStatsProvider(provider func() []byte) {

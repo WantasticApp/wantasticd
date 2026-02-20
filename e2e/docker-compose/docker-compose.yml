@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  client1:
+    image: wantasticd:latest
+    container_name: wantasticd-client1
+    command: ["-config", "/etc/wantasticd/config.json"]
+    volumes:
+      - ./configs/client1.json:/etc/wantasticd/config.json:ro
+    extra_hosts:
+      - "wg.wantastic.local:host-gateway"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  client2:
+    image: wantasticd:latest
+    container_name: wantasticd-client2
+    command: ["-config", "/etc/wantasticd/config.json"]
+    volumes:
+      - ./configs/client2.json:/etc/wantasticd/config.json:ro
+    extra_hosts:
+      - "wg.wantastic.local:host-gateway"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  client3:
+    image: wantasticd:latest
+    container_name: wantasticd-client3
+    command: ["-config", "/etc/wantasticd/config.json"]
+    volumes:
+      - ./configs/client3.json:/etc/wantasticd/config.json:ro
+    extra_hosts:
+      - "wg.wantastic.local:host-gateway"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped

@@ -53,6 +53,9 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 		}
 	}
 
+	// Read /proc/net/wireless once for the fallback signal/noise
+	procfsWireless := readWirelessProcfs()
+
 	for _, iface := range interfaces {
 		wifiInfo := WiFiInterfaceInfo{
 			Name:      iface.Name,
@@ -62,7 +65,7 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 			Channel:   frequencyToChannel(iface.Frequency),
 		}
 
-		// Get noise for this interface's frequency
+		// Get noise for this interface's frequency (from netlink SurveyInfo)
 		if noise, ok := noiseByFreq[iface.Frequency]; ok {
 			wifiInfo.Noise = noise
 		}
@@ -78,11 +81,11 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 			}
 		}
 
-		// For AP mode — Interface.Type tells us the operating mode
-		if iface.Type == wifi.InterfaceTypeAP && wifiInfo.SSID == "" {
-			// In AP mode, the SSID isn't in BSS — read from sysfs or nl80211 interface info
+		// Fallback for AP mode (or unsupported Station mode drivers)
+		if wifiInfo.SSID == "" {
 			if ssid, err := readSSIDFromSysfs(iface.Name); err == nil && ssid != "" {
 				wifiInfo.SSID = ssid
+				// AP mode interfaces are functionally "connected" if they are broadcasting an SSID
 				wifiInfo.Connected = true
 				connected = true
 			}
@@ -106,6 +109,31 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 			}
 		}
 
+		// --- Fallbacks for Missing Stats Metrics ---
+
+		// 1. Bitrate Fallback via sysfs speed
+		if wifiInfo.Bitrate == 0 {
+			if speed := readSpeedFromSysfs(iface.Name); speed > 0 {
+				wifiInfo.Bitrate = speed
+			}
+		}
+
+		// 2. Signal / Noise Fallback via /proc/net/wireless
+		if procVals, exists := procfsWireless[iface.Name]; exists {
+			// If Signal is empty (0) or 0 occurs because of station API failure
+			if wifiInfo.Signal == 0 && procVals.signal != 0 {
+				wifiInfo.Signal = procVals.signal
+			}
+			// Same for noise
+			if wifiInfo.Noise == 0 && procVals.noise != 0 {
+				wifiInfo.Noise = procVals.noise
+			}
+			// Recalculate SNR if we updated either
+			if wifiInfo.Signal != 0 && wifiInfo.Noise != 0 {
+				wifiInfo.SNR = wifiInfo.Signal - wifiInfo.Noise
+			}
+		}
+
 		// Nearby networks via AccessPoints (replaces `iw scan dump`)
 		if nearby, err := collectNearbyNetworks(client, iface); err == nil {
 			wifiInfo.Nearby = nearby
@@ -117,27 +145,128 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 	return wifiInterfaces, connected
 }
 
-// readSSIDFromSysfs reads the SSID for AP-mode interfaces from nl80211 via sysfs
+// readSSIDFromSysfs reads the SSID for AP-mode interfaces.
+// It tries sysfs, hostapd conf templates, and OpenWrt/QSDK UCI wireless config.
 func readSSIDFromSysfs(ifaceName string) (string, error) {
-	paths := []string{
-		fmt.Sprintf("/sys/class/net/%s/ssid", ifaceName),
-		fmt.Sprintf("/tmp/hostapd_%s.conf", ifaceName),
+	// First, try standard sysfs (unlikely to have it on newer kernels, but worth a shot)
+	if data, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/ssid", ifaceName)); err == nil {
+		content := strings.TrimSpace(string(data))
+		if content != "" {
+			return content, nil
+		}
 	}
-	for _, p := range paths {
-		if data, err := os.ReadFile(p); err == nil {
-			content := strings.TrimSpace(string(data))
-			if strings.Contains(p, "hostapd") {
-				for _, line := range strings.Split(content, "\n") {
-					if strings.HasPrefix(line, "ssid=") {
-						return strings.TrimPrefix(line, "ssid="), nil
-					}
-				}
-			} else {
-				return content, nil
+
+	// Try hostapd debug/conf paths
+	if data, err := os.ReadFile(fmt.Sprintf("/tmp/hostapd_%s.conf", ifaceName)); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "ssid=") {
+				return strings.TrimPrefix(line, "ssid="), nil
 			}
 		}
 	}
+
+	// Try UCI `/etc/config/wireless` (OpenWrt / QSDK)
+	// We need to map the ifname to its `wifi-iface` definition
+	if data, err := os.ReadFile("/etc/config/wireless"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		inMatchingIface := false
+		for _, line := range lines {
+			l := strings.TrimSpace(line)
+
+			if strings.HasPrefix(l, "config wifi-iface") {
+				inMatchingIface = false // reset for a new block
+				continue
+			}
+
+			// We look for `option ifname 'wlan0'`
+			if strings.HasPrefix(l, "option ifname") {
+				parts := strings.Fields(l)
+				if len(parts) >= 3 {
+					val := strings.Trim(strings.Join(parts[2:], " "), "'\"")
+					if val == ifaceName {
+						inMatchingIface = true // We found the block for our interface
+					}
+				}
+				continue
+			}
+
+			// If we are in the matching iface block, find the ssid
+			if inMatchingIface && strings.HasPrefix(l, "option ssid") {
+				parts := strings.Fields(l)
+				if len(parts) >= 3 {
+					return strings.Trim(strings.Join(parts[2:], " "), "'\""), nil
+				}
+			}
+
+			// Similarly, some old configs use `option network ...` we just need SSID though
+		}
+	}
+
 	return "", fmt.Errorf("SSID not found")
+}
+
+// readSpeedFromSysfs attempts to read the link speed from /sys/class/net/<iface>/speed
+// It returns the speed in Mbps. Returns 0 on failure.
+func readSpeedFromSysfs(ifaceName string) int {
+	data, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/speed", ifaceName))
+	if err != nil {
+		return 0
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	// Sometimes sysfs reports -1 for unknown speed.
+	if val < 0 {
+		return 0
+	}
+	return val
+}
+
+// readWirelessProcfs parses /proc/net/wireless to extract signal and noise levels fallback.
+// Returns map of interfaces to their signal and noise values.
+func readWirelessProcfs() map[string]struct{ signal, noise int } {
+	res := make(map[string]struct{ signal, noise int })
+
+	data, err := os.ReadFile("/proc/net/wireless")
+	if err != nil {
+		return res
+	}
+
+	lines := strings.Split(string(data), "\n")
+	// Skip the first two header lines
+	for i := 2; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+
+		// Example line:
+		// wlan0: 0000   58.  -52.  -96   0      0      0      0      0      0
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		iface := strings.TrimSpace(parts[0])
+
+		fields := strings.Fields(parts[1])
+		// fields[1] is typically Link Quality
+		// fields[2] is Signal Level (dBm, usually negative, might end in a dot)
+		// fields[3] is Noise Level (dBm)
+
+		if len(fields) >= 4 {
+			sigStr := strings.TrimSuffix(fields[2], ".")
+			noiseStr := strings.TrimSuffix(fields[3], ".")
+
+			sig, _ := strconv.Atoi(sigStr)
+			noise, _ := strconv.Atoi(noiseStr)
+
+			res[iface] = struct{ signal, noise int }{signal: sig, noise: noise}
+		}
+	}
+
+	return res
 }
 
 func frequencyToChannel(freq int) int {

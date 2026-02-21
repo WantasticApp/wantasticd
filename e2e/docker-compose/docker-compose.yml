@@ -1,14 +1,21 @@
-version: '3.8'
-
 services:
   client1:
-    image: wantasticd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.openwrt
+    platform: linux/amd64
     container_name: wantasticd-client1
-    command: ["-config", "/etc/wantasticd/config.json"]
+    command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
     volumes:
-      - ./configs/client1.json:/etc/wantasticd/config.json:ro
+      - ./configs/client1.conf:/etc/wantasticd/wg.conf:ro
+      - ../../bin/wantasticd-linux-amd64:/wantasticd/wantasticd:ro
+    environment:
+      - LOG_LEVEL=debug
     extra_hosts:
       - "wg.wantastic.local:host-gateway"
+    networks:
+      wantastic-e2e:
+        ipv4_address: 172.25.0.11
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
@@ -16,13 +23,22 @@ services:
     restart: unless-stopped
 
   client2:
-    image: wantasticd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.openwrt
+    platform: linux/amd64
     container_name: wantasticd-client2
-    command: ["-config", "/etc/wantasticd/config.json"]
+    command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
     volumes:
-      - ./configs/client2.json:/etc/wantasticd/config.json:ro
+      - ./configs/client2.conf:/etc/wantasticd/wg.conf:ro
+      - ../../bin/wantasticd-linux-amd64:/wantasticd/wantasticd:ro
+    environment:
+      - LOG_LEVEL=debug
     extra_hosts:
       - "wg.wantastic.local:host-gateway"
+    networks:
+      wantastic-e2e:
+        ipv4_address: 172.25.0.12
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
@@ -30,15 +46,31 @@ services:
     restart: unless-stopped
 
   client3:
-    image: wantasticd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.openwrt
+    platform: linux/amd64
     container_name: wantasticd-client3
-    command: ["-config", "/etc/wantasticd/config.json"]
+    command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
     volumes:
-      - ./configs/client3.json:/etc/wantasticd/config.json:ro
+      - ./configs/client3.conf:/etc/wantasticd/wg.conf:ro
+      - ../../bin/wantasticd-linux-amd64:/wantasticd/wantasticd:ro
+    environment:
+      - LOG_LEVEL=debug
     extra_hosts:
       - "wg.wantastic.local:host-gateway"
+    networks:
+      wantastic-e2e:
+        ipv4_address: 172.25.0.13
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
+
+networks:
+  wantastic-e2e:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24

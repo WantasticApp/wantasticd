@@ -56,6 +56,8 @@ func main() {
 		handleBind()
 	case "neighbors":
 		handleNeighbors()
+	case "status":
+		handleStatus()
 	default:
 		printUsage()
 		os.Exit(1)
@@ -311,6 +313,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  telnet     Run telnet")
 	fmt.Fprintln(os.Stderr, "  bind       Bind a local port to a remote endpoint")
 	fmt.Fprintln(os.Stderr, "  neighbors  Interact with neighbors (ls to list, sp to scan ports)")
+	fmt.Fprintln(os.Stderr, "  status     Show WireGuard tunnel status and P2P connection info")
 	fmt.Fprintln(os.Stderr, "  version    Show version information")
 }
 
@@ -580,6 +583,23 @@ func handlePing() {
 		}
 		log.Fatalf("Ping failed: %v", err)
 	}
+}
+
+func handleStatus() {
+	socketPath := ipc.GetSocketPath()
+
+	// Check if daemon is alive
+	conn, err := net.DialTimeout("unix", socketPath, 1*time.Second)
+	if err != nil {
+		log.Fatalf("Daemon not running (no IPC socket at %s). Start the agent first with 'wantasticd connect'.", socketPath)
+	}
+	conn.Close()
+
+	status, err := ipc.WgStatus()
+	if err != nil {
+		log.Fatalf("Failed to get status: %v", err)
+	}
+	fmt.Print(status)
 }
 
 func startAgentWithRetry(ctx context.Context, cfg *config.Config) (*agent.Agent, error) {

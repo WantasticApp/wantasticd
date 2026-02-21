@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"wantastic-agent/internal/device"
 	"wantastic-agent/internal/netstack"
 )
 
@@ -48,6 +49,7 @@ func GetSocketPath() string {
 // Server listens on a unix socket and proxies dial requests to the netstack
 type Server struct {
 	netstack *netstack.Netstack
+	device   *device.Device
 	listener net.Listener
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -58,6 +60,11 @@ func NewServer(ns *netstack.Netstack) *Server {
 		netstack: ns,
 		stopCh:   make(chan struct{}),
 	}
+}
+
+// SetDevice sets the device reference for the STATUS command
+func (s *Server) SetDevice(dev *device.Device) {
+	s.device = dev
 }
 
 func (s *Server) Start() error {
@@ -191,6 +198,14 @@ func (s *Server) handleConnection(c net.Conn) {
 		defer resp.Body.Close()
 		fmt.Fprintf(c, "OK %s\n", resp.Status)
 		io.Copy(c, resp.Body)
+
+	case "STATUS":
+		if s.device == nil {
+			fmt.Fprintf(c, "ERROR device not available\n")
+			return
+		}
+		info := s.device.GetWireGuardStatus()
+		fmt.Fprintf(c, "OK\n%s", info)
 
 	default:
 		fmt.Fprintf(c, "ERROR unknown command\n")
@@ -331,4 +346,30 @@ func (b *bufferedConn) SetReadDeadline(t time.Time) error {
 }
 func (b *bufferedConn) SetWriteDeadline(t time.Time) error {
 	return b.conn.SetWriteDeadline(t)
+}
+
+// WgStatus fetches WireGuard status via the IPC daemon
+func WgStatus() (string, error) {
+	socketPath := GetSocketPath()
+	conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "STATUS wg\n")
+
+	r := bufio.NewReader(conn)
+	resp, err := r.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read ipc response: %w", err)
+	}
+
+	if strings.HasPrefix(resp, "OK") {
+		var sb strings.Builder
+		io.Copy(&sb, r)
+		return sb.String(), nil
+	}
+
+	return "", fmt.Errorf("ipc error: %s", strings.TrimSpace(resp))
 }

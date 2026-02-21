@@ -8,8 +8,8 @@ if ! docker ps | grep "wantasticd-client1" > /dev/null; then
   exit 1
 fi
 
-echo "==> Waiting 35 seconds for tunnels to establish handshakes and P2P connections..."
-sleep 35
+echo "==> Waiting 5 seconds for tunnels to establish handshakes and P2P connections..."
+sleep 5
 
 echo "=========================================="
 echo "     WIREGUARD TUNNEL STATUS (P2P PROOF)  "

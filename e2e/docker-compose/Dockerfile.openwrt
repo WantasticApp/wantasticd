@@ -1,0 +1,4 @@
+FROM openwrt/rootfs:x86-64-23.05.0
+
+# OpenWrt requires /var/lock for opkg to work correctly in some containerized environments
+RUN mkdir -p /var/lock && opkg update && opkg install iperf3 iputils-ping

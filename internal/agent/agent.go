@@ -142,6 +142,8 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start IPC server for subcommands
 	if err := a.ipc.Start(); err != nil {
 		log.Printf("Warning: failed to start IPC server: %v", err)
+	} else {
+		a.ipc.SetDevice(a.device)
 	}
 
 	// Start background workers

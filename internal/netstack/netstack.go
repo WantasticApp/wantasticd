@@ -453,13 +453,20 @@ func (ns *Netstack) tuneForMacOS(netInst *virtstack.Net) {
 	s.SetNetworkProtocolOption(ipv4.ProtocolNumber, &ttl)
 	s.SetNetworkProtocolOption(ipv6.ProtocolNumber, &ttl)
 
-	// 2. Set TCP Options to look like macOS
+	// 2. Set TCP Options - increase buffer sizes for better throughput
 	opt := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     4096,
-		Default: 65535,
-		Max:     4194304,
+		Default: 262144,  // 256KB default (was 64KB)
+		Max:     16777216, // 16MB max (was 4MB)
 	}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
+
+	sendOpt := tcpip.TCPSendBufferSizeRangeOption{
+		Min:     4096,
+		Default: 262144,  // 256KB default
+		Max:     16777216, // 16MB max
+	}
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt)
 
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
@@ -867,7 +874,7 @@ func (ns *Netstack) Ping(ctx context.Context, target string) (time.Duration, err
 		return 0, net.ErrClosed
 	}
 
-	totalTimeout := 2 * time.Second
+	totalTimeout := 5 * time.Second
 	deadline := time.Now().Add(totalTimeout)
 
 	// 1. Try Real ICMP Ping (gvisor protocol "ping")
@@ -921,20 +928,13 @@ func (ns *Netstack) Ping(ctx context.Context, target string) (time.Duration, err
 				if ns.config.Verbose {
 					log.Printf("Ping Read: %d bytes", n)
 				}
-				if n >= 8 {
+				if n >= 4 {
 					// Check for Echo Reply (Type 0)
 					switch buf[0] {
 					case 0:
-						// Verify ID and Sequence to match request (Robustness)
-						recID := int(buf[4])<<8 | int(buf[5])
-						recSeq := int(buf[6])<<8 | int(buf[7])
-
-						if recID == id && recSeq == seq {
-							return time.Since(start), nil
-						}
-						if ns.config.Verbose {
-							log.Printf("Ping mismatch: ID %d!=%d or Seq %d!=%d", recID, id, recSeq, seq)
-						}
+						// gvisor manages ICMP IDs internally on ping sockets.
+						// Any Echo Reply on this dedicated connection is ours.
+						return time.Since(start), nil
 					case 3:
 						// Destination Unreachable
 						return 0, fmt.Errorf("destination unreachable (code %d)", buf[1])

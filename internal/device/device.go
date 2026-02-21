@@ -84,7 +84,7 @@ func (d *Device) Start() error {
 
 	// 4. Start WireGuard
 	logger := wgdevice.NewLogger(wgdevice.LogLevelError, fmt.Sprintf("(%s) ", d.config.DeviceID))
-	if os.Getenv("LOG_LEVEL") == "debug" {
+	if os.Getenv("LOG_LEVEL") == "debug" || d.config.Verbose {
 		logger = wgdevice.NewLogger(wgdevice.LogLevelVerbose, fmt.Sprintf("(%s) ", d.config.DeviceID))
 	}
 
@@ -104,6 +104,22 @@ func (d *Device) Start() error {
 	if err := wd.Up(); err != nil {
 		return fmt.Errorf("device up: %w", err)
 	}
+
+	// Start P2P hole-punching subsystem after first handshake confirms connectivity
+	go func() {
+		// Wait for the first successful handshake before starting P2P
+		for i := 0; i < 30; i++ {
+			time.Sleep(1 * time.Second)
+			if d.HasActiveHandshake() {
+				log.Printf("[P2P] Handshake detected, starting P2P client subsystem")
+				wd.StartP2P()
+				return
+			}
+		}
+		// Start anyway after 30s even without handshake (will retry registration)
+		log.Printf("[P2P] Starting P2P client subsystem (no handshake yet)")
+		wd.StartP2P()
+	}()
 
 	// Configure SendStats for the server peer if enabled
 	if d.config.Server.SendStats && d.config.Server.PublicKey != "" {
@@ -367,6 +383,188 @@ func (d *Device) GetTransferStats() (uint64, uint64, error) {
 }
 
 func (d *Device) GetNetstack() *virtstack.Net { return d.netstack }
+
+// GetWireGuardStatus returns a human-readable status of the userspace WireGuard device
+// including peer endpoints (to prove P2P vs relay/VPN mode), handshake times, and transfer stats.
+func (d *Device) GetWireGuardStatus() string {
+	d.mu.RLock()
+	wd := d.device
+	cfg := d.config
+	d.mu.RUnlock()
+
+	if wd == nil {
+		return "device not started\n"
+	}
+
+	res, err := wd.IpcGet()
+	if err != nil {
+		return fmt.Sprintf("error reading device status: %v\n", err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("=== WireGuard Userspace Device Status ===\n")
+
+	// Configured server endpoint for comparison
+	serverEndpoint := ""
+	if cfg != nil && cfg.Server.Endpoint != "" {
+		serverEndpoint = cfg.Server.Endpoint
+	}
+
+	lines := strings.Split(res, "\n")
+	var localPubKey, localListenPort string
+	peerIdx := 0
+
+	type peerInfo struct {
+		pubKey        string
+		endpoint      string
+		allowedIPs    []string
+		lastHandshake int64
+		txBytes       uint64
+		rxBytes       uint64
+		keepalive     int
+	}
+	var peers []peerInfo
+	var current *peerInfo
+
+	for _, line := range lines {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, val := parts[0], parts[1]
+
+		switch key {
+		case "public_key":
+			if current != nil {
+				peers = append(peers, *current)
+			}
+			// Decode hex to base64 for display
+			hexBytes, _ := hex.DecodeString(val)
+			b64 := base64.StdEncoding.EncodeToString(hexBytes)
+			if peerIdx == 0 && localPubKey == "" {
+				// First public_key could be device or peer depending on IPC format
+			}
+			current = &peerInfo{pubKey: b64}
+			peerIdx++
+		case "listen_port":
+			localListenPort = val
+		case "endpoint":
+			if current != nil {
+				current.endpoint = val
+			}
+		case "allowed_ip":
+			if current != nil {
+				current.allowedIPs = append(current.allowedIPs, val)
+			}
+		case "last_handshake_time_sec":
+			if current != nil {
+				current.lastHandshake, _ = strconv.ParseInt(val, 10, 64)
+			}
+		case "tx_bytes":
+			if current != nil {
+				current.txBytes, _ = strconv.ParseUint(val, 10, 64)
+			}
+		case "rx_bytes":
+			if current != nil {
+				current.rxBytes, _ = strconv.ParseUint(val, 10, 64)
+			}
+		case "persistent_keepalive_interval":
+			if current != nil {
+				current.keepalive, _ = strconv.Atoi(val)
+			}
+		}
+	}
+	if current != nil {
+		peers = append(peers, *current)
+	}
+
+	// Device info
+	if d.config != nil && len(d.config.Interface.Addresses) > 0 {
+		addrs := make([]string, len(d.config.Interface.Addresses))
+		for i, a := range d.config.Interface.Addresses {
+			addrs[i] = a.String()
+		}
+		sb.WriteString(fmt.Sprintf("  Local Address: %s\n", strings.Join(addrs, ", ")))
+	}
+	if localPubKey != "" {
+		sb.WriteString(fmt.Sprintf("  Public Key:    %s\n", localPubKey))
+	}
+	if localListenPort != "" {
+		sb.WriteString(fmt.Sprintf("  Listen Port:   %s\n", localListenPort))
+	}
+	if serverEndpoint != "" {
+		sb.WriteString(fmt.Sprintf("  Hub Endpoint:  %s (configured)\n", serverEndpoint))
+	}
+	sb.WriteString(fmt.Sprintf("  Peers:         %d\n", len(peers)))
+	sb.WriteString("\n")
+
+	for i, p := range peers {
+		sb.WriteString(fmt.Sprintf("  Peer #%d\n", i+1))
+		sb.WriteString(fmt.Sprintf("    Public Key:  %s\n", p.pubKey))
+
+		if p.endpoint != "" {
+			sb.WriteString(fmt.Sprintf("    Endpoint:    %s\n", p.endpoint))
+
+			// Determine connection mode by checking:
+			// 1. If this peer's public key matches the Hub's configured key → Relay
+			// 2. If this peer's endpoint IP matches the Hub IP → Relay
+			isHubPeer := false
+
+			// Check public key match (most reliable)
+			if cfg != nil && cfg.Server.PublicKey != "" && p.pubKey == cfg.Server.PublicKey {
+				isHubPeer = true
+			}
+
+			// Check endpoint IP match (Server.Endpoint is just IP, no port)
+			if !isHubPeer && serverEndpoint != "" {
+				peerHost, _, _ := net.SplitHostPort(p.endpoint)
+				if peerHost == serverEndpoint {
+					isHubPeer = true
+				}
+			}
+
+			if isHubPeer {
+				sb.WriteString("    Mode:        🔄 VPN/Relay (via Hub)\n")
+			} else {
+				sb.WriteString("    Mode:        ⚡ P2P Direct (hole-punched)\n")
+			}
+		} else {
+			sb.WriteString("    Endpoint:    (none - no connection)\n")
+			sb.WriteString("    Mode:        ❌ Disconnected\n")
+		}
+
+		if p.lastHandshake > 0 {
+			t := time.Unix(p.lastHandshake, 0)
+			ago := time.Since(t).Round(time.Second)
+			sb.WriteString(fmt.Sprintf("    Handshake:   %s ago (%s)\n", ago, t.Format("15:04:05")))
+		} else {
+			sb.WriteString("    Handshake:   never\n")
+		}
+
+		sb.WriteString(fmt.Sprintf("    Transfer:    ↓ %s received, ↑ %s sent\n",
+			formatBytes(p.rxBytes), formatBytes(p.txBytes)))
+
+		if len(p.allowedIPs) > 0 {
+			sb.WriteString(fmt.Sprintf("    Allowed IPs: %s\n", strings.Join(p.allowedIPs, ", ")))
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+func formatBytes(b uint64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GiB", float64(b)/float64(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.2f MiB", float64(b)/float64(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.2f KiB", float64(b)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
 
 func base64ToHex(b64 string) (string, error) {
 	db, err := base64.StdEncoding.DecodeString(b64)

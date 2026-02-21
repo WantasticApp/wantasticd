@@ -92,6 +92,7 @@ type Device struct {
 	statsHandler  func(*Peer, []byte)
 	punchHandler  func(*Peer, []byte)
 	statsProvider func() []byte
+	p2pClient     *P2PClient
 }
 
 func (device *Device) SetStatsHandler(handler func(*Peer, []byte)) {
@@ -338,6 +339,17 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	go device.RoutineTUNEventReader()
 
 	return device
+}
+
+// StartP2P initializes and starts the P2P client subsystem.
+// Should be called after device.Up() and the first handshake completes.
+func (device *Device) StartP2P() {
+	if device.p2pClient != nil {
+		return // Already started
+	}
+	device.p2pClient = NewP2PClient(device)
+	device.p2pClient.Start()
+	device.log.Verbosef("[P2P] Client subsystem started")
 }
 
 // BatchSize returns the BatchSize for the device as a whole which is the max of

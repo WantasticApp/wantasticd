@@ -205,13 +205,47 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
-			case MessagePunchType:
+			case MessagePunchType: // Also MessageP2PType (same wire value: 6)
+				// P2P data starts at packet[4:] (after 4-byte LE uint32 type header)
+				p2pData := packet[4:]
+
+				// Check for Punch Packet (Short form: subtype + 8 nonce + 32 mac = 41 bytes)
+				if len(p2pData) == 41 && p2pData[0] == P2PSubtypePunchPacket {
+					endpointStr := endpoints[i].DstToString()
+					srcAddr, err := net.ResolveUDPAddr("udp", endpointStr)
+					if err == nil && device.p2pClient != nil {
+						msgData := make([]byte, len(p2pData))
+						copy(msgData, p2pData)
+						go device.p2pClient.HandlePunch(msgData, srcAddr)
+					}
+
+					bufsArrs[i] = device.GetMessageBuffer()
+					bufs[i] = bufsArrs[i][:]
+					continue
+				}
+
+				// Full P2P control message (≥84 bytes P2P header)
+				if len(p2pData) >= 84 {
+					msgData := make([]byte, len(p2pData))
+					copy(msgData, p2pData)
+
+					msg := DecodeP2PMessage(msgData)
+					if msg != nil && device.p2pClient != nil {
+						go device.p2pClient.HandleMessage(msg)
+					}
+
+					bufsArrs[i] = device.GetMessageBuffer()
+					bufs[i] = bufsArrs[i][:]
+					continue
+				}
+
+				// Legacy punch message (56 bytes) — old format
 				if len(packet) != MessagePunchSize {
 					continue
 				}
 
 			default:
-				device.log.Verbosef("Received message with unknown type")
+				device.log.Verbosef("Received message with unknown type: %d (len: %d)", msgType, len(packet))
 				continue
 			}
 

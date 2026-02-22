@@ -1,4 +1,9 @@
-FROM openwrt/rootfs:x86-64-23.05.0
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN CGO_ENABLED=0 go build -o wantasticd ./cmd/wantasticd
 
+FROM openwrt/rootfs:x86-64-23.05.0
 # OpenWrt requires /var/lock for opkg to work correctly in some containerized environments
 RUN mkdir -p /var/lock && opkg update && opkg install iperf3 iputils-ping
+COPY --from=builder /app/wantasticd /wantasticd/wantasticd

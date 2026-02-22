@@ -15,3 +15,4 @@ cmd/puppeteer
 hosts.txt
 puppeteer
 wantasticd
+test_*.go

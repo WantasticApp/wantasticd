@@ -1,14 +1,13 @@
 services:
   client1:
     build:
-      context: .
-      dockerfile: Dockerfile.openwrt
+      context: ../../
+      dockerfile: e2e/docker-compose/Dockerfile.openwrt
     platform: linux/amd64
     container_name: wantasticd-client1
     command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
     volumes:
       - ./configs/client1.conf:/etc/wantasticd/wg.conf:ro
-      - ../../bin/wantasticd-linux-amd64:/wantasticd/wantasticd:ro
     environment:
       - LOG_LEVEL=debug
     extra_hosts:
@@ -24,14 +23,13 @@ services:
 
   client2:
     build:
-      context: .
-      dockerfile: Dockerfile.openwrt
+      context: ../../
+      dockerfile: e2e/docker-compose/Dockerfile.openwrt
     platform: linux/amd64
     container_name: wantasticd-client2
     command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
     volumes:
       - ./configs/client2.conf:/etc/wantasticd/wg.conf:ro
-      - ../../bin/wantasticd-linux-amd64:/wantasticd/wantasticd:ro
     environment:
       - LOG_LEVEL=debug
     extra_hosts:
@@ -47,14 +45,13 @@ services:
 
   client3:
     build:
-      context: .
-      dockerfile: Dockerfile.openwrt
+      context: ../../
+      dockerfile: e2e/docker-compose/Dockerfile.openwrt
     platform: linux/amd64
     container_name: wantasticd-client3
     command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
     volumes:
       - ./configs/client3.conf:/etc/wantasticd/wg.conf:ro
-      - ../../bin/wantasticd-linux-amd64:/wantasticd/wantasticd:ro
     environment:
       - LOG_LEVEL=debug
     extra_hosts:

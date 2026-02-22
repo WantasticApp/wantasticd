@@ -3,10 +3,10 @@ package device
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
 	"time"
-    "fmt"
 
 	"wantastic-agent/internal/device/wireguard-go/conn"
 
@@ -111,7 +111,7 @@ func (c *P2PClient) register() {
 	if ip == nil {
 		ip = net.IPv4zero
 	}
-	
+
 	c.device.net.RLock()
 	port := int(c.device.net.port)
 	c.device.net.RUnlock()
@@ -119,6 +119,7 @@ func (c *P2PClient) register() {
 	c.localAddr = net.UDPAddr{IP: ip, Port: port}
 	msg.SetLocalAddr(&c.localAddr)
 
+	c.device.log.Verbosef("[P2P] Registering with server using LocalAddr %v", c.localAddr)
 	c.sendToServer(msg)
 }
 
@@ -166,7 +167,9 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	var toConfigure []string
+	var toConfigureIDs []uint32
 
 	offset := 4
 	for i := uint32(0); i < count; i++ {
@@ -180,36 +183,49 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		peer.ObservedAddr.Port = int(binary.BigEndian.Uint16(msg.Payload[offset+70:]))
 		peer.NATType = NATType(msg.Payload[offset+72])
 		peer.P2PCapable = msg.Payload[offset+73] == 1
-        peer.AssignedIP = net.IP(msg.Payload[offset+74 : offset+78])
+		peer.AssignedIP = net.IP(msg.Payload[offset+74 : offset+78])
 		peer.State = P2PStateDiscovered
 
 		// Don't overwrite existing established connections
 		if existing, ok := c.peers[peer.ID]; !ok || existing.State != P2PStateEstablished {
 			c.peers[peer.ID] = peer
-            
-            // Dynamically add this P2P peer to the WireGuard configuration
-            // so that packets destined for its AssignedIP will be routed to its PublicKey
-            // rather than the Hub's PublicKey.
-            if len(peer.AssignedIP) == 4 && !peer.AssignedIP.Equal(net.IPv4zero) {
-                conf := fmt.Sprintf("public_key=%x\nallowed_ip=%s/32\n", peer.PublicKey[:], peer.AssignedIP.String())
-                if err := c.device.IpcSet(conf); err != nil {
-                    c.device.log.Errorf("[P2P] Failed to dynamically configure peer %d: %v", peer.ID, err)
-                } else {
-                    c.device.log.Verbosef("[P2P] Dynamically configured WireGuard peer %d for IP %s", peer.ID, peer.AssignedIP.String())
-                }
-            }
+
+			// Prepare to dynamically add this P2P peer to the WireGuard configuration
+			if len(peer.AssignedIP) == 4 && !peer.AssignedIP.Equal(net.IPv4zero) {
+				conf := fmt.Sprintf("public_key=%x\nallowed_ip=%s/32\npersistent_keepalive_interval=25\n", peer.PublicKey[:], peer.AssignedIP.String())
+				toConfigure = append(toConfigure, conf)
+				toConfigureIDs = append(toConfigureIDs, peer.ID)
+			}
 		}
 
 		offset += 78
 	}
 
+	c.mu.Unlock() // Unlock before configuring WireGuard to avoid deadlocks
+
+	// Configure WireGuard peers sequentially
+	for i, conf := range toConfigure {
+		if err := c.device.IpcSet(conf); err != nil {
+			c.device.log.Errorf("[P2P] Failed to dynamically configure peer %d: %v", toConfigureIDs[i], err)
+		} else {
+			c.device.log.Verbosef("[P2P] Dynamically configured WireGuard peer %d", toConfigureIDs[i])
+		}
+	}
+
 	c.device.log.Verbosef("[P2P] Discovered %d peers", count)
 
 	// Auto-try P2P for all discovered peers
+	c.mu.RLock()
+	var toPunch []*DiscoveredPeer
 	for _, peer := range c.peers {
 		if peer.P2PCapable && peer.State == P2PStateDiscovered {
-			go c.tryP2PUnlocked(peer)
+			toPunch = append(toPunch, peer)
 		}
+	}
+	c.mu.RUnlock()
+
+	for _, peer := range toPunch {
+		go c.tryP2PUnlocked(peer)
 	}
 }
 
@@ -463,6 +479,12 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 		ep, err := c.device.net.bind.ParseEndpoint(addr.String())
 		if err == nil {
 			peer.Endpoint = ep
+		}
+
+		// Trigger WireGuard to initiate handshake immediately now that P2P pinhole is open
+		wgPeer := c.device.LookupPeer(peer.PublicKey)
+		if wgPeer != nil {
+			wgPeer.SendKeepalive()
 		}
 	}
 }

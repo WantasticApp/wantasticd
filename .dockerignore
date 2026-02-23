@@ -1,0 +1,14 @@
+.git
+.github
+docs/
+tmp/
+ui/
+frontend/
+node_modules/
+dist/
+build/
+*.exe
+*.app
+*.md
+LICENSE
+.env

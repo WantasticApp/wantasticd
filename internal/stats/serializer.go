@@ -83,6 +83,8 @@ func SerializeMetrics(m *Metrics) []byte {
 		putVarint(int64(w.Noise))
 		putUvarint(uint64(w.Bitrate))
 	}
+
+	// The server ALWAYS expects these 4 global properties to be written!
 	if m.WiFi.Connected {
 		putUvarint(1)
 	} else {

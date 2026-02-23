@@ -15,21 +15,21 @@ echo "=========================================="
 echo "     WIREGUARD TUNNEL STATUS (P2P PROOF)  "
 echo "=========================================="
 echo "--- Client1 Status ---"
-docker exec wantasticd-client1 /wantasticd/wantasticd status || echo "Status unavailable"
+docker exec wantasticd-client1 /app/tmp/wantasticd status || echo "Status unavailable"
 echo ""
 echo "--- Client2 Status ---"
-docker exec wantasticd-client2 /wantasticd/wantasticd status || echo "Status unavailable"
+docker exec wantasticd-client2 /app/tmp/wantasticd status || echo "Status unavailable"
 echo ""
 
 echo "=========================================="
 echo "          LATENCY TESTS (PING)            "
 echo "=========================================="
 echo "PING from Client1 (10.0.0.3) -> Client2 (10.0.0.4)"
-docker exec wantasticd-client1 /wantasticd/wantasticd ping -c 4 10.0.0.4 || echo "Ping failed"
+docker exec wantasticd-client1 /app/tmp/wantasticd ping -c 4 10.0.0.4 || echo "Ping failed"
 
 echo ""
 echo "PING from Client1 (10.0.0.3) -> Client3 (10.0.0.5)"
-docker exec wantasticd-client1 /wantasticd/wantasticd ping -c 4 10.0.0.5 || echo "Ping failed"
+docker exec wantasticd-client1 /app/tmp/wantasticd ping -c 4 10.0.0.5 || echo "Ping failed"
 
 echo ""
 echo "=========================================="
@@ -43,18 +43,13 @@ docker exec -d wantasticd-client3 iperf3 -s -p 5201
 # Allow servers to start
 sleep 2
 
-echo "Binding Wantastic ports on Client1 to map into the Userspace Netstack via proxy..."
-docker exec -d wantasticd-client1 /wantasticd/wantasticd bind 5201 10.0.0.4:5201
-docker exec -d wantasticd-client1 /wantasticd/wantasticd bind 5202 10.0.0.5:5201
-sleep 2
+echo "..."
+echo "IPERF3 from Client1 -> Client2 (P2P Over WireGuard TUN)"
+docker exec wantasticd-client1 iperf3 -c 10.0.0.4 -p 5201 -t 10 || echo "iPerf3 failed"
 
 echo "..."
-echo "IPERF3 from Client1 -> Client2 (P2P Over WireGuard Tunnel via IPC proxy)"
-docker exec wantasticd-client1 iperf3 -c 127.0.0.1 -p 5201 -t 10 || echo "iPerf3 failed"
-
-echo "..."
-echo "IPERF3 from Client1 -> Client3 (P2P Over WireGuard Tunnel via IPC proxy)"
-docker exec wantasticd-client1 iperf3 -c 127.0.0.1 -p 5202 -t 10 || echo "iPerf3 failed"
+echo "IPERF3 from Client1 -> Client3 (P2P Over WireGuard TUN)"
+docker exec wantasticd-client1 iperf3 -c 10.0.0.5 -p 5201 -t 10 || echo "iPerf3 failed"
 
 echo "..."
 echo "=========================================="

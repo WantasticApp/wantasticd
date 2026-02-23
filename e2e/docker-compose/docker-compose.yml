@@ -2,11 +2,11 @@ services:
   client1:
     build:
       context: ../../
-      dockerfile: e2e/docker-compose/Dockerfile.openwrt
-    platform: linux/amd64
+      dockerfile: e2e/docker-compose/Dockerfile.dev
     container_name: wantasticd-client1
-    command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
+    command: [ "air", "--build.cmd", "CGO_ENABLED=0 go build -buildvcs=false -o ./tmp/wantasticd ./cmd/wantasticd", "--build.bin", "./tmp/wantasticd connect -v -config /etc/wantasticd/wg.conf", "--build.exclude_dir", "e2e,tmp" ]
     volumes:
+      - ../../:/app
       - ./configs/client1.conf:/etc/wantasticd/wg.conf:ro
     environment:
       - LOG_LEVEL=debug
@@ -24,11 +24,11 @@ services:
   client2:
     build:
       context: ../../
-      dockerfile: e2e/docker-compose/Dockerfile.openwrt
-    platform: linux/amd64
+      dockerfile: e2e/docker-compose/Dockerfile.dev
     container_name: wantasticd-client2
-    command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
+    command: [ "air", "--build.cmd", "CGO_ENABLED=0 go build -buildvcs=false -o ./tmp/wantasticd ./cmd/wantasticd", "--build.bin", "./tmp/wantasticd connect -v -config /etc/wantasticd/wg.conf", "--build.exclude_dir", "e2e,tmp" ]
     volumes:
+      - ../../:/app
       - ./configs/client2.conf:/etc/wantasticd/wg.conf:ro
     environment:
       - LOG_LEVEL=debug
@@ -46,11 +46,11 @@ services:
   client3:
     build:
       context: ../../
-      dockerfile: e2e/docker-compose/Dockerfile.openwrt
-    platform: linux/amd64
+      dockerfile: e2e/docker-compose/Dockerfile.dev
     container_name: wantasticd-client3
-    command: [ "/wantasticd/wantasticd", "connect", "-v", "-config", "/etc/wantasticd/wg.conf" ]
+    command: [ "air", "--build.cmd", "CGO_ENABLED=0 go build -buildvcs=false -o ./tmp/wantasticd ./cmd/wantasticd", "--build.bin", "./tmp/wantasticd connect -v -config /etc/wantasticd/wg.conf", "--build.exclude_dir", "e2e,tmp" ]
     volumes:
+      - ../../:/app
       - ./configs/client3.conf:/etc/wantasticd/wg.conf:ro
     environment:
       - LOG_LEVEL=debug

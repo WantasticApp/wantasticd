@@ -1,0 +1,9 @@
+FROM golang:1.24
+
+RUN apt-get update && apt-get install -y iputils-ping iperf3 dropbear-bin curl
+RUN curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+
+WORKDIR /app
+COPY e2e/docker-compose/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

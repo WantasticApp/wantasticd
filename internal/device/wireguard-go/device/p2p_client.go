@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -283,6 +284,17 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 	c.sessions[targetID] = session
 	c.mu.Unlock()
 
+	// If we are in TUN mode and the peer has an IP assigned, add a route for it
+	if c.device.addPeerRouteHandler != nil {
+		wgPeer := c.device.LookupPeer(peer.PublicKey)
+		if wgPeer != nil {
+			c.device.allowedips.EntriesForPeer(wgPeer, func(prefix netip.Prefix) bool {
+				c.device.addPeerRouteHandler(net.IP(prefix.Addr().AsSlice()))
+				return false // stop after first route
+			})
+		}
+	}
+
 	c.device.log.Verbosef("[P2P] Punch relay received for target %d. Observed: %v, Local: %v",
 		targetID, peer.ObservedAddr, peer.LocalAddr)
 
@@ -334,15 +346,13 @@ func (c *P2PClient) holePunch(session *P2PSession, peer *DiscoveredPeer) {
 	go c.sendPunchPackets(session, targets, ctx)
 
 	// Wait for response timeout
-	select {
-	case <-ctx.Done():
-		c.mu.Lock()
-		if !session.Established {
-			peer.State = P2PStateFailed
-			c.device.log.Verbosef("[P2P] Punch timeout for peer %d", peer.ID)
-		}
-		c.mu.Unlock()
+	<-ctx.Done()
+	c.mu.Lock()
+	if !session.Established {
+		peer.State = P2PStateFailed
+		c.device.log.Verbosef("[P2P] Punch timeout for peer %d", peer.ID)
 	}
+	c.mu.Unlock()
 }
 
 func (c *P2PClient) makePunchPacket(session *P2PSession) []byte {
@@ -493,33 +503,30 @@ func (c *P2PClient) maintenanceLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			// Retry registration if not yet registered
-			if c.myID == 0 {
-				c.register()
-				continue
-			}
-
-			// Refresh peer list periodically
-			c.requestPeerList()
-
-			// Clean up failed/stale sessions
-			c.mu.Lock()
-			for id, peer := range c.peers {
-				if peer.State == P2PStateFailed && time.Since(peer.LastUsed) > 5*time.Minute {
-					delete(c.peers, id)
-					delete(c.sessions, id)
-				}
-				// Timeout trying state
-				if peer.State == P2PStateTrying && time.Since(peer.LastUsed) > 15*time.Second {
-					peer.State = P2PStateDiscovered // Reset to retry later
-					delete(c.sessions, id)
-				}
-			}
-			c.mu.Unlock()
+	for range ticker.C {
+		// Retry registration if not yet registered
+		if c.myID == 0 {
+			c.register()
+			continue
 		}
+
+		// Refresh peer list periodically
+		c.requestPeerList()
+
+		// Clean up failed/stale sessions
+		c.mu.Lock()
+		for id, peer := range c.peers {
+			if peer.State == P2PStateFailed && time.Since(peer.LastUsed) > 5*time.Minute {
+				delete(c.peers, id)
+				delete(c.sessions, id)
+			}
+			// Timeout trying state
+			if peer.State == P2PStateTrying && time.Since(peer.LastUsed) > 15*time.Second {
+				peer.State = P2PStateDiscovered // Reset to retry later
+				delete(c.sessions, id)
+			}
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -533,4 +540,10 @@ func (c *P2PClient) GetEndpointForPeer(pk NoisePublicKey) conn.Endpoint {
 		}
 	}
 	return nil
+}
+
+// IsExitNode returns true if this peer is currently acting as an exit node
+func (c *P2PClient) IsExitNode() bool {
+	// Not driven locally by P2P messages anymore; managed by system TUN routing mapping
+	return false
 }

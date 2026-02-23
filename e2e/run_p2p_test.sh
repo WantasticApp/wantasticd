@@ -15,21 +15,21 @@ echo "=========================================="
 echo "     WIREGUARD TUNNEL STATUS (P2P PROOF)  "
 echo "=========================================="
 echo "--- Client1 Status ---"
-docker exec wantasticd-client1 /app/tmp/wantasticd status || echo "Status unavailable"
+docker exec wantasticd-client1 ip addr show wantastic0 || echo "Status unavailable"
 echo ""
 echo "--- Client2 Status ---"
-docker exec wantasticd-client2 /app/tmp/wantasticd status || echo "Status unavailable"
+docker exec wantasticd-client2 ip addr show wantastic0 || echo "Status unavailable"
 echo ""
 
 echo "=========================================="
 echo "          LATENCY TESTS (PING)            "
 echo "=========================================="
 echo "PING from Client1 (10.0.0.3) -> Client2 (10.0.0.4)"
-docker exec wantasticd-client1 /app/tmp/wantasticd ping -c 4 10.0.0.4 || echo "Ping failed"
+docker exec wantasticd-client1 ping -c 4 10.0.0.4 || echo "Ping failed"
 
 echo ""
 echo "PING from Client1 (10.0.0.3) -> Client3 (10.0.0.5)"
-docker exec wantasticd-client1 /app/tmp/wantasticd ping -c 4 10.0.0.5 || echo "Ping failed"
+docker exec wantasticd-client1 ping -c 4 10.0.0.5 || echo "Ping failed"
 
 echo ""
 echo "=========================================="
@@ -66,7 +66,6 @@ echo "=========================================="
 echo "            CLEANUP                       "
 echo "=========================================="
 echo "Killing background tasks..."
-docker exec wantasticd-client1 killall wantasticd 2>/dev/null || true
 docker exec wantasticd-client2 killall iperf3 2>/dev/null || true
 docker exec wantasticd-client3 killall iperf3 2>/dev/null || true
 

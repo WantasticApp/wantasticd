@@ -231,17 +231,21 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 	log.Printf("Wantastic agent started successfully")
 	log.Printf("Mode: System TUN (%s)", cfg.Interface.TUNName)
 
+	go func() {
+		select {
+		case <-sigCh:
+			log.Println("Received shutdown signal (Interrupt)")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	if useTray {
 		log.Println("Starting system tray client...")
 		// systray.Run MUST block the main thread on macOS
 		runner.RunSystray(ctx, cancel)
 	} else {
-		select {
-		case <-sigCh:
-			log.Println("Received shutdown signal")
-		case <-ctx.Done():
-			log.Println("Context cancelled")
-		}
+		<-ctx.Done()
 	}
 
 	if err := agt.Stop(); err != nil {
@@ -264,15 +268,18 @@ func handleTray() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go runner.RunSystray(ctx, cancel)
+	go func() {
+		select {
+		case <-sigCh:
+			log.Println("Received shutdown signal (Interrupt)")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
-	select {
-	case <-sigCh:
-		log.Println("Received shutdown signal")
-		cancel()
-	case <-ctx.Done():
-		log.Println("Tray app exiting")
-	}
+	// systray.Run MUST block the main thread on macOS
+	runner.RunSystray(ctx, cancel)
+	log.Println("Tray app exiting")
 }
 
 func handleStatus() {

@@ -4,7 +4,7 @@ services:
       context: ../../
       dockerfile: e2e/docker-compose/Dockerfile.dev
     container_name: wantasticd-client1
-    command: [ "air", "--build.cmd", "CGO_ENABLED=0 go build -buildvcs=false -o ./tmp/wantasticd ./cmd/wantasticd", "--build.bin", "./tmp/wantasticd connect -v -config /etc/wantasticd/wg.conf", "--build.exclude_dir", "e2e,tmp" ]
+    command: [ "air", "-c", ".air-openwrt.toml" ]
     volumes:
       - ../../:/app
       - ./configs/client1.conf:/etc/wantasticd/wg.conf:ro
@@ -26,7 +26,7 @@ services:
       context: ../../
       dockerfile: e2e/docker-compose/Dockerfile.dev
     container_name: wantasticd-client2
-    command: [ "air", "--build.cmd", "CGO_ENABLED=0 go build -buildvcs=false -o ./tmp/wantasticd ./cmd/wantasticd", "--build.bin", "./tmp/wantasticd connect -v -config /etc/wantasticd/wg.conf", "--build.exclude_dir", "e2e,tmp" ]
+    command: [ "air", "-c", ".air-openwrt.toml" ]
     volumes:
       - ../../:/app
       - ./configs/client2.conf:/etc/wantasticd/wg.conf:ro
@@ -48,7 +48,7 @@ services:
       context: ../../
       dockerfile: e2e/docker-compose/Dockerfile.dev
     container_name: wantasticd-client3
-    command: [ "air", "--build.cmd", "CGO_ENABLED=0 go build -buildvcs=false -o ./tmp/wantasticd ./cmd/wantasticd", "--build.bin", "./tmp/wantasticd connect -v -config /etc/wantasticd/wg.conf", "--build.exclude_dir", "e2e,tmp" ]
+    command: [ "air", "-c", ".air-openwrt.toml" ]
     volumes:
       - ../../:/app
       - ./configs/client3.conf:/etc/wantasticd/wg.conf:ro

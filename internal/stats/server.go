@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"wantastic-agent/internal/device"
-	agent_netstack "wantastic-agent/internal/netstack"
 	"wantastic-agent/pkg/version"
 
 	"golang.org/x/sys/cpu"
@@ -26,7 +25,6 @@ var viewsFS embed.FS
 // Server provides metrics and statistics about the device
 type Server struct {
 	device    *device.Device
-	netstack  *agent_netstack.Netstack
 	server    *http.Server
 	mu        sync.RWMutex
 	startTime time.Time
@@ -68,10 +66,9 @@ type Metrics struct {
 
 	// WireGuard device metrics
 	WireGuard struct {
-		Connected bool                      `json:"connected"`
-		PublicKey string                    `json:"public_key"`
-		Peers     int                       `json:"peers"`
-		PeersList []agent_netstack.PeerInfo `json:"peers_list"`
+		Connected bool   `json:"connected"`
+		PublicKey string `json:"public_key"`
+		Peers     int    `json:"peers"`
 	} `json:"wireguard"`
 
 	// Agent metrics
@@ -187,10 +184,9 @@ type GPSInfo struct {
 }
 
 // NewServer creates a new stats server instance
-func NewServer(device *device.Device, ns *agent_netstack.Netstack, version string) *Server {
+func NewServer(device *device.Device, version string) *Server {
 	s := &Server{
 		device:    device,
-		netstack:  ns,
 		startTime: time.Now(),
 	}
 
@@ -261,14 +257,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
-	peers := s.netstack.DiscoverPeersDetail()
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	json.NewEncoder(w).Encode(map[string]any{
-		"peers": peers,
-		"count": len(peers),
+		"peers": []any{},
+		"count": 0,
 	})
 }
 
@@ -456,14 +450,10 @@ func (s *Server) collectMetrics() Metrics {
 		m.WiFi.Bitrate = totalBitrate / len(wifiInterfaces)
 	}
 
-	// WireGuard metrics (would use actual device stats)
+	// WireGuard metrics
 	m.WireGuard.Connected = s.device.HasActiveHandshake()
 	m.WireGuard.PublicKey = s.device.GetPublicKey()
-
-	// Try to get peers from netstack if available
-	peers := s.netstack.DiscoverPeersDetail()
-	m.WireGuard.Peers = len(peers)
-	m.WireGuard.PeersList = peers
+	m.WireGuard.Peers = 0
 
 	// Agent metrics
 	// Agent metrics (Host Uptime)

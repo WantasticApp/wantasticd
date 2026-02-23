@@ -6,6 +6,7 @@
 package device
 
 import (
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -86,13 +87,15 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
-	ipcMutex      sync.RWMutex
-	closed        chan struct{}
-	log           *Logger
-	statsHandler  func(*Peer, []byte)
-	punchHandler  func(*Peer, []byte)
-	statsProvider func() []byte
-	p2pClient     *P2PClient
+	ipcMutex            sync.RWMutex
+	closed              chan struct{}
+	log                 *Logger
+	statsHandler        func(*Peer, []byte)
+	punchHandler        func(*Peer, []byte)
+	statsProvider       func() []byte
+	p2pClient           *P2PClient
+	tunControlHandler   func(*Peer, []byte) // Handler for P2P TUN mode coordination (message type 7)
+	addPeerRouteHandler func(net.IP)        // Handler for dynamically adding P2P peer routes to TUN
 }
 
 func (device *Device) SetStatsHandler(handler func(*Peer, []byte)) {
@@ -105,6 +108,14 @@ func (device *Device) SetPunchHandler(handler func(*Peer, []byte)) {
 
 func (device *Device) SetStatsProvider(provider func() []byte) {
 	device.statsProvider = provider
+}
+
+func (device *Device) SetTUNControlHandler(handler func(*Peer, []byte)) {
+	device.tunControlHandler = handler
+}
+
+func (device *Device) SetAddPeerRouteHandler(handler func(net.IP)) {
+	device.addPeerRouteHandler = handler
 }
 
 // deviceState represents the state of a Device.
@@ -352,6 +363,11 @@ func (device *Device) StartP2P() {
 	device.log.Verbosef("[P2P] Client subsystem started")
 }
 
+// GetP2PClient returns the P2P client instance if started
+func (device *Device) GetP2PClient() *P2PClient {
+	return device.p2pClient
+}
+
 // BatchSize returns the BatchSize for the device as a whole which is the max of
 // the bind batch size and the tun batch size. The batch size reported by device
 // is the size used to construct memory pools, and is the allowed batch size for
@@ -370,6 +386,27 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	defer device.peers.RUnlock()
 
 	return device.peers.keyMap[pk]
+}
+
+func (device *Device) LookupPeerByEndpoint(endpoint conn.Endpoint) *Peer {
+	if endpoint == nil {
+		return nil
+	}
+	endpointStr := endpoint.DstToString()
+
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+
+	for _, peer := range device.peers.keyMap {
+		peer.endpoint.Lock()
+		ep := peer.endpoint.val
+		peer.endpoint.Unlock()
+
+		if ep != nil && ep.DstToString() == endpointStr {
+			return peer
+		}
+	}
+	return nil
 }
 
 func (device *Device) RemovePeer(key NoisePublicKey) {

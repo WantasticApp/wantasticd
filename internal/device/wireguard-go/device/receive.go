@@ -244,6 +244,22 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
+			case MessageTUNControlType:
+				// P2P TUN mode coordination for exit node functionality
+				// Format: [4-byte type][payload...]
+				if len(packet) < 8 {
+					continue
+				}
+				tunData := packet[4:]
+				if peer := device.LookupPeerByEndpoint(endpoints[i]); peer != nil && device.tunControlHandler != nil {
+					msgData := make([]byte, len(tunData))
+					copy(msgData, tunData)
+					go device.tunControlHandler(peer, msgData)
+				}
+				bufsArrs[i] = device.GetMessageBuffer()
+				bufs[i] = bufsArrs[i][:]
+				continue
+
 			default:
 				device.log.Verbosef("Received message with unknown type: %d (len: %d)", msgType, len(packet))
 				continue

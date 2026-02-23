@@ -141,6 +141,39 @@ func (peer *Peer) SendStats() {
 	peer.SendStagedPackets()
 }
 
+func (peer *Peer) SendTUNControl(data []byte) {
+	if !peer.isRunning.Load() {
+		peer.device.log.Verbosef("%v - SendTUNControl: Peer not running", peer)
+		return
+	}
+
+	elem := peer.device.NewOutboundElement()
+	elem.msgType = MessageTUNControlType
+
+	if len(data) > 1200 {
+		peer.device.log.Errorf("%v - TUN Control payload too large: %d (Max ~1200)", peer, len(data))
+		return
+	}
+
+	copy(elem.buffer[MessageTransportHeaderSize:], data)
+	elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(data)]
+
+	elemsContainer := peer.device.GetOutboundElementsContainer()
+	elemsContainer.elems = append(elemsContainer.elems, elem)
+
+	select {
+	case peer.queue.staged <- elemsContainer:
+		peer.device.log.Verbosef("%v - Sending TUN control packet", peer)
+	default:
+		peer.device.PutMessageBuffer(elem.buffer)
+		peer.device.PutOutboundElement(elem)
+		peer.device.PutOutboundElementsContainer(elemsContainer)
+		return
+	}
+
+	peer.SendStagedPackets()
+}
+
 /* Queues a keepalive if no packets are queued for peer
  */
 func (peer *Peer) SendKeepalive() {
@@ -197,7 +230,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+		if err.Error() == "no known endpoint for peer" {
+			peer.device.log.Verbosef("%v - Failed to send handshake initiation: %v", peer, err)
+		} else {
+			peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+		}
 	}
 	peer.timersHandshakeInitiated()
 
@@ -598,7 +635,11 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			}
 		}
 		if err != nil {
-			device.log.Errorf("%v - Failed to send data packets: %v", peer, err)
+			if err.Error() == "no known endpoint for peer" {
+				device.log.Verbosef("%v - Failed to send data packets: %v", peer, err)
+			} else {
+				device.log.Errorf("%v - Failed to send data packets: %v", peer, err)
+			}
 			continue
 		}
 

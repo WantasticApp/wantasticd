@@ -59,6 +59,13 @@ func resolveEndpoint(hostname string) (string, error) {
 	return ips[0].IP.String(), nil
 }
 
+type ExitNode struct {
+	Enabled    bool     `json:"enabled"`
+	ExitRoutes []string `json:"exit_routes"`
+	ExitDNS    []string `json:"exit_dns"`
+	AllowLAN   bool     `json:"allow_lan"`
+}
+
 type Config struct {
 	DeviceID   string    `json:"device_id"`
 	TenantID   string    `json:"tenant_id"`
@@ -67,6 +74,7 @@ type Config struct {
 	Server     Server    `json:"server"`
 	Interface  Interface `json:"interface"`
 	Auth       Auth      `json:"auth"`
+	ExitNode   ExitNode  `json:"exit_node"`
 	Verbose    bool      `json:"verbose"`
 	AutoUpdate bool      `json:"auto_update"`
 }
@@ -85,6 +93,8 @@ type Interface struct {
 	ListenPort int            `json:"listen_port"`
 	MTU        int            `json:"mtu"`
 	DNS        []string       `json:"dns"`
+	TUNMode    bool           `json:"tun_mode"` // Use system TUN device instead of userspace netstack
+	TUNName    string         `json:"tun_name"` // Name of the TUN interface (e.g., "wantastic0")
 }
 
 // Auth holds the authentication credentials for the agent.
@@ -415,10 +425,31 @@ func (c *Config) Validate() error {
 		// Standard client behavior: use random port to avoid conflicts
 		c.Interface.ListenPort = 0
 	}
+	if c.Interface.TUNName == "" {
+		c.Interface.TUNName = DefaultTunName()
+	}
 	if c.Auth.RefreshTime == 0 {
 		c.Auth.RefreshTime = 24 * time.Hour
 	}
 	return nil
+}
+
+// DefaultTunName returns the default tun device name for the platform.
+func DefaultTunName() string {
+	switch runtime.GOOS {
+	case "openbsd":
+		return "tun"
+	case "windows":
+		return "Wantastic"
+	case "darwin":
+		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
+		// as a magic value that uses/creates any free number.
+		return "utun"
+	case "linux":
+		return "wantastic0"
+	default:
+		return "wantastic0"
+	}
 }
 
 func (c *Config) GenerateDeviceID() {

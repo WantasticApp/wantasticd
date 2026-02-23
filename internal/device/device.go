@@ -1,8 +1,10 @@
 package device
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -26,10 +28,9 @@ import (
 )
 
 type Device struct {
-	config   *config.Config
-	device   *wgdevice.Device
-	tunDev   tun.Device
-	netstack *virtstack.Net
+	config *config.Config
+	device *wgdevice.Device
+	tunDev tun.Device
 
 	mu      sync.RWMutex
 	running bool
@@ -41,6 +42,17 @@ type Device struct {
 	PortForwarder func(string, int) bool
 
 	statsProvider func() []byte
+
+	// TUN mode fields
+	nativeTun    tun.Device // Native system TUN device (when TUNMode is enabled)
+	originalTun  tun.Device // Original TUN device from wireguard-go
+	systemRoutes []string   // System routes added for TUN mode
+
+	// Exit node routes installed dynamically
+	exitNodeRoutes []string
+
+	// Device netstack for P2P connection handling
+	netstack *virtstack.Net
 }
 
 func New(cfg *config.Config) (*Device, error) {
@@ -48,6 +60,13 @@ func New(cfg *config.Config) (*Device, error) {
 		config: cfg,
 		stopCh: make(chan struct{}),
 	}, nil
+}
+
+// IsRunning safely returns whether the WireGuard device tunnel is currently active
+func (d *Device) IsRunning() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.running
 }
 
 func (d *Device) Start() error {
@@ -60,7 +79,6 @@ func (d *Device) Start() error {
 	d.mu.Unlock()
 
 	var tunDev tun.Device
-	var netstackInst *virtstack.Net
 	var err error
 
 	addrs := make([]netip.Addr, len(d.config.Interface.Addresses))
@@ -68,19 +86,13 @@ func (d *Device) Start() error {
 		addrs[i] = prefix.Addr()
 	}
 
-	// Force Userspace Netstack
-	// We no longer attempt to creating a real system TUN device.
-	// This ensures "busybox" behavior where the application is entirely self-contained.
-	log.Printf("Initializing userspace netstack...")
-	tunDev, netstackInst, err = virtstack.CreateNetTUN(addrs, nil, d.config.Interface.MTU)
+	tunDev, err = d.startTUNMode(addrs)
+
 	if err != nil {
-		return fmt.Errorf("create netstack tun: %w", err)
+		return fmt.Errorf("create tun: %w", err)
 	}
-	d.netstack = netstackInst
-	d.tunName = "userspace-tun"
+
 	d.tunDev = tunDev
-	// Wrap TUN for JIT Port Forwarding
-	tunDev = NewTunWrapper(tunDev, d.PortForwarder)
 
 	// 4. Start WireGuard
 	logger := wgdevice.NewLogger(wgdevice.LogLevelError, fmt.Sprintf("(%s) ", d.config.DeviceID))
@@ -92,6 +104,8 @@ func (d *Device) Start() error {
 	wd.DisableSomeRoamingForBrokenMobileSemantics()
 	wd.SetStatsHandler(d.handleStats)
 	wd.SetPunchHandler(d.handlePunch)
+	wd.SetTUNControlHandler(d.handleTUNControl)
+	wd.SetAddPeerRouteHandler(d.addPeerRoute)
 	if d.statsProvider != nil {
 		wd.SetStatsProvider(d.statsProvider)
 	}
@@ -105,41 +119,39 @@ func (d *Device) Start() error {
 		return fmt.Errorf("device up: %w", err)
 	}
 
+	// Add static routes to the OS networking table for the server's AllowedIPs
+	// This ensures responses to pings (and other traffic) correctly route back through the TUN
+	for _, ip := range d.config.Server.AllowedIPs {
+		if ip == "0.0.0.0/0" || ip == "::/0" {
+			// Skip adding global routes here automatically to avoid infinite routing loops
+			// with the endpoint. Exit nodes handles this explicitly with endpoint exclusions.
+			continue
+		}
+		if err := d.addRoute(ip); err != nil {
+			log.Printf("Warning: failed to add OS route for AllowedIP %s: %v", ip, err)
+		} else {
+			// Track it so it doesn't get infinitely added by P2P later
+			d.mu.Lock()
+			d.systemRoutes = append(d.systemRoutes, ip)
+			d.mu.Unlock()
+		}
+	}
+
 	// Start P2P hole-punching subsystem after first handshake confirms connectivity
 	go func() {
 		// Wait for the first successful handshake before starting P2P
 		for i := 0; i < 30; i++ {
 			time.Sleep(1 * time.Second)
 			if d.HasActiveHandshake() {
-				log.Printf("[P2P] Handshake detected, starting P2P client subsystem")
+				logger.Verbosef("[P2P] Handshake detected, starting P2P client subsystem")
 				wd.StartP2P()
 				return
 			}
 		}
 		// Start anyway after 30s even without handshake (will retry registration)
-		log.Printf("[P2P] Starting P2P client subsystem (no handshake yet)")
+		logger.Verbosef("[P2P] Starting P2P client subsystem (no handshake yet)")
 		wd.StartP2P()
 	}()
-
-	// Configure SendStats for the server peer if enabled
-	if d.config.Server.SendStats && d.config.Server.PublicKey != "" {
-		if pubKey, err := base64ToHex(d.config.Server.PublicKey); err == nil {
-			if pk, err := hex.DecodeString(pubKey); err == nil && len(pk) == 32 {
-				var noiseKey [32]byte
-				copy(noiseKey[:], pk)
-				if peer := wd.LookupPeer(noiseKey); peer != nil {
-					peer.SendStatsEnabled.Store(true)
-					log.Printf("Enabled custom stats for peer %s", d.config.Server.PublicKey)
-				} else {
-					log.Printf("Warning: Peer %s not found to enable stats", d.config.Server.PublicKey)
-				}
-			} else {
-				log.Printf("Error decoding hex public key: %v", err)
-			}
-		} else {
-			log.Printf("Error converting base64 public key to hex: %v", err)
-		}
-	}
 
 	// Diagnostic: dump device state after Up() to verify configuration
 	if ipcState, err := wd.IpcGet(); err == nil {
@@ -172,7 +184,7 @@ func (d *Device) Stop() error {
 	td := d.tunDev
 	d.mu.Unlock()
 
-	// No system cleanup needed for userspace netstack
+	d.cleanupTUNMode()
 
 	if wg != nil {
 		wg.Close()
@@ -252,7 +264,25 @@ func (d *Device) applyConfig() error {
 	if err != nil {
 		return err
 	}
-	return d.device.IpcSet(cfgStr)
+
+	if err := d.device.IpcSet(cfgStr); err != nil {
+		return err
+	}
+
+	// Restore custom stats enabling for the server peer if configured
+	if d.config.Server.SendStats && d.config.Server.PublicKey != "" {
+		if pubKey, err := base64ToHex(d.config.Server.PublicKey); err == nil {
+			if pk, err := hex.DecodeString(pubKey); err == nil && len(pk) == 32 {
+				var noiseKey [32]byte
+				copy(noiseKey[:], pk)
+				if peer := d.device.LookupPeer(noiseKey); peer != nil {
+					peer.SendStatsEnabled.Store(true)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (d *Device) UpdateConfig(cfg *pb.DeviceConfiguration) error {
@@ -280,6 +310,38 @@ func (d *Device) UpdateServerConfig(cfg *pb.ServerConfiguration) error {
 		d.config.Server.PublicKey = cfg.PublicKey
 	}
 	return d.applyConfig()
+}
+
+// UpdateExitNodeConfig updates the device's exit node configuration
+func (d *Device) UpdateExitNodeConfig(cfg *pb.ExitNodeConfiguration) error {
+	d.mu.Lock()
+	d.config.ExitNode.Enabled = cfg.Enabled
+	d.config.ExitNode.ExitRoutes = cfg.ExitRoutes
+	d.config.ExitNode.ExitDNS = cfg.ExitDns
+	d.config.ExitNode.AllowLAN = cfg.AllowLan
+	d.mu.Unlock()
+
+	// If the server connection exists, send the exit node config to the peers
+	// Note: We use SendTUNControl for Message Type 7 coordination.
+	//
+	// The specification for Message Type 7 payload could just be a JSON struct,
+	// or another binary format, depending on what the Coordinator expects.
+	// For now we will serialize it to JSON.
+
+	bytesPayload, err := json.Marshal(d.config.ExitNode)
+	if err != nil {
+		return fmt.Errorf("failed to marshal exit node config for TUN control: %w", err)
+	}
+
+	if d.config.Server.PublicKey != "" {
+		err := d.SendTUNControl(d.config.Server.PublicKey, bytesPayload)
+		if err != nil {
+			log.Printf("Debug: SendTUNControl for ExitNode failed (might not be online yet): %v", err)
+			return nil // Don't fail the whole update just because we couldn't dispatch yet
+		}
+	}
+
+	return nil
 }
 
 func (d *Device) HealthCheck() error {
@@ -314,6 +376,142 @@ func (d *Device) SetStatsProvider(provider func() []byte) {
 		d.device.SetStatsProvider(provider)
 	}
 	d.mu.RUnlock()
+}
+
+func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
+	// Handle P2P TUN control messages (message type 7)
+	// Format: [Action:1 byte][TargetPubKey:32 bytes]
+	if len(data) < 33 {
+		return
+	}
+
+	action := data[0]
+	var targetPubKey [32]byte
+	copy(targetPubKey[:], data[1:33])
+
+	targetPeer := d.device.LookupPeer(targetPubKey)
+	if targetPeer == nil {
+		log.Printf("[TUN] TUN control: target peer not found")
+		return
+	}
+
+	// Action 1: Server tells us we can now use this peer as an exit node
+	if action == 1 {
+		log.Printf("[TUN] Server designated peer %x as exit node", targetPubKey[:4])
+		// Add default route to route all traffic into the TUN interface
+		d.mu.Lock()
+		if err := d.addExitNodeRoute("0.0.0.0/0"); err != nil {
+			log.Printf("[TUN] Failed adding IPv4 exit route: %v", err)
+		}
+		if err := d.addExitNodeRoute("::/0"); err != nil {
+			log.Printf("[TUN] Failed adding IPv6 exit route: %v", err)
+		}
+		d.mu.Unlock()
+	} else if action == 0 {
+		log.Printf("[TUN] Server revoked exit node via peer %x", targetPubKey[:4])
+		d.mu.Lock()
+		d.removeExitNodeRoutes()
+		d.mu.Unlock()
+	} else if action == 2 {
+		// Action 2: Server asks us to become an exit node for others
+		log.Printf("[TUN] Server requested this device to become an exit node")
+		// Not strictly required to do much here locally other than acknowledging it,
+		// as the system will organically route packets back, but we can log it.
+		// If we wanted to, we could enable NAT/MASQUERADE on Linux here.
+	}
+}
+
+// addRoute adds a system route dynamically
+func (d *Device) addRoute(network string) error {
+	return addRouteOS(d.tunName, network)
+}
+
+// removeRoute removes a system route dynamically
+func (d *Device) removeRoute(network string) error {
+	return removeRouteOS(d.tunName, network)
+}
+
+// addExitNodeRoute adds a route dynamically during runtime for exit node behavior
+func (d *Device) addExitNodeRoute(network string) error {
+	if err := d.addRoute(network); err != nil {
+		return err
+	}
+	// Track it so we can remove it later
+	found := false
+	for _, r := range d.exitNodeRoutes {
+		if r == network {
+			found = true
+			break
+		}
+	}
+	if !found {
+		d.exitNodeRoutes = append(d.exitNodeRoutes, network)
+	}
+	log.Printf("[TUN] Added exit node route: %s", network)
+	return nil
+}
+
+// removeExitNodeRoutes removes dynamically added exit node routes
+func (d *Device) removeExitNodeRoutes() {
+	for _, route := range d.exitNodeRoutes {
+		d.removeRoute(route)
+		log.Printf("[TUN] Removed exit node route: %s", route)
+	}
+	d.exitNodeRoutes = nil
+}
+
+// addPeerRoute adds a route for a dynamically discovered P2P peer
+func (d *Device) addPeerRoute(ip net.IP) {
+	route := fmt.Sprintf("%s/32", ip.String())
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Dedup check to prevent infinite OS route addition loops
+	for _, existing := range d.systemRoutes {
+		if existing == route {
+			return
+		}
+	}
+
+	if err := d.addRoute(route); err != nil {
+		log.Printf("[TUN] Failed adding P2P peer route %s: %v", route, err)
+	} else {
+		log.Printf("[TUN] Added P2P peer route: %s", route)
+		// We add it to system routes so it gets cleaned up properly
+		d.systemRoutes = append(d.systemRoutes, route)
+	}
+}
+
+// SendTUNControl sends a Message Type 7 control payload to a specific peer
+func (d *Device) SendTUNControl(peerPubKey string, data []byte) error {
+	pk, err := base64ToHex(peerPubKey)
+	if err != nil {
+		return fmt.Errorf("invalid pubkey encoding: %w", err)
+	}
+
+	pkBytes, err := hex.DecodeString(pk)
+	if err != nil || len(pkBytes) != 32 {
+		return fmt.Errorf("invalid pubkey format/length: %w", err)
+	}
+
+	var noiseKey [32]byte
+	copy(noiseKey[:], pkBytes)
+
+	d.mu.RLock()
+	wd := d.device
+	d.mu.RUnlock()
+
+	if wd == nil {
+		return fmt.Errorf("device not started")
+	}
+
+	peer := wd.LookupPeer(noiseKey)
+	if peer == nil {
+		return fmt.Errorf("peer not found: %s", peerPubKey)
+	}
+
+	peer.SendTUNControl(data)
+	return nil
 }
 
 func (d *Device) GetStats() (map[string]any, error) {
@@ -364,8 +562,8 @@ func (d *Device) GetTransferStats() (uint64, uint64, error) {
 	}
 
 	var rx, tx uint64
-	lines := strings.Split(res, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(res, "\n")
+	for line := range lines {
 		if strings.HasPrefix(line, "rx_bytes=") {
 			parts := strings.Split(line, "=")
 			if n, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
@@ -382,188 +580,78 @@ func (d *Device) GetTransferStats() (uint64, uint64, error) {
 	return rx, tx, nil
 }
 
-func (d *Device) GetNetstack() *virtstack.Net { return d.netstack }
+// startTUNMode creates a native system TUN device for exit node functionality
+// This allows the system to route all traffic through the WireGuard tunnel
+func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
+	log.Printf("Initializing system TUN mode for exit node functionality...")
 
-// GetWireGuardStatus returns a human-readable status of the userspace WireGuard device
-// including peer endpoints (to prove P2P vs relay/VPN mode), handshake times, and transfer stats.
-func (d *Device) GetWireGuardStatus() string {
-	d.mu.RLock()
-	wd := d.device
-	cfg := d.config
-	d.mu.RUnlock()
-
-	if wd == nil {
-		return "device not started\n"
+	tunName := d.config.Interface.TUNName
+	if tunName == "" {
+		tunName = "wantastic0"
 	}
 
-	res, err := wd.IpcGet()
+	// Create native TUN device
+	nativeTun, err := tun.CreateTUN(tunName, d.config.Interface.MTU)
 	if err != nil {
-		return fmt.Sprintf("error reading device status: %v\n", err)
+		return nil, fmt.Errorf("create native TUN device: %w", err)
 	}
 
-	var sb strings.Builder
-	sb.WriteString("=== WireGuard Userspace Device Status ===\n")
+	d.nativeTun = nativeTun
+	actualName, _ := nativeTun.Name()
+	d.tunName = actualName
+	log.Printf("Created TUN interface: %s", actualName)
 
-	// Configured server endpoint for comparison
-	serverEndpoint := ""
-	if cfg != nil && cfg.Server.Endpoint != "" {
-		serverEndpoint = cfg.Server.Endpoint
+	if err := setupTUNInterface(actualName, d.config.Interface.Addresses); err != nil {
+		log.Printf("Warning: failed to setup TUN interface networking: %v", err)
 	}
 
-	lines := strings.Split(res, "\n")
-	var localPubKey, localListenPort string
-	peerIdx := 0
-
-	type peerInfo struct {
-		pubKey        string
-		endpoint      string
-		allowedIPs    []string
-		lastHandshake int64
-		txBytes       uint64
-		rxBytes       uint64
-		keepalive     int
-	}
-	var peers []peerInfo
-	var current *peerInfo
-
-	for _, line := range lines {
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key, val := parts[0], parts[1]
-
-		switch key {
-		case "public_key":
-			if current != nil {
-				peers = append(peers, *current)
-			}
-			// Decode hex to base64 for display
-			hexBytes, _ := hex.DecodeString(val)
-			b64 := base64.StdEncoding.EncodeToString(hexBytes)
-			if peerIdx == 0 && localPubKey == "" {
-				// First public_key could be device or peer depending on IPC format
-			}
-			current = &peerInfo{pubKey: b64}
-			peerIdx++
-		case "listen_port":
-			localListenPort = val
-		case "endpoint":
-			if current != nil {
-				current.endpoint = val
-			}
-		case "allowed_ip":
-			if current != nil {
-				current.allowedIPs = append(current.allowedIPs, val)
-			}
-		case "last_handshake_time_sec":
-			if current != nil {
-				current.lastHandshake, _ = strconv.ParseInt(val, 10, 64)
-			}
-		case "tx_bytes":
-			if current != nil {
-				current.txBytes, _ = strconv.ParseUint(val, 10, 64)
-			}
-		case "rx_bytes":
-			if current != nil {
-				current.rxBytes, _ = strconv.ParseUint(val, 10, 64)
-			}
-		case "persistent_keepalive_interval":
-			if current != nil {
-				current.keepalive, _ = strconv.Atoi(val)
-			}
-		}
-	}
-	if current != nil {
-		peers = append(peers, *current)
+	// Create a parallel Userspace Netstack bound to the native TUN IP
+	// This ensures P2P hole-punching and internal WireGuard routing is accelerated in Go userspace
+	ns, err := d.createMinimalNetstack(addrs)
+	if err != nil {
+		log.Printf("Warning: hybrid virtstack creation failed: %v", err)
+	} else {
+		d.netstack = ns
+		log.Printf("Initialized secondary userspace virtstack for P2P acceleration")
 	}
 
-	// Device info
-	if d.config != nil && len(d.config.Interface.Addresses) > 0 {
-		addrs := make([]string, len(d.config.Interface.Addresses))
-		for i, a := range d.config.Interface.Addresses {
-			addrs[i] = a.String()
-		}
-		sb.WriteString(fmt.Sprintf("  Local Address: %s\n", strings.Join(addrs, ", ")))
-	}
-	if localPubKey != "" {
-		sb.WriteString(fmt.Sprintf("  Public Key:    %s\n", localPubKey))
-	}
-	if localListenPort != "" {
-		sb.WriteString(fmt.Sprintf("  Listen Port:   %s\n", localListenPort))
-	}
-	if serverEndpoint != "" {
-		sb.WriteString(fmt.Sprintf("  Hub Endpoint:  %s (configured)\n", serverEndpoint))
-	}
-	sb.WriteString(fmt.Sprintf("  Peers:         %d\n", len(peers)))
-	sb.WriteString("\n")
-
-	for i, p := range peers {
-		sb.WriteString(fmt.Sprintf("  Peer #%d\n", i+1))
-		sb.WriteString(fmt.Sprintf("    Public Key:  %s\n", p.pubKey))
-
-		if p.endpoint != "" {
-			sb.WriteString(fmt.Sprintf("    Endpoint:    %s\n", p.endpoint))
-
-			// Determine connection mode by checking:
-			// 1. If this peer's public key matches the Hub's configured key → Relay
-			// 2. If this peer's endpoint IP matches the Hub IP → Relay
-			isHubPeer := false
-
-			// Check public key match (most reliable)
-			if cfg != nil && cfg.Server.PublicKey != "" && p.pubKey == cfg.Server.PublicKey {
-				isHubPeer = true
-			}
-
-			// Check endpoint IP match (Server.Endpoint is just IP, no port)
-			if !isHubPeer && serverEndpoint != "" {
-				peerHost, _, _ := net.SplitHostPort(p.endpoint)
-				if peerHost == serverEndpoint {
-					isHubPeer = true
-				}
-			}
-
-			if isHubPeer {
-				sb.WriteString("    Mode:        🔄 VPN/Relay (via Hub)\n")
-			} else {
-				sb.WriteString("    Mode:        ⚡ P2P Direct (hole-punched)\n")
-			}
-		} else {
-			sb.WriteString("    Endpoint:    (none - no connection)\n")
-			sb.WriteString("    Mode:        ❌ Disconnected\n")
-		}
-
-		if p.lastHandshake > 0 {
-			t := time.Unix(p.lastHandshake, 0)
-			ago := time.Since(t).Round(time.Second)
-			sb.WriteString(fmt.Sprintf("    Handshake:   %s ago (%s)\n", ago, t.Format("15:04:05")))
-		} else {
-			sb.WriteString("    Handshake:   never\n")
-		}
-
-		sb.WriteString(fmt.Sprintf("    Transfer:    ↓ %s received, ↑ %s sent\n",
-			formatBytes(p.rxBytes), formatBytes(p.txBytes)))
-
-		if len(p.allowedIPs) > 0 {
-			sb.WriteString(fmt.Sprintf("    Allowed IPs: %s\n", strings.Join(p.allowedIPs, ", ")))
-		}
-		sb.WriteString("\n")
-	}
-
-	return sb.String()
+	log.Printf("TUN mode initialized successfully on %s", actualName)
+	return nativeTun, nil
 }
 
-func formatBytes(b uint64) string {
-	switch {
-	case b >= 1<<30:
-		return fmt.Sprintf("%.2f GiB", float64(b)/float64(1<<30))
-	case b >= 1<<20:
-		return fmt.Sprintf("%.2f MiB", float64(b)/float64(1<<20))
-	case b >= 1<<10:
-		return fmt.Sprintf("%.2f KiB", float64(b)/float64(1<<10))
-	default:
-		return fmt.Sprintf("%d B", b)
+// cleanupTUNMode cleans up system routes and TUN interface
+func (d *Device) cleanupTUNMode() {
+	log.Printf("Cleaning up TUN mode...")
+
+	// Close native TUN device
+	if d.nativeTun != nil {
+		d.nativeTun.Close()
+		d.nativeTun = nil
 	}
+
+	log.Printf("TUN mode cleanup complete")
+}
+
+// createMinimalNetstack creates a minimal netstack for DNS resolution in TUN mode
+// This is needed because some code paths expect a netstack for DNS lookups
+func (d *Device) createMinimalNetstack(addrs []netip.Addr) (*virtstack.Net, error) {
+	// We create a minimal netstack that can forward DNS queries, using virtstack
+	// We bind it strictly to the TUN interface's IP payload for any DNS requests
+	// made by the CLI. CreateNetTUN returns the TUN interface and the Netstack.
+	// Since we already created a TUN interface organically in startTUNMode, building another
+	// overlapping structure will result in 2 interfaces, but we discard the extra one for now:
+	_, ns, err := virtstack.CreateNetTUN(addrs, nil, d.config.Interface.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("could not create virtstack: %v", err)
+	}
+	return ns, nil
+}
+
+// GetTUNName returns the name of the TUN interface (if in TUN mode)
+func (d *Device) GetTUNName() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.tunName
 }
 
 func base64ToHex(b64 string) (string, error) {
@@ -572,4 +660,71 @@ func base64ToHex(b64 string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(db), nil
+}
+
+type PeerInfo struct {
+	PublicKey     string `json:"public_key"`
+	Endpoint      string `json:"endpoint"`
+	RxBytes       uint64 `json:"rx_bytes"`
+	TxBytes       uint64 `json:"tx_bytes"`
+	IsP2P         bool   `json:"is_p2p"`
+	LastHandshake int64  `json:"last_handshake"`
+}
+
+// GetDetailedPeers queries the native WireGuard UAPI to gather live topology metadata
+func (d *Device) GetDetailedPeers() []PeerInfo {
+	d.mu.RLock()
+	wd := d.device
+	srvHex, _ := base64ToHex(d.config.Server.PublicKey)
+	d.mu.RUnlock()
+
+	if wd == nil {
+		return nil
+	}
+
+	ipcState, err := wd.IpcGet()
+	if err != nil {
+		return nil
+	}
+
+	var infos []PeerInfo
+	var current PeerInfo
+
+	scanner := bufio.NewScanner(strings.NewReader(ipcState))
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key, val := parts[0], parts[1]
+		switch key {
+		case "public_key":
+			if current.PublicKey != "" {
+				// Finalize previous peer
+				if current.PublicKey != srvHex {
+					current.IsP2P = true
+				}
+				infos = append(infos, current)
+			}
+			current = PeerInfo{PublicKey: val}
+		case "endpoint":
+			current.Endpoint = val
+		case "rx_bytes":
+			current.RxBytes, _ = strconv.ParseUint(val, 10, 64)
+		case "tx_bytes":
+			current.TxBytes, _ = strconv.ParseUint(val, 10, 64)
+		case "last_handshake_time_sec":
+			current.LastHandshake, _ = strconv.ParseInt(val, 10, 64)
+		}
+	}
+	if current.PublicKey != "" {
+		if current.PublicKey != srvHex {
+			current.IsP2P = true
+		}
+		infos = append(infos, current)
+	}
+
+	return infos
 }

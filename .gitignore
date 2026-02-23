@@ -10,9 +10,10 @@ gobuild/
 .gocache/
 .gotmp/
 tmp/
-
+!cmd/wantasticd/tray.go
 cmd/puppeteer
 hosts.txt
 puppeteer
-wantasticd
 test_*.go
+wantasticd.exe
+wantasticd-linux

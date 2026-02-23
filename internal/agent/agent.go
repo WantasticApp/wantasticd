@@ -16,25 +16,23 @@ import (
 	"wantastic-agent/internal/device"
 	"wantastic-agent/internal/grpc"
 	pb "wantastic-agent/internal/grpc/proto"
-	"wantastic-agent/internal/ipc"
-	"wantastic-agent/internal/netstack"
 	"wantastic-agent/pkg/version"
 )
 
-// Agent represents the main agent that manages the WireGuard device, netstack, and gRPC communication
+// Agent represents the main agent that manages the WireGuard device and gRPC communication
 type Agent struct {
-	config   *config.Config
-	device   *device.Device
-	client   *grpc.Client
-	netstack *netstack.Netstack
-	ipc      *ipc.Server
-	updater  *update.Manager
-	stats    *stats.Server
+	config  *config.Config
+	device  *device.Device
+	client  *grpc.Client
+	updater *update.Manager
+	stats   *stats.Server
 
 	mu      sync.RWMutex
 	running bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
+
+	apiServer *APIServer
 }
 
 // New creates a new Agent with the provided configuration
@@ -56,35 +54,24 @@ func NewWithClient(cfg *config.Config, client *grpc.Client) (*Agent, error) {
 		return nil, fmt.Errorf("create device: %w", err)
 	}
 
-	ns, err := netstack.New(cfg)
-	if err != nil {
-		dev.Close()
-		return nil, fmt.Errorf("create netstack: %w", err)
-	}
-
-	// Hook up JIT Port Forwarding
-	dev.PortForwarder = ns.EnsurePortForward
-
 	updater := update.NewManager(version.Version)
 
 	// Initialize stats server
-	statsServer := stats.NewServer(dev, ns, version.Version)
+	statsServer := stats.NewServer(dev, version.Version)
 
-	// Wire up stats provider
+	// Link the metrics serializer to the WireGuard driver so it can be pushed over P2P
 	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
 
-	ipcServer := ipc.NewServer(ns)
-
-	return &Agent{
-		config:   cfg,
-		device:   dev,
-		netstack: ns,
-		ipc:      ipcServer,
-		updater:  updater,
-		stats:    statsServer,
-		client:   client, // Store the pre-configured client
-		stopCh:   make(chan struct{}),
-	}, nil
+	agt := &Agent{
+		config:  cfg,
+		device:  dev,
+		updater: updater,
+		stats:   statsServer,
+		client:  client, // Store the pre-configured client
+		stopCh:  make(chan struct{}),
+	}
+	agt.apiServer = NewAPIServer(agt)
+	return agt, nil
 }
 
 // Start starts the agent and its components.
@@ -126,24 +113,12 @@ func (a *Agent) Start(ctx context.Context) error {
 	if err := a.device.Start(); err != nil {
 		return fmt.Errorf("start device: %w", err)
 	}
-	// Link the userspace netstack from the device to the netstack manager
-	a.netstack.SetNet(a.device.GetNetstack())
+
 	// Start stats server
 	if a.config.Verbose {
 		if err := a.stats.Start(); err != nil {
 			log.Printf("Warning: failed to start stats server: %v", err)
 		}
-	}
-	if err := a.netstack.Start(); err != nil {
-		a.device.Stop()
-		return fmt.Errorf("start netstack: %w", err)
-	}
-
-	// Start IPC server for subcommands
-	if err := a.ipc.Start(); err != nil {
-		log.Printf("Warning: failed to start IPC server: %v", err)
-	} else {
-		a.ipc.SetDevice(a.device)
 	}
 
 	// Start background workers
@@ -170,6 +145,10 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.client != nil {
 		go a.runGRPCClient(ctx)
 		go a.runConfigMonitor(ctx)
+	}
+
+	if err := a.apiServer.Start(); err != nil {
+		log.Printf("Warning: failed to start local IPC API: %v", err)
 	}
 
 	return nil
@@ -212,12 +191,8 @@ func (a *Agent) Stop() error {
 
 	a.wg.Wait()
 
-	if a.ipc != nil {
-		a.ipc.Stop()
-	}
-
-	if err := a.netstack.Stop(); err != nil {
-		log.Printf("Error stopping netstack: %v", err)
+	if a.stats != nil {
+		a.stats.Stop()
 	}
 
 	if err := a.device.Stop(); err != nil {
@@ -226,6 +201,10 @@ func (a *Agent) Stop() error {
 
 	if a.client != nil {
 		a.client.Close()
+	}
+
+	if a.apiServer != nil {
+		a.apiServer.Stop()
 	}
 
 	return nil
@@ -431,9 +410,9 @@ func (a *Agent) applyConfiguration(resp *pb.GetConfigurationResponse) error {
 		}
 	}
 
-	if resp.NetworkConfig != nil {
-		if err := a.netstack.UpdateNetworkConfig(resp.NetworkConfig); err != nil {
-			return fmt.Errorf("update network config: %w", err)
+	if resp.ExitNodeConfig != nil {
+		if err := a.device.UpdateExitNodeConfig(resp.ExitNodeConfig); err != nil {
+			return fmt.Errorf("update exit node config: %w", err)
 		}
 	}
 
@@ -445,8 +424,4 @@ func (a *Agent) IsRunning() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.running
-}
-
-func (a *Agent) GetNetstack() *netstack.Netstack {
-	return a.netstack
 }

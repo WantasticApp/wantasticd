@@ -60,6 +60,7 @@ const (
 	MessageTransportType   = 4
 	MessageStatsType       = 5
 	MessagePunchType       = 6
+	MessageTUNControlType  = 7 // P2P TUN mode coordination for exit node
 )
 
 const (

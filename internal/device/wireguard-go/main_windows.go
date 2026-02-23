@@ -81,7 +81,6 @@ func main() {
 	// wait for program to terminate
 
 	signal.Notify(term, os.Interrupt)
-	signal.Notify(term, os.Kill)
 	signal.Notify(term, windows.SIGTERM)
 
 	select {

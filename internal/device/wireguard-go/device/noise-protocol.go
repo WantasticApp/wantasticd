@@ -597,7 +597,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	lookup := device.indexTable.Lookup(msg.Receiver)
 	handshake := lookup.handshake
 	if handshake == nil {
-		device.log.Errorf("ConsumeMessageResponse: Handshake not found for receiver index %d", msg.Receiver)
+		device.log.Verbosef("ConsumeMessageResponse: Handshake not found for receiver index %d", msg.Receiver)
 		return nil
 	}
 

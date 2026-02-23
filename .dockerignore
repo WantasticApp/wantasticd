@@ -12,3 +12,12 @@ build/
 *.md
 LICENSE
 .env
+bin/
+.DS_Store
+cmd/puppeteer
+cmd/puppeteer
+frontend/
+ui/
+hosts.txt
+traditional_wg.conf
+wantastic.conf

@@ -1,7 +1,18 @@
-FROM golang:1.24
+FROM golang:1.24-alpine AS builder
 
-RUN apt-get update && apt-get install -y iputils-ping iperf3 dropbear-bin curl
-RUN curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+RUN apk add --no-cache curl && curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh | sh -s -- -b /go/bin
+
+FROM openwrt/rootfs:x86-64-23.05.0
+
+# Copy Go and Air from alpine
+COPY --from=builder /usr/local/go /usr/local/go
+COPY --from=builder /go/bin/air /usr/local/bin/air
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# OpenWrt requires /var/lock for opkg to work correctly in some containerized environments
+RUN mkdir -p /var/lock && \
+    opkg update && \
+    opkg install iperf3 iputils-ping dropbear curl ca-bundle tar
 
 WORKDIR /app
 COPY e2e/docker-compose/entrypoint.sh /entrypoint.sh

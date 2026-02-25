@@ -24,13 +24,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, darwin]
+        goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
         include:
           - goos: linux
             goarch: 386
           - goos: linux
             goarch: arm
+          - goos: windows
+            goarch: 386
           - goos: linux
             goarch: loong64
           - goos: linux
@@ -60,7 +62,15 @@ jobs:
         export GOOS=${{ matrix.goos }}
         export GOARCH=${{ matrix.goarch }}
         export CGO_ENABLED=0
-        go build -v -trimpath -ldflags="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" -o wantasticd-${{ matrix.goarch }} ./cmd/wantasticd
+        LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          LDFLAGS="$LDFLAGS -H=windowsgui"
+        fi
+        EXT=""
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          EXT=".exe"
+        fi
+        go build -v -trimpath -tags "nosystray" -ldflags="$LDFLAGS" -o wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/wantasticd
 
     - name: Compress Binary
       if: matrix.goos != 'darwin'
@@ -70,11 +80,18 @@ jobs:
 
     - name: Package
       run: |
-        export GOARCH=${{ matrix.goarch }}
-        BINARY_NAME="wantasticd-${GOARCH}"
+        EXT=""
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          EXT=".exe"
+        fi
+        BINARY_NAME="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
         # Rename to a generic name for the archive
-        mv "${BINARY_NAME}" wantasticd
-        tar -czvf "wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" wantasticd README.md
+        cp "${BINARY_NAME}" wantasticd${EXT}
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          zip "wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip" wantasticd${EXT} README.md
+        else
+          tar -czvf "wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" wantasticd README.md
+        fi
 
 
     - name: Create Version File
@@ -82,7 +99,11 @@ jobs:
 
     - name: Upload Release Asset
       run: |
-        gh release upload ${{ github.ref_name }} wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz --clobber
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          gh release upload ${{ github.ref_name }} wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip --clobber
+        else
+          gh release upload ${{ github.ref_name }} wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz --clobber
+        fi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

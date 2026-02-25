@@ -283,7 +283,7 @@ func handleTray() {
 }
 
 func handleStatus() {
-	resp, err := http.Get("http://127.0.0.1:9034/api/status")
+	resp, err := http.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/api/status")
 	if err != nil {
 		fmt.Println("Status: Offline (Daemon is not running or not reachable)")
 		return
@@ -337,7 +337,7 @@ func handleUpdate() {
 }
 
 func handlePeers() {
-	resp, err := http.Get("http://127.0.0.1:9034/peers")
+	resp, err := http.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/peers")
 	if err != nil {
 		log.Fatalf("Failed to reach daemon: %v", err)
 	}

@@ -52,9 +52,21 @@ build-all:
 	@mkdir -p bin
 	GOOS=linux GOARCH=arm GOARM=7 $(GOBUILD) -o bin/$(BINARY_NAME)-linux-armv7 $(CMD_PATH)
 
+# Build with native libiwinfo support (for OpenWrt/QSDK devices)
+GOBUILD_IWINFO=CGO_ENABLED=1 $(GOCMD) build -tags iwinfo -ldflags=$(LDFLAGS)
 
-# Note: tinygo is not used because it is designed for microcontrollers and WebAssembly,
-# not for building desktop applications.
+build-iwinfo:
+	$(GOBUILD_IWINFO) -o bin/$(BINARY_NAME)-iwinfo $(CMD_PATH)
+
+# Linux iwinfo targets for embedded devices
+IWINFO_TARGETS := linux/amd64 linux/arm64 linux/arm linux/mips linux/mipsle linux/mips64
+
+build-all-iwinfo:
+	@for target in $(IWINFO_TARGETS); do \
+		echo "Building iwinfo for $$target"; \
+		mkdir -p bin; \
+		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) $(GOBUILD_IWINFO) -o bin/$(BINARY_NAME)-$$(echo $$target | cut -d'/' -f1)-$$(echo $$target | cut -d'/' -f2)-iwinfo $(CMD_PATH); \
+	done
 
 build-%:
 	@echo "Building for $*"
@@ -93,4 +105,4 @@ release:
 test:
 	$(GOTEST) -v ./...
 
-.PHONY: all build build-all clean run test genproto
+.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto

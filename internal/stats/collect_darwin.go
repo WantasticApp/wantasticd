@@ -14,8 +14,15 @@ import (
 
 var loggedLocationWarning sync.Once
 
-// collectWiFiStatistics - implementation for macOS using system_profiler
+// collectWiFiStatistics - implementation for macOS
+// Priority: 1) Native CoreWLAN (via CGo/Objective-C)  2) system_profiler fallback
 func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
+	// Try native CoreWLAN first (no exec.Command, direct framework calls)
+	if ifaces, connected := collectWiFiStatisticsNative(); len(ifaces) > 0 {
+		return ifaces, connected
+	}
+
+	// Fallback: parse system_profiler output (for older macOS or CGo issues)
 	out, err := exec.Command("system_profiler", "SPAirPortDataType").Output()
 	if err != nil {
 		log.Printf("Failed to execute system_profiler: %v", err)

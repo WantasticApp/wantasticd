@@ -273,3 +273,21 @@ func (c *Client) StartDeviceFlow(ctx context.Context) (*pb.RegisterDeviceRespons
 		}
 	}
 }
+
+func (c *Client) SetNodeRouting(ctx context.Context, req *pb.SetNodeRoutingRequest) (*pb.SetNodeRoutingResponse, error) {
+	c.mu.RLock()
+	token := c.token
+	client := c.client
+	c.mu.RUnlock()
+
+	if client == nil {
+		return nil, fmt.Errorf("not connected to auth server")
+	}
+
+	req.Token = token
+
+	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", token))
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	return client.SetNodeRouting(ctx, req)
+}

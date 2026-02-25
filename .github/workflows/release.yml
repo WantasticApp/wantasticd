@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goarch: [amd64, arm64, arm, mips, mipsle, mips64]
+        goarch: [amd64, arm64, arm, mips, mipsle, mips64, mips64le]
     container:
       image: golang:1.24-bookworm
     steps:
@@ -132,7 +132,8 @@ jobs:
           gcc-arm-linux-gnueabihf \
           gcc-mips-linux-gnu \
           gcc-mipsel-linux-gnu \
-          gcc-mips64-linux-gnu
+          gcc-mips64-linux-gnuabi64 \
+          gcc-mips64el-linux-gnuabi64
         # Clone libiwinfo headers for CGo compilation
         git clone --depth=1 https://git.openwrt.org/project/iwinfo.git /tmp/iwinfo
         mkdir -p /usr/local/include
@@ -141,7 +142,7 @@ jobs:
         # On real devices, the dynamic libiwinfo.so from OpenWrt will be used at runtime.
         echo 'void iwinfo_finish(void){} const void* iwinfo_backend(const char* n){return 0;}' > /tmp/iwinfo_stub.c
         # Build stub for each arch
-        for arch_cc in "x86_64-linux-gnu-gcc" "aarch64-linux-gnu-gcc" "arm-linux-gnueabihf-gcc" "mips-linux-gnu-gcc" "mipsel-linux-gnu-gcc" "mips64-linux-gnu-gcc"; do
+        for arch_cc in "x86_64-linux-gnu-gcc" "aarch64-linux-gnu-gcc" "arm-linux-gnueabihf-gcc" "mips-linux-gnu-gcc" "mipsel-linux-gnu-gcc" "mips64-linux-gnuabi64-gcc" "mips64el-linux-gnuabi64-gcc"; do
           arch_name=$(echo $arch_cc | cut -d'-' -f1)
           mkdir -p /usr/local/lib/${arch_name}
           ${arch_cc} -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub_${arch_name}.o 2>/dev/null || true
@@ -155,12 +156,13 @@ jobs:
       id: cc
       run: |
         case "${{ matrix.goarch }}" in
-          amd64)   echo "CC=gcc" >> $GITHUB_OUTPUT ;;
-          arm64)   echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
-          arm)     echo "CC=arm-linux-gnueabihf-gcc" >> $GITHUB_OUTPUT ;;
-          mips)    echo "CC=mips-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
-          mipsle)  echo "CC=mipsel-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
-          mips64)  echo "CC=mips64-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
+          amd64)    echo "CC=gcc" >> $GITHUB_OUTPUT ;;
+          arm64)    echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
+          arm)      echo "CC=arm-linux-gnueabihf-gcc" >> $GITHUB_OUTPUT ;;
+          mips)     echo "CC=mips-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
+          mipsle)   echo "CC=mipsel-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
+          mips64)   echo "CC=mips64-linux-gnuabi64-gcc" >> $GITHUB_OUTPUT ;;
+          mips64le) echo "CC=mips64el-linux-gnuabi64-gcc" >> $GITHUB_OUTPUT ;;
         esac
 
     - name: Build with iwinfo

@@ -56,4 +56,4 @@ wantasticd status
 ./e2e/run_p2p_test.sh
 ```
 # P2P Benchmark
-Check out our [🚀 P2P Performance Benchmarks](./p2pbenchmark.md) to see the multi-gigabit throughput capabilities of the new Wantastic Userspace Hybrid Netstack!
+Check out our [P2P Performance Benchmarks](./p2pbenchmark.md) to see the multi-gigabit throughput capabilities of the new Wantastic Userspace Hybrid Netstack!

@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -398,7 +400,13 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 	// Action 1: Server tells us we can now use this peer as an exit node
 	if action == 1 {
 		log.Printf("[TUN] Server designated peer %x as exit node", targetPubKey[:4])
-		// Add default route to route all traffic into the TUN interface
+
+		// Map the default route to this specific WireGuard peer natively
+		peerHex := hex.EncodeToString(targetPubKey[:])
+		cfg := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=false\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n", peerHex)
+		d.device.IpcSet(cfg)
+
+		// Add os-level default route to route all traffic into the TUN interface
 		d.mu.Lock()
 		if err := d.addExitNodeRoute("0.0.0.0/0"); err != nil {
 			log.Printf("[TUN] Failed adding IPv4 exit route: %v", err)
@@ -408,16 +416,63 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 		}
 		d.mu.Unlock()
 	} else if action == 0 {
-		log.Printf("[TUN] Server revoked exit node via peer %x", targetPubKey[:4])
+		log.Printf("[TUN] Server revoked exit node routing")
+
+		// Re-assign 0.0.0.0/0 back to the server if needed, or simply remove OS routes (WG ignores it if OS route is gone)
+		if srvPubKey, err := base64ToHex(d.config.Server.PublicKey); err == nil {
+			cfg := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=false\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n", srvPubKey)
+			d.device.IpcSet(cfg)
+		}
+
 		d.mu.Lock()
 		d.removeExitNodeRoutes()
 		d.mu.Unlock()
 	} else if action == 2 {
 		// Action 2: Server asks us to become an exit node for others
 		log.Printf("[TUN] Server requested this device to become an exit node")
-		// Not strictly required to do much here locally other than acknowledging it,
-		// as the system will organically route packets back, but we can log it.
-		// If we wanted to, we could enable NAT/MASQUERADE on Linux here.
+		d.enableOnDemandNAT()
+	} else if action == 5 {
+		// Action 5: Server revokes our duties to be an exit node
+		log.Printf("[TUN] Server revoked our duties to be an exit node")
+		d.disableOnDemandNAT()
+	}
+}
+
+func (d *Device) enableOnDemandNAT() {
+	switch runtime.GOOS {
+	case "linux":
+		os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
+		os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1\n"), 0644)
+		exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE").Run()
+		exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE").Run()
+		log.Printf("[TUN] On-demand Exit Node IP forwarding & NAT enabled via procfs/iptables on Linux")
+	case "darwin":
+		exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run()
+		exec.Command("sysctl", "-w", "net.inet6.ip6.forwarding=1").Run()
+		log.Printf("[TUN] On-demand Exit Node IP forwarding enabled via sysctl on macOS")
+	case "windows":
+		exec.Command("powershell", "-Command", "Set-NetIPInterface -Forwarding Enabled").Run()
+		log.Printf("[TUN] On-demand Exit Node IP forwarding enabled via PowerShell on Windows")
+	default:
+		log.Printf("[TUN] On-demand Exit Node IP forwarding not implemented for %s", runtime.GOOS)
+	}
+}
+
+func (d *Device) disableOnDemandNAT() {
+	switch runtime.GOOS {
+	case "linux":
+		os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("0\n"), 0644)
+		os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("0\n"), 0644)
+		exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "MASQUERADE").Run()
+		exec.Command("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-j", "MASQUERADE").Run()
+		log.Printf("[TUN] On-demand Exit Node IP forwarding & NAT disabled via procfs/iptables on Linux")
+	case "darwin":
+		exec.Command("sysctl", "-w", "net.inet.ip.forwarding=0").Run()
+		exec.Command("sysctl", "-w", "net.inet6.ip6.forwarding=0").Run()
+		log.Printf("[TUN] On-demand Exit Node IP forwarding disabled via sysctl on macOS")
+	case "windows":
+		exec.Command("powershell", "-Command", "Set-NetIPInterface -Forwarding Disabled").Run()
+		log.Printf("[TUN] On-demand Exit Node IP forwarding disabled via PowerShell on Windows")
 	}
 }
 

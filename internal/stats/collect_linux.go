@@ -142,6 +142,7 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 		wifiInterfaces = append(wifiInterfaces, wifiInfo)
 	}
 
+	augmentWiFiWithFallbacks(&wifiInterfaces, &connected)
 	return wifiInterfaces, connected
 }
 
@@ -401,26 +402,31 @@ func getInterfaceMAC(ifaceName string) (string, error) {
 func collectMeshStatistics() *MeshInfo {
 	// 1. Try EasyMesh (IEEE 1905.1)
 	if mesh := collectEasyMeshLowLevel(); mesh != nil {
+		augmentMeshSignals(mesh)
 		return mesh
 	}
 
 	// 1b. Try QSDK EasyMesh
 	if mesh := collectQSDKMesh(); mesh != nil {
+		augmentMeshSignals(mesh)
 		return mesh
 	}
 
 	// 2. Try OpenMesh (BATMAN) via File System
 	if mesh := collectBatmanFileSystem(); mesh != nil {
+		augmentMeshSignals(mesh)
 		return mesh
 	}
 
 	// 3. Try OpenMesh (BATMAN) via Netlink
 	if mesh := collectOpenMeshNetlink(); mesh != nil {
+		augmentMeshSignals(mesh)
 		return mesh
 	}
 
 	// 4. Try 802.11s via File System
 	if mesh := collect80211sMesh(); mesh != nil {
+		augmentMeshSignals(mesh)
 		return mesh
 	}
 

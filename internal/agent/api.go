@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"wantastic-agent/internal/device"
@@ -28,6 +31,7 @@ func NewAPIServer(a *Agent) *APIServer {
 	mux.HandleFunc("/api/mode/toggle", s.handleToggleMode)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
+	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
 
 	s.server = &http.Server{
 		Addr:    "127.0.0.1:9034",
@@ -39,10 +43,41 @@ func NewAPIServer(a *Agent) *APIServer {
 
 // Start begins serving the local IPC API
 func (s *APIServer) Start() error {
+	port := 9034
+
+	// Support dynamic IPC ports via WTC_IPC_PORT env to avoid conflicts in localized e2e
+	if customPort := os.Getenv("WTC_IPC_PORT"); customPort != "" {
+		fmt.Sscanf(customPort, "%d", &port)
+	}
+
+	var listener net.Listener
+	var err error
+
+	for port <= 9100 {
+		s.server.Addr = fmt.Sprintf("127.0.0.1:%d", port)
+		listener, err = net.Listen("tcp", s.server.Addr)
+		if err == nil {
+			break
+		}
+		log.Printf("IPC API Error binding to %s: %v, trying next port...", s.server.Addr, err)
+		port++
+	}
+
+	if err != nil {
+		log.Printf("IPC API Error: failed to find open port")
+		return nil // Non-fatal for the agent core
+	}
+
+	// Share selected port for local tray & cli clients
+	os.Setenv("WTC_IPC_PORT", fmt.Sprintf("%d", port))
+	portFile := filepath.Join(os.TempDir(), "wantasticd_ipc_port")
+	os.WriteFile(portFile, []byte(fmt.Sprintf("%d", port)), 0644)
+
 	log.Printf("Starting local IPC API on %s", s.server.Addr)
+
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("IPC API Error: %v", err)
+		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Printf("IPC API HTTP Error: %v", err)
 		}
 	}()
 	return nil
@@ -161,12 +196,33 @@ func (s *APIServer) handleToggleExitNode(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	log.Println("[API] Exit Node toggle requested via IPC")
+	log.Println("[API] Exit Node offer toggle requested via IPC")
 
-	s.agent.mu.Lock()
-	s.agent.config.ExitNode.Enabled = !s.agent.config.ExitNode.Enabled
-	s.agent.mu.Unlock()
+	go func() {
+		if err := s.agent.ToggleOfferExitNode(); err != nil {
+			log.Printf("[API] Failed to toggle exit node offer: %v", err)
+		}
+	}()
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"toggled\"}")
+	fmt.Fprintf(w, "{\"status\":\"pending\"}")
+}
+
+func (s *APIServer) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	peerPubKey := r.URL.Query().Get("peer")
+	log.Printf("[API] Exit Node set requested via IPC to peer: %s", peerPubKey)
+
+	go func() {
+		if err := s.agent.SetExitNode(peerPubKey); err != nil {
+			log.Printf("[API] Failed to set exit node routing: %v", err)
+		}
+	}()
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "{\"status\":\"pending\"}")
 }

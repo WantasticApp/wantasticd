@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"time"
 
+	"wantastic-agent/internal/agent"
+
 	"github.com/getlantern/systray"
 )
 
@@ -35,11 +37,15 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			mPeers := systray.AddMenuItem("Peers: 0 (P2P: 0, Relay: 0)", "Active connections")
 			mPeers.Disable()
-
 			systray.AddSeparator()
 
 			mToggleOnOff := systray.AddMenuItem("Disconnect", "Toggle VPN On/Off")
-			mToggleExit := systray.AddMenuItem("Enable Exit Node", "Toggle Exit Node configuration")
+
+			mExitNodes := systray.AddMenuItem("Use Exit Node", "Route traffic through a peer")
+			mExitNodeNone := mExitNodes.AddSubMenuItemCheckbox("None (Direct)", "Default routing", true)
+			exitNodeItems := make(map[string]*systray.MenuItem)
+
+			mToggleExit := systray.AddMenuItem("Enable Exit Node", "Allow others to route through this device")
 			mToggleTUN := systray.AddMenuItem("Toggle TUN Mode", "Switch between TUN and Userspace")
 
 			systray.AddSeparator()
@@ -52,7 +58,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				for {
 					select {
 					case <-ticker.C:
-						resp, err := http.Get("http://127.0.0.1:9034/api/status")
+						resp, err := http.Get("http://" + "127.0.0.1:" + agent.GetIPCPort() + "/api/status")
 						if err != nil {
 							mStatus.SetTitle("Status: Daemon Offline")
 							continue
@@ -69,7 +75,8 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 							RxBytes       uint64   `json:"rx_bytes"`
 							TxBytes       uint64   `json:"tx_bytes"`
 							Peers         []struct {
-								IsP2P bool `json:"is_p2p"`
+								IsP2P  bool   `json:"is_p2p"`
+								PubKey string `json:"public_key"`
 							} `json:"peers"`
 						}
 
@@ -106,6 +113,27 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 							for _, p := range status.Peers {
 								if p.IsP2P {
 									p2pCount++
+
+									// Dynamically add P2P peers to exit node list
+									if _, exists := exitNodeItems[p.PubKey]; !exists && len(p.PubKey) > 8 {
+										pk := p.PubKey
+										itemTitle := "Peer " + pk[:8] + "..."
+										item := mExitNodes.AddSubMenuItemCheckbox(itemTitle, "Use as exit node", false)
+										exitNodeItems[pk] = item
+
+										// Start a listener for this specific item
+										go func(peerKey string, mi *systray.MenuItem) {
+											for range mi.ClickedCh {
+												http.Post("http://"+"127.0.0.1:"+agent.GetIPCPort()+"/api/exitnode/use?peer="+peerKey, "application/json", nil)
+												// Uncheck all visually (optimistic UI update)
+												mExitNodeNone.Uncheck()
+												for _, otherItem := range exitNodeItems {
+													otherItem.Uncheck()
+												}
+												mi.Check()
+											}
+										}(pk, item)
+									}
 								} else {
 									relayCount++
 								}
@@ -128,12 +156,18 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			go func() {
 				for {
 					select {
+					case <-mExitNodeNone.ClickedCh:
+						http.Post("http://"+"127.0.0.1:"+agent.GetIPCPort()+"/api/exitnode/use?peer=none", "application/json", nil)
+						mExitNodeNone.Check()
+						for _, otherItem := range exitNodeItems {
+							otherItem.Uncheck()
+						}
 					case <-mToggleOnOff.ClickedCh:
-						http.Post("http://127.0.0.1:9034/api/state/toggle", "application/json", nil)
+						http.Post("http://"+"127.0.0.1:"+agent.GetIPCPort()+"/api/state/toggle", "application/json", nil)
 					case <-mToggleExit.ClickedCh:
-						http.Post("http://127.0.0.1:9034/api/exitnode/toggle", "application/json", nil)
+						http.Post("http://"+"127.0.0.1:"+agent.GetIPCPort()+"/api/exitnode/toggle", "application/json", nil)
 					case <-mToggleTUN.ClickedCh:
-						http.Post("http://127.0.0.1:9034/api/mode/toggle", "application/json", nil)
+						http.Post("http://"+"127.0.0.1:"+agent.GetIPCPort()+"/api/mode/toggle", "application/json", nil)
 
 					case <-mQuit.ClickedCh:
 						log.Println("Systray quit requested")

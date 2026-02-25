@@ -1,5 +1,5 @@
-//go:build (linux && !cgo) || (linux && cgo && !amd64 && !arm64) || (!linux && !darwin && !windows)
-// +build linux,!cgo linux,cgo,!amd64,!arm64 !linux,!darwin,!windows
+//go:build (linux && !cgo) || (linux && cgo && !amd64 && !arm64) || (!linux && !darwin && !windows) || nosystray
+// +build linux,!cgo linux,cgo,!amd64,!arm64 !linux,!darwin,!windows nosystray
 
 package runner
 

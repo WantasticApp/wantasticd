@@ -1,7 +1,5 @@
-//go:build !windows && !darwin && (!linux || !cgo)
-// +build !windows
-// +build !darwin
-// +build !linux !cgo
+//go:build (linux && !cgo) || (linux && cgo && !amd64 && !arm64) || (!linux && !darwin && !windows)
+// +build linux,!cgo linux,cgo,!amd64,!arm64 !linux,!darwin,!windows
 
 package runner
 

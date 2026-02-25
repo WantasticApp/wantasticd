@@ -167,6 +167,7 @@ jobs:
 
     - name: Build with iwinfo
       run: |
+        git config --global --add safe.directory '*'
         export GOOS=linux
         export GOARCH=${{ matrix.goarch }}
         export CGO_ENABLED=1

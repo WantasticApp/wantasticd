@@ -1,8 +1,8 @@
 # Wantastic P2P Benchmark
 
-This document showcases the performance capabilities of the **Wantastic** WireGuard agent. Using our native **TUN interface** routing, we achieve multi-gigabit speeds directly between containers over a seamless peer-to-peer connection.
+This document showcases the performance capabilities of the **Wantastic** client. Using our native **TUN interface** routing, we achieve multi-gigabit speeds directly between clients over a seamless peer-to-peer connection.
 
-The following are direct throughput test results (using `iperf3`) over the WireGuard `wantastic0` TUN interface.
+The following are direct throughput test results (using `iperf3`) over the `wantastic0` TUN interface.
 
 ---
 

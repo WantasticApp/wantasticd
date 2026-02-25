@@ -1,5 +1,5 @@
 # wantasticd
-wantastic custom userspace wireguard client daemon
+wantastic's WireGuard-inspired VPN protocol client daemon 
 
 # Installation
 ## Linux
@@ -10,12 +10,12 @@ chmod +x wantasticd-linux-${ARCH}
 sudo mv wantasticd-linux-${ARCH} /usr/local/bin/wantasticd
 ```
 ## connect
-To connect to a WireGuard server, use the `connect` command.
+To connect to a wantastic server, use the `connect` command.
 ```
 wantasticd connect -config /etc/wireguard/wg0.conf
 ```
 ## status
-To check the status of the WireGuard connection, use the `status` command.
+To check the status of the wantastic connection, use the `status` command.
 ```
 wantasticd status
 ```
@@ -29,7 +29,7 @@ wantasticd login
 ## service mode
 To install the service, use the `install` command.
 ```
-wantasticd install -config /etc/wireguard/wg0.conf
+wantasticd install -config /etc/wantastic/wg0.conf
 ```
 To uninstall the service, use the `uninstall` command.
 ```

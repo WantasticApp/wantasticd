@@ -1,5 +1,5 @@
-//go:build windows || darwin || (linux && cgo)
-// +build windows darwin linux,cgo
+//go:build windows || darwin || (linux && cgo && (amd64 || arm64))
+// +build error: expression too complex for // +build lines
 
 package runner
 

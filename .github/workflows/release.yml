@@ -141,16 +141,6 @@ jobs:
         # Create a stub libiwinfo.a so the linker is satisfied during cross-compilation.
         # On real devices, the dynamic libiwinfo.so from OpenWrt will be used at runtime.
         echo 'void iwinfo_finish(void){} const void* iwinfo_backend(const char* n){return 0;}' > /tmp/iwinfo_stub.c
-        # Build stub for each arch
-        for arch_cc in "x86_64-linux-gnu-gcc" "aarch64-linux-gnu-gcc" "arm-linux-gnueabihf-gcc" "mips-linux-gnu-gcc" "mipsel-linux-gnu-gcc" "mips64-linux-gnuabi64-gcc" "mips64el-linux-gnuabi64-gcc"; do
-          arch_name=$(echo $arch_cc | cut -d'-' -f1)
-          mkdir -p /usr/local/lib/${arch_name}
-          ${arch_cc} -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub_${arch_name}.o 2>/dev/null || true
-          ar rcs /usr/local/lib/${arch_name}/libiwinfo.a /tmp/iwinfo_stub_${arch_name}.o 2>/dev/null || true
-        done
-        # Also build native stub for amd64
-        gcc -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub.o
-        ar rcs /usr/local/lib/libiwinfo.a /tmp/iwinfo_stub.o
 
     - name: Set cross-compiler
       id: cc
@@ -165,6 +155,16 @@ jobs:
           mips64le) echo "CC=mips64el-linux-gnuabi64-gcc" >> $GITHUB_OUTPUT ;;
         esac
 
+    - name: Build libiwinfo stub for architecture
+      run: |
+        export CC=${{ steps.cc.outputs.CC }}
+        # Get the AR tool for the current arch
+        export AR=$(echo $CC | sed 's/-gcc/-ar/')
+        if [ "$CC" = "gcc" ]; then AR="ar"; fi
+        
+        $CC -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub.o 2>/dev/null || true
+        $AR rcs /usr/local/lib/libiwinfo.a /tmp/iwinfo_stub.o 2>/dev/null || true
+
     - name: Build with iwinfo
       run: |
         git config --global --add safe.directory '*'
@@ -174,7 +174,7 @@ jobs:
         export CC=${{ steps.cc.outputs.CC }}
         export CGO_CFLAGS="-I/usr/local/include"
         export CGO_LDFLAGS="-L/usr/local/lib"
-        go build -v -trimpath -tags iwinfo \
+        go build -v -trimpath -tags "iwinfo nosystray" \
           -ldflags="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
           -o wantasticd-${{ matrix.goarch }} ./cmd/wantasticd
 

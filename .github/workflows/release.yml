@@ -22,6 +22,7 @@ jobs:
   release:
     needs: create-release
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       matrix:
         goos: [linux, darwin, windows]
@@ -57,11 +58,52 @@ jobs:
       with:
         go-version: '1.24.5'
 
+    - name: Install cross-compilers and libiwinfo headers (Linux only)
+      if: matrix.goos == 'linux'
+      run: |
+        sudo apt-get update && sudo apt-get install -y \
+          git gcc libc6-dev \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabihf \
+          gcc-mips-linux-gnu \
+          gcc-mipsel-linux-gnu \
+          gcc-mips64-linux-gnuabi64 \
+          gcc-mips64el-linux-gnuabi64
+        git clone --depth=1 https://git.openwrt.org/project/iwinfo.git /tmp/iwinfo
+        sudo mkdir -p /usr/local/include /usr/local/lib
+        sudo cp /tmp/iwinfo/include/iwinfo.h /usr/local/include/
+        echo 'void iwinfo_finish(void){} const void* iwinfo_backend(const char* n){return 0;}' > /tmp/iwinfo_stub.c
+
     - name: Build
       run: |
         export GOOS=${{ matrix.goos }}
         export GOARCH=${{ matrix.goarch }}
         export CGO_ENABLED=0
+        TAGS="nosystray"
+        
+        if [ "$GOOS" = "linux" ]; then
+          case "$GOARCH" in
+            amd64) export CC="gcc"; export CGO_ENABLED=1 ;;
+            arm64) export CC="aarch64-linux-gnu-gcc"; export CGO_ENABLED=1 ;;
+            arm) export CC="arm-linux-gnueabihf-gcc"; export CGO_ENABLED=1 ;;
+            mips) export CC="mips-linux-gnu-gcc"; export CGO_ENABLED=1 ;;
+            mipsle) export CC="mipsel-linux-gnu-gcc"; export CGO_ENABLED=1 ;;
+            mips64) export CC="mips64-linux-gnuabi64-gcc"; export CGO_ENABLED=1 ;;
+            mips64le) export CC="mips64el-linux-gnuabi64-gcc"; export CGO_ENABLED=1 ;;
+          esac
+          
+          if [ "$CGO_ENABLED" = "1" ]; then
+            TAGS="nosystray iwinfo"
+            export CGO_CFLAGS="-I/usr/local/include"
+            export CGO_LDFLAGS="-L/usr/local/lib"
+            export AR=$(echo $CC | sed 's/-gcc/-ar/')
+            if [ "$CC" = "gcc" ]; then export AR="ar"; fi
+            
+            $CC -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub.o 2>/dev/null || true
+            sudo $AR rcs /usr/local/lib/libiwinfo.a /tmp/iwinfo_stub.o 2>/dev/null || true
+          fi
+        fi
+        
         LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
         if [ "${{ matrix.goos }}" = "windows" ]; then
           LDFLAGS="$LDFLAGS -H=windowsgui"
@@ -70,7 +112,7 @@ jobs:
         if [ "${{ matrix.goos }}" = "windows" ]; then
           EXT=".exe"
         fi
-        go build -v -trimpath -tags "nosystray" -ldflags="$LDFLAGS" -o wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/wantasticd
+        go build -v -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/wantasticd
 
     - name: Compress Binary
       if: matrix.goos != 'darwin'
@@ -133,115 +175,8 @@ jobs:
         source-dir: r2_upload
         destination-dir: latest
 
-  # Build Linux binaries with native libiwinfo support for OpenWrt/QSDK devices
-  release-iwinfo:
-    needs: create-release
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goarch: [amd64, arm64, arm, mips, mipsle, mips64, mips64le]
-    container:
-      image: golang:1.24-bookworm
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install libiwinfo cross-compilation headers
-      run: |
-        apt-get update && apt-get install -y \
-          git gcc libc6-dev \
-          gcc-aarch64-linux-gnu \
-          gcc-arm-linux-gnueabihf \
-          gcc-mips-linux-gnu \
-          gcc-mipsel-linux-gnu \
-          gcc-mips64-linux-gnuabi64 \
-          gcc-mips64el-linux-gnuabi64
-        # Clone libiwinfo headers for CGo compilation
-        git clone --depth=1 https://git.openwrt.org/project/iwinfo.git /tmp/iwinfo
-        mkdir -p /usr/local/include
-        cp /tmp/iwinfo/include/iwinfo.h /usr/local/include/
-        # Create a stub libiwinfo.a so the linker is satisfied during cross-compilation.
-        # On real devices, the dynamic libiwinfo.so from OpenWrt will be used at runtime.
-        echo 'void iwinfo_finish(void){} const void* iwinfo_backend(const char* n){return 0;}' > /tmp/iwinfo_stub.c
-
-    - name: Set cross-compiler
-      id: cc
-      run: |
-        case "${{ matrix.goarch }}" in
-          amd64)    echo "CC=gcc" >> $GITHUB_OUTPUT ;;
-          arm64)    echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
-          arm)      echo "CC=arm-linux-gnueabihf-gcc" >> $GITHUB_OUTPUT ;;
-          mips)     echo "CC=mips-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
-          mipsle)   echo "CC=mipsel-linux-gnu-gcc" >> $GITHUB_OUTPUT ;;
-          mips64)   echo "CC=mips64-linux-gnuabi64-gcc" >> $GITHUB_OUTPUT ;;
-          mips64le) echo "CC=mips64el-linux-gnuabi64-gcc" >> $GITHUB_OUTPUT ;;
-        esac
-
-    - name: Build libiwinfo stub for architecture
-      run: |
-        export CC=${{ steps.cc.outputs.CC }}
-        # Get the AR tool for the current arch
-        export AR=$(echo $CC | sed 's/-gcc/-ar/')
-        if [ "$CC" = "gcc" ]; then AR="ar"; fi
-        
-        $CC -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub.o 2>/dev/null || true
-        $AR rcs /usr/local/lib/libiwinfo.a /tmp/iwinfo_stub.o 2>/dev/null || true
-
-    - name: Build with iwinfo
-      run: |
-        git config --global --add safe.directory '*'
-        export GOOS=linux
-        export GOARCH=${{ matrix.goarch }}
-        export CGO_ENABLED=1
-        export CC=${{ steps.cc.outputs.CC }}
-        export CGO_CFLAGS="-I/usr/local/include"
-        export CGO_LDFLAGS="-L/usr/local/lib"
-        go build -v -trimpath -tags "iwinfo nosystray" \
-          -ldflags="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-          -o wantasticd-${{ matrix.goarch }} ./cmd/wantasticd
-
-    - name: Compress Binary
-      run: |
-        apt-get install -y upx-ucl 2>/dev/null || true
-        upx -9 --best wantasticd-${{ matrix.goarch }} || echo "UPX compression failed, continuing"
-
-    - name: Package
-      run: |
-        mv wantasticd-${{ matrix.goarch }} wantasticd
-        tar -czvf "wantasticd-linux-${{ matrix.goarch }}-iwinfo.tar.gz" wantasticd README.md
-
-    - name: Upload Release Asset
-      run: |
-        gh release upload ${{ github.ref_name }} wantasticd-linux-${{ matrix.goarch }}-iwinfo.tar.gz --clobber
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Upload to R2
-      run: |
-        mkdir -p r2_upload
-        cp wantasticd-linux-${{ matrix.goarch }}-iwinfo.tar.gz r2_upload/
-      
-    - name: Upload to R2 (Versioned)
-      uses: ryand56/r2-upload-action@latest
-      with:
-        r2-account-id: ${{ secrets.R2_ACCOUNT }}
-        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-        r2-secret-access-key: ${{ secrets.R2_SECRET }}
-        r2-bucket: ${{ secrets.R2_BUCKET }}
-        source-dir: r2_upload
-        destination-dir: ${{ github.ref_name }}
-
-    - name: Upload to R2 (Latest)
-      uses: ryand56/r2-upload-action@latest
-      with:
-        r2-account-id: ${{ secrets.R2_ACCOUNT }}
-        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-        r2-secret-access-key: ${{ secrets.R2_SECRET }}
-        r2-bucket: ${{ secrets.R2_BUCKET }}
-        source-dir: r2_upload
-        destination-dir: latest
-
   upload-utils:
-    needs: [release, release-iwinfo]
+    needs: [release]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -260,3 +195,5 @@ jobs:
         r2-bucket: ${{ secrets.R2_BUCKET }}
         source-dir: root_upload
         destination-dir: ./
+
+

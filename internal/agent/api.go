@@ -28,7 +28,6 @@ func NewAPIServer(a *Agent) *APIServer {
 	}
 
 	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/mode/toggle", s.handleToggleMode)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
@@ -134,38 +133,6 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
-}
-
-func (s *APIServer) handleToggleMode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	log.Println("[API] Toggle mode requested via IPC")
-
-	// Trigger an asynchronous agent restart to toggle the mode
-	go func() {
-		s.agent.mu.Lock()
-		s.agent.config.Interface.TUNMode = !s.agent.config.Interface.TUNMode
-		cfg := s.agent.config
-		s.agent.mu.Unlock()
-
-		// Stop the current device
-		if err := s.agent.device.Stop(); err != nil {
-			log.Printf("[API] Failed to stop device during toggle: %v", err)
-		}
-
-		// Rebuild device with new config state
-		// Note: A full robust reload might require recreating the device or calling a specific Reconfigure method,
-		// but since the original tray logic just restarted the agent using startAgentWithRetry, we'll implement
-		// a simplified device restart here.
-		s.agent.device.Start()
-		log.Printf("[API] Toggled TUN mode to %v", cfg.Interface.TUNMode)
-	}()
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"toggled\"}")
 }
 
 func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {

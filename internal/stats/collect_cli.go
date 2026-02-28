@@ -5,6 +5,7 @@ package stats
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -81,6 +82,11 @@ func augmentWiFiWithFallbacks(interfaces *[]WiFiInterfaceInfo, connected *bool) 
 			iface.TxPower = readTxPowerFromDebugfs(iface.Name)
 		}
 
+		// --- Layer 4: CLI Fallback (iw) for standard Linux nodes without libiwinfo ---
+		if iface.SSID == "" || iface.Signal == 0 || iface.TxPower == 0 {
+			fillFromIwCLI(iface, connected)
+		}
+
 		recalcSNR(iface)
 	}
 
@@ -141,6 +147,61 @@ func fillFromIwinfo(iface *WiFiInterfaceInfo, connected *bool) {
 			}
 			iface.Connected = true
 			*connected = true
+		}
+	}
+}
+
+// fillFromIwCLI safely executes `iw dev X link` and `iw dev X info` as a last resort on standard Linux environments.
+func fillFromIwCLI(iface *WiFiInterfaceInfo, connected *bool) {
+	defer func() { recover() }()
+
+	// 1. Try `iw dev <iface> link` (station mode)
+	if out, err := exec.Command("iw", "dev", iface.Name, "link").Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "SSID:") {
+				iface.SSID = strings.TrimSpace(strings.TrimPrefix(line, "SSID:"))
+				iface.Connected = true
+				*connected = true
+			} else if strings.HasPrefix(line, "signal:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					if sig, err := strconv.Atoi(parts[1]); err == nil && iface.Signal == 0 {
+						iface.Signal = sig
+						iface.Connected = true
+						*connected = true
+					}
+				}
+			} else if strings.HasPrefix(line, "tx bitrate:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 3 {
+					if br, err := strconv.ParseFloat(parts[2], 64); err == nil && iface.Bitrate == 0 {
+						iface.Bitrate = int(br)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Try `iw dev <iface> info` to catch AP/Mesh mode interfaces where link is usually "Not connected".
+	if out, err := exec.Command("iw", "dev", iface.Name, "info").Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "ssid ") {
+				iface.SSID = strings.TrimSpace(strings.TrimPrefix(line, "ssid "))
+				// Merely broadcasting an SSID implies the interface is active/connected
+				iface.Connected = true
+				*connected = true
+			} else if strings.HasPrefix(line, "txpower ") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					if pwr, err := strconv.ParseFloat(parts[1], 64); err == nil && iface.TxPower == 0 {
+						iface.TxPower = int(pwr)
+					}
+				}
+			}
 		}
 	}
 }
@@ -258,6 +319,27 @@ func augmentMeshSignals(mesh *MeshInfo) {
 						mac := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
 							a.MAC[0], a.MAC[1], a.MAC[2], a.MAC[3], a.MAC[4], a.MAC[5])
 						macToSignal[mac] = int(a.Signal)
+					}
+				}
+			}
+		} else {
+			// standard linux fallback: iw dev <name> station dump
+			if out, err := exec.Command("iw", "dev", ifaceName, "station", "dump").Output(); err == nil {
+				var currentMAC string
+				for _, line := range strings.Split(string(out), "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasPrefix(line, "Station ") {
+						parts := strings.Fields(line)
+						if len(parts) >= 2 {
+							currentMAC = strings.ToLower(parts[1])
+						}
+					} else if currentMAC != "" && strings.HasPrefix(line, "signal:") {
+						parts := strings.Fields(line)
+						if len(parts) >= 2 {
+							if sig, err := strconv.Atoi(parts[1]); err == nil {
+								macToSignal[currentMAC] = sig
+							}
+						}
 					}
 				}
 			}

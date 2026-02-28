@@ -118,7 +118,12 @@ jobs:
       if: matrix.goos != 'darwin'
       run: |
         sudo apt-get update && sudo apt-get install -y upx-ucl
-        upx -9 --best wantasticd-${{ matrix.goarch }} || echo "UPX compression failed for ${{ matrix.goarch }}, continuing without compression"
+        EXT=""
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          EXT=".exe"
+        fi
+        BINARY_NAME="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
+        upx -9 --best "${BINARY_NAME}" || echo "UPX compression failed for ${{ matrix.goarch }}, continuing without compression"
 
     - name: Package
       run: |
@@ -152,7 +157,11 @@ jobs:
     - name: Prepare R2 Upload
       run: |
         mkdir -p r2_upload
-        cp wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz r2_upload/
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          cp wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip r2_upload/
+        else
+          cp wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz r2_upload/
+        fi
         cp latest r2_upload/
 
     - name: Upload to R2 (Versioned)

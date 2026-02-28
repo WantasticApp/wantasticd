@@ -429,8 +429,16 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 		d.mu.Unlock()
 	} else if action == 2 {
 		// Action 2: Server asks us to become an exit node for others
-		log.Printf("[TUN] Server requested this device to become an exit node")
-		d.enableOnDemandNAT()
+		d.mu.RLock()
+		enabled := d.config.ExitNode.Enabled
+		d.mu.RUnlock()
+
+		if enabled {
+			log.Printf("[TUN] Server requested this device to become an exit node")
+			d.enableOnDemandNAT()
+		} else {
+			log.Printf("[TUN] Server requested exit node, but local exit node sharing is disabled")
+		}
 	} else if action == 5 {
 		// Action 5: Server revokes our duties to be an exit node
 		log.Printf("[TUN] Server revoked our duties to be an exit node")

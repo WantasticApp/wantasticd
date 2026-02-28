@@ -44,7 +44,6 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mToggleOnOff := systray.AddMenuItem("Disconnect", "Toggle VPN On/Off")
 
 			mToggleExit := systray.AddMenuItem("Enable Exit Node", "Allow others to route through this device")
-			mToggleTUN := systray.AddMenuItem("Toggle TUN Mode", "Switch between TUN and Userspace")
 
 			systray.AddSeparator()
 			mQuit := systray.AddMenuItem("Quit", "Exit Tray")
@@ -57,27 +56,19 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				for {
 					select {
 					case <-ctx.Done():
+						systray.Quit()
 						return
 
 					case <-mQuit.ClickedCh:
 						cancel()
+						systray.Quit()
 						return
 
 					case <-mToggleOnOff.ClickedCh:
-						// Simple toggle logic via IPC loopback
-						go func() {
-							if mToggleOnOff.String() == "Connect" {
-								http.Post("http://127.0.0.1:9034/api/connect", "application/json", nil)
-							} else {
-								http.Post("http://127.0.0.1:9034/api/disconnect", "application/json", nil)
-							}
-						}()
+						go http.Post("http://127.0.0.1:9034/api/state/toggle", "application/json", nil)
 
 					case <-mToggleExit.ClickedCh:
-						go http.Post("http://127.0.0.1:9034/api/toggle-exit", "application/json", nil)
-
-					case <-mToggleTUN.ClickedCh:
-						go http.Post("http://127.0.0.1:9034/api/toggle-tun", "application/json", nil)
+						go http.Post("http://127.0.0.1:9034/api/exitnode/toggle", "application/json", nil)
 
 					case <-ticker.C:
 						// Fetch latest status via local API

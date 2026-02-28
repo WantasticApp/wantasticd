@@ -2,12 +2,16 @@
 wantastic's WireGuard-inspired VPN protocol client daemon 
 
 # Installation
-## Linux
-No prerequisites required.
+## Linux & macOS
+Run the following command in your terminal to automatically download, install, and configure wantasticd for your architecture:
+```bash
+curl -sSL https://get.wantastic.app | sudo sh
 ```
-wget https://github.com/wantastic/wantasticd/releases/download/${VERSION}/wantasticd-linux-${ARCH}
-chmod +x wantasticd-linux-${ARCH}
-sudo mv wantasticd-linux-${ARCH} /usr/local/bin/wantasticd
+
+## Windows
+Open PowerShell as Administrator and run the following command:
+```powershell
+irm https://get.wantastic.app/win | iex
 ```
 ## connect
 To connect to a wantastic server, use the `connect` command.

@@ -58,21 +58,11 @@ jobs:
       with:
         go-version: '1.24.5'
 
-    - name: Install cross-compilers and libiwinfo headers (Linux only)
+    - name: Install dependencies (Linux only)
       if: matrix.goos == 'linux'
       run: |
         sudo apt-get update && sudo apt-get install -y \
-          git gcc libc6-dev \
-          gcc-aarch64-linux-gnu \
-          gcc-arm-linux-gnueabihf \
-          gcc-mips-linux-gnu \
-          gcc-mipsel-linux-gnu \
-          gcc-mips64-linux-gnuabi64 \
-          gcc-mips64el-linux-gnuabi64
-        git clone --depth=1 https://git.openwrt.org/project/iwinfo.git /tmp/iwinfo
-        sudo mkdir -p /usr/local/include /usr/local/lib
-        sudo cp /tmp/iwinfo/include/iwinfo.h /usr/local/include/
-        echo 'void iwinfo_finish(void){} const void* iwinfo_backend(const char* n){return 0;}' > /tmp/iwinfo_stub.c
+          git gcc libc6-dev
 
     - name: Build
       run: |
@@ -80,29 +70,6 @@ jobs:
         export GOARCH=${{ matrix.goarch }}
         export CGO_ENABLED=0
         TAGS="nosystray"
-        
-        if [ "$GOOS" = "linux" ]; then
-          case "$GOARCH" in
-            amd64) export CC="gcc"; export CGO_ENABLED=1 ;;
-            arm64) export CC="aarch64-linux-gnu-gcc"; export CGO_ENABLED=1 ;;
-            arm) export CC="arm-linux-gnueabihf-gcc"; export CGO_ENABLED=1 ;;
-            mips) export CC="mips-linux-gnu-gcc"; export CGO_ENABLED=1 ;;
-            mipsle) export CC="mipsel-linux-gnu-gcc"; export CGO_ENABLED=1 ;;
-            mips64) export CC="mips64-linux-gnuabi64-gcc"; export CGO_ENABLED=1 ;;
-            mips64le) export CC="mips64el-linux-gnuabi64-gcc"; export CGO_ENABLED=1 ;;
-          esac
-          
-          if [ "$CGO_ENABLED" = "1" ]; then
-            TAGS="nosystray iwinfo"
-            export CGO_CFLAGS="-I/usr/local/include"
-            export CGO_LDFLAGS="-L/usr/local/lib"
-            export AR=$(echo $CC | sed 's/-gcc/-ar/')
-            if [ "$CC" = "gcc" ]; then export AR="ar"; fi
-            
-            $CC -c /tmp/iwinfo_stub.c -o /tmp/iwinfo_stub.o 2>/dev/null || true
-            sudo $AR rcs /usr/local/lib/libiwinfo.a /tmp/iwinfo_stub.o 2>/dev/null || true
-          fi
-        fi
         
         LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
         if [ "${{ matrix.goos }}" = "windows" ]; then

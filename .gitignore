@@ -10,6 +10,7 @@ gobuild/
 .gocache/
 .gotmp/
 tmp/
+node_modules/
 !cmd/wantasticd/tray.go
 cmd/puppeteer
 hosts.txt

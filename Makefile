@@ -1,4 +1,5 @@
-# Makefile for wantasticd
+# Makefile for Wantastic desktop app
+# Wails is now the primary build tool — the project root is the Go package.
 
 # Go parameters
 GOCMD=go
@@ -9,14 +10,52 @@ LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=$(VERSION) -X wantastic-ag
 GOBUILD=$(GOCMD) build -ldflags=$(LDFLAGS)
 GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
-GOGET=$(GOCMD) get
-BINARY_NAME=wantasticd
+BINARY_NAME=wantastic
 COMPRESS=upx -9 -v
-CMD_PATH=./cmd/wantasticd
+WAILS_TAGS=nosystray
 
-# Build targets
-TARGETS := \
-	darwin/arm64 \
+# ── Primary desktop build (Wails) ────────────────────────────────────────────
+# Wails injects required build tags and embeds the frontend automatically.
+# All desktop builds MUST use `wails build`; never use plain `go build` for them.
+
+# Install frontend dependencies
+deps:
+	cd gui/frontend && pnpm install
+
+# Hot-reload dev mode (Vite + Go, live editing)
+dev:
+	WANTASTIC_PORTAL_URL=http://wantastic.local wails dev -tags $(WAILS_TAGS)
+
+# Alias kept for convenience
+gui-dev: dev
+
+# Production desktop build → bin/wantastic (current platform)
+build:
+	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -o bin/$(BINARY_NAME)
+
+# Run production build straight after building
+run:
+	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -o bin/$(BINARY_NAME) && ./bin/$(BINARY_NAME)
+
+# macOS arm64 (Apple Silicon)
+build-mac:
+	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -platform darwin/arm64 -o bin/$(BINARY_NAME)-darwin-arm64
+
+# Windows amd64
+build-windows:
+	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -platform windows/amd64 -o bin/$(BINARY_NAME)-windows-amd64.exe
+
+# Linux amd64
+build-linux:
+	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -platform linux/amd64 -o bin/$(BINARY_NAME)-linux-amd64
+
+# ── Headless cross-compiled binaries (no GUI, for routers / servers) ─────────
+# These targets produce lightweight headless builds (no Wails, no frontend).
+# Build tags: nosystray disables the tray; noegtui disables Wails webview.
+HEADLESS_LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=$(VERSION) -X wantastic-agent/pkg/version.Commit=$(COMMIT) -X wantastic-agent/pkg/version.BuildDate=$(DATE)"
+GOBUILD_HEADLESS=$(GOCMD) build -tags nosystray -ldflags=$(HEADLESS_LDFLAGS)
+
+CROSS_TARGETS := \
 	linux/386 \
 	linux/amd64 \
 	linux/arm \
@@ -32,77 +71,43 @@ TARGETS := \
 	linux/s390x \
 	windows/amd64
 
-# Demo server parameters
-DEMO_BINARY_NAME=demoserver
-DEMO_CMD_PATH=./cmd/demoserver
-
-all: build
-
-build:
-	$(GOBUILD) -o bin/$(BINARY_NAME) $(CMD_PATH)
-
 build-all:
-	@for target in $(TARGETS); do \
-		echo "Building for $$target"; \
+	@for target in $(CROSS_TARGETS); do \
+		echo "Building headless for $$target"; \
 		mkdir -p bin; \
-		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) $(GOBUILD) -o bin/$(BINARY_NAME)-$$(echo $$target | cut -d'/' -f1)-$$(echo $$target | cut -d'/' -f2) $(CMD_PATH); \
-		$(COMPRESS) bin/$(BINARY_NAME)-$$(echo $$target | cut -d'/' -f1)-$$(echo $$target | cut -d'/' -f2); \
+		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) \
+			$(GOBUILD_HEADLESS) -o bin/$(BINARY_NAME)-$$(echo $$target | tr '/' '-') internal/agent/...; \
 	done
-	@echo "Building for linux/armv7"
-	@mkdir -p bin
-	GOOS=linux GOARCH=arm GOARM=7 $(GOBUILD) -o bin/$(BINARY_NAME)-linux-armv7 $(CMD_PATH)
+	@echo "Building headless for linux/armv7"
+	GOOS=linux GOARCH=arm GOARM=7 $(GOBUILD_HEADLESS) -o bin/$(BINARY_NAME)-linux-armv7 ./internal/agent/...
 
-# Build with native libiwinfo support (for OpenWrt/QSDK devices)
-GOBUILD_IWINFO=CGO_ENABLED=1 $(GOCMD) build -tags iwinfo -ldflags=$(LDFLAGS)
-
-build-iwinfo:
-	$(GOBUILD_IWINFO) -o bin/$(BINARY_NAME)-iwinfo $(CMD_PATH)
-
-# Linux iwinfo targets for embedded devices
-IWINFO_TARGETS := linux/amd64 linux/arm64 linux/arm linux/mips linux/mipsle linux/mips64
-
-build-all-iwinfo:
-	@for target in $(IWINFO_TARGETS); do \
-		echo "Building iwinfo for $$target"; \
-		mkdir -p bin; \
-		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) $(GOBUILD_IWINFO) -o bin/$(BINARY_NAME)-$$(echo $$target | cut -d'/' -f1)-$$(echo $$target | cut -d'/' -f2)-iwinfo $(CMD_PATH); \
-	done
-
-build-%:
-	@echo "Building for $*"
-	@mkdir -p bin
-	$(eval GOOS := $(word 1, $(subst /, ,$*)))
-	$(eval GOARCH := $(word 2, $(subst /, ,$*)))
-	GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) -o bin/$(BINARY_NAME)-$(GOOS)-$(GOARCH) $(CMD_PATH)
-
-
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 clean:
 	$(GOCLEAN)
 	rm -rf bin
-
-run:
-	$(GOBUILD) -o bin/$(BINARY_NAME) $(CMD_PATH)
-	./bin/$(BINARY_NAME) connect -config traditional_wg.conf -v
-
-# Demo server targets
-build-demo:
-	$(GOBUILD) -o bin/$(DEMO_BINARY_NAME) $(DEMO_CMD_PATH)
-
-run-demo:
-	$(GOBUILD) -o bin/$(DEMO_BINARY_NAME) $(DEMO_CMD_PATH)
-	./bin/$(DEMO_BINARY_NAME)
 
 genproto:
 	protoc -Iproto --go_out=internal/grpc/proto --go_opt=paths=source_relative \
 		--go-grpc_out=internal/grpc/proto --go-grpc_opt=paths=source_relative \
 		auth.proto
 
-release:
-# create tag with release action first arg and push it
-	git tag -a $(firstword $(filter-out release,$(MAKECMDGOALS))) -m "Release $(firstword $(filter-out release,$(MAKECMDGOALS)))"
-	git push origin $(firstword $(filter-out release,$(MAKECMDGOALS)))
 test:
 	$(GOTEST) -v ./...
 
-.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto
+# Copy icon into the Wails build directory
+install-icons:
+	@echo "Installing icons…"
+	@mkdir -p gui/build
+	@cp /Users/kimo/Desktop/kmoz000/ISPApp-TunnelHub/cmd/web/portal/app/public/logo/512.png \
+	     gui/build/appicon.png
+	@cp /Users/kimo/Desktop/kmoz000/ISPApp-TunnelHub/cmd/web/portal/app/public/logo/512.png \
+	     gui/frontend/public/logo.png
+	@echo "Icons installed."
+
+release:
+	git tag -a $(firstword $(filter-out release,$(MAKECMDGOALS))) -m "Release $(firstword $(filter-out release,$(MAKECMDGOALS)))"
+	git push origin $(firstword $(filter-out release,$(MAKECMDGOALS)))
+
+.PHONY: all build build-all build-mac build-windows build-linux clean run dev gui-dev \
+        deps genproto test install-icons release

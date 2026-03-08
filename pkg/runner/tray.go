@@ -1,4 +1,4 @@
-//go:build (windows || darwin || (linux && cgo && (amd64 || arm64))) && !nosystray
+//go:build (windows || darwin || (linux && cgo && (amd64 || arm64))) && systray && !nosystray
 
 package runner
 

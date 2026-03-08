@@ -11,9 +11,11 @@ echo "Building ${APP_NAME}.app..."
 # 1. Create directory structure
 mkdir -p "${MACOS_DIR}"
 
-# 2. Build the Go binary (with CGO enabled)
-echo "Compiling wantasticd..."
-TMPDIR=/tmp GOCACHE=/tmp/go-cache CGO_ENABLED=1 go build -v -o "${MACOS_DIR}/wantasticd" ./cmd/wantasticd
+# 2. Build frontend assets + desktop binary (with CGO enabled)
+echo "Building frontend assets..."
+(cd ./gui/frontend && npm run build)
+echo "Compiling Wantastic desktop app..."
+TMPDIR=/tmp GOCACHE=/tmp/go-cache CGO_ENABLED=1 go build -v -o "${MACOS_DIR}/wantastic" ./gui
 
 # 3. Create Info.plist with Location Services permission request
 echo "Creating Info.plist..."
@@ -23,7 +25,7 @@ cat << 'EOF' > "${CONTENTS_DIR}/Info.plist"
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>wantasticd</string>
+    <string>wantastic</string>
     <key>CFBundleIdentifier</key>
     <string>app.wantastic.agent</string>
     <key>CFBundleName</key>
@@ -50,7 +52,7 @@ cat << 'EOF' > "${CONTENTS_DIR}/Info.plist"
 EOF
 
 echo "Done! You can now run the app bundle:"
-echo "sudo ./${APP_NAME}.app/Contents/MacOS/wantasticd connect -config traditional.conf"
+echo "./${APP_NAME}.app/Contents/MacOS/wantastic"
 echo ""
 echo "Note: Running from within the .app bundle allows macOS to prompt for Location Services"
 echo "so it can read the SSID on Ventura+."

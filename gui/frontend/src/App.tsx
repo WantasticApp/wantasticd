@@ -52,6 +52,7 @@ export default function App() {
   const [portalHost, setPortalHost] = useState('console.wantastic.app')
   const [loading, setLoading] = useState(true)
   const [configuring, setConfiguring] = useState(false) // true while registering device
+  const [deviceFlowCode, setDeviceFlowCode] = useState<{ code: string; uri: string } | null>(null)
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -84,8 +85,15 @@ export default function App() {
     EventsOn('status:update', (s: StatusData) => {
       setStatus(s)
     })
+    EventsOn('auth:code', (data: { code: string; uri: string }) => {
+      setDeviceFlowCode(data)
+    })
     EventsOn('auth:complete', (a: AccountInfo) => {
       setAccount(a)
+      setDeviceFlowCode(null)
+    })
+    EventsOn('auth:error', () => {
+      setDeviceFlowCode(null)
     })
     // Fired when Go is downloading / decrypting WireGuard config from backend
     EventsOn('service:configuring', () => {
@@ -191,6 +199,7 @@ export default function App() {
             account={account}
             portalHost={portalHost}
             configuring={configuring}
+            deviceFlowCode={deviceFlowCode ?? undefined}
             onLogin={async () => { await StartLogin(); await refreshAccount() }}
             onLogout={async () => { await Logout(); setAccount(null) }}
             onOpenConsole={() => OpenConsole()}
@@ -204,6 +213,7 @@ export default function App() {
                 account={account}
                 portalHost={portalHost}
                 configuring={configuring}
+                deviceFlowCode={deviceFlowCode ?? undefined}
                 onLogin={async () => { await StartLogin(); await refreshAccount() }}
                 onLogout={async () => { await Logout(); setAccount(null) }}
                 onOpenConsole={() => OpenConsole()}

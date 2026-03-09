@@ -313,11 +313,11 @@ func LoadFromToken(ctx context.Context, serverURL, token string) (*Config, error
 	osInfo := runtime.GOOS
 	arch := runtime.GOARCH
 
-	// Generate a random int64 nonce
-	var nonce int64
+	// Generate a random uint64 nonce (must match spec: uint64, field 5)
+	var nonce uint64
 	if err := binary.Read(rand.Reader, binary.LittleEndian, &nonce); err != nil {
 		// Fallback to time if rand fails (unlikely)
-		nonce = time.Now().UnixNano()
+		nonce = uint64(time.Now().UnixNano())
 	}
 
 	resp, err := client.RegisterDevice(ctx, nonce, osInfo, arch, hostname)
@@ -337,7 +337,7 @@ func LoadFromToken(ctx context.Context, serverURL, token string) (*Config, error
 
 		// Construct Nonce (12 bytes, first 8 from nonce)
 		nonceBytes := make([]byte, 12)
-		binary.LittleEndian.PutUint64(nonceBytes[:8], uint64(nonce))
+		binary.LittleEndian.PutUint64(nonceBytes[:8], nonce)
 
 		// Create Cipher
 		aead, err := chacha20poly1305.New(key)
@@ -384,6 +384,76 @@ func LoadFromToken(ctx context.Context, serverURL, token string) (*Config, error
 	cfg.Auth.Token = resp.Token
 
 	// Parse routes if available
+	for _, route := range resp.Routes {
+		if prefix, err := netip.ParsePrefix(route); err == nil {
+			cfg.Interface.Addresses = append(cfg.Interface.Addresses, prefix)
+		}
+	}
+
+	cfg.GenerateDeviceID()
+	return cfg, nil
+}
+
+// LoadFromRegisterResponse builds a Config from a RegisterDeviceResponse and the
+// Auth0 access token that was used to obtain it. The nonce must be the same value
+// passed to RegisterDevice so that the ChaCha20-Poly1305 decryption succeeds.
+// This is the preferred path for the Wails desktop agent — the gRPC device flow
+// calls RegisterDevice internally and surfaces both the token and nonce.
+func LoadFromRegisterResponse(resp *pb.RegisterDeviceResponse, accessToken string, nonce uint64, serverURL string) (*Config, error) {
+	if !resp.Success {
+		return nil, fmt.Errorf("registration failed")
+	}
+
+	if len(resp.EncryptedConfig) > 0 {
+		// Derive key from Auth0 access token: Key = SHA256(accessToken)
+		hash := sha256.Sum256([]byte(accessToken))
+		key := hash[:]
+
+		// Nonce: 12 bytes, first 8 are the little-endian uint64 nonce
+		nonceBytes := make([]byte, 12)
+		binary.LittleEndian.PutUint64(nonceBytes[:8], nonce)
+
+		aead, err := chacha20poly1305.New(key)
+		if err != nil {
+			return nil, fmt.Errorf("create cipher: %w", err)
+		}
+
+		decrypted, err := aead.Open(nil, nonceBytes, resp.EncryptedConfig, nil)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt config: %w", err)
+		}
+
+		cfgStruct, err := parseTraditionalWireGuardConfig(string(decrypted))
+		if err != nil {
+			return nil, fmt.Errorf("parse decrypted config: %w", err)
+		}
+
+		cfg := &cfgStruct
+		cfg.Auth.ServerURL = serverURL
+		cfg.Auth.Token = resp.Token
+		cfg.GenerateDeviceID()
+		return cfg, nil
+	}
+
+	// Fallback: use raw protobuf fields when no encrypted config is present
+	log.Println("⚠️  No encrypted configuration received, using raw fields")
+	cfg := &Config{
+		Server: Server{
+			Endpoint:            resp.Endpoint,
+			PublicKey:           resp.ServerKey,
+			AllowedIPs:          resp.AllowedIps,
+			PersistentKeepalive: int(resp.PersistentKeepalive),
+			SendStats:           true,
+		},
+		Interface: Interface{
+			MTU:        int(resp.Mtu),
+			ListenPort: int(resp.ListenPort),
+			DNS:        resp.DnsServers,
+		},
+	}
+	cfg.Auth.ServerURL = serverURL
+	cfg.Auth.Token = resp.Token
+
 	for _, route := range resp.Routes {
 		if prefix, err := netip.ParsePrefix(route); err == nil {
 			cfg.Interface.Addresses = append(cfg.Interface.Addresses, prefix)

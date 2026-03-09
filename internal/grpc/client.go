@@ -2,13 +2,14 @@ package grpc
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -90,15 +91,17 @@ func (c *Client) connect() error {
 		log.Printf("Resolved %s -> %s", origHost, resolvedHost)
 	}
 
-	// Determine transport security based on port
+	// Determine transport security: use TLS for all non-localhost addresses.
+	// The Wantastic gRPC server listens on :52990 with TLS.
+	// Local dev servers (e.g. :50051 on 127.0.0.1) use plaintext.
 	var transportCreds credentials.TransportCredentials
-	if strings.HasSuffix(serverAddr, ":443") {
-		// Use TLS for port 443 — skip cert verification for compatibility
-		// with self-signed certs on embedded/local environments
-		transportCreds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
-		log.Printf("Using TLS (skip verify) for connection to %s", serverAddr)
+	host, _, _ := net.SplitHostPort(serverAddr)
+	isLocal := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if !isLocal {
+		// Use TLS — skip cert verification for compatibility with self-signed certs
+		transportCreds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+		log.Printf("Using TLS for connection to %s", serverAddr)
 	} else {
-		// Use insecure (plaintext) for other ports (e.g. 50051)
 		transportCreds = insecure.NewCredentials()
 		log.Printf("Using insecure (plaintext) connection to %s", serverAddr)
 	}
@@ -134,31 +137,29 @@ func (c *Client) Close() {
 	}
 }
 
-func (c *Client) RegisterDevice(ctx context.Context, nonce int64, osInfo, arch, hostname string) (*pb.RegisterDeviceResponse, error) {
+func (c *Client) RegisterDevice(ctx context.Context, nonce uint64, osInfo, arch, hostname string) (*pb.RegisterDeviceResponse, error) {
 	c.mu.RLock()
-	// Connection check removed as we might be connecting for the first time with a token
-	if c.client == nil {
+	if c.conn == nil {
 		c.mu.RUnlock()
 		return nil, fmt.Errorf("client not initialized")
 	}
 	token := c.token
 	c.mu.RUnlock()
 
-	req := &pb.RegisterDeviceRequest{
-		Token:    token,
-		Nonce:    nonce,
-		Os:       osInfo,
-		Arch:     arch,
-		Hostname: hostname,
-	}
+	// Use raw wire encoding so field numbers match the spec regardless of what
+	// the generated auth.pb.go descriptor says. See register_device_wire.go.
+	reqBytes := marshalRegisterDeviceRequest(token, hostname, osInfo, arch, nonce)
 
-	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", c.token))
+	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", token))
 	ctx = metadata.NewOutgoingContext(ctx, md)
 
-	resp, err := c.client.RegisterDevice(ctx, req)
-	if err != nil {
+	var rawResp rawProtoMessage
+	if err := c.conn.Invoke(ctx, "/grpc.AuthService/RegisterDevice",
+		rawProtoMessage(reqBytes), &rawResp); err != nil {
 		return nil, fmt.Errorf("register device: %w", err)
 	}
+
+	resp := unmarshalRegisterDeviceResponse(rawResp)
 
 	if resp.Success {
 		c.mu.Lock()
@@ -264,12 +265,89 @@ func (c *Client) StartDeviceFlow(ctx context.Context) (*pb.RegisterDeviceRespons
 
 				// Gather system information for registration
 				hostname, _ := os.Hostname()
-				return c.RegisterDevice(ctx, time.Now().UnixNano(), runtime.GOOS, runtime.GOARCH, hostname)
+				return c.RegisterDevice(ctx, uint64(time.Now().UnixNano()), runtime.GOOS, runtime.GOARCH, hostname)
 			}
 		case <-timeout:
 			return nil, fmt.Errorf("device flow timed out")
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		}
+	}
+}
+
+// StartDeviceFlowWithCallback starts the gRPC device flow and calls onVerification
+// immediately with the user_code and verification_uri before polling begins.
+// It returns the Auth0 access token, the nonce used for RegisterDevice, and the
+// RegisterDeviceResponse. The access token is the decryption key for EncryptedConfig.
+func (c *Client) StartDeviceFlowWithCallback(
+	ctx context.Context,
+	onVerification func(userCode, verificationURI string),
+) (accessToken string, nonce uint64, regResp *pb.RegisterDeviceResponse, err error) {
+	c.mu.RLock()
+	client := c.client
+	c.mu.RUnlock()
+
+	if client == nil {
+		return "", 0, nil, fmt.Errorf("not connected to auth server")
+	}
+
+	startResp, err := client.StartDeviceFlow(ctx, &pb.StartDeviceFlowRequest{
+		DeviceId: c.deviceID,
+	})
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("start device flow: %w", err)
+	}
+
+	// Surface the user code to the caller immediately (before blocking poll)
+	if onVerification != nil {
+		onVerification(startResp.UserCode, startResp.VerificationUri)
+	}
+
+	log.Printf("Device flow started — waiting for approval (code: %s)", startResp.UserCode)
+
+	interval := startResp.Interval
+	if interval <= 0 {
+		interval = 5
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(time.Duration(startResp.ExpiresIn) * time.Second)
+
+	for {
+		select {
+		case <-ticker.C:
+			pollResp, pollErr := client.PollDeviceFlow(ctx, &pb.PollDeviceFlowRequest{
+				DeviceCode: startResp.DeviceCode,
+			})
+			if pollErr != nil {
+				log.Printf("Poll error (retrying): %v", pollErr)
+				continue
+			}
+			if pollResp.Success {
+				c.mu.Lock()
+				c.token = pollResp.Token
+				c.mu.Unlock()
+
+				log.Println("Device flow approved — registering device…")
+
+				// Generate a cryptographic nonce for config encryption
+				var n uint64
+				if err := binary.Read(rand.Reader, binary.LittleEndian, &n); err != nil {
+					n = uint64(time.Now().UnixNano())
+				}
+
+				hostname, _ := os.Hostname()
+				reg, regErr := c.RegisterDevice(ctx, n, runtime.GOOS, runtime.GOARCH, hostname)
+				if regErr != nil {
+					return "", 0, nil, regErr
+				}
+				return pollResp.Token, n, reg, nil
+			}
+		case <-timeout:
+			return "", 0, nil, fmt.Errorf("device flow timed out")
+		case <-ctx.Done():
+			return "", 0, nil, ctx.Err()
 		}
 	}
 }

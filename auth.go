@@ -3,20 +3,21 @@ package main
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"wantastic-agent/internal/config"
+	wantasticgrpc "wantastic-agent/internal/grpc"
+
+	"github.com/denisbrodbeck/machineid"
 )
 
 // ─── Portal URL ────────────────────────────────────────────────────────────
@@ -25,17 +26,15 @@ import (
 
 const (
 	defaultPortalURL = "https://console.wantastic.app"
-	defaultAPIServer = "api.wantastic.app:443"
+	defaultAPIServer = "api.wantastic.app:52990"
 
 	// HMAC shared secret — must match OverlayServiceNode cipher.SharedSecret
-	agentSharedSecret = "Wantastic_v1_Rolling_Code_Secret"
+	agentSharedSecret = "wantastic_cipher_v_1_0_0"
 
 	// HTTP header names used for agent HMAC authentication
 	headerTimestamp = "x-wantastic-ts"
 	headerDevice    = "x-wantastic-device"
 	headerSignature = "x-wantastic-sig"
-
-	auth0CallbackPort = 0 // 0 = auto-assign free port
 )
 
 func portalBaseURL() string {
@@ -107,9 +106,15 @@ func fetchPortalCredentials(deviceID string) portalCredentials {
 	return creds
 }
 
-// stableDeviceID returns a short stable identifier for this machine,
-// derived from the hostname SHA256 (fallback when machineid is unavailable).
+// stableDeviceID returns a stable hardware-derived identifier for this machine.
+// Uses machineid.ProtectedID (scoped to "wantastic") hashed with SHA256 so the
+// raw hardware ID is never transmitted. Falls back to a hostname-derived hash
+// when the platform machine ID is unavailable (e.g. sandboxed builds).
 func stableDeviceID() string {
+	if id, err := machineid.ProtectedID("wantastic"); err == nil && id != "" {
+		h := sha256.Sum256([]byte(id))
+		return hex.EncodeToString(h[:16])
+	}
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "unknown"
@@ -168,172 +173,56 @@ func (c *Auth0Client) ClearToken() error {
 	return os.Remove(c.tokenPath)
 }
 
-// ─── PKCE helpers ──────────────────────────────────────────────────────────
+// ─── gRPC Device Flow ─────────────────────────────────────────────────────
 
-func generateCodeVerifier() (string, error) {
-	b := make([]byte, 64)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-func generateCodeChallenge(verifier string) string {
-	h := sha256.Sum256([]byte(verifier))
-	return base64.RawURLEncoding.EncodeToString(h[:])
-}
-
-func generateState() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-// ─── PKCE flow ─────────────────────────────────────────────────────────────
-
-// RunPKCEFlow fetches Auth0 credentials from the portal, opens the system
-// browser for login, waits for the local callback, exchanges the code for
-// tokens, persists them, and returns account info.
-func (c *Auth0Client) RunPKCEFlow(ctx context.Context) (*AccountInfo, error) {
-	// Fetch Auth0 config dynamically from the portal — works for production
-	// (console.wantastic.app) and local dev (wantastic.local).
+// RunDeviceFlow implements the Wantastic Agent Authentication Protocol:
+//  1. Fetches portal credentials (connectivity gate)
+//  2. Opens a gRPC device flow: StartDeviceFlow → browser open → poll → RegisterDevice
+//  3. Decrypts the WireGuard config with the Auth0 access token
+//
+// onVerification is called as soon as the user_code and verification_uri are
+// available — the caller should open the browser and surface the code in the UI.
+// Returns the account info, the decrypted WireGuard config, the portal session
+// token (for /api/device-handoff auto-login), and any error.
+func (c *Auth0Client) RunDeviceFlow(
+	ctx context.Context,
+	onVerification func(userCode, uri string),
+) (*AccountInfo, *config.Config, string, error) {
 	deviceID := stableDeviceID()
-	creds := fetchPortalCredentials(deviceID)
 
-	verifier, err := generateCodeVerifier()
+	// Step 1: Fetch portal credentials (connectivity / HMAC gate)
+	fetchPortalCredentials(deviceID) // returned fields unused in gRPC path
+
+	// Step 2: gRPC device flow
+	grpcClient, err := wantasticgrpc.New(apiServerAddr(), deviceID, "")
 	if err != nil {
-		return nil, fmt.Errorf("generate verifier: %w", err)
+		return nil, nil, "", fmt.Errorf("connect to auth server: %w", err)
 	}
-	challenge := generateCodeChallenge(verifier)
-	state, err := generateState()
+	defer grpcClient.Close()
+
+	accessToken, nonce, regResp, err := grpcClient.StartDeviceFlowWithCallback(ctx, onVerification)
 	if err != nil {
-		return nil, fmt.Errorf("generate state: %w", err)
+		return nil, nil, "", fmt.Errorf("device flow: %w", err)
 	}
 
-	// Start local callback listener on a random free port
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, fmt.Errorf("callback listener: %w", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
-
-	// Build authorization URL
-	params := url.Values{
-		"response_type":         {"code"},
-		"client_id":             {creds.Auth0ClientID},
-		"redirect_uri":          {redirectURI},
-		"scope":                 {"openid profile email offline_access"},
-		"audience":              {creds.Audience},
-		"state":                 {state},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-	}
-	authURL := fmt.Sprintf("https://%s/authorize?%s", creds.Auth0Domain, params.Encode())
-
-	// Open browser
-	openBrowserURL(authURL)
-
-	// Serve callback
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-
-	srv := &http.Server{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if q.Get("state") != state {
-			http.Error(w, "invalid state", http.StatusBadRequest)
-			errCh <- fmt.Errorf("state mismatch")
-			return
-		}
-		if errMsg := q.Get("error"); errMsg != "" {
-			http.Error(w, errMsg, http.StatusBadRequest)
-			errCh <- fmt.Errorf("auth error: %s — %s", errMsg, q.Get("error_description"))
-			return
-		}
-		code := q.Get("code")
-		if code == "" {
-			http.Error(w, "missing code", http.StatusBadRequest)
-			errCh <- fmt.Errorf("missing code in callback")
-			return
-		}
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<!doctype html><html><body style="font-family:system-ui;text-align:center;padding:4rem;">
-<h2>✅ Login successful</h2><p>You can close this tab and return to Wantastic.</p>
-</body></html>`)
-		codeCh <- code
+	// Persist Auth0 access token
+	_ = c.saveTokens(storedTokens{
+		AccessToken: accessToken,
+		ExpiresAt:   time.Now().Add(24 * time.Hour), // best-effort; server sets real expiry
 	})
-	srv.Handler = mux
 
-	go srv.Serve(ln)
-	defer srv.Close()
-
-	// Wait for code or timeout
-	var code string
-	select {
-	case code = <-codeCh:
-	case err = <-errCh:
-		return nil, err
-	case <-time.After(5 * time.Minute):
-		return nil, fmt.Errorf("login timed out")
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	// Exchange code for tokens
-	tokens, err := c.exchangeCode(code, verifier, redirectURI, creds)
+	// Step 3: Decrypt WireGuard config from RegisterDeviceResponse
+	cfg, err := config.LoadFromRegisterResponse(regResp, accessToken, nonce, apiServerAddr())
 	if err != nil {
-		return nil, fmt.Errorf("token exchange: %w", err)
-	}
-	if err := c.saveTokens(*tokens); err != nil {
-		return nil, fmt.Errorf("save tokens: %w", err)
+		return nil, nil, "", fmt.Errorf("load config from registration: %w", err)
 	}
 
-	info := c.ParseDisplayClaims(tokens.AccessToken)
+	info := c.ParseDisplayClaims(accessToken)
 	info.LoggedIn = true
-	info.Token = tokens.AccessToken
-	return info, nil
-}
+	info.Token = accessToken
 
-// exchangeCode trades the auth code for access + refresh tokens
-func (c *Auth0Client) exchangeCode(code, verifier, redirectURI string, creds portalCredentials) (*storedTokens, error) {
-	body := url.Values{
-		"grant_type":    {"authorization_code"},
-		"client_id":     {creds.Auth0ClientID},
-		"code":          {code},
-		"code_verifier": {verifier},
-		"redirect_uri":  {redirectURI},
-	}
-
-	resp, err := http.PostForm(fmt.Sprintf("https://%s/oauth/token", creds.Auth0Domain), body)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	var result struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-		Error        string `json:"error"`
-		Description  string `json:"error_description"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, fmt.Errorf("parse token response: %w", err)
-	}
-	if result.Error != "" {
-		return nil, fmt.Errorf("token error: %s — %s", result.Error, result.Description)
-	}
-
-	return &storedTokens{
-		AccessToken:  result.AccessToken,
-		RefreshToken: result.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(result.ExpiresIn) * time.Second),
-	}, nil
+	sessionToken := regResp.GetToken() // portal session token for /api/device-handoff
+	return info, cfg, sessionToken, nil
 }
 
 // ParseDisplayClaims returns basic user info from the JWT claims (no verification)

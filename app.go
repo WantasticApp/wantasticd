@@ -369,21 +369,70 @@ func (a *App) GetAccount() (*AccountInfo, error) {
 	return info, nil
 }
 
-// StartLogin launches the PKCE browser flow. On success, if the VPN service
-// is not yet configured, it also registers the device and starts the service.
+// StartLogin launches the gRPC Device Flow. Emits "auth:code" with the user_code
+// and verification_uri as soon as they are available so the UI can display them.
+// On approval, registers the device, fetches the WireGuard config, and starts
+// the embedded VPN service. Emits "auth:complete" and "service:ready" on success.
 func (a *App) StartLogin() {
 	go func() {
-		info, err := a.auth.RunPKCEFlow(a.ctx)
+		onVerification := func(userCode, uri string) {
+			wailsruntime.EventsEmit(a.ctx, "auth:code",
+				map[string]string{"code": userCode, "uri": uri})
+			openBrowserURL(uri)
+		}
+
+		info, cfg, sessionToken, err := a.auth.RunDeviceFlow(a.ctx, onVerification)
 		if err != nil {
 			wailsruntime.EventsEmit(a.ctx, "auth:error", err.Error())
 			return
 		}
 		wailsruntime.EventsEmit(a.ctx, "auth:complete", info)
 
-		if !a.configured && info != nil && info.Token != "" {
-			go a.initServiceFromToken(info.Token)
+		if !a.configured && cfg != nil {
+			go a.initServiceWithConfig(cfg, sessionToken)
 		}
 	}()
+}
+
+// initServiceWithConfig persists a pre-fetched WireGuard config to app storage
+// and starts the embedded VPN service. After a successful start, it performs
+// the portal auto-login handoff by navigating the system browser to
+// /api/device-handoff?t=<sessionToken> if a portal session token was returned.
+func (a *App) initServiceWithConfig(cfg *config.Config, sessionToken string) {
+	wailsruntime.EventsEmit(a.ctx, "service:configuring", true)
+	log.Printf("Persisting VPN configuration and starting embedded service…")
+
+	if _, err := saveConfigToAppStorage(cfg); err != nil {
+		log.Printf("Failed to persist config in app storage: %v", err)
+		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not save VPN configuration: %v", err))
+		return
+	}
+
+	cfg.Interface.TUNMode = true
+	cfg.Interface.TUNName = autoTUNName()
+
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+	agt, err := startAgentWithRetry(agentCtx, cfg)
+	if err != nil {
+		agentCancel()
+		log.Printf("Failed to start embedded VPN service: %v", err)
+		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not start VPN service: %v", err))
+		return
+	}
+
+	a.agentCancel = agentCancel
+	a.agt = agt
+	a.configured = true
+	log.Printf("Embedded VPN service started via device flow: TUN=%s", cfg.Interface.TUNName)
+
+	// Step 3 of the auth protocol: auto-login the console WebView
+	if sessionToken != "" {
+		handoffURL := portalBaseURL() + "/api/device-handoff?t=" + sessionToken
+		log.Printf("Device-handoff: navigating to %s", handoffURL)
+		wailsruntime.BrowserOpenURL(a.ctx, handoffURL)
+	}
+
+	wailsruntime.EventsEmit(a.ctx, "service:ready", true)
 }
 
 // initServiceFromToken registers this device with the Wantastic backend using

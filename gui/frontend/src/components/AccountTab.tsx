@@ -5,12 +5,13 @@ interface Props {
   account: AccountInfo | null
   portalHost?: string
   configuring?: boolean   // true while Go is registering device + fetching WireGuard config
+  deviceFlowCode?: { code: string; uri: string } // set once gRPC returns the user_code
   onLogin: () => Promise<void>
   onLogout: () => Promise<void>
   onOpenConsole: () => void
 }
 
-export default function AccountTab({ account, portalHost = 'console.wantastic.app', configuring, onLogin, onLogout, onOpenConsole }: Props) {
+export default function AccountTab({ account, portalHost = 'console.wantastic.app', configuring, deviceFlowCode, onLogin, onLogout, onOpenConsole }: Props) {
   const [loggingIn, setLoggingIn] = useState(false)
 
   // Show progress while the device is being registered with the backend
@@ -47,7 +48,7 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
             onClick={handleLogin}
             disabled={loggingIn}
           >
-            {loggingIn ? (
+            {loggingIn && !deviceFlowCode ? (
               <>
                 <div className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} />
                 Opening browser…
@@ -65,6 +66,38 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
           <div className="login-hint">
             Your browser will open for secure authentication via {portalHost}
           </div>
+
+          {/* Device-flow code — shown once the gRPC server returns a user_code */}
+          {loggingIn && deviceFlowCode && (
+            <div className="glass-card" style={{ marginTop: 12, textAlign: 'center' }}>
+              <div className="glass-card-title" style={{ marginBottom: 8 }}>Enter this code in your browser</div>
+              <div style={{
+                fontFamily: 'monospace',
+                fontSize: 26,
+                fontWeight: 700,
+                letterSpacing: '0.25em',
+                color: '#fff',
+                background: 'rgba(255,255,255,0.07)',
+                borderRadius: 8,
+                padding: '10px 16px',
+                marginBottom: 10,
+              }}>
+                {deviceFlowCode.code}
+              </div>
+              <a
+                href={deviceFlowCode.uri}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: 'var(--accent)', fontSize: 12 }}
+              >
+                {deviceFlowCode.uri}
+              </a>
+              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, color: '#888', fontSize: 12 }}>
+                <div className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                Waiting for approval in browser…
+              </div>
+            </div>
+          )}
         </div>
       </div>
     )

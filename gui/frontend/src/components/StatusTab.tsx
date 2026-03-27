@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState } from 'react'
+import { formatBytes } from '../utils'
 import * as d3 from 'd3'
 import type { StatusData } from '../App'
 
@@ -92,13 +93,6 @@ function Row({ label, value }: { label: string; value: string }) {
       <span className="stat-val">{value}</span>
     </div>
   )
-}
-
-function formatBytes(b: number): string {
-  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB'
-  if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB'
-  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB'
-  return b + ' B'
 }
 
 export default function StatusTab({ status, onToggle }: Props) {

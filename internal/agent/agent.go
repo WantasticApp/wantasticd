@@ -111,6 +111,12 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	// Wire up the gRPC client so the device can validate and execute export
+	// requests received via P2P TUN control messages (subtype 8).
+	if a.client != nil {
+		a.device.SetGRPCClient(a.client)
+	}
+
 	if err := a.device.Start(); err != nil {
 		return fmt.Errorf("start device: %w", err)
 	}

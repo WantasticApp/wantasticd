@@ -3,7 +3,6 @@ package config
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -17,7 +16,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"wantastic-agent/internal/grpc"
 	pb "wantastic-agent/internal/grpc/proto"
 
 	"github.com/denisbrodbeck/machineid"
@@ -77,6 +75,8 @@ type Config struct {
 	ExitNode   ExitNode  `json:"exit_node"`
 	Verbose    bool      `json:"verbose"`
 	AutoUpdate bool      `json:"auto_update"`
+
+	filePath string // path this config was loaded from; not serialised
 }
 
 type Server struct {
@@ -120,6 +120,7 @@ func LoadFromFile(path string) (*Config, error) {
 		if err := cfg.Validate(); err != nil {
 			return nil, fmt.Errorf("validate config: %w", err)
 		}
+		cfg.filePath = path
 		return &cfg, nil
 	}
 
@@ -133,6 +134,7 @@ func LoadFromFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
+	cfg.filePath = path
 	return &cfg, nil
 }
 
@@ -247,150 +249,6 @@ func parseTraditionalWireGuardConfig(configData string) (Config, error) {
 	// Default to sending stats for traditional configs (users can opt-out if we add a flag later)
 	cfg.Server.SendStats = true
 
-	return cfg, nil
-}
-
-func LoadFromDeviceFlow(ctx context.Context, serverURL string) (*Config, error) {
-	client, err := grpc.New(serverURL, "", "")
-	if err != nil {
-		return nil, fmt.Errorf("create grpc client: %w", err)
-	}
-	defer client.Close()
-
-	resp, err := client.StartDeviceFlow(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("start device flow: %w", err)
-	}
-
-	// The updated StartDeviceFlow returns a RegisterDeviceResponse
-	// We can use the SAME LOGIC as LoadFromToken to process it
-	if !resp.Success {
-		return nil, fmt.Errorf("registration failed")
-	}
-
-	// Fallback to raw fields (LoadFromToken also does this now)
-	cfg := &Config{
-		Server: Server{
-			Endpoint:            resp.Endpoint,
-			PublicKey:           resp.ServerKey,
-			AllowedIPs:          resp.AllowedIps,
-			PersistentKeepalive: int(resp.PersistentKeepalive),
-			SendStats:           true,
-		},
-		Interface: Interface{
-			MTU:        int(resp.Mtu),
-			ListenPort: int(resp.ListenPort),
-			DNS:        resp.DnsServers,
-		},
-	}
-	cfg.Auth.ServerURL = serverURL
-	// Use new token if provided, otherwise keep existing enrollment token
-	if resp.Token != "" {
-		cfg.Auth.Token = resp.Token
-	}
-	// Parse routes
-	for _, route := range resp.Routes {
-		if prefix, err := netip.ParsePrefix(route); err == nil {
-			cfg.Interface.Addresses = append(cfg.Interface.Addresses, prefix)
-		}
-	}
-
-	cfg.GenerateDeviceID()
-	return cfg, nil
-}
-
-// LoadFromToken loads the configuration from a token.
-func LoadFromToken(ctx context.Context, serverURL, token string) (*Config, error) {
-	// Create gRPC client
-	client, err := grpc.New(serverURL, "", token)
-	if err != nil {
-		return nil, fmt.Errorf("create grpc client: %w", err)
-	}
-	defer client.Close()
-
-	// Gather system information (fingerprint)
-	hostname, _ := os.Hostname()
-	osInfo := runtime.GOOS
-	arch := runtime.GOARCH
-
-	// Generate a random uint64 nonce (must match spec: uint64, field 5)
-	var nonce uint64
-	if err := binary.Read(rand.Reader, binary.LittleEndian, &nonce); err != nil {
-		// Fallback to time if rand fails (unlikely)
-		nonce = uint64(time.Now().UnixNano())
-	}
-
-	resp, err := client.RegisterDevice(ctx, nonce, osInfo, arch, hostname)
-	if err != nil {
-		return nil, fmt.Errorf("register device: %w", err)
-	}
-
-	if !resp.Success {
-		return nil, fmt.Errorf("registration failed")
-	}
-
-	// 3. Handle response (Prefer EncryptedConfig, fallback to raw fields)
-	if len(resp.EncryptedConfig) > 0 {
-		// Derive key from token: Key = SHA256(Token)
-		hash := sha256.Sum256([]byte(token))
-		key := hash[:]
-
-		// Construct Nonce (12 bytes, first 8 from nonce)
-		nonceBytes := make([]byte, 12)
-		binary.LittleEndian.PutUint64(nonceBytes[:8], nonce)
-
-		// Create Cipher
-		aead, err := chacha20poly1305.New(key)
-		if err != nil {
-			return nil, fmt.Errorf("create cipher: %w", err)
-		}
-
-		// Decrypt
-		decrypted, err := aead.Open(nil, nonceBytes, resp.EncryptedConfig, nil)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt config: %w", err)
-		}
-
-		// Parse decrypted config
-		cfgStruct, err := parseTraditionalWireGuardConfig(string(decrypted))
-		if err != nil {
-			return nil, fmt.Errorf("parse decrypted config: %w", err)
-		}
-
-		cfg := &cfgStruct
-		cfg.Auth.ServerURL = serverURL
-		cfg.Auth.Token = resp.Token
-		cfg.GenerateDeviceID()
-		return cfg, nil
-	}
-
-	// Fallback: Use raw fields from response
-	log.Println("⚠️  No encrypted configuration received, using raw fields")
-	cfg := &Config{
-		PrivateKey: resp.Token, // Mapped token to private key for raw fallback if needed
-		Server: Server{
-			Endpoint:            resp.Endpoint,
-			PublicKey:           resp.ServerKey,
-			AllowedIPs:          resp.AllowedIps,
-			PersistentKeepalive: int(resp.PersistentKeepalive),
-		},
-		Interface: Interface{
-			MTU:        int(resp.Mtu),
-			ListenPort: int(resp.ListenPort),
-			DNS:        resp.DnsServers,
-		},
-	}
-	cfg.Auth.ServerURL = serverURL
-	cfg.Auth.Token = resp.Token
-
-	// Parse routes if available
-	for _, route := range resp.Routes {
-		if prefix, err := netip.ParsePrefix(route); err == nil {
-			cfg.Interface.Addresses = append(cfg.Interface.Addresses, prefix)
-		}
-	}
-
-	cfg.GenerateDeviceID()
 	return cfg, nil
 }
 
@@ -583,6 +441,55 @@ func (c *Config) SaveToFile(path string) error {
 	}
 
 	return nil
+}
+
+// Clone returns a deep copy of the Config for use as a rollback backup.
+// The filePath is preserved so the clone can be saved to the same location.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	backup := *c // value copy of all scalar fields
+
+	if len(c.Server.AllowedIPs) > 0 {
+		backup.Server.AllowedIPs = make([]string, len(c.Server.AllowedIPs))
+		copy(backup.Server.AllowedIPs, c.Server.AllowedIPs)
+	}
+	if len(c.Interface.Addresses) > 0 {
+		backup.Interface.Addresses = make([]netip.Prefix, len(c.Interface.Addresses))
+		copy(backup.Interface.Addresses, c.Interface.Addresses)
+	}
+	if len(c.Interface.DNS) > 0 {
+		backup.Interface.DNS = make([]string, len(c.Interface.DNS))
+		copy(backup.Interface.DNS, c.Interface.DNS)
+	}
+	if len(c.ExitNode.ExitRoutes) > 0 {
+		backup.ExitNode.ExitRoutes = make([]string, len(c.ExitNode.ExitRoutes))
+		copy(backup.ExitNode.ExitRoutes, c.ExitNode.ExitRoutes)
+	}
+	if len(c.ExitNode.ExitDNS) > 0 {
+		backup.ExitNode.ExitDNS = make([]string, len(c.ExitNode.ExitDNS))
+		copy(backup.ExitNode.ExitDNS, c.ExitNode.ExitDNS)
+	}
+	return &backup
+}
+
+// Save atomically persists the config to the file it was loaded from.
+// Returns an error if the config has no known file path (e.g. created from a
+// gRPC response); callers should use SaveToFile(path) in that case.
+func (c *Config) Save() error {
+	if c.filePath == "" {
+		return fmt.Errorf("config has no file path; use SaveToFile(path) instead")
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := c.filePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	return os.Rename(tmp, c.filePath)
 }
 
 // UpdateFromGRPC updates the configuration from a GRPC response.

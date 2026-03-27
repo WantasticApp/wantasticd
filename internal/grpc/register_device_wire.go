@@ -29,9 +29,10 @@ import (
 )
 
 // marshalRegisterDeviceRequest serialises a RegisterDeviceRequest message
-// using the spec-correct field numbers. The returned bytes are ready to be
-// handed to gRPC as a rawProtoMessage.
-func marshalRegisterDeviceRequest(token, hostname, osStr, arch string, nonce uint64) []byte {
+// using the spec-correct field numbers. device_id (field 6) is the plain
+// hardware machine ID (UUID on macOS) — the same value sent as the
+// device_id param in the PKCE OAuth authorize URL.
+func marshalRegisterDeviceRequest(token, hostname, osStr, arch, deviceID string, nonce uint64) []byte {
 	var b []byte
 
 	if token != "" {
@@ -53,6 +54,10 @@ func marshalRegisterDeviceRequest(token, hostname, osStr, arch string, nonce uin
 	if nonce != 0 {
 		b = protowire.AppendTag(b, 5, protowire.VarintType)
 		b = protowire.AppendVarint(b, nonce)
+	}
+	if deviceID != "" {
+		b = protowire.AppendTag(b, 6, protowire.BytesType)
+		b = protowire.AppendString(b, deviceID)
 	}
 
 	return b

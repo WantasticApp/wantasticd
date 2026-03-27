@@ -22,6 +22,8 @@ export namespace main {
 	}
 	export class PeerInfo {
 	    public_key: string;
+	    name: string;
+	    hostname: string;
 	    endpoint: string;
 	    allowed_ips: string;
 	    rx_bytes: number;
@@ -38,6 +40,8 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.public_key = source["public_key"];
+	        this.name = source["name"];
+	        this.hostname = source["hostname"];
 	        this.endpoint = source["endpoint"];
 	        this.allowed_ips = source["allowed_ips"];
 	        this.rx_bytes = source["rx_bytes"];

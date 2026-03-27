@@ -12,7 +12,7 @@ GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
 BINARY_NAME=wantastic
 COMPRESS=upx -9 -v
-WAILS_TAGS=nosystray
+# WAILS_TAGS=nosystray
 
 # ── Primary desktop build (Wails) ────────────────────────────────────────────
 # Wails injects required build tags and embeds the frontend automatically.
@@ -24,7 +24,7 @@ deps:
 
 # Hot-reload dev mode (Vite + Go, live editing)
 dev:
-	WANTASTIC_PORTAL_URL=http://wantastic.local wails dev -tags $(WAILS_TAGS)
+	WANTASTIC_PORTAL_URL=http://wantastic.local wails dev
 
 # Alias kept for convenience
 gui-dev: dev

@@ -13,7 +13,7 @@ import (
 )
 
 //go:embed all:gui/frontend/dist
-var assets embed.FS
+var frontendAssets embed.FS
 
 func main() {
 	app := NewApp()
@@ -24,15 +24,15 @@ func main() {
 		Height:            640,
 		MinWidth:          380,
 		MinHeight:         520,
-		MaxWidth:          520,
-		MaxHeight:         860,
+		MaxWidth:          1400,
+		MaxHeight:         1000,
 		DisableResize:     false,
 		Fullscreen:        false,
 		Frameless:         false,
-		StartHidden:       false,
-		HideWindowOnClose: false,
+		StartHidden:       true,  // app starts hidden; show via systray or startup logic
+		HideWindowOnClose: true,  // X hides to tray; Quit is in the tray menu
 		AssetServer: &assetserver.Options{
-			Assets: assets,
+			Assets: frontendAssets,
 		},
 		BackgroundColour: &options.RGBA{R: 10, G: 12, B: 20, A: 255},
 		OnStartup:        app.startup,
@@ -49,6 +49,9 @@ func main() {
 			Appearance:           mac.NSAppearanceNameDarkAqua,
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
+			// Note: ActivationPolicy (no-Dock-icon / accessory mode) is not yet
+			// exposed in Wails v2.11.0 mac.Options. The app will show a Dock icon
+			// until Wails exposes this option (it is already commented out upstream).
 		},
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,

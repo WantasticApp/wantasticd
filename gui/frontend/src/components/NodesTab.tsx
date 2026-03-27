@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { StatusData, PeerInfo } from '../App'
+import { formatBytes } from '../utils'
 // @ts-ignore
 import { SetExitNode } from '../../wailsjs/go/main/App'
 
@@ -15,17 +16,24 @@ const COLORS = [
   'linear-gradient(135deg,#00d97e,#8b5cf6)',
 ]
 
-function formatBytes(b: number): string {
-  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB'
-  if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB'
-  if (b >= 1e3) return (b / 1e3).toFixed(0) + ' KB'
-  return b + ' B'
-}
-
 function shortKey(k: string): string {
   if (!k) return '—'
   const s = k.replace(/=+$/, '')
   return s.slice(0, 7) + '…' + s.slice(-5)
+}
+
+function peerLabel(peer: PeerInfo): string {
+  if (peer.name) return peer.name
+  if (peer.hostname) return peer.hostname
+  return shortKey(peer.public_key)
+}
+
+function peerSublabel(peer: PeerInfo): string {
+  if (peer.name || peer.hostname) {
+    // Show truncated key as subtitle when we have a name
+    return shortKey(peer.public_key)
+  }
+  return peer.endpoint || 'No endpoint'
 }
 
 function timeSince(ts: string): string {
@@ -47,9 +55,10 @@ function NodeCard({ peer, index, exitNodeKey }: {
   const [open, setOpen] = useState(false)
   const [settingExit, setSettingExit] = useState(false)
 
-  const label = shortKey(peer.public_key)
-  const grad  = COLORS[index % COLORS.length]
-  const initial = peer.public_key?.[0]?.toUpperCase() ?? '?'
+  const label   = peerLabel(peer)
+  const sublabel = peerSublabel(peer)
+  const grad    = COLORS[index % COLORS.length]
+  const initial = (peer.name?.[0] || peer.hostname?.[0] || peer.public_key?.[0])?.toUpperCase() ?? '?'
   const isActiveExit = exitNodeKey === peer.public_key
 
   const handleSetExit = async (e: React.MouseEvent) => {
@@ -76,7 +85,7 @@ function NodeCard({ peer, index, exitNodeKey }: {
         {/* Meta */}
         <div className="node-meta">
           <div className="node-name">{label}</div>
-          <div className="node-sub">{peer.endpoint || 'No endpoint'}</div>
+          <div className="node-sub">{sublabel}</div>
         </div>
 
         {/* Right side */}

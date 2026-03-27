@@ -18,3 +18,7 @@ puppeteer
 test_*.go
 wantasticd.exe
 wantasticd-linux
+wailsjs/
+build/
+
+./CLAUDE.md

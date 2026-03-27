@@ -1,19 +1,26 @@
-import { useState } from 'react'
 import type { AccountInfo } from '../App'
 
 interface Props {
   account: AccountInfo | null
   portalHost?: string
-  configuring?: boolean   // true while Go is registering device + fetching WireGuard config
-  deviceFlowCode?: { code: string; uri: string } // set once gRPC returns the user_code
+  configuring?: boolean      // true while Go is registering device + fetching WireGuard config
+  loginPending?: boolean     // true from Sign In click until auth:complete / auth:error
+  authError?: string         // set on auth:error event; cleared on next login attempt
   onLogin: () => Promise<void>
   onLogout: () => Promise<void>
   onOpenConsole: () => void
 }
 
-export default function AccountTab({ account, portalHost = 'console.wantastic.app', configuring, deviceFlowCode, onLogin, onLogout, onOpenConsole }: Props) {
-  const [loggingIn, setLoggingIn] = useState(false)
-
+export default function AccountTab({
+  account,
+  portalHost = 'console.wantastic.app',
+  configuring,
+  loginPending,
+  authError,
+  onLogin,
+  onLogout,
+  onOpenConsole,
+}: Props) {
   // Show progress while the device is being registered with the backend
   if (configuring) {
     return (
@@ -25,12 +32,6 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
         </div>
       </div>
     )
- }
-
-  const handleLogin = async () => {
-    setLoggingIn(true)
-    try { await onLogin() } catch {}
-    setLoggingIn(false)
   }
 
   if (!account?.logged_in) {
@@ -43,15 +44,32 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
           <div className="login-sub">
             Log in with your Wantastic account to access your VPN configuration, manage devices, and open the console.
           </div>
+
+          {/* Error banner */}
+          {authError && (
+            <div style={{
+              color: 'var(--red)',
+              fontSize: 13,
+              marginBottom: 10,
+              textAlign: 'center',
+              background: 'rgba(248,81,73,0.1)',
+              border: '1px solid rgba(248,81,73,0.3)',
+              borderRadius: 6,
+              padding: '7px 12px',
+            }}>
+              ⚠️ {authError}
+            </div>
+          )}
+
           <button
             className="cta-btn login"
-            onClick={handleLogin}
-            disabled={loggingIn}
+            onClick={onLogin}
+            disabled={loginPending}
           >
-            {loggingIn && !deviceFlowCode ? (
+            {loginPending ? (
               <>
                 <div className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} />
-                Opening browser…
+                Opening sign-in page…
               </>
             ) : (
               <>
@@ -59,45 +77,13 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" fill="rgba(255,255,255,0.2)"/>
                   <path d="M12 6a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm0 12c-2.67 0-5.33-1.18-7-3.08C5.7 13.4 8.67 12 12 12s6.3 1.4 7 2.92C17.33 16.82 14.67 18 12 18z" fill="white"/>
                 </svg>
-                Sign in with Auth0
+                Sign in
               </>
             )}
           </button>
           <div className="login-hint">
-            Your browser will open for secure authentication via {portalHost}
+            A sign-in page will open in your browser via {portalHost}
           </div>
-
-          {/* Device-flow code — shown once the gRPC server returns a user_code */}
-          {loggingIn && deviceFlowCode && (
-            <div className="glass-card" style={{ marginTop: 12, textAlign: 'center' }}>
-              <div className="glass-card-title" style={{ marginBottom: 8 }}>Enter this code in your browser</div>
-              <div style={{
-                fontFamily: 'monospace',
-                fontSize: 26,
-                fontWeight: 700,
-                letterSpacing: '0.25em',
-                color: '#fff',
-                background: 'rgba(255,255,255,0.07)',
-                borderRadius: 8,
-                padding: '10px 16px',
-                marginBottom: 10,
-              }}>
-                {deviceFlowCode.code}
-              </div>
-              <a
-                href={deviceFlowCode.uri}
-                target="_blank"
-                rel="noreferrer"
-                style={{ color: 'var(--accent)', fontSize: 12 }}
-              >
-                {deviceFlowCode.uri}
-              </a>
-              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, color: '#888', fontSize: 12 }}>
-                <div className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
-                Waiting for approval in browser…
-              </div>
-            </div>
-          )}
         </div>
       </div>
     )
@@ -108,6 +94,21 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
 
   return (
     <div>
+      {/* VPN service error — shown when login succeeded but agent failed to start */}
+      {authError && (
+        <div style={{
+          color: 'var(--red)',
+          fontSize: 13,
+          margin: '0 0 12px',
+          textAlign: 'center',
+          background: 'rgba(248,81,73,0.1)',
+          border: '1px solid rgba(248,81,73,0.3)',
+          borderRadius: 6,
+          padding: '7px 12px',
+        }}>
+          ⚠️ {authError}
+        </div>
+      )}
       {/* Avatar row */}
       <div className="avatar-row">
         {account.avatar_url ? (
@@ -152,7 +153,7 @@ export default function AccountTab({ account, portalHost = 'console.wantastic.ap
         </svg>
       </button>
       <div className="login-hint" style={{ marginBottom: 16 }}>
-        Opens in your browser with your session already authenticated.
+        Opens inside the app with your session already authenticated.
       </div>
 
       {/* Logout */}

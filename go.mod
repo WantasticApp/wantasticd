@@ -3,10 +3,12 @@ module wantastic-agent
 go 1.24.5
 
 require (
+	fyne.io/systray v1.12.0
 	github.com/andybalholm/brotli v1.2.0
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/getlantern/systray v1.2.2
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/mdlayher/genetlink v1.3.2
 	github.com/mdlayher/netlink v1.8.0
 	github.com/mdlayher/wifi v0.7.2
@@ -35,7 +37,6 @@ require (
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jchv/go-winloader v0.0.0-20210711035445-715c2860da7e // indirect
 	github.com/labstack/echo/v4 v4.13.3 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect

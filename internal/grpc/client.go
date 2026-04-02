@@ -6,11 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -90,15 +87,17 @@ func (c *Client) connect() error {
 		log.Printf("Resolved %s -> %s", origHost, resolvedHost)
 	}
 
-	// Determine transport security based on port
+	// Determine transport security: use TLS for all non-localhost addresses.
+	// The Wantastic gRPC server listens on :52990 with TLS.
+	// Local dev servers (e.g. :50051 on 127.0.0.1) use plaintext.
 	var transportCreds credentials.TransportCredentials
-	if strings.HasSuffix(serverAddr, ":443") {
-		// Use TLS for port 443 — skip cert verification for compatibility
-		// with self-signed certs on embedded/local environments
-		transportCreds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
-		log.Printf("Using TLS (skip verify) for connection to %s", serverAddr)
+	host, _, _ := net.SplitHostPort(serverAddr)
+	isLocal := host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal")
+	if !isLocal {
+		// Use TLS — skip cert verification for compatibility with self-signed certs
+		transportCreds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+		log.Printf("Using TLS for connection to %s", serverAddr)
 	} else {
-		// Use insecure (plaintext) for other ports (e.g. 50051)
 		transportCreds = insecure.NewCredentials()
 		log.Printf("Using insecure (plaintext) connection to %s", serverAddr)
 	}
@@ -134,31 +133,29 @@ func (c *Client) Close() {
 	}
 }
 
-func (c *Client) RegisterDevice(ctx context.Context, nonce int64, osInfo, arch, hostname string) (*pb.RegisterDeviceResponse, error) {
+func (c *Client) RegisterDevice(ctx context.Context, nonce uint64, osInfo, arch, hostname, deviceID string) (*pb.RegisterDeviceResponse, error) {
 	c.mu.RLock()
-	// Connection check removed as we might be connecting for the first time with a token
-	if c.client == nil {
+	if c.conn == nil {
 		c.mu.RUnlock()
 		return nil, fmt.Errorf("client not initialized")
 	}
 	token := c.token
 	c.mu.RUnlock()
 
-	req := &pb.RegisterDeviceRequest{
-		Token:    token,
-		Nonce:    nonce,
-		Os:       osInfo,
-		Arch:     arch,
-		Hostname: hostname,
-	}
+	// Use raw wire encoding so field numbers match the spec regardless of what
+	// the generated auth.pb.go descriptor says. See register_device_wire.go.
+	reqBytes := marshalRegisterDeviceRequest(token, hostname, osInfo, arch, deviceID, nonce)
 
-	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", c.token))
+	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", token))
 	ctx = metadata.NewOutgoingContext(ctx, md)
 
-	resp, err := c.client.RegisterDevice(ctx, req)
-	if err != nil {
+	var rawResp rawProtoMessage
+	if err := c.conn.Invoke(ctx, "/grpc.AuthService/RegisterDevice",
+		rawProtoMessage(reqBytes), &rawResp); err != nil {
 		return nil, fmt.Errorf("register device: %w", err)
 	}
+
+	resp := unmarshalRegisterDeviceResponse(rawResp)
 
 	if resp.Success {
 		c.mu.Lock()
@@ -216,64 +213,6 @@ func (c *Client) GetConfiguration(ctx context.Context) (*pb.GetConfigurationResp
 	return resp, nil
 }
 
-func (c *Client) StartDeviceFlow(ctx context.Context) (*pb.RegisterDeviceResponse, error) {
-	c.mu.RLock()
-	client := c.client
-	c.mu.RUnlock()
-
-	if client == nil {
-		return nil, fmt.Errorf("not connected to auth server")
-	}
-
-	req := &pb.StartDeviceFlowRequest{
-		DeviceId: c.deviceID,
-	}
-
-	resp, err := client.StartDeviceFlow(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("start device flow: %w", err)
-	}
-
-	fmt.Printf("\n🚀 Device Authorization Required\n")
-	fmt.Printf("-------------------------------\n")
-	fmt.Printf("1. Open: %s\n", resp.VerificationUri)
-	fmt.Printf("2. Enter Code: %s\n\n", resp.UserCode)
-	log.Println("Waiting for authorization...")
-
-	ticker := time.NewTicker(time.Duration(resp.Interval) * time.Second)
-	defer ticker.Stop()
-
-	timeout := time.After(time.Duration(resp.ExpiresIn) * time.Second)
-
-	for {
-		select {
-		case <-ticker.C:
-			pollReq := &pb.PollDeviceFlowRequest{
-				DeviceCode: resp.DeviceCode,
-			}
-			pollResp, err := client.PollDeviceFlow(ctx, pollReq)
-			if err != nil {
-				continue
-			}
-			if pollResp.Success {
-				c.mu.Lock()
-				c.token = pollResp.Token
-				c.mu.Unlock()
-
-				log.Println("✅ Authorization successful! Registering device...")
-
-				// Gather system information for registration
-				hostname, _ := os.Hostname()
-				return c.RegisterDevice(ctx, time.Now().UnixNano(), runtime.GOOS, runtime.GOARCH, hostname)
-			}
-		case <-timeout:
-			return nil, fmt.Errorf("device flow timed out")
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-}
-
 func (c *Client) SetNodeRouting(ctx context.Context, req *pb.SetNodeRoutingRequest) (*pb.SetNodeRoutingResponse, error) {
 	c.mu.RLock()
 	token := c.token
@@ -290,4 +229,50 @@ func (c *Client) SetNodeRouting(ctx context.Context, req *pb.SetNodeRoutingReque
 	ctx = metadata.NewOutgoingContext(ctx, md)
 
 	return client.SetNodeRouting(ctx, req)
+}
+
+// ValidateExportToken verifies an export token with the current server.
+func (c *Client) ValidateExportToken(ctx context.Context, token string) (bool, error) {
+	c.mu.RLock()
+	if c.conn == nil {
+		c.mu.RUnlock()
+		return false, fmt.Errorf("client not initialized")
+	}
+	authToken := c.token
+	c.mu.RUnlock()
+
+	reqBytes := marshalValidateExportTokenRequest(token)
+	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", authToken))
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	var rawResp rawProtoMessage
+	if err := c.conn.Invoke(ctx, "/grpc.AuthService/ValidateExportToken",
+		rawProtoMessage(reqBytes), &rawResp); err != nil {
+		return false, fmt.Errorf("validate export token: %w", err)
+	}
+
+	return unmarshalValidateExportTokenResponse(rawResp), nil
+}
+
+// RegisterPeer registers the device as a peer in the target account.
+func (c *Client) RegisterPeer(ctx context.Context, accountID, pubKeyHex string) (*ExportPeerInfo, error) {
+	c.mu.RLock()
+	if c.conn == nil {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("client not initialized")
+	}
+	authToken := c.token
+	c.mu.RUnlock()
+
+	reqBytes := marshalRegisterPeerRequest(accountID, pubKeyHex)
+	md := metadata.Pairs("authorization", fmt.Sprintf("Bearer %s", authToken))
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	var rawResp rawProtoMessage
+	if err := c.conn.Invoke(ctx, "/grpc.AuthService/RegisterPeer",
+		rawProtoMessage(reqBytes), &rawResp); err != nil {
+		return nil, fmt.Errorf("register peer: %w", err)
+	}
+
+	return unmarshalRegisterPeerResponse(rawResp), nil
 }

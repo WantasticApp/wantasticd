@@ -890,12 +890,10 @@ func collectCPUUsage() string {
 	if err != nil {
 		return "0%"
 	}
-
 	load, err := fs.LoadAvg()
 	if err != nil {
 		return "0%"
 	}
-
 	return fmt.Sprintf("%.2f (avg1)", load.Load1)
 }
 

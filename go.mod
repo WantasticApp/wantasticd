@@ -32,10 +32,13 @@ require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
+	github.com/mdp/qrterminal/v3 v3.2.1 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/stretchr/testify v1.5.1 // indirect
 	golang.org/x/sync v0.19.0 // indirect
+	golang.org/x/term v0.39.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
+	rsc.io/qr v0.2.0 // indirect
 )

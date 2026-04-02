@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 	"wantastic-agent/internal/daemon"
 	"wantastic-agent/internal/update"
@@ -50,43 +51,40 @@ func main() {
 
 func handleLogin() {
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
-	token := loginCmd.String("token", "", "Direct authentication token")
-	serverURL := loginCmd.String("server-url", "auth.wantastic.app:443", "Authentication server URL")
+	token := loginCmd.String("token", "", "Direct access token (skips browser auth)")
+	portalURL := loginCmd.String("portal-url", "https://"+auth.DefaultOAuth2Domain, "Portal base URL")
+	dev := loginCmd.Bool("dev", false, "Use local dev portal (http://"+auth.DefaultOAuth2DevDomain+")")
 	installService := loginCmd.Bool("d", false, "Install and run as system service (daemon)")
 	loginCmd.Parse(os.Args[2:])
-
-	// Auto-determine TUN name based on platform
+	if *dev && *portalURL == "https://"+auth.DefaultOAuth2Domain {
+		*portalURL = "https://" + auth.DefaultOAuth2DevDomain
+		auth.SetInsecureSkipVerify()
+		log.Println("Dev mode: TLS verification disabled")
+	}
 	tunName := autoTUNName()
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-
 	var cfg *config.Config
 	var err error
-
 	if *token != "" {
-		cfg, err = config.LoadFromToken(ctx, *serverURL, *token)
+		cfg, err = config.LoadFromToken(ctx, *portalURL, *token)
 	} else {
-		cfg, err = config.LoadFromDeviceFlow(ctx, *serverURL)
+		cfg, err = config.LoadFromDeviceFlow(ctx, *portalURL)
 	}
-
 	if err != nil {
-		log.Fatalf("Failed to configure agent: %v", err)
+		log.Fatalf("Login failed: %v", err)
 	}
-
-	// Default to new standard path
+	// Print the portal confirmation URL so the user can verify the device appeared.
+	if cfg.HandoffURL != "" {
+		log.Printf("Device registered. Open your console to confirm: %s", cfg.HandoffURL)
+	}
 	configPath := "/etc/wantastic/config.conf"
 	configDir := "/etc/wantastic"
-
-	// If running as non-root/daemon setup request validation
 	if *installService && os.Geteuid() != 0 {
 		log.Printf("Warning: Service installation (-d) requires root privileges.")
 	}
-
-	// Ensure directory exists
-	if err := os.MkdirAll(configDir, 0755); err != nil {
+	if err := os.MkdirAll(configDir, 0700); err != nil {
 		log.Printf("Warning: failed to create config directory %s: %v", configDir, err)
-		// Fallback to local directory if system directory fails (e.g. non-root)
 		configPath = "wantastic.conf"
 		log.Printf("Falling back to local file: %s", configPath)
 	}

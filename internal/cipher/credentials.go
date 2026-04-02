@@ -12,7 +12,7 @@ import (
 const (
 	HeaderTimestamp = "x-wantastic-ts"
 	HeaderSignature = "x-wantastic-sig"
-	SharedSecret    = "Wantastic_v1_Rolling_Code_Secret"
+	SharedSecret    = "wantastic_cipher_v_1_0_0"
 )
 
 // EncryptedCredentials implements credentials.PerRPCCredentials

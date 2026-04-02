@@ -15,16 +15,13 @@ import (
 
 	"wantastic-agent/internal/config"
 	"wantastic-agent/internal/device"
-	"wantastic-agent/internal/grpc"
-	pb "wantastic-agent/internal/grpc/proto"
 	"wantastic-agent/pkg/version"
 )
 
-// Agent represents the main agent that manages the WireGuard device and gRPC communication
+// Agent manages the WireGuard device, local health workers, and optional auto-update.
 type Agent struct {
 	config  *config.Config
 	device  *device.Device
-	client  *grpc.Client
 	updater *update.Manager
 	stats   *stats.Server
 
@@ -36,14 +33,8 @@ type Agent struct {
 	apiServer *APIServer
 }
 
-// New creates a new Agent with the provided configuration
+// New creates a new Agent with the provided configuration.
 func New(cfg *config.Config) (*Agent, error) {
-	return NewWithClient(cfg, nil)
-}
-
-// NewWithClient creates a new Agent with the provided configuration and optional gRPC client
-// If client is nil, the agent will create one automatically based on the configuration
-func NewWithClient(cfg *config.Config, client *grpc.Client) (*Agent, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -57,29 +48,21 @@ func NewWithClient(cfg *config.Config, client *grpc.Client) (*Agent, error) {
 
 	updater := update.NewManager(version.Version)
 
-	// Initialize stats server
 	statsServer := stats.NewServer(dev, version.Version)
-
-	// Link the metrics serializer to the WireGuard driver so it can be pushed over P2P
 	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
 
 	agt := &Agent{
-		config:  cfg,
-		device:  dev,
-		updater: updater,
-		stats:   statsServer,
-		client:  client, // Store the pre-configured client
-		stopCh:  make(chan struct{}),
+		config:    cfg,
+		device:    dev,
+		updater:   updater,
+		stats:     statsServer,
+		stopCh:    make(chan struct{}),
 	}
 	agt.apiServer = NewAPIServer(agt)
 	return agt, nil
 }
 
 // Start starts the agent and its components.
-// It first checks if the agent is already running, and if so, returns an error.
-// Start initializes and starts the agent with the provided context.
-// This begins device operation, network stack initialization, and optional gRPC client connection.
-// Returns an error if the agent is already running or if initialization fails.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.running {
@@ -89,47 +72,19 @@ func (a *Agent) Start(ctx context.Context) error {
 	a.running = true
 	a.mu.Unlock()
 
-	// Use pre-configured client if available, otherwise create one if authentication credentials are provided
-	if a.client == nil {
-		if a.config.Auth.ServerURL != "" && a.config.Auth.Token != "" {
-			client, err := grpc.New(a.config.Auth.ServerURL, a.config.DeviceID, a.config.Auth.Token)
-			if err != nil {
-				log.Printf("Warning: could not create gRPC client, running with local configuration only: %v", err)
-			} else {
-				a.client = client
-				if err := a.runOnce(ctx); err != nil {
-					log.Printf("Warning: initial configuration fetch failed, running with local configuration: %v", err)
-				}
-			}
-		} else {
-			log.Printf("Running with local configuration only (no gRPC authentication required)")
-		}
-	} else {
-		// Use the pre-configured client
-		if err := a.runOnce(ctx); err != nil {
-			log.Printf("Warning: initial configuration fetch failed with pre-configured client: %v", err)
-		}
-	}
-
 	if err := a.device.Start(); err != nil {
 		return fmt.Errorf("start device: %w", err)
 	}
 
-	// Start stats server
 	if a.config.Verbose {
 		if err := a.stats.Start(); err != nil {
 			log.Printf("Warning: failed to start stats server: %v", err)
 		}
 	}
 
-	// Start background workers
-	// We always run HealthCheck and DNSCheck (Linux)
-	workerCount := 2
+	workerCount := 2 // HealthCheck + DNSCheck
 	if a.config.AutoUpdate {
-		workerCount++ // UpdateChecker
-	}
-	if a.client != nil {
-		workerCount += 2 // GRPC + ConfigMonitor
+		workerCount++
 	}
 	a.wg.Add(workerCount)
 
@@ -143,11 +98,6 @@ func (a *Agent) Start(ctx context.Context) error {
 		log.Println("Auto-update disabled (use --auto-update to enable)")
 	}
 
-	if a.client != nil {
-		go a.runGRPCClient(ctx)
-		go a.runConfigMonitor(ctx)
-	}
-
 	if err := a.apiServer.Start(); err != nil {
 		log.Printf("Warning: failed to start local IPC API: %v", err)
 	}
@@ -155,24 +105,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) runOnce(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	if err := a.checkForConfigUpdates(ctx); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Stop stops the agent and its components.
-// It first checks if the agent is already stopped, and if so, returns nil.
-// If not, it sets the running flag to false and unlocks the mutex.
-// Then, it closes the stopCh channel if it hasn't been closed already.
-// After that, it waits for all goroutines to finish.
-// If a gRPC client is available, it closes it.
-// Finally, it stops the netstack and device components.
-// Returns an error if any component fails to stop.
+// Stop stops the agent and all its components.
 func (a *Agent) Stop() error {
 	a.mu.Lock()
 	if !a.running {
@@ -181,10 +114,8 @@ func (a *Agent) Stop() error {
 	}
 	a.running = false
 
-	// Only close stopCh if it hasn't been closed already
 	select {
 	case <-a.stopCh:
-		// Channel already closed
 	default:
 		close(a.stopCh)
 	}
@@ -200,35 +131,11 @@ func (a *Agent) Stop() error {
 		log.Printf("Error stopping device: %v", err)
 	}
 
-	if a.client != nil {
-		a.client.Close()
-	}
-
 	if a.apiServer != nil {
 		a.apiServer.Stop()
 	}
 
 	return nil
-}
-
-func (a *Agent) runGRPCClient(ctx context.Context) {
-	defer a.wg.Done()
-
-	ticker := time.NewTicker(a.config.Auth.RefreshTime)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.stopCh:
-			return
-		case <-ticker.C:
-			if err := a.client.RefreshAuth(ctx); err != nil {
-				log.Printf("Auth refresh failed: %v", err)
-			}
-		}
-	}
 }
 
 func (a *Agent) runHealthCheck(ctx context.Context) {
@@ -246,26 +153,6 @@ func (a *Agent) runHealthCheck(ctx context.Context) {
 		case <-ticker.C:
 			if err := a.device.HealthCheck(); err != nil {
 				log.Printf("Device health check failed: %v", err)
-			}
-		}
-	}
-}
-
-func (a *Agent) runConfigMonitor(ctx context.Context) {
-	defer a.wg.Done()
-
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.stopCh:
-			return
-		case <-ticker.C:
-			if err := a.checkForConfigUpdates(ctx); err != nil {
-				log.Printf("Config update check failed: %v", err)
 			}
 		}
 	}
@@ -374,50 +261,6 @@ func (a *Agent) performSelfUpdate(ctx context.Context, version string) {
 		// Exit the process so supervisor (e.g. systemd) restarts it with new binary
 		os.Exit(0)
 	}
-}
-
-func (a *Agent) checkForConfigUpdates(ctx context.Context) error {
-	resp, err := a.client.GetConfiguration(ctx)
-	if err != nil {
-		return fmt.Errorf("get configuration: %w", err)
-	}
-
-	if resp.UpdateAvailable {
-		if a.config.AutoUpdate {
-			log.Printf("Update available via Config: %s -> %s", a.updater.GetCurrentVersion(), resp.UpdateVersion)
-			a.performSelfUpdate(ctx, resp.UpdateVersion)
-		} else {
-			log.Printf("Update available: %s -> %s (auto-update disabled, run with --auto-update to enable)", a.updater.GetCurrentVersion(), resp.UpdateVersion)
-		}
-	}
-
-	if err := a.applyConfiguration(resp); err != nil {
-		return fmt.Errorf("apply configuration: %w", err)
-	}
-
-	return nil
-}
-
-func (a *Agent) applyConfiguration(resp *pb.GetConfigurationResponse) error {
-	if resp.DeviceConfig != nil {
-		if err := a.device.UpdateConfig(resp.DeviceConfig); err != nil {
-			return fmt.Errorf("update device config: %w", err)
-		}
-	}
-
-	if resp.ServerConfig != nil {
-		if err := a.device.UpdateServerConfig(resp.ServerConfig); err != nil {
-			return fmt.Errorf("update server config: %w", err)
-		}
-	}
-
-	if resp.ExitNodeConfig != nil {
-		if err := a.device.UpdateExitNodeConfig(resp.ExitNodeConfig); err != nil {
-			return fmt.Errorf("update exit node config: %w", err)
-		}
-	}
-
-	return nil
 }
 
 // IsRunning returns true if the agent is running, false otherwise.

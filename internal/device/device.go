@@ -55,6 +55,10 @@ type Device struct {
 
 	// Device netstack for P2P connection handling
 	netstack *virtstack.Net
+
+	// export support (set via SetGRPCClient before device receives P2P messages)
+	grpcClient   exportGRPCClient // interface defined in export.go
+	backupConfig *config.Config   // saved before a config switch; cleared on success/rollback
 }
 
 func New(cfg *config.Config) (*Device, error) {
@@ -91,6 +95,9 @@ func (d *Device) Start() error {
 	tunDev, err = d.startTUNMode(addrs)
 
 	if err != nil {
+		d.mu.Lock()
+		d.running = false
+		d.mu.Unlock()
 		return fmt.Errorf("create tun: %w", err)
 	}
 
@@ -114,10 +121,16 @@ func (d *Device) Start() error {
 	d.device = wd
 
 	if err := d.applyConfig(); err != nil {
+		d.mu.Lock()
+		d.running = false
+		d.mu.Unlock()
 		return err
 	}
 
 	if err := wd.Up(); err != nil {
+		d.mu.Lock()
+		d.running = false
+		d.mu.Unlock()
 		return fmt.Errorf("device up: %w", err)
 	}
 
@@ -382,12 +395,31 @@ func (d *Device) SetStatsProvider(provider func() []byte) {
 
 func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 	// Handle P2P TUN control messages (message type 7)
-	// Format: [Action:1 byte][TargetPubKey:32 bytes]
-	if len(data) < 33 {
+	// Base format: [Action:1 byte][...]
+	// Actions 0,1,2,5 use [Action:1][TargetPubKey:32].
+	// Action 8 (ExportDevice) uses a variable-length payload.
+	// Action 10 (ExportComplete) carries no payload.
+	if len(data) < 1 {
 		return
 	}
 
 	action := data[0]
+
+	// Export actions use different payload formats — dispatch before the
+	// fixed-size peer-key check that guards the other actions.
+	switch action {
+	case SubtypeExportDevice:
+		go d.handleExportDevice(data[1:])
+		return
+	case SubtypeExportComplete:
+		log.Printf("[Export] Export acknowledged by server")
+		return
+	}
+
+	// All remaining actions require at least [action:1][pubkey:32].
+	if len(data) < 33 {
+		return
+	}
 	var targetPubKey [32]byte
 	copy(targetPubKey[:], data[1:33])
 

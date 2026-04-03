@@ -82,7 +82,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
-	workerCount := 2 // HealthCheck + DNSCheck
+	workerCount := 3 // HealthCheck + DNSCheck + MetricsTicker
 	if a.config.AutoUpdate {
 		workerCount++
 	}
@@ -90,6 +90,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	go a.runHealthCheck(ctx)
 	go a.runDNSCheck(ctx)
+	go a.runMetricsTicker(ctx)
 
 	if a.config.AutoUpdate {
 		log.Println("Auto-update enabled")
@@ -136,6 +137,24 @@ func (a *Agent) Stop() error {
 	}
 
 	return nil
+}
+
+func (a *Agent) runMetricsTicker(ctx context.Context) {
+	defer a.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.stopCh:
+			return
+		case <-ticker.C:
+			a.device.SendStatsToServer()
+		}
+	}
 }
 
 func (a *Agent) runHealthCheck(ctx context.Context) {

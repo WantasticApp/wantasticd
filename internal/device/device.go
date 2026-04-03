@@ -609,6 +609,41 @@ func (d *Device) SendTUNControl(peerPubKey string, data []byte) error {
 	return nil
 }
 
+// SendStatsToServer pushes a stats message (Message Type 5) to the server peer.
+// Safe to call from any goroutine; no-ops if the device is not started or the
+// server peer is not found / not stats-enabled.
+func (d *Device) SendStatsToServer() {
+	if !d.config.Server.SendStats || d.config.Server.PublicKey == "" {
+		return
+	}
+
+	pubHex, err := base64ToHex(d.config.Server.PublicKey)
+	if err != nil {
+		return
+	}
+	pkBytes, err := hex.DecodeString(pubHex)
+	if err != nil || len(pkBytes) != 32 {
+		return
+	}
+
+	var noiseKey [32]byte
+	copy(noiseKey[:], pkBytes)
+
+	d.mu.RLock()
+	wd := d.device
+	d.mu.RUnlock()
+	if wd == nil {
+		return
+	}
+
+	peer := wd.LookupPeer(noiseKey)
+	if peer == nil {
+		return
+	}
+
+	go peer.SendStats()
+}
+
 func (d *Device) GetStats() (map[string]any, error) {
 	return map[string]any{
 		"id":        d.config.DeviceID,

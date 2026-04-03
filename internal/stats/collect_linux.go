@@ -731,10 +731,11 @@ func collectQSDKMesh() *MeshInfo {
 
 	for _, n := range data.Topo {
 		node := &MeshNode{
-			Name: n.Name,
-			MAC:  n.MAC,
-			IP:   n.IP,
-			Role: "agent",
+			Name:     n.Name,
+			MAC:      n.MAC,
+			Backhaul: n.Backhaul,
+			IP:       n.IP,
+			Role:     "agent",
 		}
 		if n.Hops == 0 {
 			node.Role = "controller"

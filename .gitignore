@@ -17,3 +17,5 @@ puppeteer
 test_*.go
 wantasticd.exe
 wantasticd-linux
+./bulk_install.sh
+bulk_install.sh

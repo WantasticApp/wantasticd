@@ -1,233 +1,344 @@
 #!/bin/sh
+# Wantastic Agent — Universal Install Script
+# Platforms: Linux (systemd / procd-OpenWrt / OpenRC-Alpine / SysV / BusyBox), macOS
+# Windows:   irm https://get.wantastic.app/install.ps1 | iex
+#
+# Usage:
+#   curl -sSL https://get.wantastic.app/install.sh | sh
+#   curl -sSL https://get.wantastic.app/install.sh | sh -s -- --token <TOKEN>
 set -e
 
-# Wantasticd Installation Script
-# https://wantastic.app
-
 BASE_URL="https://get.wantastic.app"
+INSTALL_TOKEN=""
 
-# Detect OS
-# Use case statement instead of tr to avoid potential locale/environment issues (fixing "Linlx")
-UNAME_S="$(uname -s)"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --token|-t) INSTALL_TOKEN="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# ── platform ─────────────────────────────────────────────────────────────────
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
 case "$UNAME_S" in
-    Linux*)     OS="linux" ;;
-    Darwin*)    OS="darwin" ;;
-    *)          echo "Unsupported Operating System: $UNAME_S"; exit 1 ;;
+  Linux*)  OS="linux"  ;;
+  Darwin*) OS="darwin" ;;
+  *)
+    echo "Unsupported OS: $UNAME_S"
+    echo "For Windows run: irm https://get.wantastic.app/install.ps1 | iex"
+    exit 1 ;;
 esac
 
+case "$(uname -m 2>/dev/null || echo unknown)" in
+  x86_64)         ARCH="amd64"    ;;
+  aarch64|arm64)  ARCH="arm64"    ;;
+  armv7*|armv6*)  ARCH="arm"      ;;
+  i386|i686)      ARCH="386"      ;;
+  mips64)         ARCH="mips64"   ;;
+  mips64el)       ARCH="mips64le" ;;
+  mipsle|mipsel)  ARCH="mipsle"   ;;
+  mips)           ARCH="mips"     ;;
+  riscv64)        ARCH="riscv64"  ;;
+  ppc64le)        ARCH="ppc64le"  ;;
+  *)
+    echo "Unsupported architecture: $(uname -m)"
+    echo "Download manually from $BASE_URL"
+    exit 1 ;;
+esac
+
+echo "Platform: $OS/$ARCH"
+
+# ── readonly filesystem (OpenWrt / embedded) ──────────────────────────────────
 NEED_REMOUNT_RO=0
 if [ "$OS" = "linux" ]; then
-    # Check if root filesystem is mounted read-only
-    IS_RO=0
-    # Check standard ro option (ro,)
-    if grep -q " / .* ro," /proc/mounts 2>/dev/null; then
-        IS_RO=1
+  if grep -qE " / .*\bro\b" /proc/mounts 2>/dev/null; then
+    echo "Root filesystem is read-only — remounting rw…"
+    if mount -o remount,rw / 2>/dev/null; then
+      NEED_REMOUNT_RO=1
+    else
+      echo "  Warning: remount failed, install may fail"
     fi
-    # Check parenthesized options (ro) or space-separated (ro )
-    if grep -q " / .*[\( ]ro[\), ]" /proc/mounts 2>/dev/null; then
-        IS_RO=1
-    fi
-
-    if [ "$IS_RO" = "1" ]; then
-        echo "Root filesystem is Read-Only. Attempting to remount RW..."
-        mount -o remount,rw / && NEED_REMOUNT_RO=1 || echo "  Warning: Failed to remount / as RW"
-    fi
+  fi
 fi
 
-ARCH="$(uname -m)"
+# ── download helpers ──────────────────────────────────────────────────────────
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# Normalize Arch
-case "$ARCH" in
-    x86_64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    armv7*) ARCH="arm" ;;
-    i386|i686) ARCH="386" ;;
-    mips64) ARCH="mips64" ;;
-    riscv64) ARCH="riscv64" ;;
-    ppc64le) ARCH="ppc64le" ;;
-    *) 
-    echo "Architecture $ARCH is not directly supported by this script."
-    echo "Please download the binary manually from GitHub releases."
-    exit 1 
+http_get() {
+  _url="$1"; _dest="$2"
+  if have curl; then
+    _code=$(curl -sSL -w "%{http_code}" -o "$_dest" "$_url")
+    [ "$_code" = "200" ] && return 0
+    echo "HTTP $_code downloading $_url"; return 1
+  elif have wget; then
+    wget -qO "$_dest" "$_url" && return 0
+    echo "wget failed: $_url"; return 1
+  else
+    echo "Error: curl or wget required"; exit 1
+  fi
+}
+
+http_text() {
+  if have curl; then curl -sSL "$1"
+  elif have wget; then wget -qO- "$1"
+  else echo "Error: curl or wget required"; exit 1
+  fi
+}
+
+# ── download binary ───────────────────────────────────────────────────────────
+echo "Fetching latest version…"
+VERSION=$(http_text "${BASE_URL}/latest" | tr -d '[:space:]')
+[ -n "$VERSION" ] || { echo "Error: could not determine latest version"; exit 1; }
+echo "Version: $VERSION"
+
+TMP_DIR=$(mktemp -d 2>/dev/null || { mkdir -p /tmp/wantastic_install; printf '/tmp/wantastic_install'; })
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+ARCHIVE_URL="${BASE_URL}/latest/wantasticd-${OS}-${ARCH}.tar.gz"
+echo "Downloading $ARCHIVE_URL…"
+http_get "$ARCHIVE_URL" "$TMP_DIR/pkg.tar.gz"
+tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"
+
+if [ "$OS" = "darwin" ]; then
+  EXTRACTED=$(find "$TMP_DIR" -name "wantasticd" -type f -perm +111 2>/dev/null | head -n 1)
+else
+  EXTRACTED=$(find "$TMP_DIR" -name "wantasticd" -type f 2>/dev/null | head -n 1)
+fi
+[ -n "$EXTRACTED" ] || { echo "Error: binary not found in archive"; ls -la "$TMP_DIR"; exit 1; }
+
+# ── install binary (atomic) ───────────────────────────────────────────────────
+if   [ -d "/usr/local/bin" ] && echo "$PATH" | grep -q "/usr/local/bin"; then
+  INSTALL_DIR="/usr/local/bin"
+elif [ -d "/usr/bin" ]; then
+  INSTALL_DIR="/usr/bin"
+else
+  INSTALL_DIR="/bin"
+fi
+INSTALL_PATH="${INSTALL_DIR}/wantasticd"
+
+echo "Installing to $INSTALL_PATH…"
+cp "$EXTRACTED" "${INSTALL_PATH}.new"
+chmod +x "${INSTALL_PATH}.new"
+mv -f "${INSTALL_PATH}.new" "$INSTALL_PATH"
+echo "wantasticd $VERSION installed."
+
+# ── DNS (Linux) ───────────────────────────────────────────────────────────────
+if [ "$OS" = "linux" ]; then
+  if ! grep -qE "nameserver[[:space:]]+(1\.1\.1\.1|8\.8\.8\.8)" /etc/resolv.conf 2>/dev/null; then
+    echo "Adding reliable DNS to /etc/resolv.conf…"
+    printf '\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' >> /etc/resolv.conf 2>/dev/null || \
+      echo "  Warning: could not update /etc/resolv.conf"
+  fi
+fi
+
+# ── login — saves config to /etc/wantastic/config.conf ───────────────────────
+CONFIG_DIR="/etc/wantastic"
+CONFIG_FILE="${CONFIG_DIR}/config.conf"
+mkdir -p "$CONFIG_DIR" 2>/dev/null && chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+
+echo ""
+echo "=== Logging in ==="
+LOGIN_ARGS=""
+[ -n "$INSTALL_TOKEN" ] && LOGIN_ARGS="--token $INSTALL_TOKEN"
+
+# shellcheck disable=SC2086
+if "$INSTALL_PATH" login $LOGIN_ARGS; then
+  echo "Login successful. Config saved to $CONFIG_FILE"
+else
+  echo ""
+  echo "Login failed — writing placeholder config to $CONFIG_FILE"
+  echo "Edit it and re-run: wantasticd login"
+  cat > "$CONFIG_FILE" <<'CONF'
+[Interface]
+PrivateKey = <YOUR_PRIVATE_KEY>
+Address    = 10.x.x.x/32
+
+[Peer]
+PublicKey           = <YOUR_SERVER_PUBLIC_KEY>
+Endpoint            = wg.wantastic.app:51820
+AllowedIPs          = 10.0.0.0/8
+PersistentKeepalive = 25
+CONF
+fi
+
+# ── init system detection ─────────────────────────────────────────────────────
+detect_init() {
+  if [ -d /run/systemd/private ] || \
+     { command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; }; then
+    echo systemd; return
+  fi
+  if command -v procd >/dev/null 2>&1 || [ -f /etc/openwrt_release ]; then
+    echo procd; return
+  fi
+  if command -v rc-update >/dev/null 2>&1; then
+    echo openrc; return
+  fi
+  if [ -d /etc/init.d ]; then
+    if command -v update-rc.d >/dev/null 2>&1 || command -v chkconfig >/dev/null 2>&1; then
+      echo sysv; return
+    fi
+    echo busybox; return
+  fi
+  echo unknown
+}
+
+# ── service installation ──────────────────────────────────────────────────────
+install_service_systemd() {
+  cat > /etc/systemd/system/wantasticd.service <<EOF
+[Unit]
+Description=Wantastic Overlay Networking Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_PATH} connect --config ${CONFIG_FILE}
+Restart=on-failure
+RestartSec=5
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable wantasticd
+  systemctl restart wantasticd
+  echo "Service registered with systemd and started."
+}
+
+install_service_procd() {
+  # procd init script (OpenWrt / embedded)
+  cat > /etc/init.d/wantasticd <<EOF
+#!/bin/sh /etc/rc.common
+START=99
+STOP=10
+USE_PROCD=1
+start_service() {
+  procd_open_instance
+  procd_set_param command ${INSTALL_PATH} connect --config ${CONFIG_FILE}
+  procd_set_param respawn 3600 5 0
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_close_instance
+}
+EOF
+  chmod +x /etc/init.d/wantasticd
+  /etc/init.d/wantasticd enable
+  /etc/init.d/wantasticd restart
+  echo "Service registered with procd and started."
+}
+
+install_service_openrc() {
+  cat > /etc/init.d/wantasticd <<EOF
+#!/sbin/openrc-run
+description="Wantastic Overlay Networking Daemon"
+command="${INSTALL_PATH}"
+command_args="connect --config ${CONFIG_FILE}"
+command_background=true
+pidfile=/run/wantasticd.pid
+depend() { need net; }
+EOF
+  chmod +x /etc/init.d/wantasticd
+  rc-update add wantasticd default
+  rc-service wantasticd restart
+  echo "Service registered with OpenRC and started."
+}
+
+install_service_sysv() {
+  cat > /etc/init.d/wantasticd <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides: wantasticd
+# Required-Start: \$network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+### END INIT INFO
+PIDFILE=/var/run/wantasticd.pid
+case "\$1" in
+  start) start-stop-daemon --start --background --make-pidfile \
+           --pidfile \$PIDFILE --exec ${INSTALL_PATH} -- connect --config ${CONFIG_FILE} ;;
+  stop)  start-stop-daemon --stop --pidfile \$PIDFILE; rm -f \$PIDFILE ;;
+  restart) \$0 stop; sleep 1; \$0 start ;;
+  *) echo "Usage: \$0 {start|stop|restart}"; exit 1 ;;
+esac
+EOF
+  chmod +x /etc/init.d/wantasticd
+  if command -v update-rc.d >/dev/null 2>&1; then
+    update-rc.d wantasticd defaults
+  elif command -v chkconfig >/dev/null 2>&1; then
+    chkconfig --add wantasticd
+  fi
+  /etc/init.d/wantasticd restart
+  echo "Service registered with SysV init and started."
+}
+
+install_service_busybox() {
+  # Minimal embedded: respawn via /etc/inittab
+  INIT_SCRIPT=/etc/init.d/wantasticd
+  printf '#!/bin/sh\nexec %s connect --config %s\n' \
+    "$INSTALL_PATH" "$CONFIG_FILE" > "$INIT_SCRIPT"
+  chmod +x "$INIT_SCRIPT"
+  if ! grep -q "wantasticd" /etc/inittab 2>/dev/null; then
+    printf '::respawn:%s\n' "$INIT_SCRIPT" >> /etc/inittab
+    echo "Added respawn entry to /etc/inittab."
+    # Signal init to re-read inittab (BusyBox init responds to SIGHUP)
+    kill -HUP 1 2>/dev/null || true
+  fi
+  # Also start it now in the background
+  "$INSTALL_PATH" connect --config "$CONFIG_FILE" &
+  echo "Service started in background (BusyBox respawn configured)."
+}
+
+install_service_launchd() {
+  PLIST=/Library/LaunchDaemons/com.wantastic.wantasticd.plist
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.wantastic.wantasticd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${INSTALL_PATH}</string>
+    <string>connect</string>
+    <string>--config</string><string>${CONFIG_FILE}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/wantasticd.log</string>
+  <key>StandardErrorPath</key><string>/var/log/wantasticd.log</string>
+</dict></plist>
+EOF
+  launchctl bootout system "$PLIST" 2>/dev/null || true
+  launchctl bootstrap system "$PLIST"
+  echo "Service registered with launchd and started."
+}
+
+if [ "$OS" = "darwin" ]; then
+  INIT_SYS="launchd"
+else
+  INIT_SYS=$(detect_init)
+fi
+
+echo ""
+echo "=== Installing as system service (init: $INIT_SYS) ==="
+case "$INIT_SYS" in
+  systemd) install_service_systemd ;;
+  procd)   install_service_procd   ;;
+  openrc)  install_service_openrc  ;;
+  sysv)    install_service_sysv    ;;
+  busybox) install_service_busybox ;;
+  launchd) install_service_launchd ;;
+  *)
+    echo "Unknown init system — start manually: wantasticd connect --config $CONFIG_FILE"
     ;;
 esac
 
-# Check for curl
-if ! command -v curl >/dev/null 2>&1; then
-    echo "Error: curl is required to install wantasticd."
-    exit 1
+# ── restore read-only filesystem ──────────────────────────────────────────────
+if [ "$NEED_REMOUNT_RO" = "1" ]; then
+  echo "Restoring read-only filesystem…"
+  mount -o remount,ro / 2>/dev/null || echo "  Warning: could not remount ro"
 fi
 
-echo "Detected Platform: $OS-$ARCH"
-
-# 1. Fetch Latest Version
-echo "Checking for latest version..."
-VERSION=$(curl -sSL "${BASE_URL}/latest")
-
-if [ -z "$VERSION" ]; then
-    echo "Error: Could not determine latest version from ${BASE_URL}/latest"
-    exit 1
-fi
-
-echo "Latest version: $VERSION"
-
-# 2. Construct Download URL
-# Structure: https://get.wantastic.app/latest/wantasticd-<os>-<arch>.tar.gz
-# We use 'latest' path directly as requested
-BINARY_URL="${BASE_URL}/latest/wantasticd-${OS}-${ARCH}.tar.gz"
-
-# Create temp directory
-# Create temp directory
-TMP_DIR=$(mktemp -d 2>/dev/null)
-if [ -z "$TMP_DIR" ]; then
-    echo "Warning: mktemp failed, trying local ./tmp directory"
-    mkdir -p ./tmp/wantastic_install
-    TMP_DIR="./tmp/wantastic_install"
-fi
-cd "$TMP_DIR"
-
-echo "Downloading ${BINARY_URL}..."
-http_code=$(curl -sSL -w "%{http_code}" -o wantasticd.tar.gz "$BINARY_URL")
-
-if [ "$http_code" != "200" ]; then
-    echo "Error: Failed to download release (HTTP $http_code)"
-    echo "Url: $BINARY_URL"
-    rm -rf "$TMP_DIR"
-    exit 1
-fi
-
-# 3. Extract
-echo "Extracting..."
-tar -xzf wantasticd.tar.gz
-
-# Find the binary inside the extracted folder
-# The archive should contain a binary named 'wantasticd' (renamed during packaging)
-# But we iterate to be safe if it's in a subdir
-EXTRACTED_BIN=$(find . -type f -name "wantasticd" | head -n 1)
-
-if [ -z "$EXTRACTED_BIN" ]; then
-    echo "Error: Could not find 'wantasticd' binary in archive."
-    ls -la
-    exit 1
-fi
-
-# 4. Install
-# Determine install directory
-# Priority: /usr/local/bin -> /bin -> /usr/bin
-if [ -d "/usr/local/bin" ] && echo "$PATH" | grep -q "/usr/local/bin"; then
-    INSTALL_DIR="/usr/local/bin"
-elif [ -d "/bin" ]; then
-    INSTALL_DIR="/bin"
-elif [ -d "/usr/bin" ]; then
-    INSTALL_DIR="/usr/bin"
-else
-    echo "Error: Could not find a suitable installation directory in PATH."
-    exit 1
-fi
-
-INSTALL_PATH="${INSTALL_DIR}/wantasticd"
-echo "Installing to $INSTALL_PATH..."
-
-# Move binary
-if [ -w "$INSTALL_DIR" ]; then
-    mv "$EXTRACTED_BIN" "$INSTALL_PATH"
-    chmod +x "$INSTALL_PATH"
-else
-    echo "Elevation required..."
-    mv "$EXTRACTED_BIN" "$INSTALL_PATH"
-    chmod +x "$INSTALL_PATH"
-fi
-
-# Cleanup
-cd /
-rm -rf "$TMP_DIR"
-
-echo "Success! Wantasticd ($VERSION) installed to $INSTALL_PATH"
-
-# 5. DNS Check (Always ensure 1.1.1.1 or 8.8.8.8 present)
-if [ "$OS" = "linux" ]; then
-    if ! grep -q "1.1.1.1" /etc/resolv.conf && ! grep -q "8.8.8.8" /etc/resolv.conf; then
-        echo "Adding reliable DNS (1.1.1.1, 8.8.8.8) to /etc/resolv.conf..."
-        # Try to append.
-        printf "\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n" >> /etc/resolv.conf || echo "  Warning: Failed to update /etc/resolv.conf"
-    fi
-fi
-
-# 6. Login & Connect Flow
 echo ""
-echo "=== Initialization ==="
-TOKEN="$1"
-
-if [ -n "$TOKEN" ]; then
-    echo "Token provided. Attempting instant login and connection..."
-    # Run login with token. This command will authenticate, save config, AND start the agent (blocking).
-    "$INSTALL_PATH" login -token "$TOKEN"
-else
-    echo "No token provided."
-    echo "Starting interactive login..."
-    # Run interactive login. 
-    # If it fails (e.g. no internet, firewall, embedded device issues), fall back to manual config guidance
-    if ! "$INSTALL_PATH" login; then
-        echo ""
-        echo "Interactive login failed or timed out."
-        echo "This is common on embedded devices or restricted networks."
-        echo "Switching to manual configuration setup..."
-
-        # Define config location
-        CONF_DIR="/etc/wantasticd"
-        CONF_FILE="${CONF_DIR}/config.conf"
-
-        # Create Config Directory
-        if [ ! -d "$CONF_DIR" ]; then
-            echo "Creating config directory: $CONF_DIR"
-            if ! mkdir -p "$CONF_DIR"; then
-                 echo "Warning: Failed to create $CONF_DIR. Falling back to current directory."
-                 CONF_DIR="$(pwd)"
-                 CONF_FILE="${CONF_DIR}/wantastic_demo.conf"
-            fi
-        fi
-
-        # Write Demo Config
-        # We use tee to handle permission escalation if needed
-        # This is a template based on standard WireGuard config
-        cat <<EOF | tee "$CONF_FILE" > /dev/null
-[Interface]
-# Replace with your Private Key
-PrivateKey = <YOUR_PRIVATE_KEY>
-# Replace with your assigned IP address
-Address = 10.x.x.x/32
-
-[Peer]
-# Server Public Key
-PublicKey = <YOUR_PUBLIC_KEY>
-# Server Endpoint
-Endpoint = wg.wantastic.app:51820
-# Allowed IPs for the overlay network
-AllowedIPs = 10.0.0.0/8
-PersistentKeepalive = 25
-EOF
-
-        echo ""
-        echo "--------------------------------------------------------"
-        echo "Manual Configuration Required"
-        echo "--------------------------------------------------------"
-        echo "A demo configuration file has been created at:"
-        echo "  $CONF_FILE"
-        echo ""
-        echo "1. Edit this file with your actual credentials:"
-        echo "   nano $CONF_FILE"
-        echo ""
-        echo "2. Connect manually:"
-        echo "   wantasticd connect -config $CONF_FILE &"
-        echo "--------------------------------------------------------"
-    fi
-fi
-
-if [ "$OS" = "linux" ] && [ "$NEED_REMOUNT_RO" = "1" ]; then
-    echo ""
-    echo "Restoring / to Read-Only mode..."
-    if [ "$(id -u)" = "0" ]; then
-        mount -o remount,ro / || echo "  Warning: Failed to remount / as RO"
-    fi
-fi
-
+echo "Done. wantasticd $VERSION is installed and running."

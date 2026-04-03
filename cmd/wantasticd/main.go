@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -16,7 +17,6 @@ import (
 	"time"
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
-	"wantastic-agent/internal/daemon"
 	"wantastic-agent/internal/update"
 
 	"wantastic-agent/internal/agent"
@@ -53,17 +53,18 @@ func handleLogin() {
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
 	token := loginCmd.String("token", "", "Direct access token (skips browser auth)")
 	portalURL := loginCmd.String("portal-url", "https://"+auth.DefaultOAuth2Domain, "Portal base URL")
-	dev := loginCmd.Bool("dev", false, "Use local dev portal (http://"+auth.DefaultOAuth2DevDomain+")")
-	installService := loginCmd.Bool("d", false, "Install and run as system service (daemon)")
+	dev := loginCmd.Bool("dev", false, "Use local dev portal (https://"+auth.DefaultOAuth2DevDomain+")")
 	loginCmd.Parse(os.Args[2:])
+
 	if *dev && *portalURL == "https://"+auth.DefaultOAuth2Domain {
 		*portalURL = "https://" + auth.DefaultOAuth2DevDomain
 		auth.SetInsecureSkipVerify()
 		log.Println("Dev mode: TLS verification disabled")
 	}
-	tunName := autoTUNName()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
+
 	var cfg *config.Config
 	var err error
 	if *token != "" {
@@ -74,15 +75,13 @@ func handleLogin() {
 	if err != nil {
 		log.Fatalf("Login failed: %v", err)
 	}
-	// Print the portal confirmation URL so the user can verify the device appeared.
+
 	if cfg.HandoffURL != "" {
 		log.Printf("Device registered. Open your console to confirm: %s", cfg.HandoffURL)
 	}
-	configPath := "/etc/wantastic/config.conf"
+
 	configDir := "/etc/wantastic"
-	if *installService && os.Geteuid() != 0 {
-		log.Printf("Warning: Service installation (-d) requires root privileges.")
-	}
+	configPath := configDir + "/config.conf"
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		log.Printf("Warning: failed to create config directory %s: %v", configDir, err)
 		configPath = "wantastic.conf"
@@ -90,30 +89,9 @@ func handleLogin() {
 	}
 
 	if err := cfg.SaveToFile(configPath); err != nil {
-		log.Printf("Warning: could not save configuration file: %v", err)
-		if *installService {
-			log.Fatalf("Error: Cannot install service without saving configuration file.")
-		}
-		log.Println("Running with in-memory configuration only.")
-		runAgentWithConfig(cfg)
-	} else {
-		log.Println("Login successful. Configuration saved to", configPath)
-
-		if *installService {
-			log.Println("Setting up system service...")
-			if err := daemon.SetupService(configPath); err != nil {
-				log.Fatalf("Failed to setup service: %v", err)
-			}
-			log.Println("Service installed and started successfully.")
-			return
-		}
-
-		log.Println("Connecting...")
-		useTray := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
-		runner.RunServiceHook(func(ctx context.Context) {
-			runAgent(ctx, configPath, false, false, tunName, useTray)
-		})
+		log.Fatalf("Failed to save configuration: %v", err)
 	}
+	log.Println("Configuration saved to", configPath)
 }
 
 func runAgentWithConfig(cfg *config.Config) {
@@ -148,7 +126,6 @@ func handleConnect() {
 	connectCmd := flag.NewFlagSet("connect", flag.ExitOnError)
 	configPath := connectCmd.String("config", "", "Path to configuration file")
 	verbose := connectCmd.Bool("v", false, "Enable verbose logging and debug output")
-	installService := connectCmd.Bool("d", false, "Install and run as system service (daemon)")
 	autoUpdate := connectCmd.Bool("auto-update", false, "Enable automatic self-updates")
 
 	useTray := false
@@ -185,15 +162,6 @@ func handleConnect() {
 		}
 	}
 
-	if *installService {
-		log.Println("Setting up system service...")
-		if err := daemon.SetupService(*configPath); err != nil {
-			log.Fatalf("Failed to setup service: %v", err)
-		}
-		log.Println("Service installed and started successfully.")
-		return
-	}
-
 	runner.RunServiceHook(func(ctx context.Context) {
 		runAgent(ctx, *configPath, *verbose, *autoUpdate, tunName, useTray)
 	})
@@ -216,6 +184,9 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 	}
 
 	cfg.AutoUpdate = autoUpdate
+
+	// Ensure system has working public DNS before connecting.
+	ensureSystemDNS()
 
 	// Enforce TUN mode config natively
 	cfg.Interface.TUNMode = true
@@ -250,6 +221,55 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 		log.Fatalf("Failed to stop agent: %v", err)
 	}
 	log.Println("Agent stopped successfully")
+}
+
+// ensureSystemDNS checks /etc/resolv.conf for a reliable public DNS server
+// (1.1.1.1 or 8.8.8.8) and appends both if neither is present. This prevents
+// WireGuard endpoint resolution failures on devices with missing or broken DNS.
+// No-op on non-Linux platforms.
+func ensureSystemDNS() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	const resolvConf = "/etc/resolv.conf"
+	data, err := os.ReadFile(resolvConf)
+	if err != nil {
+		return
+	}
+	content := string(data)
+	has1111 := strings.Contains(content, "1.1.1.1")
+	has8888 := strings.Contains(content, "8.8.8.8")
+	if has1111 || has8888 {
+		return
+	}
+
+	// Neither reliable DNS present — check existing nameservers still respond.
+	hasWorking := false
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "nameserver") {
+			parts := strings.Fields(line)
+			if len(parts) == 2 {
+				if _, err := net.LookupHost("one.one.one.one"); err == nil {
+					hasWorking = true
+					break
+				}
+			}
+		}
+	}
+	if hasWorking {
+		return
+	}
+
+	log.Println("No reliable DNS found — adding 1.1.1.1 and 8.8.8.8 to /etc/resolv.conf")
+	f, err := os.OpenFile(resolvConf, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Warning: could not update /etc/resolv.conf: %v", err)
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString("\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 }
 
 func printVersion() {

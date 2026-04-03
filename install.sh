@@ -10,10 +10,12 @@ set -e
 
 BASE_URL="https://get.wantastic.app"
 INSTALL_TOKEN=""
+DO_LOGIN=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --token|-t) INSTALL_TOKEN="$2"; shift 2 ;;
+    --token|-t) INSTALL_TOKEN="$2"; DO_LOGIN=1; shift 2 ;;
+    --login)    DO_LOGIN=1; shift ;;
     *) shift ;;
   esac
 done
@@ -131,24 +133,26 @@ if [ "$OS" = "linux" ]; then
   fi
 fi
 
-# ── login — saves config to /etc/wantastic/config.conf ───────────────────────
-CONFIG_DIR="/etc/wantastic"
-CONFIG_FILE="${CONFIG_DIR}/config.conf"
-mkdir -p "$CONFIG_DIR" 2>/dev/null && chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+# ── config (/etc/wantastic — never overwritten if it exists) ─────────────────
+CONFIG_FILE="/etc/wantastic"
 
-echo ""
-echo "=== Logging in ==="
-LOGIN_ARGS=""
-[ -n "$INSTALL_TOKEN" ] && LOGIN_ARGS="--token $INSTALL_TOKEN"
+if [ "$DO_LOGIN" = "1" ]; then
+  if [ -f "$CONFIG_FILE" ]; then
+    echo "Config already exists at $CONFIG_FILE — skipping login."
+  else
+    echo ""
+    echo "=== Logging in ==="
+    LOGIN_ARGS=""
+    [ -n "$INSTALL_TOKEN" ] && LOGIN_ARGS="--token $INSTALL_TOKEN"
 
-# shellcheck disable=SC2086
-if "$INSTALL_PATH" login $LOGIN_ARGS; then
-  echo "Login successful. Config saved to $CONFIG_FILE"
-else
-  echo ""
-  echo "Login failed — writing placeholder config to $CONFIG_FILE"
-  echo "Edit it and re-run: wantasticd login"
-  cat > "$CONFIG_FILE" <<'CONF'
+    # shellcheck disable=SC2086
+    if "$INSTALL_PATH" login $LOGIN_ARGS; then
+      echo "Login successful. Config saved to $CONFIG_FILE"
+    else
+      echo ""
+      echo "Login failed — writing placeholder config to $CONFIG_FILE"
+      echo "Edit it and re-run: wantasticd login"
+      cat > "$CONFIG_FILE" <<'CONF'
 [Interface]
 PrivateKey = <YOUR_PRIVATE_KEY>
 Address    = 10.x.x.x/32
@@ -159,6 +163,10 @@ Endpoint            = wg.wantastic.app:51820
 AllowedIPs          = 10.0.0.0/8
 PersistentKeepalive = 25
 CONF
+    fi
+  fi
+else
+  echo "Skipping login. Run 'wantasticd login' or re-install with --login to authenticate."
 fi
 
 # ── init system detection ─────────────────────────────────────────────────────

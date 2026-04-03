@@ -63,6 +63,15 @@ if [ "$OS" = "linux" ]; then
   fi
 fi
 
+# ── DNS (Linux) ───────────────────────────────────────────────────────────────
+if [ "$OS" = "linux" ]; then
+  if ! grep -qE "nameserver[[:space:]]+(1\.1\.1\.1|8\.8\.8\.8)" /etc/resolv.conf 2>/dev/null; then
+    echo "Adding reliable DNS to /etc/resolv.conf…"
+    printf '\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' >> /etc/resolv.conf 2>/dev/null || \
+      echo "  Warning: could not update /etc/resolv.conf"
+  fi
+fi
+
 # ── download helpers ──────────────────────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -124,20 +133,15 @@ chmod +x "${INSTALL_PATH}.new"
 mv -f "${INSTALL_PATH}.new" "$INSTALL_PATH"
 echo "wantasticd $VERSION installed."
 
-# ── DNS (Linux) ───────────────────────────────────────────────────────────────
-if [ "$OS" = "linux" ]; then
-  if ! grep -qE "nameserver[[:space:]]+(1\.1\.1\.1|8\.8\.8\.8)" /etc/resolv.conf 2>/dev/null; then
-    echo "Adding reliable DNS to /etc/resolv.conf…"
-    printf '\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' >> /etc/resolv.conf 2>/dev/null || \
-      echo "  Warning: could not update /etc/resolv.conf"
-  fi
-fi
-
 # ── config (/etc/wantastic — never overwritten if it exists) ─────────────────
 CONFIG_FILE="/etc/wantastic"
 
+if [ ! -f "$CONFIG_FILE" ]; then
+  touch "$CONFIG_FILE" 2>/dev/null && chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+fi
+
 if [ "$DO_LOGIN" = "1" ]; then
-  if [ -f "$CONFIG_FILE" ]; then
+  if [ -s "$CONFIG_FILE" ]; then
     echo "Config already exists at $CONFIG_FILE — skipping login."
   else
     echo ""
@@ -150,23 +154,11 @@ if [ "$DO_LOGIN" = "1" ]; then
       echo "Login successful. Config saved to $CONFIG_FILE"
     else
       echo ""
-      echo "Login failed — writing placeholder config to $CONFIG_FILE"
-      echo "Edit it and re-run: wantasticd login"
-      cat > "$CONFIG_FILE" <<'CONF'
-[Interface]
-PrivateKey = <YOUR_PRIVATE_KEY>
-Address    = 10.x.x.x/32
-
-[Peer]
-PublicKey           = <YOUR_SERVER_PUBLIC_KEY>
-Endpoint            = wg.wantastic.app:51820
-AllowedIPs          = 10.0.0.0/8
-PersistentKeepalive = 25
-CONF
+      echo "Login failed — $CONFIG_FILE is empty. Edit it and re-run: wantasticd login"
     fi
   fi
 else
-  echo "Skipping login. Run 'wantasticd login' or re-install with --login to authenticate."
+  echo "Skipping login. Run 'wantasticd login' to authenticate."
 fi
 
 # ── init system detection ─────────────────────────────────────────────────────
@@ -232,7 +224,8 @@ start_service() {
 EOF
   chmod +x /etc/init.d/wantasticd
   /etc/init.d/wantasticd enable
-  /etc/init.d/wantasticd restart
+  /etc/init.d/wantasticd stop 2>/dev/null || true
+  /etc/init.d/wantasticd start
   echo "Service registered with procd and started."
 }
 

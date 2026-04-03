@@ -393,18 +393,33 @@ func traverseMeshSignals(node *MeshNode, signals map[string]int) {
 		return
 	}
 
-	macLower := strings.ToLower(node.MAC)
-	if node.Signal == 0 && macLower != "" {
-		if sig, ok := signals[macLower]; ok {
-			node.Signal = sig
-		} else if len(macLower) >= 14 {
-			// Fuzzy match: mesh MACs can differ in last byte per interface
-			prefix := macLower[:14]
-			for mapMac, sig := range signals {
-				if len(mapMac) >= 14 && strings.HasPrefix(mapMac, prefix) {
-					node.Signal = sig
-					break
+	if node.Signal == 0 {
+		// Try backhaul MAC first (most reliable for EasyMesh/QSDK — it appears
+		// in the parent's station dump, unlike the device's primary MAC).
+		candidates := []string{
+			strings.ToLower(node.Backhaul),
+			strings.ToLower(node.MAC),
+		}
+		for _, mac := range candidates {
+			if mac == "" {
+				continue
+			}
+			if sig, ok := signals[mac]; ok {
+				node.Signal = sig
+				break
+			}
+			// Fuzzy prefix match: last byte can differ per radio interface
+			if len(mac) >= 14 {
+				prefix := mac[:14]
+				for mapMac, sig := range signals {
+					if len(mapMac) >= 14 && strings.HasPrefix(mapMac, prefix) {
+						node.Signal = sig
+						break
+					}
 				}
+			}
+			if node.Signal != 0 {
+				break
 			}
 		}
 	}

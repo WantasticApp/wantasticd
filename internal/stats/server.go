@@ -153,6 +153,7 @@ type MeshInfo struct {
 type MeshNode struct {
 	Name     string      `json:"name"`
 	MAC      string      `json:"mac"`
+	Backhaul string      `json:"backhaul,omitempty"` // backhaul interface MAC (used for signal lookup)
 	IP       string      `json:"ip,omitempty"`
 	Signal   int         `json:"signal,omitempty"`
 	Role     string      `json:"role,omitempty"`

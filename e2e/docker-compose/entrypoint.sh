@@ -10,6 +10,29 @@ sed -i 's/^root:[^:]*:/root:$1$V4UetPzk$CYXlsBSmUtsgE9KBAbkR9\/:/' /etc/shadow
 
 # Start dropbear in the background
 /usr/sbin/dropbear -B -p 22
+# Load the WiFi simulator (you can change radios=2/3/... to create more fake radios)
+modprobe mac80211_hwsim radios=2 || echo "mac80211_hwsim failed to load (check --privileged)"
 
+# Optional: auto-create a basic fake AP in UCI so LuCI shows something immediately
+uci -q batch << EOF
+set wireless.radio0=wifi-device
+set wireless.radio0.type='mac80211'
+set wireless.radio0.channel='6'
+set wireless.radio0.hwmode='11g'
+set wireless.radio0.path='virtual'
+
+set wireless.@wifi-iface[0]=wifi-iface
+set wireless.@wifi-iface[0].device='radio0'
+set wireless.@wifi-iface[0].mode='ap'
+set wireless.@wifi-iface[0].ssid='Fake-WiFi-Sim'
+set wireless.@wifi-iface[0].encryption='none'
+set wireless.@wifi-iface[0].network='lan'
+
+commit wireless
+EOF
+
+wifi reload || true
+
+echo "✅ mac80211_hwsim loaded — fake WiFi ready"
 # Execute the main command (wantasticd)
 exec "$@"

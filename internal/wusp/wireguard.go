@@ -296,19 +296,3 @@ var AllWireGuardParams = concat(
 	WireGuardTunnelInterfaceParams,
 	WireGuardPeerParams,
 )
-
-// iptr returns a pointer to the given int64 value. Used in Limits.Min/Max.
-func iptr(v int64) *int64 { return &v }
-
-// concat merges multiple []Param slices into one.
-func concat(slices ...[]Param) []Param {
-	n := 0
-	for _, s := range slices {
-		n += len(s)
-	}
-	out := make([]Param, 0, n)
-	for _, s := range slices {
-		out = append(out, s...)
-	}
-	return out
-}

@@ -133,10 +133,10 @@ func TagForParamType(pt ParamType) TypeTag {
 // without heap allocation.
 type Value struct {
 	Tag  TypeTag
-	ival int64    // TagFalse/TagTrue (unused), TagUint (uint64 cast), TagInt, TagTime
-	fval float64  // TagFloat
-	blob []byte   // TagString, TagBytes, TagIP4, TagIP6, TagIP4Pfx, TagIP6Pfx, TagMAC
-	list []Value  // TagList
+	ival int64   // TagFalse/TagTrue (unused), TagUint (uint64 cast), TagInt, TagTime
+	fval float64 // TagFloat
+	blob []byte  // TagString, TagBytes, TagIP4, TagIP6, TagIP4Pfx, TagIP6Pfx, TagMAC
+	list []Value // TagList
 }
 
 // Null returns a null Value.
@@ -407,8 +407,8 @@ const (
 
 // EncodeOptions controls encoding behaviour.
 type EncodeOptions struct {
-	Compress        bool // compress payload with LZ4 block
-	IncludeDeviceID bool
+	Compress         bool // compress payload with LZ4 block
+	IncludeDeviceID  bool
 	IncludeTimestamp bool
 }
 
@@ -846,10 +846,10 @@ func (r *rbuf) readStr() (string, error) {
 // ---------------------------------------------------------------------------
 
 const (
-	lz4HashLog  = 12                  // 4096-entry table — fits in L1 cache
+	lz4HashLog  = 12 // 4096-entry table — fits in L1 cache
 	lz4HashSize = 1 << lz4HashLog
 	lz4MinMatch = 4
-	lz4LastLits = 5    // last 5 bytes must be literals per spec
+	lz4LastLits = 5 // last 5 bytes must be literals per spec
 	lz4MFLimit  = lz4MinMatch + lz4LastLits
 )
 
@@ -880,9 +880,9 @@ func (s *lz4State) compress(src []byte) []byte {
 	bound := len(src) + len(src)/255 + 16
 	dst := make([]byte, bound)
 
-	ip := 0      // current read position
-	op := 0      // current write position in dst
-	anchor := 0  // start of pending literal run
+	ip := 0     // current read position
+	op := 0     // current write position in dst
+	anchor := 0 // start of pending literal run
 	limit := len(src) - lz4MFLimit
 
 	for ip <= limit {
@@ -891,7 +891,7 @@ func (s *lz4State) compress(src []byte) []byte {
 		s.table[h] = int32(ip + 1)
 
 		// Validate match: same 4 bytes, within 65535 byte window, forward ref.
-		if ref >= 0 && ip-ref <= 65535 &&
+		if ref >= 0 && ref < ip && ip-ref <= 65535 &&
 			src[ref] == src[ip] && src[ref+1] == src[ip+1] &&
 			src[ref+2] == src[ip+2] && src[ref+3] == src[ip+3] {
 

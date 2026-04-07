@@ -11,9 +11,13 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # add 8.8.8.8 in /etc/resolv.conf to ensure network access for opkg
 # OpenWrt requires /var/lock for opkg to work correctly in some containerized environments
 RUN mkdir -p /var/lock
+# Install original packages + LuCI + uhttpd (the official web server for LuCI)
 RUN opkg update && \
-    opkg install iperf3 iputils-ping dropbear curl ca-bundle tar || \
+    opkg install iperf3 iputils-ping dropbear curl ca-bundle tar luci uhttpd || \
     echo "WARNING: opkg install failed (network/feed issue) — continuing without optional packages"
+
+# Enable uhttpd on boot (so LuCI starts automatically)
+RUN /etc/init.d/uhttpd enable || true
 
 WORKDIR /app
 COPY e2e/docker-compose/entrypoint.sh /entrypoint.sh

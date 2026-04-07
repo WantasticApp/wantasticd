@@ -52,10 +52,10 @@ const (
 // Only the fields relevant to the type need to be filled in.
 type Limits struct {
 	// Numeric bounds (int / unsignedInt / long / unsignedLong / decimal).
-	Min    *int64
-	Max    *int64
-	MinF   *float64 // decimal lower bound
-	MaxF   *float64 // decimal upper bound
+	Min  *int64
+	Max  *int64
+	MinF *float64 // decimal lower bound
+	MaxF *float64 // decimal upper bound
 
 	// String / base64 / hexBinary length.
 	MinLength int
@@ -115,14 +115,14 @@ type Object struct {
 // Convenience helpers for limit construction.
 // ---------------------------------------------------------------------------
 
-func intPtr(v int64) *int64   { return &v }
+func intPtr(v int64) *int64     { return &v }
 func f64Ptr(v float64) *float64 { return &v }
 
-func maxLen(n int) Limits     { return Limits{MaxLength: n} }
+func maxLen(n int) Limits { return Limits{MaxLength: n} }
 func bounded(lo, hi int64) Limits {
 	return Limits{Min: intPtr(lo), Max: intPtr(hi)}
 }
-func minBound(lo int64) Limits { return Limits{Min: intPtr(lo)} }
+func minBound(lo int64) Limits    { return Limits{Min: intPtr(lo)} }
 func enumL(vals ...string) Limits { return Limits{Enums: vals} }
 func maxLenEnum(n int, vals ...string) Limits {
 	return Limits{MaxLength: n, Enums: vals}
@@ -140,7 +140,7 @@ var DeviceRootParams = []Param{
 		Type:         TypeString,
 		Access:       ReadOnly,
 		SinceVersion: "2.4",
-		Description:  "Indicates the highest version of the BBF standard data model the agent supports. Format: \"<major>.<minor>\", e.g. \"2.20\".",
+		Description:  "Indicates the highest version of the BBF standard data model the agent supports. Format: \"<major>.<minor>\", e.g. \"" + BroadbandRootDataModelVersion + "\".",
 		Limits:       maxLen(32),
 	},
 	{
@@ -1182,31 +1182,4 @@ var DeviceLocalAgentParams = []Param{
 		Description:  "Maximum number of concurrent subscriptions supported (-1 = no limit).",
 		Limits:       minBound(-1),
 	},
-}
-
-// ---------------------------------------------------------------------------
-// AllDeviceParams aggregates every Param slice for easy iteration.
-// ---------------------------------------------------------------------------
-
-// AllDeviceParams is the union of all Device.* parameter slices defined in
-// this file. Consumers can range over it to build USP Get parameter lists,
-// schema validators, or human-readable documentation.
-// AllDeviceParams is populated by init() so that wireguard.go (and future
-// sub-tree files) can append their params after their own vars are ready.
-var AllDeviceParams []Param
-
-func init() {
-	AllDeviceParams = concat(
-		DeviceRootParams,
-		DeviceInfoParams,
-		DeviceTimeParams,
-		DeviceIPParams,
-		DeviceFirewallParams,
-		DeviceNATParams,
-		DeviceBulkDataParams,
-		DeviceLocalAgentParams,
-		AllWireGuardParams,       // wireguard.go — Device.WireGuard.*
-		AllManagementServerParams, // tr069.go    — Device.ManagementServer.* (CWMP/TR-069)
-		AllLocalAgentSubParams,    // tr369.go    — Device.LocalAgent.* sub-tables (USP/TR-369)
-	)
 }

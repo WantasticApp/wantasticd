@@ -619,6 +619,9 @@ func collectEasyMesh() *MeshInfo {
 		Role:     "agent",
 		IsCenter: isController,
 	}
+	if meshName := readEasyMeshName(); meshName != "" {
+		mesh.Name = meshName
+	}
 	if isController {
 		mesh.Role = "controller"
 	}
@@ -628,18 +631,20 @@ func collectEasyMesh() *MeshInfo {
 		nodeMap := make(map[string]*MeshNode)
 
 		for _, n := range data.Nodes {
+			mac := normalizeMAC(n.MAC)
 			node := &MeshNode{
-				MAC:  n.MAC,
+				MAC:  mac,
 				Role: n.Type,
 			}
-			nodeMap[n.MAC] = node
+			nodeMap[mac] = node
 		}
 
 		for _, n := range data.Nodes {
+			mac := normalizeMAC(n.MAC)
 			if n.Upstream == "" || n.Upstream == "00:00:00:00:00:00" {
-				root.Children = append(root.Children, nodeMap[n.MAC])
-			} else if parent, ok := nodeMap[strings.ToLower(n.Upstream)]; ok {
-				parent.Children = append(parent.Children, nodeMap[n.MAC])
+				root.Children = append(root.Children, nodeMap[mac])
+			} else if parent, ok := nodeMap[normalizeMAC(n.Upstream)]; ok {
+				parent.Children = append(parent.Children, nodeMap[mac])
 			}
 		}
 		mesh.Topology = root
@@ -647,11 +652,13 @@ func collectEasyMesh() *MeshInfo {
 
 	if mesh.Role == "agent" {
 		if controllerMAC, err := readUCIValue("multiap", "agent", "controller_mac"); err == nil {
-			mesh.Name = "EasyMesh Node"
+			if mesh.Name == "" {
+				mesh.Name = "EasyMesh Node"
+			}
 			if mesh.Topology == nil {
 				mesh.Topology = &MeshNode{
 					Name: "Upstream Controller",
-					MAC:  controllerMAC,
+					MAC:  normalizeMAC(controllerMAC),
 					Role: "controller",
 				}
 			}
@@ -691,6 +698,48 @@ func readUCIValue(config, section, option string) (string, error) {
 	return "", fmt.Errorf("UCI value not found")
 }
 
+func readEasyMeshName() string {
+	name, err := readUCIValue("repacd", "MAPConfig", "FronthaulSSID")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(name)
+}
+
+func readQSDKStationSignals() map[string]int {
+	signals := make(map[string]int)
+
+	if !ubusAvailable() {
+		return signals
+	}
+
+	out, err := ubusCall("device", "getStaList", 5*time.Second)
+	if err != nil {
+		return signals
+	}
+
+	var data struct {
+		Station []struct {
+			MAC  string `json:"mac"`
+			RSSI int    `json:"rssi"`
+		} `json:"station"`
+	}
+
+	if err := json.Unmarshal(out, &data); err != nil {
+		return signals
+	}
+
+	for _, station := range data.Station {
+		mac := normalizeMAC(station.MAC)
+		if mac == "" || station.RSSI == 0 {
+			continue
+		}
+		signals[mac] = station.RSSI
+	}
+
+	return signals
+}
+
 func collectQSDKMesh() *MeshInfo {
 	if !ubusAvailable() {
 		return nil
@@ -725,15 +774,23 @@ func collectQSDKMesh() *MeshInfo {
 		Role:     "controller",
 		IsCenter: true,
 	}
+	if meshName := readEasyMeshName(); meshName != "" {
+		mesh.Name = meshName
+	}
 
 	nodeMap := make(map[string]*MeshNode)
 	var root *MeshNode
 
 	for _, n := range data.Topo {
+		mac := normalizeMAC(n.MAC)
+		nodeName := n.Name
+		if nodeName == "" && n.Hops == 0 && mesh.Name != "" {
+			nodeName = mesh.Name
+		}
 		node := &MeshNode{
-			Name:     n.Name,
-			MAC:      n.MAC,
-			Backhaul: n.Backhaul,
+			Name:     nodeName,
+			MAC:      mac,
+			Backhaul: normalizeMAC(n.Backhaul),
 			IP:       n.IP,
 			Role:     "agent",
 		}
@@ -741,28 +798,34 @@ func collectQSDKMesh() *MeshInfo {
 			node.Role = "controller"
 			root = node
 		}
-		nodeMap[n.MAC] = node
+		nodeMap[mac] = node
 	}
 
 	for _, n := range data.Topo {
 		if n.PMAC == "" {
 			continue
 		}
-		child := nodeMap[n.MAC]
-		parent, ok := nodeMap[n.PMAC]
+		child := nodeMap[normalizeMAC(n.MAC)]
+		parent, ok := nodeMap[normalizeMAC(n.PMAC)]
 		if ok {
 			parent.Children = append(parent.Children, child)
 		}
 	}
 
 	if root != nil {
+		if root.Name == "" && mesh.Name != "" {
+			root.Name = mesh.Name
+		}
 		mesh.Topology = root
 	} else if len(nodeMap) > 0 {
 		for _, n := range data.Topo {
 			if n.PMAC == "" {
-				root = nodeMap[n.MAC]
+				root = nodeMap[normalizeMAC(n.MAC)]
 				break
 			}
+		}
+		if root != nil && root.Name == "" && mesh.Name != "" {
+			root.Name = mesh.Name
 		}
 		mesh.Topology = root
 	}

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -52,11 +51,11 @@ func New(cfg *config.Config) (*Agent, error) {
 	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
 
 	agt := &Agent{
-		config:    cfg,
-		device:    dev,
-		updater:   updater,
-		stats:     statsServer,
-		stopCh:    make(chan struct{}),
+		config:  cfg,
+		device:  dev,
+		updater: updater,
+		stats:   statsServer,
+		stopCh:  make(chan struct{}),
 	}
 	agt.apiServer = NewAPIServer(agt)
 	return agt, nil
@@ -299,18 +298,9 @@ func (a *Agent) SetExitNode(peerPubKey string) error {
 		return fmt.Errorf("no server configured for exit node coordination")
 	}
 
-	data := make([]byte, 33)
-	if peerPubKey == "none" {
-		data[0] = 3 // Action 3: Client Request Routing (All zeros = Direct Mode / Disable Exit Node)
-	} else {
-		// Ensure peerPubKey hex converts successfully
-		decoded, err := hex.DecodeString(peerPubKey)
-		if err != nil || len(decoded) != 32 {
-			return fmt.Errorf("invalid peer public key for routing: %s", peerPubKey)
-		}
-
-		data[0] = 3 // Action 3: Client requests server to establish exit node route
-		copy(data[1:], decoded)
+	data, err := device.EncodeExitNodeSelectionTUNControl(peerPubKey)
+	if err != nil {
+		return fmt.Errorf("invalid peer public key for routing: %w", err)
 	}
 
 	log.Printf("[Agent] Sending Exit Node Routing request to peer %s via Noise Protocol TUN control", peerPubKey)
@@ -326,13 +316,7 @@ func (a *Agent) ToggleOfferExitNode() error {
 	a.mu.Unlock()
 
 	if serverPubKey != "" && a.device != nil {
-		data := make([]byte, 2)
-		data[0] = 4 // Action 4: Toggle Offer Exit Node status updates
-		if enabled {
-			data[1] = 1
-		} else {
-			data[1] = 0
-		}
+		data := device.EncodeExitNodeOfferTUNControl(enabled)
 		log.Printf("[Agent] Sending Exit Node offer status (%v) to server via Noise Protocol", enabled)
 		return a.device.SendTUNControl(serverPubKey, data)
 	}

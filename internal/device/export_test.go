@@ -1,13 +1,9 @@
 package device
 
-// export_test.go — integration tests for the msg-type-8 export flow.
+// export_test.go covers the TUN-control export request/result flow.
 //
-// Tests are in the same package (device) so they can access unexported types
-// and functions (decodeExportDevicePayload, exportConfirmPayload, etc.).
-//
-// Tests that exercise handleExportDevice use a mockGRPCClient that satisfies
-// the exportGRPCClient interface, allowing full flow testing without a real
-// gRPC server or TUN device for the early-abort paths.
+// Tests are in the same package so they can access unexported helpers such as
+// decodeExportRequest and exportResultPayload.
 
 import (
 	"bytes"
@@ -25,15 +21,15 @@ import (
 
 func TestMain(m *testing.M) {
 	// Disable retry backoff so tests don't take 6s per case.
-	exportConfirmSleep = 0 * time.Second
+	exportResultRetrySleep = 0 * time.Second
 	os.Exit(m.Run())
 }
 
 // ── mock gRPC client ──────────────────────────────────────────────────────
 
 type mockGRPCClient struct {
-	validateFn  func(ctx context.Context, token string) (bool, error)
-	registerFn  func(ctx context.Context, accountID, pubKeyHex string) (*wantasticgrpc.ExportPeerInfo, error)
+	validateFn func(ctx context.Context, token string) (bool, error)
+	registerFn func(ctx context.Context, accountID, pubKeyHex string) (*wantasticgrpc.ExportPeerInfo, error)
 }
 
 func (m *mockGRPCClient) ValidateExportToken(ctx context.Context, token string) (bool, error) {
@@ -57,8 +53,8 @@ func (m *mockGRPCClient) RegisterPeer(ctx context.Context, accountID, pubKeyHex 
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-// buildExportPayload encodes the four TLV fields of a subtype-8 message body.
-func buildExportPayload(accountID, network, endpoint, token string) []byte {
+// buildExportRequestPayload encodes the four TLV fields of an export-request body.
+func buildExportRequestPayload(accountID, network, endpoint, token string) []byte {
 	appendField := func(buf []byte, s string) []byte {
 		buf = append(buf, byte(len(s)))
 		buf = append(buf, []byte(s)...)
@@ -72,11 +68,11 @@ func buildExportPayload(accountID, network, endpoint, token string) []byte {
 	return b
 }
 
-// ── decodeExportDevicePayload ─────────────────────────────────────────────
+// ── decodeExportRequest ──────────────────────────────────────────────────
 
-func TestDecodeExportDevicePayload_Happy(t *testing.T) {
-	data := buildExportPayload("acct-123", "net-a", "srv.example.com:52990", "tok-xyz")
-	p, err := decodeExportDevicePayload(data)
+func TestDecodeExportRequest_Happy(t *testing.T) {
+	data := buildExportRequestPayload("acct-123", "net-a", "srv.example.com:52990", "tok-xyz")
+	p, err := decodeExportRequest(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -94,26 +90,26 @@ func TestDecodeExportDevicePayload_Happy(t *testing.T) {
 	}
 }
 
-func TestDecodeExportDevicePayload_Empty(t *testing.T) {
-	_, err := decodeExportDevicePayload([]byte{})
+func TestDecodeExportRequest_Empty(t *testing.T) {
+	_, err := decodeExportRequest([]byte{})
 	if err == nil {
 		t.Fatal("expected error for empty payload, got nil")
 	}
 }
 
-func TestDecodeExportDevicePayload_Truncated(t *testing.T) {
-	full := buildExportPayload("acct", "net", "ep", "tok")
+func TestDecodeExportRequest_Truncated(t *testing.T) {
+	full := buildExportRequestPayload("acct", "net", "ep", "tok")
 	for cut := 1; cut < len(full); cut++ {
-		_, err := decodeExportDevicePayload(full[:cut])
+		_, err := decodeExportRequest(full[:cut])
 		if err == nil {
 			t.Errorf("expected error for truncated payload at %d bytes, got nil", cut)
 		}
 	}
 }
 
-func TestDecodeExportDevicePayload_TooLarge(t *testing.T) {
+func TestDecodeExportRequest_TooLarge(t *testing.T) {
 	big := make([]byte, maxExportPayloadSize+1)
-	_, err := decodeExportDevicePayload(big)
+	_, err := decodeExportRequest(big)
 	if err == nil {
 		t.Fatal("expected error for oversized payload, got nil")
 	}
@@ -122,35 +118,35 @@ func TestDecodeExportDevicePayload_TooLarge(t *testing.T) {
 	}
 }
 
-func TestDecodeExportDevicePayload_ExactMaxSize(t *testing.T) {
+func TestDecodeExportRequest_ExactMaxSize(t *testing.T) {
 	// A payload exactly at the limit should be attempted (may still fail on parse,
 	// but should not be rejected as "too large").
 	big := make([]byte, maxExportPayloadSize)
-	_, err := decodeExportDevicePayload(big)
+	_, err := decodeExportRequest(big)
 	if err != nil && strings.Contains(err.Error(), "too large") {
 		t.Errorf("payload at exact limit should not be rejected as too large: %v", err)
 	}
 }
 
-func TestDecodeExportDevicePayload_MissingTrailingField(t *testing.T) {
+func TestDecodeExportRequest_MissingTrailingField(t *testing.T) {
 	// Only three fields — missing token.
 	var b []byte
 	for _, s := range []string{"acct", "net", "ep"} {
 		b = append(b, byte(len(s)))
 		b = append(b, []byte(s)...)
 	}
-	_, err := decodeExportDevicePayload(b)
+	_, err := decodeExportRequest(b)
 	if err == nil {
 		t.Fatal("expected error for payload with missing token field")
 	}
 }
 
-// ── exportConfirmPayload.encode ───────────────────────────────────────────
+// ── exportResultPayload.encode ────────────────────────────────────────────
 
-func TestExportConfirmPayload_Encode_Basic(t *testing.T) {
+func TestExportResultPayload_Encode_Basic(t *testing.T) {
 	var pubKey [32]byte
 	pubKey[0] = 0xAB
-	p := &exportConfirmPayload{
+	p := &exportResultPayload{
 		Status:      0,
 		NewPubKey:   pubKey,
 		ExportToken: "tok",
@@ -183,8 +179,8 @@ func TestExportConfirmPayload_Encode_Basic(t *testing.T) {
 	}
 }
 
-func TestExportConfirmPayload_Encode_FailureStatus(t *testing.T) {
-	p := &exportConfirmPayload{Status: 1, Message: "auth error"}
+func TestExportResultPayload_Encode_FailureStatus(t *testing.T) {
+	p := &exportResultPayload{Status: 1, Message: "auth error"}
 	buf := p.encode()
 	if buf[0] != 1 {
 		t.Errorf("failure status should be 1, got %d", buf[0])
@@ -197,9 +193,9 @@ func TestExportConfirmPayload_Encode_FailureStatus(t *testing.T) {
 	}
 }
 
-func TestExportConfirmPayload_Encode_LongTokenCapped(t *testing.T) {
+func TestExportResultPayload_Encode_LongTokenCapped(t *testing.T) {
 	longToken := strings.Repeat("x", maxExportFieldLen+50)
-	p := &exportConfirmPayload{ExportToken: longToken}
+	p := &exportResultPayload{ExportToken: longToken}
 	buf := p.encode()
 	// Token length byte must fit in a uint8 (≤ 255).
 	tokenLenByte := int(buf[33])
@@ -208,9 +204,9 @@ func TestExportConfirmPayload_Encode_LongTokenCapped(t *testing.T) {
 	}
 }
 
-func TestExportConfirmPayload_Encode_LongMessageCapped(t *testing.T) {
+func TestExportResultPayload_Encode_LongMessageCapped(t *testing.T) {
 	longMsg := strings.Repeat("m", maxExportFieldLen+100)
-	p := &exportConfirmPayload{Message: longMsg}
+	p := &exportResultPayload{Message: longMsg}
 	buf := p.encode()
 	// len(token) == 0, so message len byte is at offset 34.
 	msgLenByte := int(buf[34])
@@ -219,8 +215,8 @@ func TestExportConfirmPayload_Encode_LongMessageCapped(t *testing.T) {
 	}
 }
 
-func TestExportConfirmPayload_Encode_TotalLength(t *testing.T) {
-	p := &exportConfirmPayload{
+func TestExportResultPayload_Encode_TotalLength(t *testing.T) {
+	p := &exportResultPayload{
 		ExportToken: "abc",
 		Message:     "def",
 	}
@@ -231,15 +227,15 @@ func TestExportConfirmPayload_Encode_TotalLength(t *testing.T) {
 	}
 }
 
-// ── handleExportDevice: early-abort paths ─────────────────────────────────
+// ── handleExportRequest: early-abort paths ────────────────────────────────
 //
 // These tests check paths that do not need a running WireGuard device:
 //   - malformed payload → log and return (no crash)
-//   - no gRPC client set → sendExportConfirm(1,...) → SendTUNControl fails
+//   - no gRPC client set → sendExportResult(1,...) → SendTUNControl fails
 //     gracefully because d.device == nil (returns error, doesn't panic)
 //   - token validation failure → same graceful path
 
-// minimalDevice returns a Device with a non-nil config so that sendExportConfirm
+// minimalDevice returns a Device with a non-nil config so that sendExportResult
 // can safely read config fields without panicking. The WG device (d.device) is
 // left nil, so SendTUNControl will return an error rather than panic — which is
 // the expected behaviour for all early-abort test paths.
@@ -250,54 +246,54 @@ func minimalDevice() *Device {
 	}
 }
 
-func TestHandleExportDevice_BadPayload(t *testing.T) {
-	// decodeExportDevicePayload returns error → early return before any gRPC/WG call.
+func TestHandleExportRequest_BadPayload(t *testing.T) {
+	// decodeExportRequest returns error → early return before any gRPC/WG call.
 	d := minimalDevice()
-	d.handleExportDevice([]byte{})
+	d.handleExportRequest([]byte{})
 }
 
-func TestHandleExportDevice_OversizedPayload(t *testing.T) {
+func TestHandleExportRequest_OversizedPayload(t *testing.T) {
 	d := minimalDevice()
 	big := make([]byte, maxExportPayloadSize+10)
-	d.handleExportDevice(big)
+	d.handleExportRequest(big)
 }
 
-func TestHandleExportDevice_NoGRPCClient(t *testing.T) {
+func TestHandleExportRequest_NoGRPCClient(t *testing.T) {
 	// Valid payload, no gRPC client → sends failure confirmation.
 	// SendTUNControl returns error (d.device==nil) so retries exhaust silently.
 	d := minimalDevice()
-	data := buildExportPayload("acct", "net", "ep:1234", "tok")
-	d.handleExportDevice(data)
+	data := buildExportRequestPayload("acct", "net", "ep:1234", "tok")
+	d.handleExportRequest(data)
 }
 
-func TestHandleExportDevice_TokenValidationFails(t *testing.T) {
+func TestHandleExportRequest_TokenValidationFails(t *testing.T) {
 	d := minimalDevice()
 	d.grpcClient = &mockGRPCClient{
 		validateFn: func(_ context.Context, _ string) (bool, error) {
 			return false, nil
 		},
 	}
-	data := buildExportPayload("acct", "net", "ep:1234", "tok")
-	d.handleExportDevice(data)
+	data := buildExportRequestPayload("acct", "net", "ep:1234", "tok")
+	d.handleExportRequest(data)
 }
 
-func TestHandleExportDevice_TokenValidationError(t *testing.T) {
+func TestHandleExportRequest_TokenValidationError(t *testing.T) {
 	d := minimalDevice()
 	d.grpcClient = &mockGRPCClient{
 		validateFn: func(_ context.Context, _ string) (bool, error) {
 			return false, errors.New("network unreachable")
 		},
 	}
-	data := buildExportPayload("acct", "net", "ep:1234", "tok")
-	d.handleExportDevice(data)
+	data := buildExportRequestPayload("acct", "net", "ep:1234", "tok")
+	d.handleExportRequest(data)
 }
 
-func TestHandleExportDevice_ConcurrentExportRejected(t *testing.T) {
+func TestHandleExportRequest_ConcurrentExportRejected(t *testing.T) {
 	exportInProgress.Store(1)
 	defer exportInProgress.Store(0)
 
 	d := minimalDevice()
-	data := buildExportPayload("acct", "net", "ep:1234", "tok")
+	data := buildExportRequestPayload("acct", "net", "ep:1234", "tok")
 	called := false
 	d.grpcClient = &mockGRPCClient{
 		validateFn: func(_ context.Context, _ string) (bool, error) {
@@ -305,23 +301,23 @@ func TestHandleExportDevice_ConcurrentExportRejected(t *testing.T) {
 			return true, nil
 		},
 	}
-	d.handleExportDevice(data)
+	d.handleExportRequest(data)
 	if called {
 		t.Error("gRPC client should not be called when export is already in progress")
 	}
 }
 
-// ── decodeExportDevicePayload: round-trip with all ASCII printables ────────
+// ── decodeExportRequest: round-trip with all ASCII printables ─────────────
 
-func TestDecodeExportDevicePayload_SpecialChars(t *testing.T) {
+func TestDecodeExportRequest_SpecialChars(t *testing.T) {
 	cases := []struct{ account, network, endpoint, token string }{
 		{"a", "b", "c:1", "d"},
 		{"acct-1", "net/a", "192.168.1.1:51820", "Bearer eyJhbG"},
 		{"", "", "localhost:52990", "tok"},
 	}
 	for _, tc := range cases {
-		data := buildExportPayload(tc.account, tc.network, tc.endpoint, tc.token)
-		p, err := decodeExportDevicePayload(data)
+		data := buildExportRequestPayload(tc.account, tc.network, tc.endpoint, tc.token)
+		p, err := decodeExportRequest(data)
 		if err != nil {
 			t.Errorf("case %+v: unexpected error: %v", tc, err)
 			continue
@@ -382,14 +378,14 @@ func TestCheckWritable_ReadOnlyFile(t *testing.T) {
 	}
 }
 
-// ── exportConfirmPayload encode/decode symmetry ───────────────────────────
+// ── exportResultPayload encode/decode symmetry ────────────────────────────
 
-func TestExportConfirmPayload_Roundtrip(t *testing.T) {
+func TestExportResultPayload_Roundtrip(t *testing.T) {
 	var key [32]byte
 	for i := range key {
 		key[i] = byte(i)
 	}
-	p := &exportConfirmPayload{
+	p := &exportResultPayload{
 		Status:      0,
 		NewPubKey:   key,
 		ExportToken: "export-token-abc",

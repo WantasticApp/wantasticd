@@ -222,6 +222,10 @@ func (d *Device) handleStats(peer *wgdevice.Peer, data []byte) {
 		return
 	}
 
+	if pubKey := peer.PublicKeyHex(); pubKey != "" {
+		d.setPeerHostname(pubKey, metrics.Hostname)
+	}
+
 	// Log a summary
 	log.Printf("STATS from %v: TS=%d, Host=%s, CPU=%s, Mem=%d/%d, WiFi=%v (%d dBm)",
 		peer, metrics.Timestamp, metrics.Hostname, metrics.CPU.Usage,

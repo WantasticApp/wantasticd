@@ -40,7 +40,10 @@ func setupTUNInterface(tunName string, addrs []netip.Prefix) error {
 	return nil
 }
 
-// addRouteOS adds a system route dynamically pointing to the TUN interface
+// addRouteOS adds a system route pointing to the TUN interface.
+// It deletes any existing route for the same destination first so the
+// operation is idempotent across daemon restarts (stale routes from a
+// previous run pointing to a now-dead utun index are removed automatically).
 func addRouteOS(tunName string, network string) error {
 	prefix, err := netip.ParsePrefix(network)
 	if err != nil {
@@ -52,8 +55,11 @@ func addRouteOS(tunName string, network string) error {
 		family = "-inet6"
 	}
 
+	// Remove any stale route for this destination (ignore errors — it may not exist).
+	exec.Command("route", "-q", "-n", "delete", family, network).Run()
+
 	log.Printf("[TUN] Adding macOS route %s via %s", network, tunName)
-	cmd := exec.Command("route", "-q", "-n", "add", family, network, "-interface", tunName)
+	cmd := exec.Command("route", "-n", "add", family, network, "-interface", tunName)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("route add failed: %v, output: %s", err, out)
@@ -74,7 +80,7 @@ func removeRouteOS(tunName string, network string) error {
 	}
 
 	log.Printf("[TUN] Removing macOS route %s via %s", network, tunName)
-	cmd := exec.Command("route", "-q", "-n", "delete", family, network, "-interface", tunName)
+	cmd := exec.Command("route", "-n", "delete", family, network, "-interface", tunName)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("route delete failed: %v, output: %s", err, out)

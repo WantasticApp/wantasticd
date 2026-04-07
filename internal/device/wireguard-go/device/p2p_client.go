@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"net/netip"
 	"sync"
 	"time"
 
@@ -17,10 +16,11 @@ import (
 type P2PClient struct {
 	device *Device
 
-	myID         uint32
-	myPublicKey  NoisePublicKey
-	localAddr    net.UDPAddr
-	observedAddr net.UDPAddr
+	myID          uint32
+	myPublicKey   NoisePublicKey
+	serverPeerKey NoisePublicKey
+	localAddr     net.UDPAddr
+	observedAddr  net.UDPAddr
 
 	// Discovered peers
 	peers map[uint32]*DiscoveredPeer
@@ -169,9 +169,6 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 
 	c.mu.Lock()
 
-	var toConfigure []string
-	var toConfigureIDs []uint32
-
 	offset := 4
 	for i := uint32(0); i < count; i++ {
 		peer := &DiscoveredPeer{
@@ -187,43 +184,35 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		peer.AssignedIP = net.IP(msg.Payload[offset+74 : offset+78])
 		peer.State = P2PStateDiscovered
 
-		// Don't overwrite existing established connections
-		if existing, ok := c.peers[peer.ID]; !ok || existing.State != P2PStateEstablished {
-			c.peers[peer.ID] = peer
-
-			// Prepare to dynamically add this P2P peer to the WireGuard configuration
-			if len(peer.AssignedIP) == 4 && !peer.AssignedIP.Equal(net.IPv4zero) {
-				conf := fmt.Sprintf("public_key=%x\nallowed_ip=%s/32\npersistent_keepalive_interval=25\n", peer.PublicKey[:], peer.AssignedIP.String())
-				toConfigure = append(toConfigure, conf)
-				toConfigureIDs = append(toConfigureIDs, peer.ID)
+		// Don't overwrite existing established or in-progress connections
+		if existing, ok := c.peers[peer.ID]; ok {
+			if existing.State == P2PStateEstablished || existing.State == P2PStateTrying {
+				offset += 78
+				continue
 			}
+			// Preserve LastUsed timing so retry backoff survives peer list refreshes
+			peer.LastUsed = existing.LastUsed
 		}
+		c.peers[peer.ID] = peer
+		// NOTE: WireGuard peer configuration is intentionally deferred until P2P
+		// hole punch succeeds (in HandlePunch). Adding the peer without an endpoint
+		// causes spurious handshake failures and breaks relay fallback because
+		// WireGuard matches traffic to the endpoint-less peer instead of routing
+		// it through the server (0.0.0.0/0).
 
 		offset += 78
 	}
 
-	c.mu.Unlock() // Unlock before configuring WireGuard to avoid deadlocks
-
-	// Configure WireGuard peers sequentially
-	for i, conf := range toConfigure {
-		if err := c.device.IpcSet(conf); err != nil {
-			c.device.log.Errorf("[P2P] Failed to dynamically configure peer %d: %v", toConfigureIDs[i], err)
-		} else {
-			c.device.log.Verbosef("[P2P] Dynamically configured WireGuard peer %d", toConfigureIDs[i])
-		}
-	}
-
-	c.device.log.Verbosef("[P2P] Discovered %d peers", count)
-
-	// Auto-try P2P for all discovered peers
-	c.mu.RLock()
+	// Auto-try P2P for all newly discovered peers
 	var toPunch []*DiscoveredPeer
 	for _, peer := range c.peers {
 		if peer.P2PCapable && peer.State == P2PStateDiscovered {
 			toPunch = append(toPunch, peer)
 		}
 	}
-	c.mu.RUnlock()
+	c.mu.Unlock()
+
+	c.device.log.Verbosef("[P2P] Discovered %d peers", count)
 
 	for _, peer := range toPunch {
 		go c.tryP2PUnlocked(peer)
@@ -232,21 +221,28 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 
 // TryP2P attempts to establish direct connection to peer
 func (c *P2PClient) TryP2P(peerID uint32) bool {
-	c.mu.Lock()
+	c.mu.RLock()
 	peer, ok := c.peers[peerID]
-	if !ok || !peer.P2PCapable || peer.State == P2PStateEstablished {
-		c.mu.Unlock()
-		return ok && peer.State == P2PStateEstablished
+	c.mu.RUnlock()
+	if !ok {
+		return false
 	}
-	peer.State = P2PStateTrying
-	c.mu.Unlock()
-
 	c.tryP2PUnlocked(peer)
 	return true
 }
 
 func (c *P2PClient) tryP2PUnlocked(peer *DiscoveredPeer) {
-	// Request server to coordinate
+	// Transition to trying state under lock to prevent concurrent punch attempts
+	c.mu.Lock()
+	if peer.State != P2PStateDiscovered {
+		c.mu.Unlock()
+		return // Already trying, established, or failed — skip
+	}
+	peer.State = P2PStateTrying
+	peer.LastUsed = time.Now()
+	c.mu.Unlock()
+
+	// Request server to coordinate hole punch
 	msg := &P2PMessage{
 		Subtype:  P2PSubtypePunchRequest,
 		TargetID: peer.ID,
@@ -283,17 +279,6 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 	copy(session.Nonce[:], msg.Nonce[:])
 	c.sessions[targetID] = session
 	c.mu.Unlock()
-
-	// If we are in TUN mode and the peer has an IP assigned, add a route for it
-	if c.device.addPeerRouteHandler != nil {
-		wgPeer := c.device.LookupPeer(peer.PublicKey)
-		if wgPeer != nil {
-			c.device.allowedips.EntriesForPeer(wgPeer, func(prefix netip.Prefix) bool {
-				c.device.addPeerRouteHandler(net.IP(prefix.Addr().AsSlice()))
-				return false // stop after first route
-			})
-		}
-	}
 
 	c.device.log.Verbosef("[P2P] Punch relay received for target %d. Observed: %v, Local: %v",
 		targetID, peer.ObservedAddr, peer.LocalAddr)
@@ -350,7 +335,8 @@ func (c *P2PClient) holePunch(session *P2PSession, peer *DiscoveredPeer) {
 	c.mu.Lock()
 	if !session.Established {
 		peer.State = P2PStateFailed
-		c.device.log.Verbosef("[P2P] Punch timeout for peer %d", peer.ID)
+		peer.LastUsed = time.Now()
+		c.device.log.Verbosef("[P2P] Punch timeout for peer %d — will retry in ~30s", peer.ID)
 	}
 	c.mu.Unlock()
 }
@@ -412,17 +398,26 @@ func (c *P2PClient) GetEndpoint(peerID uint32) conn.Endpoint {
 }
 
 func (c *P2PClient) sendToServer(msg *P2PMessage) {
-	// Find server peer (first peer with an endpoint)
+	// Prefer the peer we first registered through; that's the coordination server.
+	c.mu.RLock()
+	serverKey := c.serverPeerKey
+	c.mu.RUnlock()
+	if !serverKey.IsZero() {
+		if serverPeer := c.device.LookupPeer(serverKey); serverPeer != nil {
+			c.sendP2PMessage(serverPeer, msg)
+			return
+		}
+	}
+
+	// Before any direct peers exist, the only endpoint-bearing peer should be the server.
 	c.device.peers.RLock()
 	var serverPeer *Peer
 	for _, peer := range c.device.peers.keyMap {
 		peer.endpoint.Lock()
-		if peer.endpoint.val != nil {
-			serverPeer = peer
-		}
+		hasEndpoint := peer.endpoint.val != nil
 		peer.endpoint.Unlock()
-
-		if serverPeer != nil {
+		if hasEndpoint {
+			serverPeer = peer
 			break
 		}
 	}
@@ -431,6 +426,12 @@ func (c *P2PClient) sendToServer(msg *P2PMessage) {
 	if serverPeer == nil {
 		return
 	}
+
+	c.mu.Lock()
+	if c.serverPeerKey.IsZero() {
+		c.serverPeerKey = serverPeer.handshake.remoteStatic
+	}
+	c.mu.Unlock()
 
 	c.sendP2PMessage(serverPeer, msg)
 }
@@ -474,15 +475,16 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 	// Verify
 	if c.verifyPunchPacket(packet, session) {
 		c.mu.Lock()
-		defer c.mu.Unlock()
 
 		if peer.State == P2PStateEstablished {
+			c.mu.Unlock()
 			return // Already established
 		}
 
 		c.device.log.Verbosef("[P2P] ⚡ Punch success from %v (ID %d)", addr, peer.ID)
 
 		peer.State = P2PStateEstablished
+		peer.LastUsed = time.Now()
 		session.Established = true
 
 		// Update Endpoint to the address we received from
@@ -491,11 +493,52 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 			peer.Endpoint = ep
 		}
 
-		// Trigger WireGuard to initiate handshake immediately now that P2P pinhole is open
-		wgPeer := c.device.LookupPeer(peer.PublicKey)
-		if wgPeer != nil {
-			wgPeer.SendKeepalive()
-		}
+		// Capture values for goroutine before releasing the lock
+		pubKey := peer.PublicKey
+		assignedIP := make(net.IP, len(peer.AssignedIP))
+		copy(assignedIP, peer.AssignedIP)
+		addrStr := addr.String()
+
+		c.mu.Unlock()
+
+		// Configure WireGuard peer with the established direct endpoint.
+		// This is done after punch succeeds so WireGuard always has a reachable
+		// endpoint, and traffic for this peer's /32 actually flows. If punch had
+		// not succeeded the peer is never added to WireGuard routing, so traffic
+		// falls back through the server's 0.0.0.0/0 route (relay).
+		go c.configureWireGuardPeer(pubKey, assignedIP, addrStr)
+	}
+}
+
+// configureWireGuardPeer adds the peer to WireGuard routing with its direct P2P
+// endpoint. Called in a goroutine after hole punch succeeds so the receive path
+// is not blocked. If the peer already exists in WireGuard (e.g. from a previous
+// session) the endpoint and allowed-IPs are updated in place.
+func (c *P2PClient) configureWireGuardPeer(pubKey NoisePublicKey, assignedIP net.IP, endpointAddr string) {
+	var zeroKey [32]byte
+	if pubKey == zeroKey || len(assignedIP) != 4 || assignedIP.Equal(net.IPv4zero) {
+		c.device.log.Verbosef("[P2P] configureWireGuardPeer: skipping peer with missing key or IP")
+		return
+	}
+
+	conf := fmt.Sprintf("public_key=%x\nendpoint=%s\nallowed_ip=%s/32\npersistent_keepalive_interval=25\n",
+		pubKey[:], endpointAddr, assignedIP.String())
+	if err := c.device.IpcSet(conf); err != nil {
+		c.device.log.Errorf("[P2P] Failed to configure WireGuard peer %s via direct endpoint: %v", endpointAddr, err)
+		return
+	}
+	c.device.log.Verbosef("[P2P] Configured WireGuard peer with direct endpoint %s (allowed %s/32)", endpointAddr, assignedIP)
+
+	// Add OS-level route for the peer's IP so the kernel knows to forward
+	// packets destined for that address into the TUN interface.
+	if c.device.addPeerRouteHandler != nil {
+		c.device.addPeerRouteHandler(assignedIP)
+	}
+
+	// Trigger an immediate handshake now that WireGuard knows the endpoint.
+	wgPeer := c.device.LookupPeer(pubKey)
+	if wgPeer != nil {
+		wgPeer.SendKeepalive()
 	}
 }
 
@@ -513,17 +556,27 @@ func (c *P2PClient) maintenanceLoop() {
 		// Refresh peer list periodically
 		c.requestPeerList()
 
-		// Clean up failed/stale sessions
+		// Reset failed/stale sessions so they can be retried
 		c.mu.Lock()
+		now := time.Now()
 		for id, peer := range c.peers {
-			if peer.State == P2PStateFailed && time.Since(peer.LastUsed) > 5*time.Minute {
-				delete(c.peers, id)
-				delete(c.sessions, id)
-			}
-			// Timeout trying state
-			if peer.State == P2PStateTrying && time.Since(peer.LastUsed) > 15*time.Second {
-				peer.State = P2PStateDiscovered // Reset to retry later
-				delete(c.sessions, id)
+			switch peer.State {
+			case P2PStateFailed:
+				// After a backoff period, reset to Discovered so the next
+				// handlePeerList call will kick off a fresh punch attempt.
+				if now.Sub(peer.LastUsed) > 30*time.Second {
+					peer.State = P2PStateDiscovered
+					delete(c.sessions, id)
+					c.device.log.Verbosef("[P2P] Resetting failed peer %d for retry", id)
+				}
+			case P2PStateTrying:
+				// Guard against punch-request sent but no PunchRelay ever arrived
+				// (server unreachable, dropped packet, etc.).
+				if now.Sub(peer.LastUsed) > 30*time.Second {
+					peer.State = P2PStateDiscovered
+					delete(c.sessions, id)
+					c.device.log.Verbosef("[P2P] Resetting stalled peer %d for retry", id)
+				}
 			}
 		}
 		c.mu.Unlock()
@@ -546,4 +599,17 @@ func (c *P2PClient) GetEndpointForPeer(pk NoisePublicKey) conn.Endpoint {
 func (c *P2PClient) IsExitNode() bool {
 	// Not driven locally by P2P messages anymore; managed by system TUN routing mapping
 	return false
+}
+
+// GetDiscoveredPeers returns a snapshot of all currently discovered peers.
+// The returned slice is safe to read without holding any lock.
+func (c *P2PClient) GetDiscoveredPeers() []*DiscoveredPeer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*DiscoveredPeer, 0, len(c.peers))
+	for _, p := range c.peers {
+		cp := *p // copy so callers don't race against mutations
+		out = append(out, &cp)
+	}
+	return out
 }

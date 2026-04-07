@@ -4,14 +4,12 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
-	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,13 +43,19 @@ type Device struct {
 
 	statsProvider func() []byte
 
+	peerHostnamesMu sync.RWMutex
+	peerHostnames   map[string]string
+
 	// TUN mode fields
 	nativeTun    tun.Device // Native system TUN device (when TUNMode is enabled)
 	originalTun  tun.Device // Original TUN device from wireguard-go
 	systemRoutes []string   // System routes added for TUN mode
 
 	// Exit node routes installed dynamically
-	exitNodeRoutes []string
+	exitNodeRoutes  []string
+	exitNodePeerKey [32]byte
+	exitNodeActive  bool
+	exitNodeShared  bool
 
 	// Device netstack for P2P connection handling
 	netstack *virtstack.Net
@@ -63,8 +67,9 @@ type Device struct {
 
 func New(cfg *config.Config) (*Device, error) {
 	return &Device{
-		config: cfg,
-		stopCh: make(chan struct{}),
+		config:        cfg,
+		stopCh:        make(chan struct{}),
+		peerHostnames: make(map[string]string),
 	}, nil
 }
 
@@ -197,7 +202,28 @@ func (d *Device) Stop() error {
 
 	wg := d.device
 	td := d.tunDev
+	routes := d.systemRoutes
+	exitRoutes := d.exitNodeRoutes
+	sharedExitNode := d.exitNodeShared
+	d.systemRoutes = nil
+	d.exitNodeRoutes = nil
+	d.exitNodePeerKey = [32]byte{}
+	d.exitNodeActive = false
 	d.mu.Unlock()
+
+	// Remove all OS routes before closing the TUN interface so the
+	// kernel doesn't leave stale entries pointing at a dead utun index.
+	for _, route := range append(routes, exitRoutes...) {
+		if err := d.removeRoute(route); err != nil {
+			log.Printf("[TUN] Warning: failed to remove route %s on stop: %v", route, err)
+		}
+	}
+
+	if sharedExitNode {
+		if err := d.disableExitNodeSharing(); err != nil {
+			log.Printf("[TUN] Warning: failed to disable exit node sharing on stop: %v", err)
+		}
+	}
 
 	d.cleanupTUNMode()
 
@@ -327,32 +353,27 @@ func (d *Device) UpdateServerConfig(cfg *pb.ServerConfiguration) error {
 	return d.applyConfig()
 }
 
-// UpdateExitNodeConfig updates the device's exit node configuration
+// UpdateExitNodeConfig updates the device's local exit-node preferences.
 func (d *Device) UpdateExitNodeConfig(cfg *pb.ExitNodeConfiguration) error {
 	d.mu.Lock()
 	d.config.ExitNode.Enabled = cfg.Enabled
-	d.config.ExitNode.ExitRoutes = cfg.ExitRoutes
-	d.config.ExitNode.ExitDNS = cfg.ExitDns
+	d.config.ExitNode.ExitRoutes = append([]string(nil), cfg.ExitRoutes...)
+	d.config.ExitNode.ExitDNS = append([]string(nil), cfg.ExitDns...)
 	d.config.ExitNode.AllowLAN = cfg.AllowLan
+	activeExitNode := d.exitNodeActive
+	activePeerKey := d.exitNodePeerKey
+	sharedExitNode := d.exitNodeShared
 	d.mu.Unlock()
 
-	// If the server connection exists, send the exit node config to the peers
-	// Note: We use SendTUNControl for Message Type 7 coordination.
-	//
-	// The specification for Message Type 7 payload could just be a JSON struct,
-	// or another binary format, depending on what the Coordinator expects.
-	// For now we will serialize it to JSON.
-
-	bytesPayload, err := json.Marshal(d.config.ExitNode)
-	if err != nil {
-		return fmt.Errorf("failed to marshal exit node config for TUN control: %w", err)
+	if activeExitNode {
+		if err := d.activateExitNodeRouting(activePeerKey); err != nil {
+			return fmt.Errorf("re-apply active exit node routing: %w", err)
+		}
 	}
 
-	if d.config.Server.PublicKey != "" {
-		err := d.SendTUNControl(d.config.Server.PublicKey, bytesPayload)
-		if err != nil {
-			log.Printf("Debug: SendTUNControl for ExitNode failed (might not be online yet): %v", err)
-			return nil // Don't fail the whole update just because we couldn't dispatch yet
+	if !cfg.Enabled && sharedExitNode {
+		if err := d.disableExitNodeSharing(); err != nil {
+			return fmt.Errorf("disable exit node sharing: %w", err)
 		}
 	}
 
@@ -393,129 +414,6 @@ func (d *Device) SetStatsProvider(provider func() []byte) {
 	d.mu.RUnlock()
 }
 
-func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
-	// Handle P2P TUN control messages (message type 7)
-	// Base format: [Action:1 byte][...]
-	// Actions 0,1,2,5 use [Action:1][TargetPubKey:32].
-	// Action 8 (ExportDevice) uses a variable-length payload.
-	// Action 10 (ExportComplete) carries no payload.
-	if len(data) < 1 {
-		return
-	}
-
-	action := data[0]
-
-	// Export actions use different payload formats — dispatch before the
-	// fixed-size peer-key check that guards the other actions.
-	switch action {
-	case SubtypeExportDevice:
-		go d.handleExportDevice(data[1:])
-		return
-	case SubtypeExportComplete:
-		log.Printf("[Export] Export acknowledged by server")
-		return
-	}
-
-	// All remaining actions require at least [action:1][pubkey:32].
-	if len(data) < 33 {
-		return
-	}
-	var targetPubKey [32]byte
-	copy(targetPubKey[:], data[1:33])
-
-	targetPeer := d.device.LookupPeer(targetPubKey)
-	if targetPeer == nil {
-		log.Printf("[TUN] TUN control: target peer not found")
-		return
-	}
-
-	// Action 1: Server tells us we can now use this peer as an exit node
-	if action == 1 {
-		log.Printf("[TUN] Server designated peer %x as exit node", targetPubKey[:4])
-
-		// Map the default route to this specific WireGuard peer natively
-		peerHex := hex.EncodeToString(targetPubKey[:])
-		cfg := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=false\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n", peerHex)
-		d.device.IpcSet(cfg)
-
-		// Add os-level default route to route all traffic into the TUN interface
-		d.mu.Lock()
-		if err := d.addExitNodeRoute("0.0.0.0/0"); err != nil {
-			log.Printf("[TUN] Failed adding IPv4 exit route: %v", err)
-		}
-		if err := d.addExitNodeRoute("::/0"); err != nil {
-			log.Printf("[TUN] Failed adding IPv6 exit route: %v", err)
-		}
-		d.mu.Unlock()
-	} else if action == 0 {
-		log.Printf("[TUN] Server revoked exit node routing")
-
-		// Re-assign 0.0.0.0/0 back to the server if needed, or simply remove OS routes (WG ignores it if OS route is gone)
-		if srvPubKey, err := base64ToHex(d.config.Server.PublicKey); err == nil {
-			cfg := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=false\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n", srvPubKey)
-			d.device.IpcSet(cfg)
-		}
-
-		d.mu.Lock()
-		d.removeExitNodeRoutes()
-		d.mu.Unlock()
-	} else if action == 2 {
-		// Action 2: Server asks us to become an exit node for others
-		d.mu.RLock()
-		enabled := d.config.ExitNode.Enabled
-		d.mu.RUnlock()
-
-		if enabled {
-			log.Printf("[TUN] Server requested this device to become an exit node")
-			d.enableOnDemandNAT()
-		} else {
-			log.Printf("[TUN] Server requested exit node, but local exit node sharing is disabled")
-		}
-	} else if action == 5 {
-		// Action 5: Server revokes our duties to be an exit node
-		log.Printf("[TUN] Server revoked our duties to be an exit node")
-		d.disableOnDemandNAT()
-	}
-}
-
-func (d *Device) enableOnDemandNAT() {
-	switch runtime.GOOS {
-	case "linux":
-		os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
-		os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1\n"), 0644)
-		exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE").Run()
-		exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE").Run()
-		log.Printf("[TUN] On-demand Exit Node IP forwarding & NAT enabled via procfs/iptables on Linux")
-	case "darwin":
-		exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run()
-		exec.Command("sysctl", "-w", "net.inet6.ip6.forwarding=1").Run()
-		log.Printf("[TUN] On-demand Exit Node IP forwarding enabled via sysctl on macOS")
-	case "windows":
-		exec.Command("powershell", "-Command", "Set-NetIPInterface -Forwarding Enabled").Run()
-		log.Printf("[TUN] On-demand Exit Node IP forwarding enabled via PowerShell on Windows")
-	default:
-		log.Printf("[TUN] On-demand Exit Node IP forwarding not implemented for %s", runtime.GOOS)
-	}
-}
-
-func (d *Device) disableOnDemandNAT() {
-	switch runtime.GOOS {
-	case "linux":
-		os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("0\n"), 0644)
-		os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("0\n"), 0644)
-		exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "MASQUERADE").Run()
-		exec.Command("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-j", "MASQUERADE").Run()
-		log.Printf("[TUN] On-demand Exit Node IP forwarding & NAT disabled via procfs/iptables on Linux")
-	case "darwin":
-		exec.Command("sysctl", "-w", "net.inet.ip.forwarding=0").Run()
-		exec.Command("sysctl", "-w", "net.inet6.ip6.forwarding=0").Run()
-		log.Printf("[TUN] On-demand Exit Node IP forwarding disabled via sysctl on macOS")
-	case "windows":
-		exec.Command("powershell", "-Command", "Set-NetIPInterface -Forwarding Disabled").Run()
-		log.Printf("[TUN] On-demand Exit Node IP forwarding disabled via PowerShell on Windows")
-	}
-}
-
 // addRoute adds a system route dynamically
 func (d *Device) addRoute(network string) error {
 	return addRouteOS(d.tunName, network)
@@ -524,35 +422,6 @@ func (d *Device) addRoute(network string) error {
 // removeRoute removes a system route dynamically
 func (d *Device) removeRoute(network string) error {
 	return removeRouteOS(d.tunName, network)
-}
-
-// addExitNodeRoute adds a route dynamically during runtime for exit node behavior
-func (d *Device) addExitNodeRoute(network string) error {
-	if err := d.addRoute(network); err != nil {
-		return err
-	}
-	// Track it so we can remove it later
-	found := false
-	for _, r := range d.exitNodeRoutes {
-		if r == network {
-			found = true
-			break
-		}
-	}
-	if !found {
-		d.exitNodeRoutes = append(d.exitNodeRoutes, network)
-	}
-	log.Printf("[TUN] Added exit node route: %s", network)
-	return nil
-}
-
-// removeExitNodeRoutes removes dynamically added exit node routes
-func (d *Device) removeExitNodeRoutes() {
-	for _, route := range d.exitNodeRoutes {
-		d.removeRoute(route)
-		log.Printf("[TUN] Removed exit node route: %s", route)
-	}
-	d.exitNodeRoutes = nil
 }
 
 // addPeerRoute adds a route for a dynamically discovered P2P peer
@@ -794,14 +663,19 @@ func base64ToHex(b64 string) (string, error) {
 
 type PeerInfo struct {
 	PublicKey     string `json:"public_key"`
+	AssignedIP    string `json:"assigned_ip"` // VPN IP (e.g. "172.16.0.12")
+	Hostname      string `json:"hostname"`
 	Endpoint      string `json:"endpoint"`
 	RxBytes       uint64 `json:"rx_bytes"`
 	TxBytes       uint64 `json:"tx_bytes"`
 	IsP2P         bool   `json:"is_p2p"`
+	P2PState      string `json:"p2p_state"` // "discovered"|"trying"|"established"|"failed"|""
 	LastHandshake int64  `json:"last_handshake"`
 }
 
-// GetDetailedPeers queries the native WireGuard UAPI to gather live topology metadata
+// GetDetailedPeers returns live peer topology: WireGuard IPC data merged with
+// P2P-discovered peers so the systray always shows all network participants,
+// even before a P2P punch succeeds (relay-only peers).
 func (d *Device) GetDetailedPeers() []PeerInfo {
 	d.mu.RLock()
 	wd := d.device
@@ -812,49 +686,175 @@ func (d *Device) GetDetailedPeers() []PeerInfo {
 		return nil
 	}
 
-	ipcState, err := wd.IpcGet()
-	if err != nil {
-		return nil
-	}
+	// --- Phase 1: read WireGuard IPC state (server + punched P2P peers) ---
+	byPubKey := make(map[string]*PeerInfo)
 
-	var infos []PeerInfo
-	var current PeerInfo
-
-	scanner := bufio.NewScanner(strings.NewReader(ipcState))
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key, val := parts[0], parts[1]
-		switch key {
-		case "public_key":
-			if current.PublicKey != "" {
-				// Finalize previous peer
-				if current.PublicKey != srvHex {
-					current.IsP2P = true
-				}
-				infos = append(infos, current)
+	if ipcState, err := wd.IpcGet(); err == nil {
+		var cur *PeerInfo
+		scanner := bufio.NewScanner(strings.NewReader(ipcState))
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
 			}
-			current = PeerInfo{PublicKey: val}
-		case "endpoint":
-			current.Endpoint = val
-		case "rx_bytes":
-			current.RxBytes, _ = strconv.ParseUint(val, 10, 64)
-		case "tx_bytes":
-			current.TxBytes, _ = strconv.ParseUint(val, 10, 64)
-		case "last_handshake_time_sec":
-			current.LastHandshake, _ = strconv.ParseInt(val, 10, 64)
+			key, val := parts[0], parts[1]
+			switch key {
+			case "public_key":
+				if cur != nil {
+					byPubKey[cur.PublicKey] = cur
+				}
+				cur = &PeerInfo{
+					PublicKey: val,
+					Hostname:  d.getPeerHostname(val),
+				}
+				if val != srvHex {
+					cur.IsP2P = true
+					cur.P2PState = "established"
+				}
+			case "endpoint":
+				if cur != nil {
+					cur.Endpoint = val
+				}
+			case "rx_bytes":
+				if cur != nil {
+					cur.RxBytes, _ = strconv.ParseUint(val, 10, 64)
+				}
+			case "tx_bytes":
+				if cur != nil {
+					cur.TxBytes, _ = strconv.ParseUint(val, 10, 64)
+				}
+			case "last_handshake_time_sec":
+				if cur != nil {
+					cur.LastHandshake, _ = strconv.ParseInt(val, 10, 64)
+				}
+			case "allowed_ip":
+				// First /32 allowed_ip on a non-server peer is its VPN IP
+				if cur != nil && cur.IsP2P && cur.AssignedIP == "" {
+					if strings.HasSuffix(val, "/32") {
+						cur.AssignedIP = strings.TrimSuffix(val, "/32")
+					}
+				}
+			}
 		}
-	}
-	if current.PublicKey != "" {
-		if current.PublicKey != srvHex {
-			current.IsP2P = true
+		if cur != nil {
+			byPubKey[cur.PublicKey] = cur
 		}
-		infos = append(infos, current)
 	}
 
+	// --- Phase 2: merge P2P-discovered peers (pre-punch and relay peers) ---
+	p2pClient := wd.GetP2PClient()
+	if p2pClient != nil {
+		for _, dp := range p2pClient.GetDiscoveredPeers() {
+			pubHex := fmt.Sprintf("%x", dp.PublicKey[:])
+			if pubHex == srvHex {
+				continue // skip the server
+			}
+
+			stateStr := p2pStateString(dp.State)
+			assignedIP := ""
+			if len(dp.AssignedIP) == 4 {
+				assignedIP = dp.AssignedIP.String()
+			}
+
+			if info, ok := byPubKey[pubHex]; ok {
+				// Already in WireGuard IPC — just enrich with P2P state and IP
+				info.P2PState = stateStr
+				if info.AssignedIP == "" {
+					info.AssignedIP = assignedIP
+				}
+				if info.Hostname == "" {
+					info.Hostname = d.getPeerHostname(pubHex)
+				}
+			} else {
+				// Relay-only peer: not yet in WireGuard, add it
+				byPubKey[pubHex] = &PeerInfo{
+					PublicKey:  pubHex,
+					AssignedIP: assignedIP,
+					Hostname:   d.getPeerHostname(pubHex),
+					IsP2P:      true,
+					P2PState:   stateStr,
+				}
+			}
+		}
+	}
+
+	// Collect and return — server first, then peers sorted by VPN IP
+	infos := make([]PeerInfo, 0, len(byPubKey))
+	for _, info := range byPubKey {
+		infos = append(infos, *info)
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		return peerInfoSortLess(infos[i], infos[j])
+	})
 	return infos
+}
+
+func (d *Device) getPeerHostname(publicKey string) string {
+	if publicKey == "" {
+		return ""
+	}
+	d.peerHostnamesMu.RLock()
+	defer d.peerHostnamesMu.RUnlock()
+	return d.peerHostnames[publicKey]
+}
+
+func (d *Device) setPeerHostname(publicKey, hostname string) {
+	hostname = strings.TrimSpace(hostname)
+	if publicKey == "" || hostname == "" {
+		return
+	}
+	d.peerHostnamesMu.Lock()
+	d.peerHostnames[publicKey] = hostname
+	d.peerHostnamesMu.Unlock()
+}
+
+func peerInfoSortLess(a, b PeerInfo) bool {
+	aAddr, aErr := netip.ParseAddr(a.AssignedIP)
+	bAddr, bErr := netip.ParseAddr(b.AssignedIP)
+	switch {
+	case aErr == nil && bErr == nil:
+		if cmp := aAddr.Compare(bAddr); cmp != 0 {
+			return cmp < 0
+		}
+	case aErr == nil:
+		return true
+	case bErr == nil:
+		return false
+	}
+
+	if a.Hostname != b.Hostname {
+		if a.Hostname == "" {
+			return false
+		}
+		if b.Hostname == "" {
+			return true
+		}
+		return a.Hostname < b.Hostname
+	}
+	if a.AssignedIP != b.AssignedIP {
+		if a.AssignedIP == "" {
+			return false
+		}
+		if b.AssignedIP == "" {
+			return true
+		}
+		return a.AssignedIP < b.AssignedIP
+	}
+	return a.PublicKey < b.PublicKey
+}
+
+func p2pStateString(s wgdevice.P2PState) string {
+	switch s {
+	case wgdevice.P2PStateDiscovered:
+		return "discovered"
+	case wgdevice.P2PStateTrying:
+		return "trying"
+	case wgdevice.P2PStateEstablished:
+		return "established"
+	case wgdevice.P2PStateFailed:
+		return "failed"
+	default:
+		return ""
+	}
 }

@@ -348,6 +348,10 @@ func augmentMeshSignals(mesh *MeshInfo) {
 	iwinfo.Close()
 
 	traverseMeshSignals(mesh.Topology, macToSignal)
+
+	if strings.HasPrefix(mesh.Protocol, "easymesh") {
+		augmentEasyMeshControllerSignals(mesh.Topology, readQSDKStationSignals())
+	}
 }
 
 // readDebugfsStationMACs reads MAC→signal from all debugfs station dirs.
@@ -369,7 +373,7 @@ func readDebugfsStationMACs() map[string]int {
 			}
 
 			for _, st := range stations {
-				mac := strings.ToLower(st.Name())
+				mac := normalizeMAC(st.Name())
 				sigFile := filepath.Join(stationsDir, st.Name(), "signal")
 				data, err := os.ReadFile(sigFile)
 				if err != nil {
@@ -388,39 +392,63 @@ func readDebugfsStationMACs() map[string]int {
 	return result
 }
 
+func normalizeMAC(mac string) string {
+	return strings.ToLower(strings.TrimSpace(mac))
+}
+
+func lookupSignalForNode(node *MeshNode, signals map[string]int) (int, bool) {
+	if node == nil {
+		return 0, false
+	}
+
+	candidates := []string{
+		normalizeMAC(node.Backhaul),
+		normalizeMAC(node.MAC),
+	}
+	for _, mac := range candidates {
+		if mac == "" {
+			continue
+		}
+		if sig, ok := signals[mac]; ok {
+			return sig, true
+		}
+		// Fuzzy prefix match: last byte can differ per radio interface.
+		if len(mac) >= 14 {
+			prefix := mac[:14]
+			for mapMAC, sig := range signals {
+				if len(mapMAC) >= 14 && strings.HasPrefix(mapMAC, prefix) {
+					return sig, true
+				}
+			}
+		}
+	}
+
+	return 0, false
+}
+
+func augmentEasyMeshControllerSignals(root *MeshNode, signals map[string]int) {
+	if root == nil || len(signals) == 0 {
+		return
+	}
+
+	for _, child := range root.Children {
+		if child == nil || child.Signal != 0 {
+			continue
+		}
+		if sig, ok := lookupSignalForNode(child, signals); ok {
+			child.Signal = sig
+		}
+	}
+}
+
 func traverseMeshSignals(node *MeshNode, signals map[string]int) {
 	if node == nil {
 		return
 	}
 
 	if node.Signal == 0 {
-		// Try backhaul MAC first (most reliable for EasyMesh/QSDK — it appears
-		// in the parent's station dump, unlike the device's primary MAC).
-		candidates := []string{
-			strings.ToLower(node.Backhaul),
-			strings.ToLower(node.MAC),
-		}
-		for _, mac := range candidates {
-			if mac == "" {
-				continue
-			}
-			if sig, ok := signals[mac]; ok {
-				node.Signal = sig
-				break
-			}
-			// Fuzzy prefix match: last byte can differ per radio interface
-			if len(mac) >= 14 {
-				prefix := mac[:14]
-				for mapMac, sig := range signals {
-					if len(mapMac) >= 14 && strings.HasPrefix(mapMac, prefix) {
-						node.Signal = sig
-						break
-					}
-				}
-			}
-			if node.Signal != 0 {
-				break
-			}
+		if sig, ok := lookupSignalForNode(node, signals); ok {
+			node.Signal = sig
 		}
 	}
 

@@ -1,17 +1,16 @@
 package device
 
-// export.go — handles P2P device export messages (subtypes 8, 9, 10).
+// export.go handles the TUN-control export flow.
 //
 // Message flow:
 //
 //	Server                           Device
-//	  |-- TUN ctrl action=8 -------->|  ExportDevice  (variable payload)
-//	  |                              |  validate token
+//	  |-- export-request ----------->|  validate token
 //	  |                              |  generate new keypair
 //	  |                              |  register with target server
 //	  |                              |  switch WireGuard config
-//	  |<-- TUN ctrl action=9 --------|  ExportConfirm (status + pubkey + message)
-//	  |-- TUN ctrl action=10 ------->|  ExportComplete (acknowledgement)
+//	  |<-- export-result ------------|  status + pubkey + message
+//	  |-- export-ack --------------->|  acknowledgement
 
 import (
 	"context"
@@ -28,19 +27,12 @@ import (
 	wantasticgrpc "wantastic-agent/internal/grpc"
 )
 
-// P2P export action bytes (carried in the first byte of TUN control message data).
-const (
-	SubtypeExportDevice   = uint8(8)  // Server → Client: export request
-	SubtypeExportConfirm  = uint8(9)  // Client → Server: export confirmation
-	SubtypeExportComplete = uint8(10) // Server → Client: export acknowledged
-)
-
-// exportConfirmSleep controls the backoff between sendExportConfirm retries.
+// exportResultRetrySleep controls the backoff between sendExportResult retries.
 // Overridden to 0 in tests to avoid slow sleeps.
-var exportConfirmSleep = time.Second
+var exportResultRetrySleep = time.Second
 
-// maxExportPayloadSize is the maximum number of bytes accepted in a subtype-8
-// TUN control message body. Payloads larger than this are rejected to prevent
+// maxExportPayloadSize is the maximum number of bytes accepted in an
+// export-request TUN-control message body. Payloads larger than this are rejected to prevent
 // memory exhaustion from a malicious server.
 const maxExportPayloadSize = 1024
 
@@ -69,25 +61,25 @@ func (d *Device) SetGRPCClient(client exportGRPCClient) {
 
 // ── Payload types ─────────────────────────────────────────────────────────
 
-// ExportDevicePayload is the decoded body of a subtype-8 message.
+// exportRequest is the decoded body of an export-request TUN-control message.
 //
 //	[account_len:1][account]
 //	[network_len:1][network]
 //	[endpoint_len:1][endpoint]
 //	[token_len:1][token]
-type ExportDevicePayload struct {
+type exportRequest struct {
 	TargetAccountID string
 	TargetNetwork   string
 	ServerEndpoint  string
 	ExportToken     string
 }
 
-func decodeExportDevicePayload(data []byte) (*ExportDevicePayload, error) {
+func decodeExportRequest(data []byte) (*exportRequest, error) {
 	if len(data) > maxExportPayloadSize {
 		return nil, fmt.Errorf("payload too large: %d bytes (max %d)", len(data), maxExportPayloadSize)
 	}
 
-	p := &ExportDevicePayload{}
+	p := &exportRequest{}
 	offset := 0
 
 	readField := func(name string) (string, error) {
@@ -123,20 +115,20 @@ func decodeExportDevicePayload(data []byte) (*ExportDevicePayload, error) {
 	return p, nil
 }
 
-// exportConfirmPayload is the body of a subtype-9 confirmation message.
+// exportResultPayload is the body of an export-result TUN-control message.
 //
 //	[status:1]
 //	[new_pubkey:32]  (zero-filled on failure)
 //	[token_len:1][token]
 //	[msg_len:1][message]
-type exportConfirmPayload struct {
+type exportResultPayload struct {
 	Status      uint8
 	NewPubKey   [32]byte
 	ExportToken string
 	Message     string
 }
 
-func (p *exportConfirmPayload) encode() []byte {
+func (p *exportResultPayload) encode() []byte {
 	token := p.ExportToken
 	if len(token) > maxExportFieldLen {
 		token = token[:maxExportFieldLen]
@@ -163,10 +155,10 @@ func (p *exportConfirmPayload) encode() []byte {
 
 // ── Handler ───────────────────────────────────────────────────────────────
 
-// handleExportDevice processes a subtype-8 export request received from the server.
-// Called as a goroutine from handleTUNControl; always sends a subtype-9
-// confirmation back (unless the payload itself cannot be decoded).
-func (d *Device) handleExportDevice(data []byte) {
+// handleExportRequest processes an export-request received from the server.
+// Called as a goroutine from handleTUNControl; always sends an export-result
+// back unless the payload itself cannot be decoded.
+func (d *Device) handleExportRequest(data []byte) {
 	// Reject concurrent export attempts — only one migration at a time.
 	if !exportInProgress.CompareAndSwap(0, 1) {
 		log.Printf("[Export] Ignoring export request: another export is already in progress")
@@ -174,7 +166,7 @@ func (d *Device) handleExportDevice(data []byte) {
 	}
 	defer exportInProgress.Store(0)
 
-	payload, err := decodeExportDevicePayload(data)
+	payload, err := decodeExportRequest(data)
 	if err != nil {
 		// No token available — server will time out and may retry.
 		log.Printf("[Export] Cannot decode payload: %v", err)
@@ -188,7 +180,7 @@ func (d *Device) handleExportDevice(data []byte) {
 	if d.grpcClient == nil {
 		msg := "no gRPC client available; cannot validate export token"
 		log.Printf("[Export] %s", msg)
-		d.sendExportConfirm(1, [32]byte{}, payload.ExportToken, msg)
+		d.sendExportResult(1, [32]byte{}, payload.ExportToken, msg)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -200,7 +192,7 @@ func (d *Device) handleExportDevice(data []byte) {
 			msg = "token validation error: " + err.Error()
 		}
 		log.Printf("[Export] %s", msg)
-		d.sendExportConfirm(1, [32]byte{}, payload.ExportToken, msg)
+		d.sendExportResult(1, [32]byte{}, payload.ExportToken, msg)
 		return
 	}
 
@@ -208,11 +200,11 @@ func (d *Device) handleExportDevice(data []byte) {
 	newPubKey, err := d.performExport(payload)
 	if err != nil {
 		log.Printf("[Export] Export failed: %v", err)
-		d.sendExportConfirm(1, [32]byte{}, payload.ExportToken, err.Error())
+		d.sendExportResult(1, [32]byte{}, payload.ExportToken, err.Error())
 		return
 	}
 
-	d.sendExportConfirm(0, newPubKey, payload.ExportToken, "export completed successfully")
+	d.sendExportResult(0, newPubKey, payload.ExportToken, "export completed successfully")
 	log.Printf("[Export] Export completed successfully")
 }
 
@@ -220,7 +212,7 @@ func (d *Device) handleExportDevice(data []byte) {
 // and atomically switches the WireGuard configuration.
 // Returns the new public key on success. Any failure triggers a full rollback
 // so the device remains connected to the original server.
-func (d *Device) performExport(payload *ExportDevicePayload) ([32]byte, error) {
+func (d *Device) performExport(payload *exportRequest) ([32]byte, error) {
 	// 0. Check that we can write the config file before making any changes.
 	//    This prevents a situation where the WG config is switched but the
 	//    on-disk config cannot be updated, which would cause a desync on restart.
@@ -425,7 +417,7 @@ func (d *Device) rollbackConfig() error {
 
 // registerWithTargetServer opens a temporary gRPC connection to the target server
 // and registers the device's new public key under the target account.
-func (d *Device) registerWithTargetServer(payload *ExportDevicePayload, pubKeyHex string) (*wantasticgrpc.ExportPeerInfo, error) {
+func (d *Device) registerWithTargetServer(payload *exportRequest, pubKeyHex string) (*wantasticgrpc.ExportPeerInfo, error) {
 	d.mu.RLock()
 	token := d.config.Auth.Token
 	deviceID := d.config.DeviceID
@@ -443,18 +435,18 @@ func (d *Device) registerWithTargetServer(payload *ExportDevicePayload, pubKeyHe
 	return newClient.RegisterPeer(ctx, payload.TargetAccountID, pubKeyHex)
 }
 
-// sendExportConfirm sends a subtype-9 (ExportConfirm) TUN control message to
+// sendExportResult sends an export-result TUN-control message to
 // the server. Retries up to 3 times with linear back-off.
 // status=0 means success; status=1 means failure.
-func (d *Device) sendExportConfirm(status uint8, pubKey [32]byte, token, message string) {
-	payload := &exportConfirmPayload{
+func (d *Device) sendExportResult(status uint8, pubKey [32]byte, token, message string) {
+	payload := &exportResultPayload{
 		Status:      status,
 		NewPubKey:   pubKey,
 		ExportToken: token,
 		Message:     message,
 	}
 	// TUN control data: [action:1][payload bytes]
-	data := append([]byte{SubtypeExportConfirm}, payload.encode()...)
+	data := append([]byte{byte(TUNControlActionExportResult)}, payload.encode()...)
 
 	d.mu.RLock()
 	serverPubKey := d.config.Server.PublicKey
@@ -462,10 +454,10 @@ func (d *Device) sendExportConfirm(status uint8, pubKey [32]byte, token, message
 
 	for i := 0; i < 3; i++ {
 		if err := d.SendTUNControl(serverPubKey, data); err == nil {
-			log.Printf("[Export] Confirmation sent (attempt=%d status=%d)", i+1, status)
+			log.Printf("[Export] Result sent (attempt=%d status=%d)", i+1, status)
 			return
 		}
-		time.Sleep(time.Duration(i+1) * exportConfirmSleep)
+		time.Sleep(time.Duration(i+1) * exportResultRetrySleep)
 	}
-	log.Printf("[Export] Failed to send confirmation after 3 attempts (status=%d)", status)
+	log.Printf("[Export] Failed to send result after 3 attempts (status=%d)", status)
 }

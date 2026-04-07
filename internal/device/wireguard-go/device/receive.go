@@ -245,7 +245,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				}
 
 			case MessageTUNControlType:
-				// P2P TUN mode coordination for exit node functionality
+				// TUN control coordination for exit-node and export functionality
 				// Format: [4-byte type][payload...]
 				if len(packet) < 8 {
 					continue

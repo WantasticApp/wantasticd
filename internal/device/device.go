@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"wantastic-agent/internal/config"
-	pb "wantastic-agent/internal/grpc/proto"
 
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
 
@@ -59,10 +58,6 @@ type Device struct {
 
 	// Device netstack for P2P connection handling
 	netstack *virtstack.Net
-
-	// export support (set via SetGRPCClient before device receives P2P messages)
-	grpcClient   exportGRPCClient // interface defined in export.go
-	backupConfig *config.Config   // saved before a config switch; cleared on success/rollback
 }
 
 func New(cfg *config.Config) (*Device, error) {
@@ -320,60 +315,6 @@ func (d *Device) applyConfig() error {
 					peer.SendStatsEnabled.Store(true)
 				}
 			}
-		}
-	}
-
-	return nil
-}
-
-func (d *Device) UpdateConfig(cfg *pb.DeviceConfiguration) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(cfg.Addresses) > 0 {
-		d.config.Interface.Addresses = nil
-		for _, a := range cfg.Addresses {
-			p, _ := netip.ParsePrefix(a)
-			d.config.Interface.Addresses = append(d.config.Interface.Addresses, p)
-		}
-	}
-	if cfg.ListenPort > 0 {
-		d.config.Interface.ListenPort = int(cfg.ListenPort)
-	}
-	return d.applyConfig()
-}
-
-func (d *Device) UpdateServerConfig(cfg *pb.ServerConfiguration) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.config.Server.Endpoint = cfg.Endpoint
-	d.config.Server.Port = int(cfg.Port)
-	if cfg.PublicKey != "" {
-		d.config.Server.PublicKey = cfg.PublicKey
-	}
-	return d.applyConfig()
-}
-
-// UpdateExitNodeConfig updates the device's local exit-node preferences.
-func (d *Device) UpdateExitNodeConfig(cfg *pb.ExitNodeConfiguration) error {
-	d.mu.Lock()
-	d.config.ExitNode.Enabled = cfg.Enabled
-	d.config.ExitNode.ExitRoutes = append([]string(nil), cfg.ExitRoutes...)
-	d.config.ExitNode.ExitDNS = append([]string(nil), cfg.ExitDns...)
-	d.config.ExitNode.AllowLAN = cfg.AllowLan
-	activeExitNode := d.exitNodeActive
-	activePeerKey := d.exitNodePeerKey
-	sharedExitNode := d.exitNodeShared
-	d.mu.Unlock()
-
-	if activeExitNode {
-		if err := d.activateExitNodeRouting(activePeerKey); err != nil {
-			return fmt.Errorf("re-apply active exit node routing: %w", err)
-		}
-	}
-
-	if !cfg.Enabled && sharedExitNode {
-		if err := d.disableExitNodeSharing(); err != nil {
-			return fmt.Errorf("disable exit node sharing: %w", err)
 		}
 	}
 

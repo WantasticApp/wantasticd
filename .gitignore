@@ -19,3 +19,4 @@ wantasticd.exe
 wantasticd-linux
 ./bulk_install.sh
 bulk_install.sh
+.claude/

@@ -20,10 +20,6 @@ const (
 	TUNControlActionRequestExitNodeRouting TUNControlAction = 3
 	TUNControlActionSetExitNodeOffer       TUNControlAction = 4
 	TUNControlActionDisableExitNodeSharing TUNControlAction = 5
-
-	TUNControlActionExportRequest TUNControlAction = 8
-	TUNControlActionExportResult  TUNControlAction = 9
-	TUNControlActionExportAck     TUNControlAction = 10
 )
 
 const tunControlPeerPayloadSize = 1 + 32
@@ -42,12 +38,6 @@ func (a TUNControlAction) String() string {
 		return "set-exit-node-offer"
 	case TUNControlActionDisableExitNodeSharing:
 		return "disable-exit-node-sharing"
-	case TUNControlActionExportRequest:
-		return "export-request"
-	case TUNControlActionExportResult:
-		return "export-result"
-	case TUNControlActionExportAck:
-		return "export-ack"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(a))
 	}
@@ -109,10 +99,6 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 
 	action := TUNControlAction(data[0])
 	switch action {
-	case TUNControlActionExportRequest:
-		go d.handleExportRequest(data[1:])
-	case TUNControlActionExportAck:
-		log.Printf("[Export] Export acknowledged by server")
 	case TUNControlActionUseExitNodeRouting:
 		targetPubKey, err := decodeTUNControlPeerKey(data)
 		if err != nil {

@@ -93,11 +93,6 @@ run-demo:
 	$(GOBUILD) -o bin/$(DEMO_BINARY_NAME) $(DEMO_CMD_PATH)
 	./bin/$(DEMO_BINARY_NAME)
 
-genproto:
-	protoc -Iproto --go_out=internal/grpc/proto --go_opt=paths=source_relative \
-		--go-grpc_out=internal/grpc/proto --go-grpc_opt=paths=source_relative \
-		auth.proto
-
 release:
 # create tag with release action first arg and push it
 	git tag -a $(firstword $(filter-out release,$(MAKECMDGOALS))) -m "Release $(firstword $(filter-out release,$(MAKECMDGOALS)))"

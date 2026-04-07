@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 	"wantastic-agent/internal/auth"
-	pb "wantastic-agent/internal/grpc/proto"
 
 	"github.com/denisbrodbeck/machineid"
 	"github.com/google/uuid"
@@ -512,30 +511,4 @@ func (c *Config) Save() error {
 		return fmt.Errorf("write temp config: %w", err)
 	}
 	return os.Rename(tmp, c.filePath)
-}
-
-// UpdateFromGRPC updates the configuration from a GRPC response.
-// It populates the interface addresses, listen port, and MTU from the device config.
-// It also populates the server endpoint, port, and public key from the server config.
-// Returns an error if any step of the process fails.
-func (c *Config) UpdateFromGRPC(resp *pb.GetConfigurationResponse) error {
-	if resp.DeviceConfig != nil {
-		for _, addr := range resp.DeviceConfig.Addresses {
-			prefix, err := netip.ParsePrefix(addr)
-			if err != nil {
-				return fmt.Errorf("parse address %s: %w", addr, err)
-			}
-			c.Interface.Addresses = append(c.Interface.Addresses, prefix)
-		}
-		c.Interface.ListenPort = int(resp.DeviceConfig.ListenPort)
-		c.Interface.MTU = int(resp.DeviceConfig.Mtu)
-	}
-
-	if resp.ServerConfig != nil {
-		c.Server.Endpoint = resp.ServerConfig.Endpoint
-		c.Server.Port = int(resp.ServerConfig.Port)
-		c.Server.PublicKey = resp.ServerConfig.PublicKey
-	}
-
-	return nil
 }

@@ -32,7 +32,7 @@ type QueueInboundElement struct {
 	counter  uint64
 	keypair  *Keypair
 	endpoint conn.Endpoint
-	isStats  bool
+	msgType  uint32
 }
 
 type QueueInboundElementsContainer struct {
@@ -142,7 +142,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check if transport
 
-			case MessageTransportType, MessageStatsType:
+			case MessageTransportType, MessageStatsType, MessageWUSPType:
 
 				// check size
 
@@ -175,7 +175,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
-				elem.isStats = (msgType == MessageStatsType)
+				elem.msgType = msgType
 
 				elemsForPeer, ok := elemsByPeer[peer]
 				if !ok {
@@ -534,15 +534,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			// check for stats
-			if elem.isStats {
-				device.log.Verbosef("%v - Received stats packet: %d bytes (raw decrypted)", peer, len(elem.packet))
-				if device.statsHandler != nil {
-					device.statsHandler(peer, elem.packet)
-				}
-				continue
-			}
-
 			if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
 				continue
 			}
@@ -555,10 +546,17 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
-			if elem.isStats {
+			switch elem.msgType {
+			case MessageStatsType:
 				device.log.Verbosef("%v - Received stats packet: %d bytes", peer, len(elem.packet))
 				if device.statsHandler != nil {
 					device.statsHandler(peer, elem.packet)
+				}
+				continue
+			case MessageWUSPType:
+				device.log.Verbosef("%v - Received WUSP packet: %d bytes", peer, len(elem.packet))
+				if device.wuspHandler != nil {
+					device.wuspHandler(peer, elem.packet)
 				}
 				continue
 			}

@@ -2,7 +2,7 @@ FROM golang:1.24-alpine AS builder
 
 RUN apk add --no-cache curl && curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh | sh -s -- -b /go/bin
 
-FROM openwrt/rootfs:x86-64-23.05.0
+FROM openwrt/rootfs:armvirt-64
 
 # Copy Go and Air from alpine
 COPY --from=builder /usr/local/go /usr/local/go

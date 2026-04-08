@@ -53,6 +53,11 @@ var allCoreDeviceParams = concat(
 	DeviceLocalAgentParams,
 )
 
+var allDeviceModelParams = concat(
+	allCoreDeviceParams,
+	DeviceWiFiParams,
+)
+
 // AllDeviceObjects is the union of the standard Device.* object catalog plus
 // the extra CWMP and USP sub-tables maintained in dedicated files.
 var AllDeviceObjects = concatObjects(
@@ -69,6 +74,7 @@ var AllDeviceParams = concat(
 	AllWireGuardParams,
 	AllManagementServerParams,
 	AllLocalAgentSubParams,
+	DeviceWiFiParams,
 )
 
 // BroadbandDataModels collects the version/source metadata for every bundled
@@ -81,7 +87,7 @@ var BroadbandDataModels = []BroadbandDataModel{
 		BroadbandTR181Source,
 		BroadbandTR181SourceURL,
 		DeviceObjects,
-		allCoreDeviceParams,
+		allDeviceModelParams,
 	),
 	newBroadbandDataModel(
 		"cwmp",

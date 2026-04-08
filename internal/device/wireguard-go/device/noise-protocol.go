@@ -60,7 +60,8 @@ const (
 	MessageTransportType   = 4
 	MessageStatsType       = 5
 	MessagePunchType       = 6
-	MessageTUNControlType  = 7 // TUN control coordination for exit-node and export messages
+	MessageTUNControlType  = 7 // TUN control coordination for exit-node
+	MessageWUSPType        = 8 // WUSP (USP agent) control-plane traffic over encrypted transport
 )
 
 const (

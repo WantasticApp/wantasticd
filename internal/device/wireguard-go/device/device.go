@@ -91,6 +91,7 @@ type Device struct {
 	closed              chan struct{}
 	log                 *Logger
 	statsHandler        func(*Peer, []byte)
+	wuspHandler         func(*Peer, []byte)
 	punchHandler        func(*Peer, []byte)
 	statsProvider       func() []byte
 	p2pClient           *P2PClient
@@ -100,6 +101,10 @@ type Device struct {
 
 func (device *Device) SetStatsHandler(handler func(*Peer, []byte)) {
 	device.statsHandler = handler
+}
+
+func (device *Device) SetWUSPHandler(handler func(*Peer, []byte)) {
+	device.wuspHandler = handler
 }
 
 func (device *Device) SetPunchHandler(handler func(*Peer, []byte)) {

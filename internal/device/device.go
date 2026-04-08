@@ -341,6 +341,10 @@ func (d *Device) SetStatsHandler(handler func(*wgdevice.Peer, []byte)) {
 	d.device.SetStatsHandler(handler)
 }
 
+func (d *Device) SetWUSPHandler(handler func(*wgdevice.Peer, []byte)) {
+	d.device.SetWUSPHandler(handler)
+}
+
 func (d *Device) SetPunchHandler(handler func(*wgdevice.Peer, []byte)) {
 	d.device.SetPunchHandler(handler)
 }
@@ -417,6 +421,46 @@ func (d *Device) SendTUNControl(peerPubKey string, data []byte) error {
 
 	peer.SendTUNControl(data)
 	return nil
+}
+
+// SendWUSP sends an encrypted Message Type 8 payload to a specific peer.
+func (d *Device) SendWUSP(peerPubKey string, data []byte) error {
+	pk, err := base64ToHex(peerPubKey)
+	if err != nil {
+		return fmt.Errorf("invalid pubkey encoding: %w", err)
+	}
+
+	pkBytes, err := hex.DecodeString(pk)
+	if err != nil || len(pkBytes) != 32 {
+		return fmt.Errorf("invalid pubkey format/length: %w", err)
+	}
+
+	var noiseKey [32]byte
+	copy(noiseKey[:], pkBytes)
+
+	d.mu.RLock()
+	wd := d.device
+	d.mu.RUnlock()
+
+	if wd == nil {
+		return fmt.Errorf("device not started")
+	}
+
+	peer := wd.LookupPeer(noiseKey)
+	if peer == nil {
+		return fmt.Errorf("peer not found: %s", peerPubKey)
+	}
+
+	peer.SendWUSP(data)
+	return nil
+}
+
+// SendWUSPToServer sends an encrypted Message Type 8 payload to the configured server peer.
+func (d *Device) SendWUSPToServer(data []byte) error {
+	if d.config.Server.PublicKey == "" {
+		return fmt.Errorf("server public key not configured")
+	}
+	return d.SendWUSP(d.config.Server.PublicKey, data)
 }
 
 // SendStatsToServer pushes a stats message (Message Type 5) to the server peer.

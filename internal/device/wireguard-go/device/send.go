@@ -174,6 +174,39 @@ func (peer *Peer) SendTUNControl(data []byte) {
 	peer.SendStagedPackets()
 }
 
+func (peer *Peer) SendWUSP(data []byte) {
+	if !peer.isRunning.Load() {
+		peer.device.log.Verbosef("%v - SendWUSP: Peer not running", peer)
+		return
+	}
+
+	elem := peer.device.NewOutboundElement()
+	elem.msgType = MessageWUSPType
+
+	if len(data) > 1200 {
+		peer.device.log.Errorf("%v - WUSP payload too large: %d (Max ~1200)", peer, len(data))
+		return
+	}
+
+	copy(elem.buffer[MessageTransportHeaderSize:], data)
+	elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(data)]
+
+	elemsContainer := peer.device.GetOutboundElementsContainer()
+	elemsContainer.elems = append(elemsContainer.elems, elem)
+
+	select {
+	case peer.queue.staged <- elemsContainer:
+		peer.device.log.Verbosef("%v - Sending WUSP packet", peer)
+	default:
+		peer.device.PutMessageBuffer(elem.buffer)
+		peer.device.PutOutboundElement(elem)
+		peer.device.PutOutboundElementsContainer(elemsContainer)
+		return
+	}
+
+	peer.SendStagedPackets()
+}
+
 /* Queues a keepalive if no packets are queued for peer
  */
 func (peer *Peer) SendKeepalive() {

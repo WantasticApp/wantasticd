@@ -1183,3 +1183,118 @@ var DeviceLocalAgentParams = []Param{
 		Limits:       minBound(-1),
 	},
 }
+
+// ---------------------------------------------------------------------------
+// Device.WiFi. parameters (OpenWrt-focused representative set)
+// ---------------------------------------------------------------------------
+
+var DeviceWiFiParams = []Param{
+	{
+		Path: "Device.WiFi.RadioNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Number of entries in Device.WiFi.Radio.{i}.",
+	},
+	{
+		Path: "Device.WiFi.SSIDNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Number of entries in Device.WiFi.SSID.{i}.",
+	},
+	{
+		Path: "Device.WiFi.AccessPointNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Number of entries in Device.WiFi.AccessPoint.{i}.",
+	},
+	{
+		Path: "Device.WiFi.EndPointNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Number of entries in Device.WiFi.EndPoint.{i}.",
+	},
+	{
+		Path: "Device.WiFi.Radio.{i}.Enable", Type: TypeBoolean, Access: ReadWrite,
+		SinceVersion: "2.0",
+		Description:  "Enables or disables the Wi-Fi radio.",
+	},
+	{
+		Path: "Device.WiFi.Radio.{i}.Status", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Operational status of the radio.",
+		Limits:       enumL("Up", "Down", "Dormant", "Unknown"),
+	},
+	{
+		Path: "Device.WiFi.Radio.{i}.Name", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Platform-specific radio name.",
+		Limits:       maxLen(64),
+	},
+	{
+		Path: "Device.WiFi.Radio.{i}.OperatingFrequencyBand", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Current operating frequency band of the radio.",
+		Limits:       enumL("2.4GHz", "5GHz", "6GHz", "60GHz", "Unknown"),
+	},
+	{
+		Path: "Device.WiFi.Radio.{i}.Channel", Type: TypeUnsignedInt, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Current operating channel.",
+	},
+	{
+		Path: "Device.WiFi.Radio.{i}.OperatingChannelBandwidth", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Current operating channel bandwidth.",
+		Limits:       maxLenEnum(32, "Auto", "20MHz", "40MHz", "80MHz", "160MHz", "320MHz", "Unknown"),
+	},
+	{
+		Path: "Device.WiFi.SSID.{i}.Enable", Type: TypeBoolean, Access: ReadWrite,
+		SinceVersion: "2.0",
+		Description:  "Enables or disables the SSID instance.",
+	},
+	{
+		Path: "Device.WiFi.SSID.{i}.Status", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Operational status of the SSID.",
+		Limits:       enumL("Up", "Down", "Dormant", "Unknown"),
+	},
+	{
+		Path: "Device.WiFi.SSID.{i}.Name", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Platform-specific SSID interface name.",
+		Limits:       maxLen(64),
+	},
+	{
+		Path: "Device.WiFi.SSID.{i}.SSID", Type: TypeString, Access: ReadWrite,
+		SinceVersion: "2.0",
+		Description:  "Human-readable service set identifier.",
+		Limits:       maxLen(64),
+	},
+	{
+		Path: "Device.WiFi.SSID.{i}.LowerLayers", Type: TypePathRef, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Reference to the lower radio instance backing this SSID.",
+	},
+	{
+		Path: "Device.WiFi.SSID.{i}.BSSID", Type: TypeMACAddress, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Layer-2 BSSID currently advertised by the SSID instance.",
+	},
+	{
+		Path: "Device.WiFi.AccessPoint.{i}.Enable", Type: TypeBoolean, Access: ReadWrite,
+		SinceVersion: "2.0",
+		Description:  "Enables or disables the access point instance.",
+	},
+	{
+		Path: "Device.WiFi.AccessPoint.{i}.Status", Type: TypeString, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Operational status of the access point.",
+		Limits:       enumL("Up", "Down", "Dormant", "Unknown"),
+	},
+	{
+		Path: "Device.WiFi.AccessPoint.{i}.SSIDReference", Type: TypePathRef, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Reference to the SSID instance served by this access point.",
+	},
+	{
+		Path: "Device.WiFi.AccessPoint.{i}.AssociatedDeviceNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly,
+		SinceVersion: "2.0",
+		Description:  "Number of associated client devices currently connected to this access point.",
+	},
+}

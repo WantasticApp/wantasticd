@@ -1,5 +1,6 @@
 services:
   client1:
+    privileged: true  
     build:
       context: ../../
       dockerfile: e2e/docker-compose/Dockerfile.dev
@@ -22,6 +23,7 @@ services:
     restart: unless-stopped
 
   client2:
+    privileged: true
     build:
       context: ../../
       dockerfile: e2e/docker-compose/Dockerfile.dev
@@ -44,6 +46,7 @@ services:
     restart: unless-stopped
 
   client3:
+    privileged: true
     build:
       context: ../../
       dockerfile: e2e/docker-compose/Dockerfile.dev

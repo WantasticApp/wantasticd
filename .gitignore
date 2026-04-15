@@ -20,3 +20,5 @@ wantasticd-linux
 ./bulk_install.sh
 bulk_install.sh
 .claude/
+orig.conf
+test.conf

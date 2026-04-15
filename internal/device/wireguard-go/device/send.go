@@ -16,6 +16,7 @@ import (
 
 	"wantastic-agent/internal/device/wireguard-go/conn"
 	"wantastic-agent/internal/device/wireguard-go/tun"
+	"wantastic-agent/internal/wusp"
 
 	"github.com/andybalholm/brotli"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -180,31 +181,54 @@ func (peer *Peer) SendWUSP(data []byte) {
 		return
 	}
 
-	elem := peer.device.NewOutboundElement()
-	elem.msgType = MessageWUSPType
-
-	if len(data) > 1200 {
-		peer.device.log.Errorf("%v - WUSP payload too large: %d (Max ~1200)", peer, len(data))
-		return
+	frames := [][]byte{data}
+	if len(data) > wusp.WUSPMaxDatagramPayload {
+		var err error
+		frames, err = wusp.FragmentUSPControlPayload(data, peer.device.nextWUSPFragmentMessageID(), wusp.WUSPMaxDatagramPayload)
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to fragment WUSP payload: %v", peer, err)
+			return
+		}
 	}
 
-	copy(elem.buffer[MessageTransportHeaderSize:], data)
-	elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(data)]
+	for _, frame := range frames {
+		if len(frame) > wusp.WUSPMaxDatagramPayload {
+			peer.device.log.Errorf("%v - WUSP payload too large: %d (Max %d)", peer, len(frame), wusp.WUSPMaxDatagramPayload)
+			return
+		}
 
-	elemsContainer := peer.device.GetOutboundElementsContainer()
-	elemsContainer.elems = append(elemsContainer.elems, elem)
+		elemsContainer := peer.device.GetOutboundElementsContainer()
+		elem := peer.device.NewOutboundElement()
+		elem.msgType = MessageWUSPType
+		copy(elem.buffer[MessageTransportHeaderSize:], frame)
+		elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(frame)]
+		elemsContainer.elems = append(elemsContainer.elems, elem)
 
-	select {
-	case peer.queue.staged <- elemsContainer:
-		peer.device.log.Verbosef("%v - Sending WUSP packet", peer)
-	default:
+		select {
+		case peer.queue.staged <- elemsContainer:
+		default:
+			peer.releaseStagedWUSPPackets(elemsContainer)
+			return
+		}
+
+		peer.SendStagedPackets()
+	}
+	peer.device.log.Verbosef("%v - Sending %d WUSP packet(s)", peer, len(frames))
+}
+
+func (peer *Peer) releaseStagedWUSPPackets(elemsContainer *QueueOutboundElementsContainer) {
+	if elemsContainer == nil {
+		return
+	}
+	for _, elem := range elemsContainer.elems {
+		if elem == nil {
+			continue
+		}
 		peer.device.PutMessageBuffer(elem.buffer)
 		peer.device.PutOutboundElement(elem)
-		peer.device.PutOutboundElementsContainer(elemsContainer)
-		return
 	}
-
-	peer.SendStagedPackets()
+	elemsContainer.elems = elemsContainer.elems[:0]
+	peer.device.PutOutboundElementsContainer(elemsContainer)
 }
 
 /* Queues a keepalive if no packets are queued for peer

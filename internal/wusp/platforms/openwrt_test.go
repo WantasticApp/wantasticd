@@ -1,15 +1,19 @@
-package wusp
+package platforms
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"wantastic-agent/internal/wusp"
 )
 
 func TestOpenWrtBackendCollect(t *testing.T) {
@@ -74,7 +78,7 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 			case object == "device" && method == "getStaList":
 				return []byte(`{"station":[{"mac":"e0:5d:54:4b:e6:fa","rssi":-62,"iface":"wlan0"},{"mac":"e0:5d:54:4b:e5:92","rssi":-50,"iface":"wlan0"}]}`), nil
 			default:
-				return nil, ErrUSPPathUnsupported
+				return nil, wusp.ErrUSPPathUnsupported
 			}
 		},
 	})
@@ -112,7 +116,7 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	if !ok {
 		t.Fatal("Device.IP.ULAPrefix missing from collected message")
 	}
-	if ula.Tag != TagIP6Pfx {
+	if ula.Tag != wusp.TagIP6Pfx {
 		t.Fatalf("Device.IP.ULAPrefix tag=%v want TagIP6Pfx", ula.Tag)
 	}
 }
@@ -123,30 +127,61 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	mustWriteFile(t, filepath.Join(configDir, "system"), "config timeserver 'ntp'\n\toption enabled '0'\n\toption enable_server '0'\n")
 	mustWriteFile(t, filepath.Join(configDir, "network"), "config globals 'globals'\n")
 
-	var calls []string
+	var (
+		calls     []string
+		ubusCalls []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req struct {
+			Params []json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode ubus request: %v", err)
+		}
+		if len(req.Params) != 4 {
+			t.Fatalf("ubus params len=%d want 4", len(req.Params))
+		}
+
+		var object, method string
+		if err := json.Unmarshal(req.Params[1], &object); err != nil {
+			t.Fatalf("Decode ubus object: %v", err)
+		}
+		if err := json.Unmarshal(req.Params[2], &method); err != nil {
+			t.Fatalf("Decode ubus method: %v", err)
+		}
+		ubusCalls = append(ubusCalls, object+"."+method)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":[0,{}]}`))
+	}))
+	defer server.Close()
+
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UCIConfigDir: configDir,
 		StatePath:    filepath.Join(root, "state.json"),
+		UbusURL:      server.URL,
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			calls = append(calls, strings.TrimSpace(name+" "+strings.Join(args, " ")))
 			return nil, nil
 		},
 	})
 
-	if err := backend.Set(context.Background(), "Device.DeviceInfo.HostName", String("mesh-node-1")); err != nil {
+	if err := backend.Set(context.Background(), "Device.DeviceInfo.HostName", wusp.String("mesh-node-1")); err != nil {
 		t.Fatalf("Set(hostname) returned error: %v", err)
 	}
-	if err := backend.Set(context.Background(), "Device.Time.Enable", Bool(true)); err != nil {
+	if err := backend.Set(context.Background(), "Device.Time.Enable", wusp.Bool(true)); err != nil {
 		t.Fatalf("Set(time enable) returned error: %v", err)
 	}
-	if err := backend.Set(context.Background(), "Device.Firewall.Enable", Bool(false)); err != nil {
+	if err := backend.Set(context.Background(), "Device.Firewall.Enable", wusp.Bool(false)); err != nil {
 		t.Fatalf("Set(firewall) returned error: %v", err)
 	}
 	_, prefix, _ := net.ParseCIDR("fd12:3456:789a::/48")
-	if err := backend.Set(context.Background(), "Device.IP.ULAPrefix", IP6Prefix(prefix)); err != nil {
+	if err := backend.Set(context.Background(), "Device.IP.ULAPrefix", wusp.IP6Prefix(prefix)); err != nil {
 		t.Fatalf("Set(ula prefix) returned error: %v", err)
 	}
-	if err := backend.Set(context.Background(), "Device.DeviceInfo.FriendlyName", String("Kitchen AP")); err != nil {
+	if err := backend.Set(context.Background(), "Device.DeviceInfo.FriendlyName", wusp.String("Kitchen AP")); err != nil {
 		t.Fatalf("Set(friendly name) returned error: %v", err)
 	}
 	if err := backend.Delete(context.Background(), "Device.DeviceInfo.FriendlyName"); err != nil {
@@ -162,58 +197,40 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	}
 
 	wantCalls := []string{
-		"uci set system.@system[0].hostname=mesh-node-1",
-		"uci commit system",
 		"hostname mesh-node-1",
-		"uci set system.ntp.enabled=1",
-		"uci set system.ntp.enable_server=1",
-		"uci commit system",
-		"uci set firewall.@defaults[0].disabled=1",
-		"uci commit firewall",
-		"uci set network.globals.ula_prefix=fd12:3456:789a::/48",
-		"uci commit network",
 	}
 	for _, want := range wantCalls {
 		if !containsCall(calls, want) {
 			t.Fatalf("missing command %q in %v", want, calls)
 		}
 	}
-}
 
-func assertStringField(t *testing.T, msg *Message, path, want string) {
-	t.Helper()
-	got, ok := msg.Get(path)
-	if !ok {
-		t.Fatalf("%s missing from message", path)
+	wantUbusCalls := []string{
+		"uci.set",
+		"uci.commit",
+		"uci.apply",
+		"uci.set",
+		"uci.set",
+		"uci.commit",
+		"uci.apply",
+		"uci.set",
+		"uci.commit",
+		"uci.apply",
+		"uci.set",
+		"uci.commit",
+		"uci.apply",
 	}
-	if got.AsString() != want {
-		t.Fatalf("%s=%q want %q", path, got.AsString(), want)
+	if len(ubusCalls) != len(wantUbusCalls) {
+		t.Fatalf("ubusCalls=%v want %v", ubusCalls, wantUbusCalls)
 	}
-}
-
-func assertBoolField(t *testing.T, msg *Message, path string, want bool) {
-	t.Helper()
-	got, ok := msg.Get(path)
-	if !ok {
-		t.Fatalf("%s missing from message", path)
-	}
-	if got.AsBool() != want {
-		t.Fatalf("%s=%t want %t", path, got.AsBool(), want)
-	}
-}
-
-func assertUintField(t *testing.T, msg *Message, path string, want uint64) {
-	t.Helper()
-	got, ok := msg.Get(path)
-	if !ok {
-		t.Fatalf("%s missing from message", path)
-	}
-	if got.AsUint() != want {
-		t.Fatalf("%s=%d want %d", path, got.AsUint(), want)
+	for i := range wantUbusCalls {
+		if ubusCalls[i] != wantUbusCalls[i] {
+			t.Fatalf("ubusCalls[%d]=%q want %q", i, ubusCalls[i], wantUbusCalls[i])
+		}
 	}
 }
 
-func assertTimeField(t *testing.T, msg *Message, path string, want time.Time) {
+func assertTimeField(t *testing.T, msg *wusp.Message, path string, want time.Time) {
 	t.Helper()
 	got, ok := msg.Get(path)
 	if !ok {
@@ -221,24 +238,5 @@ func assertTimeField(t *testing.T, msg *Message, path string, want time.Time) {
 	}
 	if !got.AsTime().Equal(want) {
 		t.Fatalf("%s=%s want %s", path, got.AsTime().UTC().Format(time.RFC3339), want.UTC().Format(time.RFC3339))
-	}
-}
-
-func containsCall(calls []string, want string) bool {
-	for _, call := range calls {
-		if call == want {
-			return true
-		}
-	}
-	return false
-}
-
-func mustWriteFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("MkdirAll(%s): %v", path, err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile(%s): %v", path, err)
 	}
 }

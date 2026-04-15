@@ -2,7 +2,7 @@
 
 # wantasticd
 
-**Wantastic Overlay Networking Daemon** — a lightweight, cross-platform WireGuard-based mesh networking agent.
+**Wantastic Networking Daemon** — a lightweight, cross-platform WireGuard-based mesh networking agent.
 
 [![Stars](https://img.shields.io/github/stars/kmoz000/wantasticd?style=flat-square&logo=github&label=Stars)](https://github.com/kmoz000/wantasticd/stargazers)
 [![Release](https://img.shields.io/github/v/release/kmoz000/wantasticd?style=flat-square)](https://github.com/kmoz000/wantasticd/releases)

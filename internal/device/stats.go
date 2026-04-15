@@ -231,9 +231,32 @@ func (d *Device) handleStats(peer *wgdevice.Peer, data []byte) {
 		peer, metrics.Timestamp, metrics.Hostname, metrics.CPU.Usage,
 		metrics.Memory.Allocated/1024/1024, metrics.Memory.Total/1024/1024,
 		metrics.WiFi.Connected, metrics.WiFi.Signal)
+
+	d.mu.RLock()
+	hook := d.statsHook
+	d.mu.RUnlock()
+	if hook != nil {
+		hook(peer, data)
+	}
 }
 
 func (d *Device) handlePunch(peer *wgdevice.Peer, data []byte) {
 	// Just log it for now as the endpoint update is already handled by receive.go
 	log.Printf("[P2P] Received HOLE PUNCH from %v (Internal Endpoint Updated)", peer)
+
+	d.mu.RLock()
+	hook := d.punchHook
+	d.mu.RUnlock()
+	if hook != nil {
+		hook(peer, data)
+	}
+}
+
+func (d *Device) handleWUSP(peer *wgdevice.Peer, data []byte) {
+	d.mu.RLock()
+	hook := d.wuspHook
+	d.mu.RUnlock()
+	if hook != nil {
+		hook(peer, data)
+	}
 }

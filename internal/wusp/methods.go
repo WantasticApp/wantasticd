@@ -2,7 +2,6 @@ package wusp
 
 import (
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -218,7 +217,7 @@ func EncodeMessage(msg *Message) ([]byte, error) {
 	if err := ValidateMessageFast(msg); err != nil {
 		return nil, err
 	}
-	return safeRawEncoder.Encode(msg)
+	return encodeMessageValidated(msg, false)
 }
 
 // EncodeMessageLZ4 validates and encodes msg with LZ4 compression.
@@ -226,7 +225,7 @@ func EncodeMessageLZ4(msg *Message) ([]byte, error) {
 	if err := ValidateMessageFast(msg); err != nil {
 		return nil, err
 	}
-	return safeLZ4Encoder.Encode(msg)
+	return encodeMessageValidated(msg, true)
 }
 
 // DecodeMessage decodes a frame, drops future unknown registry IDs, and
@@ -240,6 +239,13 @@ func DecodeMessage(data []byte) (*Message, error) {
 		return nil, err
 	}
 	return msg, nil
+}
+
+func encodeMessageValidated(msg *Message, compress bool) ([]byte, error) {
+	if compress {
+		return safeLZ4Encoder.Encode(msg)
+	}
+	return safeRawEncoder.Encode(msg)
 }
 
 func buildSafeParamIndex(params []Param) map[string]safeParamInfo {
@@ -369,9 +375,9 @@ func validateValueFast(path string, info safeParamInfo, value Value) error {
 	case TypeDateTime:
 		return nil
 	case TypeBase64:
-		return validateBinaryLimits(path, param.Limits, len(value.AsBytes()), base64.StdEncoding.EncodedLen)
+		return validateBinaryLimits(path, param.Limits, len(value.AsBytes()))
 	case TypeHexBinary:
-		return validateBinaryLimits(path, param.Limits, len(value.AsBytes()), hex.EncodedLen)
+		return validateBinaryLimits(path, param.Limits, len(value.AsBytes()))
 	case TypeIPv4Address:
 		if len(value.AsBytes()) != 4 {
 			return &ValidationError{Path: path, Reason: "invalid IPv4 value length"}
@@ -445,13 +451,12 @@ func validateDecimalLimits(path string, limits Limits, value float64) error {
 	return nil
 }
 
-func validateBinaryLimits(path string, limits Limits, rawLen int, encodedLen func(int) int) error {
-	encoded := encodedLen(rawLen)
-	if limits.MinLength > 0 && encoded < limits.MinLength {
-		return &ValidationError{Path: path, Reason: fmt.Sprintf("encoded length %d is below minimum %d", encoded, limits.MinLength)}
+func validateBinaryLimits(path string, limits Limits, rawLen int) error {
+	if limits.MinLength > 0 && rawLen < limits.MinLength {
+		return &ValidationError{Path: path, Reason: fmt.Sprintf("raw length %d is below minimum %d", rawLen, limits.MinLength)}
 	}
-	if limits.MaxLength > 0 && encoded > limits.MaxLength {
-		return &ValidationError{Path: path, Reason: fmt.Sprintf("encoded length %d is above maximum %d", encoded, limits.MaxLength)}
+	if limits.MaxLength > 0 && rawLen > limits.MaxLength {
+		return &ValidationError{Path: path, Reason: fmt.Sprintf("raw length %d is above maximum %d", rawLen, limits.MaxLength)}
 	}
 	return nil
 }
@@ -564,12 +569,17 @@ func normalizeFillProfile(profile FillProfile) FillProfile {
 }
 
 func safeFilledValueForParam(param Param, index int, profile FillProfile) Value {
+	var value Value
 	switch profile {
 	case FillProfileMaxCompressible:
-		return safeMaxCompressibleValue(param, index)
+		value = safeMaxCompressibleValue(param, index)
 	default:
-		return safeRealisticValue(param, index)
+		value = safeRealisticValue(param, index)
 	}
+	if err := ValidateFieldFast(Field{Path: param.Path, Val: value}); err != nil {
+		return Null()
+	}
+	return value
 }
 
 func safeRealisticValue(param Param, index int) Value {
@@ -686,9 +696,9 @@ func safeMaxBinaryLengthForParam(param Param) int {
 	target := 128
 	switch {
 	case param.Type == TypeHexBinary && param.Limits.MaxLength > 0:
-		target = safeIntMax(1, param.Limits.MaxLength/2)
+		target = safeIntMax(1, param.Limits.MaxLength)
 	case param.Type == TypeBase64 && param.Limits.MaxLength > 0:
-		target = safeIntMax(1, safeDecodedBase64Len(param.Limits.MaxLength))
+		target = safeIntMax(1, param.Limits.MaxLength)
 	case strings.Contains(strings.ToLower(param.Path), "privatekey"),
 		strings.Contains(strings.ToLower(param.Path), "publickey"),
 		strings.Contains(strings.ToLower(param.Path), "presharedkey"):
@@ -704,6 +714,10 @@ func safeMaxBinaryLengthForParam(param Param) int {
 func safeMaxStringValueForParam(param Param, index int) string {
 	if len(param.Limits.Enums) > 0 {
 		return safeLongestString(param.Limits.Enums)
+	}
+
+	if param.Path == "Device.RootDataModelVersion" {
+		return BroadbandRootDataModelVersion
 	}
 
 	switch {
@@ -723,7 +737,7 @@ func safeMaxStringValueForParam(param Param, index int) string {
 	case strings.Contains(param.Limits.Pattern, `^[a-zA-Z0-9\-\.]*$`):
 		return safeFitString("host-"+safeSanitizeSeed(param.Path), safeStringLengthTarget(param.Limits, 96))
 	default:
-		return safeFitString(safeSanitizeSeed(param.Path), safeStringLengthTarget(param.Limits, 96))
+		return safePatternAwareString(param, safeFitString(safeSanitizeSeed(param.Path), safeStringLengthTarget(param.Limits, 96)))
 	}
 }
 
@@ -821,7 +835,7 @@ func safeListItemValue(param Param, index, itemIndex, itemCount int) string {
 		if param.Limits.MaxLength > 0 {
 			target = safeIntMax(1, (param.Limits.MaxLength-safeIntMax(0, itemCount-1))/itemCount)
 		}
-		return safeFitString(fmt.Sprintf("%s-%03d", safeSanitizeSeed(param.Path), index+itemIndex), target)
+		return safePatternAwareString(param, safeFitString(fmt.Sprintf("%s-%03d", safeSanitizeSeed(param.Path), index+itemIndex), target))
 	}
 }
 
@@ -841,7 +855,7 @@ func safeCompressibleListItemValue(param Param, itemCount int) string {
 		if param.Limits.MaxLength > 0 {
 			target = safeIntMax(1, (param.Limits.MaxLength-safeIntMax(0, itemCount-1))/itemCount)
 		}
-		return strings.Repeat("A", target)
+		return safePatternAwareString(param, strings.Repeat("A", target))
 	}
 }
 
@@ -872,10 +886,10 @@ func safeSamplePathRef(path string) string {
 		return "Device.WireGuard.Peer.1."
 	case strings.Contains(path, "ManagementServer"):
 		return "Device.ManagementServer.ManageableDevice.1."
-	case strings.Contains(path, "LocalAgent.ControllerTrust.Role"):
-		return "Device.LocalAgent.ControllerTrust.Role.1."
-	case strings.Contains(path, "LocalAgent.Certificate"):
-		return "Device.LocalAgent.Certificate.1."
+	case strings.Contains(path, "WUSP.ControllerTrust.Role"), strings.Contains(path, "LocalAgent.ControllerTrust.Role"):
+		return "Device.WUSP.ControllerTrust.Role.1."
+	case strings.Contains(path, "WUSP.Certificate"), strings.Contains(path, "LocalAgent.Certificate"):
+		return "Device.WUSP.Certificate.1."
 	default:
 		return "Device.IP.Interface.1."
 	}
@@ -895,6 +909,10 @@ func safeMaxCompressibleStringValue(param Param, index int) string {
 		return safeLongestString(param.Limits.Enums)
 	}
 
+	if param.Path == "Device.RootDataModelVersion" {
+		return BroadbandRootDataModelVersion
+	}
+
 	switch {
 	case strings.Contains(strings.ToLower(param.Description), "base64-encoded"):
 		return base64.StdEncoding.EncodeToString(safeRepeatedBytes(safeMaxBinaryLengthForParam(param), 0x41))
@@ -912,8 +930,66 @@ func safeMaxCompressibleStringValue(param Param, index int) string {
 		return strings.Repeat("a", safeStringLengthTarget(param.Limits, 96))
 	default:
 		_ = index
-		return strings.Repeat("A", safeStringLengthTarget(param.Limits, 96))
+		return safePatternAwareString(param, strings.Repeat("A", safeStringLengthTarget(param.Limits, 96)))
 	}
+}
+
+func safePatternAwareString(param Param, fallback string) string {
+	pattern := strings.TrimSpace(param.Limits.Pattern)
+	if pattern == "" {
+		return fallback
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fallback
+	}
+	if safePatternCandidateValid(re, param.Limits, fallback) {
+		return fallback
+	}
+
+	for _, candidate := range []string{
+		BroadbandRootDataModelVersion,
+		"2.20.1",
+		"1 Firmware Upgrade Image",
+		"2 Web Content",
+		"3 Vendor Configuration File",
+		"4 Vendor Log File",
+		"X ABCDEF VendorType",
+		"00000000-0000-0000-0000-000000000000",
+		"ABCDEF",
+		"rwxn",
+		"host.example",
+		"https://example.net/",
+		"Device.WUSP.Certificate.1.",
+		"Device.IP.Interface.1.",
+		"Enabled",
+		"Success",
+		"1",
+		"A",
+	} {
+		if !safeStringWithinLimits(param.Limits, candidate) {
+			continue
+		}
+		if re.MatchString(candidate) {
+			return candidate
+		}
+	}
+
+	return fallback
+}
+
+func safePatternCandidateValid(re *regexp.Regexp, limits Limits, value string) bool {
+	return re != nil && safeStringWithinLimits(limits, value) && re.MatchString(value)
+}
+
+func safeStringWithinLimits(limits Limits, value string) bool {
+	if limits.MinLength > 0 && len(value) < limits.MinLength {
+		return false
+	}
+	if limits.MaxLength > 0 && len(value) > limits.MaxLength {
+		return false
+	}
+	return true
 }
 
 func safeSanitizeSeed(seed string) string {

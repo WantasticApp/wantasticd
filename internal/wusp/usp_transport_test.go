@@ -30,6 +30,7 @@ var (
 
 func TestUSPAgentTransportRequestRoundTrip(t *testing.T) {
 	msg := transportTestMessage()
+	model := RuntimeDevice()
 	paths := []string{
 		"Device.DeviceInfo.Manufacturer",
 		"Device.DeviceInfo.SerialNumber",
@@ -41,6 +42,29 @@ func TestUSPAgentTransportRequestRoundTrip(t *testing.T) {
 			ID:     1,
 			Method: USPAgentMethodGet,
 			Paths:  paths,
+		},
+		{
+			ID:            101,
+			Method:        USPAgentMethodGet,
+			PathCodes:     selectorsToCodes(model.BatchSelectors("Device.DeviceInfo.Manufacturer", "Device.WireGuard.Peer.{i}.")),
+			PathInstances: selectorsToInstances(model.BatchSelectors("Device.DeviceInfo.Manufacturer", "Device.WireGuard.Peer.{i}.")),
+			Paths: []string{
+				"Device.DeviceInfo.Manufacturer",
+				"Device.WireGuard.Peer.{i}.",
+			},
+		},
+		{
+			ID:     102,
+			Method: USPAgentMethodGet,
+			PathCodes: []uint64{
+				mustTransportSelector(t, "Device.WireGuard.Peer.1.").Code,
+			},
+			PathInstances: [][]uint64{
+				mustTransportSelector(t, "Device.WireGuard.Peer.1.").Instances,
+			},
+			Paths: []string{
+				"Device.WireGuard.Peer.1.",
+			},
 		},
 		{
 			ID:     2,
@@ -55,7 +79,28 @@ func TestUSPAgentTransportRequestRoundTrip(t *testing.T) {
 			}),
 		},
 		{
-			ID:     3,
+			ID:         3,
+			Method:     USPAgentMethodAdd,
+			ObjectPath: "Device.WireGuard.Peer.{i}.",
+			Message: cloneMessageForTransportTests(&Message{
+				Fields: []Field{
+					{Path: "Device.WireGuard.Peer.{i}.Alias", Val: String("peer-added")},
+				},
+			}),
+		},
+		{
+			ID:         103,
+			Method:     USPAgentMethodAdd,
+			ObjectCode: mustTransportPathCode(t, "Device.WireGuard.Peer.{i}."),
+			ObjectPath: "Device.WireGuard.Peer.{i}.",
+			Message: cloneMessageForTransportTests(&Message{
+				Fields: []Field{
+					{Path: "Device.WireGuard.Peer.{i}.Alias", Val: String("peer-coded")},
+				},
+			}),
+		},
+		{
+			ID:     4,
 			Method: USPAgentMethodDelete,
 			Paths: []string{
 				"Device.DeviceInfo.FriendlyName",
@@ -63,7 +108,42 @@ func TestUSPAgentTransportRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
-			ID:     4,
+			ID:         5,
+			Method:     USPAgentMethodOperate,
+			ObjectPath: "Device.WUSP.Request.{i}.",
+			Message: &Message{
+				Fields: []Field{
+					{Path: "Device.WUSP.Request.1.Command", Val: String("Reboot")},
+				},
+			},
+			Metadata: map[string]string{
+				"command_key": "operate-1",
+			},
+		},
+		{
+			ID:         6,
+			Method:     USPAgentMethodNotify,
+			ObjectPath: "Device.WUSP.Subscription.{i}.",
+			Message: &Message{
+				Fields: []Field{
+					{Path: "Device.WUSP.Subscription.1.ID", Val: String("sub-1")},
+				},
+			},
+			Metadata: map[string]string{
+				"subscription_id": "sub-1",
+			},
+		},
+		{
+			ID:     7,
+			Method: USPAgentMethodGetSupportedDM,
+			Paths:  []string{"Device.WireGuard."},
+		},
+		{
+			ID:     8,
+			Method: USPAgentMethodGetSupportedProtocol,
+		},
+		{
+			ID:     9,
 			Method: USPAgentMethodUpload,
 			Transfer: &USPTransferRequest{
 				Path:        "Device.DeviceInfo.SerialNumber",
@@ -78,7 +158,7 @@ func TestUSPAgentTransportRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
-			ID:     5,
+			ID:     10,
 			Method: USPAgentMethodDownload,
 			Transfer: &USPTransferRequest{
 				Path:     "Device.DeviceInfo.SoftwareVersion",
@@ -128,12 +208,69 @@ func TestUSPAgentTransportResponseRoundTrip(t *testing.T) {
 			Method: USPAgentMethodSet,
 		},
 		{
-			ID:     13,
+			ID:         13,
+			Method:     USPAgentMethodAdd,
+			ObjectPath: "Device.WireGuard.Peer.{i}.",
+			Paths:      []string{"Device.WireGuard.Peer.1."},
+		},
+		{
+			ID:         113,
+			Method:     USPAgentMethodAdd,
+			ObjectPath: "Device.WireGuard.Peer.{i}.",
+			ObjectCode: mustTransportPathCode(t, "Device.WireGuard.Peer.{i}."),
+			Paths:      []string{"Device.WireGuard.Peer.1."},
+			PathCodes: []uint64{
+				mustTransportSelector(t, "Device.WireGuard.Peer.1.").Code,
+			},
+			PathInstances: [][]uint64{
+				mustTransportSelector(t, "Device.WireGuard.Peer.1.").Instances,
+			},
+		},
+		{
+			ID:     14,
 			Method: USPAgentMethodDelete,
 			Error:  "wusp: path not found: Device.DeviceInfo.FriendlyName",
 		},
 		{
-			ID:     14,
+			ID:     15,
+			Method: USPAgentMethodGetInstances,
+			Paths:  []string{"Device.WireGuard.Peer.1."},
+		},
+		{
+			ID:     115,
+			Method: USPAgentMethodGetInstances,
+			Paths:  []string{"Device.WireGuard.Peer.1."},
+		},
+		{
+			ID:         16,
+			Method:     USPAgentMethodOperate,
+			ObjectPath: "Device.WUSP.Request.{i}.",
+			Message: &Message{
+				Fields: []Field{
+					{Path: "Device.WUSP.Request.1.Status", Val: String("Success")},
+				},
+			},
+			Metadata: map[string]string{
+				"command_key": "operate-1",
+			},
+		},
+		{
+			ID:         17,
+			Method:     USPAgentMethodNotify,
+			ObjectPath: "Device.WUSP.Subscription.{i}.",
+		},
+		{
+			ID:                 18,
+			Method:             USPAgentMethodGetSupportedDM,
+			SupportedDataModel: NewUSPAgent(USPAgentOptions{}).GetSupportedDM("Device.WireGuard."),
+		},
+		{
+			ID:       19,
+			Method:   USPAgentMethodGetSupportedProtocol,
+			Protocol: NewUSPAgent(USPAgentOptions{}).GetSupportedProtocol(),
+		},
+		{
+			ID:     20,
 			Method: USPAgentMethodUpload,
 			Transfer: &USPTransferResult{
 				Path:  "Device.DeviceInfo.SerialNumber",
@@ -146,7 +283,7 @@ func TestUSPAgentTransportResponseRoundTrip(t *testing.T) {
 			},
 		},
 		{
-			ID:     15,
+			ID:     21,
 			Method: USPAgentMethodDownload,
 			Transfer: &USPTransferResult{
 				Path:  "Device.DeviceInfo.SoftwareVersion",
@@ -171,6 +308,79 @@ func TestUSPAgentTransportResponseRoundTrip(t *testing.T) {
 			}
 			assertUSPAgentResponseEqual(t, tc, decoded)
 		})
+	}
+}
+
+func TestUSPAgentTransportCompactsSelectorsToCodes(t *testing.T) {
+	req := USPAgentRequest{
+		ID:     500,
+		Method: USPAgentMethodGet,
+		Paths: []string{
+			"Device.DeviceInfo.Manufacturer",
+			"Device.WireGuard.Peer.1.",
+		},
+	}
+
+	frame, err := EncodeUSPAgentRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest returned error: %v", err)
+	}
+	if frame[3]&(1<<4) == 0 {
+		t.Fatalf("request flags=%08b want path-code bit set", frame[3])
+	}
+
+	decoded, err := DecodeUSPAgentRequest(frame)
+	if err != nil {
+		t.Fatalf("DecodeUSPAgentRequest returned error: %v", err)
+	}
+	if len(decoded.PathCodes) != 2 {
+		t.Fatalf("decoded path codes=%v", decoded.PathCodes)
+	}
+	if len(decoded.PathInstances) != 2 {
+		t.Fatalf("decoded path instances=%v", decoded.PathInstances)
+	}
+	if !reflect.DeepEqual(decoded.Paths, req.Paths) {
+		t.Fatalf("decoded paths=%v want=%v", decoded.Paths, req.Paths)
+	}
+	if len(decoded.PathInstances[0]) != 0 {
+		t.Fatalf("decoded path instances[0]=%v want empty", decoded.PathInstances[0])
+	}
+	if !reflect.DeepEqual(decoded.PathInstances[1], []uint64{1}) {
+		t.Fatalf("decoded path instances[1]=%v want [1]", decoded.PathInstances[1])
+	}
+
+	resp := USPAgentResponse{
+		ID:         501,
+		Method:     USPAgentMethodAdd,
+		ObjectPath: "Device.WireGuard.Peer.{i}.",
+		Paths:      []string{"Device.WireGuard.Peer.1."},
+	}
+	frame, err = EncodeUSPAgentResponse(resp)
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentResponse returned error: %v", err)
+	}
+	if frame[3]&(1<<7) == 0 {
+		t.Fatalf("response flags=%08b want selector-code bit set", frame[3])
+	}
+
+	decodedResp, err := DecodeUSPAgentResponse(frame)
+	if err != nil {
+		t.Fatalf("DecodeUSPAgentResponse returned error: %v", err)
+	}
+	if len(decodedResp.PathCodes) != 1 {
+		t.Fatalf("decoded response path codes=%v want one coded selector", decodedResp.PathCodes)
+	}
+	if decodedResp.ObjectCode == 0 {
+		t.Fatal("decoded response object code missing")
+	}
+	if len(decodedResp.PathInstances) != 1 || !reflect.DeepEqual(decodedResp.PathInstances[0], []uint64{1}) {
+		t.Fatalf("decoded response path instances=%v want [[1]]", decodedResp.PathInstances)
+	}
+	if !reflect.DeepEqual(decodedResp.Paths, resp.Paths) {
+		t.Fatalf("decoded response paths=%v want=%v", decodedResp.Paths, resp.Paths)
+	}
+	if decodedResp.ObjectPath != resp.ObjectPath {
+		t.Fatalf("decoded response object path=%q want=%q", decodedResp.ObjectPath, resp.ObjectPath)
 	}
 }
 
@@ -598,6 +808,24 @@ func assertUSPAgentRequestEqual(t *testing.T, want, got USPAgentRequest) {
 			t.Fatalf("request paths[%d]=%q want=%q", i, got.Paths[i], want.Paths[i])
 		}
 	}
+	if want.ObjectPath != got.ObjectPath {
+		t.Fatalf("request objectPath=%q want=%q", got.ObjectPath, want.ObjectPath)
+	}
+	if len(want.PathCodes) > 0 && !reflect.DeepEqual(want.PathCodes, got.PathCodes) {
+		t.Fatalf("request pathCodes mismatch: got=%v want=%v", got.PathCodes, want.PathCodes)
+	}
+	if len(want.PathInstances) > 0 && !equalSelectorInstances(want.PathInstances, got.PathInstances) {
+		t.Fatalf("request pathInstances mismatch: got=%v want=%v", got.PathInstances, want.PathInstances)
+	}
+	if want.ObjectCode != 0 && want.ObjectCode != got.ObjectCode {
+		t.Fatalf("request objectCode=%d want=%d", got.ObjectCode, want.ObjectCode)
+	}
+	if len(want.ObjectInstances) > 0 && !reflect.DeepEqual(normalizeSelectorInstanceList(want.ObjectInstances), normalizeSelectorInstanceList(got.ObjectInstances)) {
+		t.Fatalf("request objectInstances mismatch: got=%v want=%v", got.ObjectInstances, want.ObjectInstances)
+	}
+	if !reflect.DeepEqual(want.Metadata, got.Metadata) {
+		t.Fatalf("request metadata mismatch: got=%v want=%v", got.Metadata, want.Metadata)
+	}
 	assertOptionalMessageEqual(t, want.Message, got.Message)
 	assertTransferRequestEqual(t, want.Transfer, got.Transfer)
 }
@@ -613,6 +841,33 @@ func assertUSPAgentResponseEqual(t *testing.T, want, got USPAgentResponse) {
 	}
 	if want.Error != got.Error {
 		t.Fatalf("response error=%q want=%q", got.Error, want.Error)
+	}
+	if !reflect.DeepEqual(want.Paths, got.Paths) {
+		t.Fatalf("response paths mismatch: got=%v want=%v", got.Paths, want.Paths)
+	}
+	if want.ObjectPath != got.ObjectPath {
+		t.Fatalf("response objectPath=%q want=%q", got.ObjectPath, want.ObjectPath)
+	}
+	if len(want.PathCodes) > 0 && !reflect.DeepEqual(want.PathCodes, got.PathCodes) {
+		t.Fatalf("response pathCodes mismatch: got=%v want=%v", got.PathCodes, want.PathCodes)
+	}
+	if len(want.PathInstances) > 0 && !equalSelectorInstances(want.PathInstances, got.PathInstances) {
+		t.Fatalf("response pathInstances mismatch: got=%v want=%v", got.PathInstances, want.PathInstances)
+	}
+	if want.ObjectCode != 0 && want.ObjectCode != got.ObjectCode {
+		t.Fatalf("response objectCode=%d want=%d", got.ObjectCode, want.ObjectCode)
+	}
+	if len(want.ObjectInstances) > 0 && !reflect.DeepEqual(normalizeSelectorInstanceList(want.ObjectInstances), normalizeSelectorInstanceList(got.ObjectInstances)) {
+		t.Fatalf("response objectInstances mismatch: got=%v want=%v", got.ObjectInstances, want.ObjectInstances)
+	}
+	if !reflect.DeepEqual(want.Metadata, got.Metadata) {
+		t.Fatalf("response metadata mismatch: got=%v want=%v", got.Metadata, want.Metadata)
+	}
+	if !reflect.DeepEqual(want.SupportedDataModel, got.SupportedDataModel) {
+		t.Fatalf("response supported data model mismatch")
+	}
+	if !reflect.DeepEqual(want.Protocol, got.Protocol) {
+		t.Fatalf("response protocol mismatch: got=%+v want=%+v", got.Protocol, want.Protocol)
 	}
 	assertOptionalMessageEqual(t, want.Message, got.Message)
 	assertTransferResultEqual(t, want.Transfer, got.Transfer)
@@ -670,6 +925,59 @@ func assertTransferResultEqual(t *testing.T, want, got *USPTransferResult) {
 	}
 }
 
+func mustTransportPathCode(t *testing.T, path string) uint64 {
+	t.Helper()
+	code, ok := RuntimeDevice().PathCode(path)
+	if !ok || code == 0 {
+		t.Fatalf("path code missing for %s", path)
+	}
+	return code
+}
+
+func mustTransportSelector(t *testing.T, path string) PathSelector {
+	t.Helper()
+	selector, ok := RuntimeDevice().SelectorForPath(path)
+	if !ok || selector.Code == 0 {
+		t.Fatalf("path selector missing for %s", path)
+	}
+	return selector
+}
+
+func selectorsToCodes(selectors []PathSelector) []uint64 {
+	out := make([]uint64, 0, len(selectors))
+	for _, selector := range selectors {
+		out = append(out, selector.Code)
+	}
+	return out
+}
+
+func selectorsToInstances(selectors []PathSelector) [][]uint64 {
+	out := make([][]uint64, 0, len(selectors))
+	for _, selector := range selectors {
+		out = append(out, append([]uint64(nil), selector.Instances...))
+	}
+	return out
+}
+
+func equalSelectorInstances(a, b [][]uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !reflect.DeepEqual(normalizeSelectorInstanceList(a[i]), normalizeSelectorInstanceList(b[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeSelectorInstanceList(in []uint64) []uint64 {
+	if len(in) == 0 {
+		return []uint64{}
+	}
+	return in
+}
+
 func cloneMessageForTransportTests(msg *Message) *Message {
 	if msg == nil {
 		return nil
@@ -702,8 +1010,20 @@ func uspAgentMethodName(method USPAgentMethod) string {
 		return "get"
 	case USPAgentMethodSet:
 		return "set"
+	case USPAgentMethodAdd:
+		return "add"
 	case USPAgentMethodDelete:
 		return "delete"
+	case USPAgentMethodGetInstances:
+		return "get-instances"
+	case USPAgentMethodOperate:
+		return "operate"
+	case USPAgentMethodNotify:
+		return "notify"
+	case USPAgentMethodGetSupportedDM:
+		return "get-supported-dm"
+	case USPAgentMethodGetSupportedProtocol:
+		return "get-supported-protocol"
 	case USPAgentMethodUpload:
 		return "upload"
 	case USPAgentMethodDownload:

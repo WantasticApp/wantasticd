@@ -3,8 +3,8 @@ package wusp
 import "testing"
 
 func TestBroadbandDataModelsCoverAggregates(t *testing.T) {
-	if len(BroadbandDataModels) != 4 {
-		t.Fatalf("expected 4 broadband data models, got %d", len(BroadbandDataModels))
+	if len(BroadbandDataModels) != 3 {
+		t.Fatalf("expected 3 broadband data models, got %d", len(BroadbandDataModels))
 	}
 
 	paramCount := 0
@@ -41,5 +41,107 @@ func TestLookupBroadbandDataModel(t *testing.T) {
 	}
 	if model.FirstVersion != "2.20" || model.LatestVersion != "2.20" {
 		t.Fatalf("wireguard version range=%q..%q, want 2.20..2.20", model.FirstVersion, model.LatestVersion)
+	}
+}
+
+func TestImportedCWMPCatalogAvailable(t *testing.T) {
+	models := ListImportedCWMPFullModels()
+	if len(models) == 0 {
+		t.Fatal("expected imported CWMP full models")
+	}
+
+	summary, ok := LookupImportedCWMPFullModel("tr-181-2-20-1-cwmp-full.xml")
+	if !ok {
+		t.Fatal("active imported model summary not found")
+	}
+	if summary.ParamCount == 0 || summary.ObjectCount == 0 {
+		t.Fatalf("unexpected empty imported summary: %+v", summary)
+	}
+
+	model, err := LoadImportedCWMPFullModel("tr-181-2-20-1-cwmp-full.xml")
+	if err != nil {
+		t.Fatalf("load imported model: %v", err)
+	}
+	if len(model.Objects) != summary.ObjectCount || len(model.Params) != summary.ParamCount {
+		t.Fatalf("loaded imported model counts mismatch: objects=%d/%d params=%d/%d", len(model.Objects), summary.ObjectCount, len(model.Params), summary.ParamCount)
+	}
+}
+
+func TestRuntimeDevicePathIndex(t *testing.T) {
+	device := RuntimeDevice()
+	if device == nil {
+		t.Fatal("RuntimeDevice returned nil")
+	}
+	if device.Root != "device." {
+		t.Fatalf("root=%q want device.", device.Root)
+	}
+
+	param, ok := device.GetParam("device.deviceinfo.friendlyname")
+	if !ok {
+		t.Fatal("friendly name param not found")
+	}
+	if param.Path != "Device.DeviceInfo.FriendlyName" {
+		t.Fatalf("friendly name path=%q", param.Path)
+	}
+
+	object, ok := device.GetObject("device.wusp.request.{i}.")
+	if !ok || !object.MultiInstance {
+		t.Fatalf("wusp request object=%+v ok=%v", object, ok)
+	}
+
+	subset := device.Search("device.wusp.")
+	if subset == nil || len(subset.Params) == 0 || len(subset.Objects) == 0 {
+		t.Fatalf("subset=%+v", subset)
+	}
+
+	device.SetParam(Param{Path: "Device.WUSP.CustomFlag", Type: TypeBoolean, Access: ReadWrite, SinceVersion: "1.0"})
+	if _, ok := device.GetParam("device.wusp.customflag"); !ok {
+		t.Fatal("custom param not found after SetParam")
+	}
+
+	canonicalPath, ok := device.CanonicalPath("Device.WireGuard.Peer.1.Alias")
+	if !ok {
+		t.Fatal("canonical path lookup failed")
+	}
+	if canonicalPath != "Device.WireGuard.Peer.{i}.Alias" {
+		t.Fatalf("canonical path=%q", canonicalPath)
+	}
+
+	paramCode, ok := device.PathCode("Device.WireGuard.Peer.1.Alias")
+	if !ok || paramCode == 0 {
+		t.Fatalf("param code=%d ok=%v", paramCode, ok)
+	}
+	if EncodePathCode("Device.WireGuard.Peer.{i}.Alias") != paramCode {
+		t.Fatalf("encoded path code mismatch for peer alias")
+	}
+
+	objectCode, ok := device.PathCode("Device.WUSP.Request.1.")
+	if !ok || objectCode == 0 {
+		t.Fatalf("object code=%d ok=%v", objectCode, ok)
+	}
+	objectPath, ok := device.PathByCode(objectCode)
+	if !ok || objectPath != "Device.WUSP.Request.{i}." {
+		t.Fatalf("object path=%q ok=%v", objectPath, ok)
+	}
+
+	objects := device.BatchGetObjectsByCode(objectCode)
+	if len(objects) != 1 || objects[0].Path != "Device.WUSP.Request.{i}." {
+		t.Fatalf("objects=%+v", objects)
+	}
+
+	codes := device.BatchPathCodes(
+		"Device.DeviceInfo.Manufacturer",
+		"Device.WUSP.Request.1.",
+	)
+	if len(codes) != 2 {
+		t.Fatalf("codes=%v", codes)
+	}
+
+	paths := device.BatchPathsByCode(codes...)
+	if len(paths) != 2 {
+		t.Fatalf("paths=%v", paths)
+	}
+	if paths[0] != "Device.DeviceInfo.Manufacturer" || paths[1] != "Device.WUSP.Request.{i}." {
+		t.Fatalf("resolved paths=%v", paths)
 	}
 }

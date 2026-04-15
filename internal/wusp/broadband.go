@@ -6,24 +6,17 @@ import (
 )
 
 const (
-	// BroadbandTR181ModelVersion is the BBF TR-181 Issue 2 Amendment 20 source
-	// snapshot used by the core Device., LocalAgent., and WireGuard. schema data.
+	// BroadbandTR181ModelVersion is the BBF full-model snapshot used by the
+	// imported runtime Device.* schema.
 	BroadbandTR181ModelVersion = "2.20.1"
 
 	// BroadbandRootDataModelVersion is the major.minor value exposed by
 	// Device.RootDataModelVersion.
 	BroadbandRootDataModelVersion = "2.20"
 
-	// BroadbandCWMPModelVersion tracks the TR-181 CWMP presentation version used
-	// for Device.ManagementServer.* definitions.
-	BroadbandCWMPModelVersion = "2.20"
-
-	BroadbandTR181Source      = "BBF TR-181 Issue 2, Amendment 20 (November 2025)"
-	BroadbandTR181SourceURL   = "https://usp-data-models.broadband-forum.org/tr-181-2-20-1-usp-full.xml"
-	BroadbandCWMPSource       = "BroadbandForum/cwmp-data-models tr-181-2-cwmp.xml"
-	BroadbandCWMPSourceURL    = "https://cwmp-data-models.broadband-forum.org/"
-	BroadbandLocalAgentSource = "BroadbandForum/device-data-model tr-181-2-localagent.xml"
-	BroadbandWireGuardSource  = "BroadbandForum/device-data-model tr-181-2-wireguard.xml"
+	BroadbandTR181Source     = "BroadbandForum/cwmp-data-models tr-181-2-20-1-cwmp-full.xml"
+	BroadbandTR181SourceURL  = "https://github.com/BroadbandForum/cwmp-data-models/blob/main/tr-181-2-20-1-cwmp-full.xml"
+	BroadbandWireGuardSource = "BroadbandForum/device-data-model tr-181-2-wireguard.xml"
 )
 
 // BroadbandDataModel describes one source data-model slice bundled into WUSP.
@@ -42,70 +35,35 @@ type BroadbandDataModel struct {
 	ParamCount    int
 }
 
-var allCoreDeviceParams = concat(
-	DeviceRootParams,
-	DeviceInfoParams,
-	DeviceTimeParams,
-	DeviceIPParams,
-	DeviceFirewallParams,
-	DeviceNATParams,
-	DeviceBulkDataParams,
-	DeviceLocalAgentParams,
-)
+var allImportedDeviceParams = cloneParams(runtimeDeviceParams)
 
-var allDeviceModelParams = concat(
-	allCoreDeviceParams,
-	DeviceWiFiParams,
-)
-
-// AllDeviceObjects is the union of the standard Device.* object catalog plus
-// the extra CWMP and USP sub-tables maintained in dedicated files.
+// AllDeviceObjects is the full runtime schema object registry consumed by the
+// WUSP supported-data-model surface.
 var AllDeviceObjects = concatObjects(
 	DeviceObjects,
-	ManagementServerObjects,
-	LocalAgentExtraObjects,
+	WireGuardObjects,
+	WUSPObjects,
 )
 
 // AllDeviceParams is the full WUSP schema registry consumed by the encoder and
 // tests. It stays centralized here so the package has one authoritative
 // aggregation point.
 var AllDeviceParams = concat(
-	allCoreDeviceParams,
+	allImportedDeviceParams,
 	AllWireGuardParams,
-	AllManagementServerParams,
-	AllLocalAgentSubParams,
-	DeviceWiFiParams,
+	AllWUSPParams,
 )
 
-// BroadbandDataModels collects the version/source metadata for every bundled
-// BBF data-model slice in one place.
+// BroadbandDataModels collects the runtime model slices bundled into WUSP.
 var BroadbandDataModels = []BroadbandDataModel{
 	newBroadbandDataModel(
 		"device",
-		"TR-181 Device",
+		"TR-181 Device (CWMP Full Import)",
 		BroadbandTR181ModelVersion,
 		BroadbandTR181Source,
 		BroadbandTR181SourceURL,
 		DeviceObjects,
-		allDeviceModelParams,
-	),
-	newBroadbandDataModel(
-		"cwmp",
-		"TR-181 ManagementServer (CWMP)",
-		BroadbandCWMPModelVersion,
-		BroadbandCWMPSource,
-		BroadbandCWMPSourceURL,
-		ManagementServerObjects,
-		AllManagementServerParams,
-	),
-	newBroadbandDataModel(
-		"usp",
-		"TR-181 LocalAgent (USP)",
-		BroadbandTR181ModelVersion,
-		BroadbandLocalAgentSource,
-		BroadbandTR181SourceURL,
-		LocalAgentExtraObjects,
-		AllLocalAgentSubParams,
+		allImportedDeviceParams,
 	),
 	newBroadbandDataModel(
 		"wireguard",
@@ -113,9 +71,40 @@ var BroadbandDataModels = []BroadbandDataModel{
 		BroadbandTR181ModelVersion,
 		BroadbandWireGuardSource,
 		BroadbandTR181SourceURL,
-		nil,
+		WireGuardObjects,
 		AllWireGuardParams,
 	),
+	newBroadbandDataModel(
+		"wusp",
+		"Wantastic WUSP",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPObjects,
+		AllWUSPParams,
+	),
+}
+
+var runtimeDeviceModel = NewDevice(ImportedModelSummary{
+	ID:           "runtime-device",
+	FileName:     "runtime-device",
+	Name:         "Device",
+	ModelVersion: BroadbandTR181ModelVersion,
+	Source:       "Wantastic runtime device model",
+	SourceURL:    BroadbandTR181SourceURL,
+	ObjectCount:  len(AllDeviceObjects),
+	ParamCount:   len(AllDeviceParams),
+}, AllDeviceObjects, AllDeviceParams)
+
+// RuntimeDevice returns the canonical Wantastic Device model, rooted at
+// "device.", with the imported BBF schema plus the runtime WireGuard and WUSP
+// extensions merged in.
+func RuntimeDevice() *Device {
+	return runtimeDeviceModel.Clone()
+}
+
+func runtimeDeviceFast() *Device {
+	return runtimeDeviceModel
 }
 
 func LookupBroadbandDataModel(id string) (BroadbandDataModel, bool) {
@@ -218,6 +207,9 @@ func parseModelVersionPart(value string) int {
 
 // iptr returns a pointer to the given int64 value. Used in Limits.Min/Max.
 func iptr(v int64) *int64 { return &v }
+
+// fptr returns a pointer to the given float64 value. Used in Limits.MinF/MaxF.
+func fptr(v float64) *float64 { return &v }
 
 // concat merges multiple []Param slices into one.
 func concat(slices ...[]Param) []Param {

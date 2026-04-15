@@ -41,6 +41,9 @@ type Device struct {
 	PortForwarder func(string, int) bool
 
 	statsProvider func() []byte
+	statsHook     func(*wgdevice.Peer, []byte)
+	wuspHook      func(*wgdevice.Peer, []byte)
+	punchHook     func(*wgdevice.Peer, []byte)
 
 	peerHostnamesMu sync.RWMutex
 	peerHostnames   map[string]string
@@ -112,6 +115,7 @@ func (d *Device) Start() error {
 	wd := wgdevice.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 	wd.DisableSomeRoamingForBrokenMobileSemantics()
 	wd.SetStatsHandler(d.handleStats)
+	wd.SetWUSPHandler(d.handleWUSP)
 	wd.SetPunchHandler(d.handlePunch)
 	wd.SetTUNControlHandler(d.handleTUNControl)
 	wd.SetAddPeerRouteHandler(d.addPeerRoute)
@@ -338,15 +342,21 @@ func (d *Device) GetPublicKey() string {
 }
 
 func (d *Device) SetStatsHandler(handler func(*wgdevice.Peer, []byte)) {
-	d.device.SetStatsHandler(handler)
+	d.mu.Lock()
+	d.statsHook = handler
+	d.mu.Unlock()
 }
 
 func (d *Device) SetWUSPHandler(handler func(*wgdevice.Peer, []byte)) {
-	d.device.SetWUSPHandler(handler)
+	d.mu.Lock()
+	d.wuspHook = handler
+	d.mu.Unlock()
 }
 
 func (d *Device) SetPunchHandler(handler func(*wgdevice.Peer, []byte)) {
-	d.device.SetPunchHandler(handler)
+	d.mu.Lock()
+	d.punchHook = handler
+	d.mu.Unlock()
 }
 
 func (d *Device) SetStatsProvider(provider func() []byte) {

@@ -1,4 +1,4 @@
-package wusp
+package platforms
 
 import (
 	"context"
@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"wantastic-agent/internal/iwinfo"
+	"wantastic-agent/internal/wusp"
+	"wantastic-agent/internal/wusp/platforms/ubus"
 )
 
 type OpenWrtBackendOptions struct {
@@ -29,8 +31,11 @@ type OpenWrtBackendOptions struct {
 	OSReleasePath         string
 	SerialNumberPath      string
 	NetClassDir           string
+	UbusURL               string
+	UbusSessionID         string
 	UbusTimeout           time.Duration
 	UbusCaller            func(string, string, time.Duration) ([]byte, error)
+	UbusClient            *ubus.Client
 	CommandRunner         func(context.Context, string, ...string) ([]byte, error)
 	Now                   func() time.Time
 }
@@ -47,6 +52,7 @@ type OpenWrtBackend struct {
 	osReleasePath         string
 	serialNumberPath      string
 	netClassDir           string
+	ubusClient            *ubus.Client
 	ubusTimeout           time.Duration
 	ubusCaller            func(string, string, time.Duration) ([]byte, error)
 	commandRunner         func(context.Context, string, ...string) ([]byte, error)
@@ -146,6 +152,8 @@ type openWrtWiFiStation struct {
 	Iface string `json:"iface"`
 }
 
+var _ wusp.DataBackend = (*OpenWrtBackend)(nil)
+
 func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	backend := &OpenWrtBackend{
 		uciConfigDir:          coalesceString(opts.UCIConfigDir, "/etc/config"),
@@ -159,6 +167,7 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		osReleasePath:         coalesceString(opts.OSReleasePath, "/etc/os-release"),
 		serialNumberPath:      coalesceString(opts.SerialNumberPath, "/proc/device-tree/serial-number"),
 		netClassDir:           coalesceString(opts.NetClassDir, "/sys/class/net"),
+		ubusClient:            opts.UbusClient,
 		ubusTimeout:           opts.UbusTimeout,
 		ubusCaller:            opts.UbusCaller,
 		commandRunner:         opts.CommandRunner,
@@ -167,8 +176,16 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	if backend.ubusTimeout <= 0 {
 		backend.ubusTimeout = 3 * time.Second
 	}
+	if backend.ubusClient == nil {
+		backend.ubusClient = ubus.NewClient(ubus.Options{
+			URL:       opts.UbusURL,
+			SessionID: opts.UbusSessionID,
+		})
+	}
 	if backend.ubusCaller == nil {
-		backend.ubusCaller = backend.ubusCallHTTP
+		backend.ubusCaller = func(object, method string, timeout time.Duration) ([]byte, error) {
+			return backend.ubusClient.Call(context.Background(), object, method, nil, timeout)
+		}
 	}
 	if backend.commandRunner == nil {
 		backend.commandRunner = defaultOpenWrtCommandRunner
@@ -179,7 +196,30 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	return backend
 }
 
-func (b *OpenWrtBackend) Collect(ctx context.Context, paths ...string) (*Message, error) {
+func newOpenWrtBackendFromOptions(opts Options) wusp.DataBackend {
+	return NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir:          opts.UCIConfigDir,
+		StatePath:             opts.StatePath,
+		HostnamePath:          opts.HostnamePath,
+		UptimePath:            opts.UptimePath,
+		MemInfoPath:           opts.MemInfoPath,
+		IPv6DisablePath:       opts.IPv6DisablePath,
+		TCPImplementationPath: opts.TCPImplementationPath,
+		OpenWrtReleasePath:    opts.OpenWrtReleasePath,
+		OSReleasePath:         opts.OSReleasePath,
+		SerialNumberPath:      opts.SerialNumberPath,
+		NetClassDir:           opts.NetClassDir,
+		UbusURL:               opts.UbusURL,
+		UbusSessionID:         opts.UbusSessionID,
+		UbusTimeout:           opts.UbusTimeout,
+		UbusCaller:            opts.UbusCaller,
+		UbusClient:            opts.UbusClient,
+		CommandRunner:         opts.CommandRunner,
+		Now:                   opts.Now,
+	})
+}
+
+func (b *OpenWrtBackend) Collect(ctx context.Context, paths ...string) (*wusp.Message, error) {
 	msg, err := b.collectAll(ctx)
 	if err != nil {
 		return nil, err
@@ -187,10 +227,10 @@ func (b *OpenWrtBackend) Collect(ctx context.Context, paths ...string) (*Message
 	if len(paths) == 0 {
 		return msg, nil
 	}
-	return subsetMessageByPaths(msg, paths...), nil
+	return subsetPlatformMessageByPaths(msg, paths...), nil
 }
 
-func (b *OpenWrtBackend) Set(ctx context.Context, path string, value Value) error {
+func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value) error {
 	path = strings.TrimSpace(path)
 	switch path {
 	case "Device.DeviceInfo.HostName":
@@ -220,7 +260,7 @@ func (b *OpenWrtBackend) Set(ctx context.Context, path string, value Value) erro
 		}
 		return b.setUCIOption(ctx, "firewall", "@defaults[0]", "disabled", disabled, true, firewallReloadScript)
 	default:
-		return ErrUSPPathUnsupported
+		return wusp.ErrUSPPathUnsupported
 	}
 }
 
@@ -245,7 +285,7 @@ func (b *OpenWrtBackend) Delete(ctx context.Context, paths ...string) error {
 				return err
 			}
 		default:
-			return ErrUSPPathUnsupported
+			return wusp.ErrUSPPathUnsupported
 		}
 	}
 	return nil
@@ -257,7 +297,7 @@ const (
 	firewallReloadScript = "/etc/init.d/firewall"
 )
 
-func (b *OpenWrtBackend) collectAll(ctx context.Context) (*Message, error) {
+func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) {
 	snapshot := b.collectSnapshot(ctx)
 
 	modelName := firstNonEmpty(strings.TrimSpace(snapshot.board.Model), snapshot.release["DISTRIB_DEVICE_MODEL"], strings.TrimSpace(snapshot.board.BoardName))
@@ -270,108 +310,58 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*Message, error) {
 	manufacturerOUI := b.readManufacturerOUI()
 	friendlyName := firstNonEmpty(snapshot.state.FriendlyName, snapshot.hostname)
 
-	msg := &Message{Fields: make([]Field, 0, 32)}
-	appendField(msg, "Device.RootDataModelVersion", String(BroadbandRootDataModelVersion))
-	appendField(msg, "Device.DeviceInfo.Manufacturer", String(manufacturer))
+	msg := &wusp.Message{Fields: make([]wusp.Field, 0, 32)}
+	appendField(msg, "Device.RootDataModelVersion", wusp.String(wusp.BroadbandRootDataModelVersion))
+	appendField(msg, "Device.DeviceInfo.Manufacturer", wusp.String(manufacturer))
 	if len(manufacturerOUI) == 6 {
-		appendField(msg, "Device.DeviceInfo.ManufacturerOUI", String(manufacturerOUI))
+		appendField(msg, "Device.DeviceInfo.ManufacturerOUI", wusp.String(manufacturerOUI))
 	}
-	appendField(msg, "Device.DeviceInfo.ModelName", String(modelName))
-	appendField(msg, "Device.DeviceInfo.ModelNumber", String(modelNumber))
-	appendField(msg, "Device.DeviceInfo.Description", String(description))
-	appendField(msg, "Device.DeviceInfo.ProductClass", String(productClass))
-	appendField(msg, "Device.DeviceInfo.SerialNumber", String(snapshot.serialNumber))
-	appendField(msg, "Device.DeviceInfo.HardwareVersion", String(hardwareVersion))
-	appendField(msg, "Device.DeviceInfo.SoftwareVersion", String(softwareVersion))
-	appendField(msg, "Device.DeviceInfo.ProvisioningCode", String(snapshot.state.ProvisioningCode))
-	appendField(msg, "Device.DeviceInfo.UpTime", Uint(uint64(snapshot.uptimeSeconds)))
-	appendField(msg, "Device.DeviceInfo.HostName", String(snapshot.hostname))
-	appendField(msg, "Device.DeviceInfo.FriendlyName", String(friendlyName))
-	appendField(msg, "Device.DeviceInfo.MemoryStatus.Total", Uint(uint64(snapshot.memTotal)))
-	appendField(msg, "Device.DeviceInfo.MemoryStatus.Free", Uint(uint64(snapshot.memFree)))
-	appendField(msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", String(snapshot.tcpImplementation))
-	appendField(msg, "Device.Time.Enable", Bool(snapshot.timeEnabled))
+	appendField(msg, "Device.DeviceInfo.ModelName", wusp.String(modelName))
+	appendField(msg, "Device.DeviceInfo.ModelNumber", wusp.String(modelNumber))
+	appendField(msg, "Device.DeviceInfo.Description", wusp.String(description))
+	appendField(msg, "Device.DeviceInfo.ProductClass", wusp.String(productClass))
+	appendField(msg, "Device.DeviceInfo.SerialNumber", wusp.String(snapshot.serialNumber))
+	appendField(msg, "Device.DeviceInfo.HardwareVersion", wusp.String(hardwareVersion))
+	appendField(msg, "Device.DeviceInfo.SoftwareVersion", wusp.String(softwareVersion))
+	appendField(msg, "Device.DeviceInfo.ProvisioningCode", wusp.String(snapshot.state.ProvisioningCode))
+	appendField(msg, "Device.DeviceInfo.UpTime", wusp.Uint(uint64(snapshot.uptimeSeconds)))
+	appendField(msg, "Device.DeviceInfo.HostName", wusp.String(snapshot.hostname))
+	appendField(msg, "Device.DeviceInfo.FriendlyName", wusp.String(friendlyName))
+	appendField(msg, "Device.DeviceInfo.MemoryStatus.Total", wusp.Uint(uint64(snapshot.memTotal)))
+	appendField(msg, "Device.DeviceInfo.MemoryStatus.Free", wusp.Uint(uint64(snapshot.memFree)))
+	appendField(msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", wusp.String(snapshot.tcpImplementation))
+	appendField(msg, "Device.Time.Enable", wusp.Bool(snapshot.timeEnabled))
 	if snapshot.timeStatus != "" {
-		appendField(msg, "Device.Time.Status", String(snapshot.timeStatus))
+		appendField(msg, "Device.Time.Status", wusp.String(snapshot.timeStatus))
 	}
-	appendField(msg, "Device.Time.CurrentLocalTime", Time(snapshot.currentLocalTime))
-	appendField(msg, "Device.Time.LocalTimeZone", String(snapshot.localTimeZone))
-	appendField(msg, "Device.Time.ClientNumberOfEntries", Uint(uint64(snapshot.timeClientCount)))
-	appendField(msg, "Device.Time.ServerNumberOfEntries", Uint(uint64(snapshot.timeServerCount)))
-	appendField(msg, "Device.IP.IPv4Capable", Bool(true))
-	appendField(msg, "Device.IP.IPv4Enable", Bool(true))
-	appendField(msg, "Device.IP.IPv4Status", String("Enabled"))
-	appendField(msg, "Device.IP.IPv6Capable", Bool(true))
-	appendField(msg, "Device.IP.IPv6Enable", Bool(snapshot.ipv6Enabled))
-	appendField(msg, "Device.IP.IPv6Status", String(boolToStatus(snapshot.ipv6Enabled)))
-	appendField(msg, "Device.IP.InterfaceNumberOfEntries", Uint(uint64(snapshot.interfaceCount)))
+	appendField(msg, "Device.Time.CurrentLocalTime", wusp.Time(snapshot.currentLocalTime))
+	appendField(msg, "Device.Time.LocalTimeZone", wusp.String(snapshot.localTimeZone))
+	appendField(msg, "Device.Time.ClientNumberOfEntries", wusp.Uint(uint64(snapshot.timeClientCount)))
+	appendField(msg, "Device.Time.ServerNumberOfEntries", wusp.Uint(uint64(snapshot.timeServerCount)))
+	appendField(msg, "Device.IP.IPv4Capable", wusp.Bool(true))
+	appendField(msg, "Device.IP.IPv4Enable", wusp.Bool(true))
+	appendField(msg, "Device.IP.IPv4Status", wusp.String("Enabled"))
+	appendField(msg, "Device.IP.IPv6Capable", wusp.Bool(true))
+	appendField(msg, "Device.IP.IPv6Enable", wusp.Bool(snapshot.ipv6Enabled))
+	appendField(msg, "Device.IP.IPv6Status", wusp.String(boolToStatus(snapshot.ipv6Enabled)))
+	appendField(msg, "Device.IP.InterfaceNumberOfEntries", wusp.Uint(uint64(snapshot.interfaceCount)))
 	if _, prefix, err := net.ParseCIDR(snapshot.ulaPrefix); err == nil && prefix != nil {
-		appendField(msg, "Device.IP.ULAPrefix", IP6Prefix(prefix))
+		appendField(msg, "Device.IP.ULAPrefix", wusp.IP6Prefix(prefix))
 	}
-	appendField(msg, "Device.Firewall.Enable", Bool(snapshot.firewallEnabled))
+	appendField(msg, "Device.Firewall.Enable", wusp.Bool(snapshot.firewallEnabled))
 	if !snapshot.firewallLastChange.IsZero() {
-		appendField(msg, "Device.Firewall.LastChange", Time(snapshot.firewallLastChange))
+		appendField(msg, "Device.Firewall.LastChange", wusp.Time(snapshot.firewallLastChange))
 	}
-	appendField(msg, "Device.Firewall.Type", String("Stateful"))
+	appendField(msg, "Device.Firewall.Type", wusp.String("Stateful"))
 	b.appendWiFiFields(msg)
 	return msg, nil
 }
 
-func appendField(msg *Message, path string, value Value) {
+func appendField(msg *wusp.Message, path string, value wusp.Value) {
 	if path = strings.TrimSpace(path); path == "" {
 		return
 	}
-	if id, ok := globalRegistry.IDFor(path); ok {
-		msg.Fields = append(msg.Fields, Field{
-			id:   id,
-			Path: path,
-			Val:  value,
-		})
-		return
-	}
-	if _, _, ok := lookupSafeParam(path); !ok {
-		return
-	}
-	msg.Fields = append(msg.Fields, Field{
-		id:   0,
-		Path: path,
-		Val:  value,
-	})
-}
-
-func subsetMessageByPaths(msg *Message, paths ...string) *Message {
-	out := &Message{
-		DeviceID:  msg.DeviceID,
-		Timestamp: msg.Timestamp,
-		Fields:    make([]Field, 0, len(msg.Fields)),
-	}
-	if len(paths) == 0 {
-		for _, field := range msg.Fields {
-			out.Fields = append(out.Fields, cloneField(field))
-		}
-		return out
-	}
-
-	seen := make(map[string]struct{})
-	for _, requested := range paths {
-		requested = strings.TrimSpace(requested)
-		if requested == "" {
-			continue
-		}
-		for _, field := range msg.Fields {
-			if requested == field.Path || (isObjectPath(requested) && strings.HasPrefix(field.Path, requested)) {
-				if _, ok := seen[field.Path]; ok {
-					continue
-				}
-				seen[field.Path] = struct{}{}
-				out.Fields = append(out.Fields, cloneField(field))
-			}
-		}
-	}
-	sort.Slice(out.Fields, func(i, j int) bool {
-		return out.Fields[i].Path < out.Fields[j].Path
-	})
-	return out
+	msg.Set(path, value)
 }
 
 func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
@@ -451,7 +441,7 @@ func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
 	}
 }
 
-func (b *OpenWrtBackend) appendWiFiFields(msg *Message) {
+func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 	radios := b.readWirelessRadioStatus()
 	if len(radios) == 0 {
 		radios = b.readWirelessRadioStatusFromUCI()
@@ -479,14 +469,14 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *Message) {
 		radioIndexByName[key] = radioIndex
 		radioEnabled := !radio.Disabled && !parseOpenWrtBool(configString(radio.Config, "disabled"), false)
 
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Enable", radioIndex), Bool(radioEnabled))
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Status", radioIndex), String(wifiStatusValue(radioEnabled, radio.Up)))
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Name", radioIndex), String(key))
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingFrequencyBand", radioIndex), String(wifiBandFromConfig(radio.Config)))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Enable", radioIndex), wusp.Bool(radioEnabled))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Status", radioIndex), wusp.String(wifiStatusValue(radioEnabled, radio.Up)))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Name", radioIndex), wusp.String(key))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingFrequencyBand", radioIndex), wusp.String(wifiBandFromConfig(radio.Config)))
 		if channel := configInt(radio.Config, "channel"); channel > 0 {
-			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), Uint(uint64(channel)))
+			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), wusp.Uint(uint64(channel)))
 		}
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingChannelBandwidth", radioIndex), String(wifiBandwidthFromConfig(radio.Config)))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingChannelBandwidth", radioIndex), wusp.String(wifiBandwidthFromConfig(radio.Config)))
 
 		interfaces := append([]openWrtWirelessIfaceStatus(nil), radio.Interfaces...)
 		sort.SliceStable(interfaces, func(i, j int) bool {
@@ -519,34 +509,34 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *Message) {
 				bssidValue = strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, ifName, "address")))
 			}
 
-			appendField(msg, ssidPath+"Enable", Bool(ssidEnabled))
-			appendField(msg, ssidPath+"Status", String(wifiStatusValue(ssidEnabled, iface.Up)))
-			appendField(msg, ssidPath+"Name", String(firstNonEmpty(ifName, iface.Section)))
+			appendField(msg, ssidPath+"Enable", wusp.Bool(ssidEnabled))
+			appendField(msg, ssidPath+"Status", wusp.String(wifiStatusValue(ssidEnabled, iface.Up)))
+			appendField(msg, ssidPath+"Name", wusp.String(firstNonEmpty(ifName, iface.Section)))
 			if ssidValue != "" {
-				appendField(msg, ssidPath+"SSID", String(ssidValue))
+				appendField(msg, ssidPath+"SSID", wusp.String(ssidValue))
 			}
-			appendField(msg, ssidPath+"LowerLayers", String(fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex)))
+			appendField(msg, ssidPath+"LowerLayers", wusp.String(fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex)))
 			if mac, err := net.ParseMAC(bssidValue); err == nil && len(mac) == 6 {
-				appendField(msg, ssidPath+"BSSID", MAC(mac))
+				appendField(msg, ssidPath+"BSSID", wusp.MAC(mac))
 			}
 
 			if wifiInterfaceModeIsAP(mode) {
 				apCount++
 				apPath := fmt.Sprintf("Device.WiFi.AccessPoint.%d.", apCount)
-				appendField(msg, apPath+"Enable", Bool(ssidEnabled))
-				appendField(msg, apPath+"Status", String(wifiStatusValue(ssidEnabled, iface.Up)))
-				appendField(msg, apPath+"SSIDReference", String(ssidPath))
-				appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", Uint(uint64(stationCounts[ifName])))
+				appendField(msg, apPath+"Enable", wusp.Bool(ssidEnabled))
+				appendField(msg, apPath+"Status", wusp.String(wifiStatusValue(ssidEnabled, iface.Up)))
+				appendField(msg, apPath+"SSIDReference", wusp.String(ssidPath))
+				appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(stationCounts[ifName])))
 			} else if wifiInterfaceModeIsEndpoint(mode) {
 				endPointCount++
 			}
 		}
 	}
 
-	appendField(msg, "Device.WiFi.RadioNumberOfEntries", Uint(uint64(len(radioKeys))))
-	appendField(msg, "Device.WiFi.SSIDNumberOfEntries", Uint(uint64(ssidCount)))
-	appendField(msg, "Device.WiFi.AccessPointNumberOfEntries", Uint(uint64(apCount)))
-	appendField(msg, "Device.WiFi.EndPointNumberOfEntries", Uint(uint64(endPointCount)))
+	appendField(msg, "Device.WiFi.RadioNumberOfEntries", wusp.Uint(uint64(len(radioKeys))))
+	appendField(msg, "Device.WiFi.SSIDNumberOfEntries", wusp.Uint(uint64(ssidCount)))
+	appendField(msg, "Device.WiFi.AccessPointNumberOfEntries", wusp.Uint(uint64(apCount)))
+	appendField(msg, "Device.WiFi.EndPointNumberOfEntries", wusp.Uint(uint64(endPointCount)))
 }
 
 func (b *OpenWrtBackend) setHostname(ctx context.Context, hostname string) error {
@@ -575,6 +565,10 @@ func (b *OpenWrtBackend) setTimeEnabled(ctx context.Context, enabled bool) error
 }
 
 func (b *OpenWrtBackend) setUCIOption(ctx context.Context, config, section, option, value string, commit bool, reloadScript string) error {
+	if err := b.setUCIOptionViaUbus(ctx, config, section, option, value, commit); err == nil {
+		return nil
+	}
+
 	key := fmt.Sprintf("%s.%s.%s=%s", config, section, option, value)
 	if _, err := b.commandRunner(ctx, "uci", "set", key); err != nil {
 		return err
@@ -588,6 +582,10 @@ func (b *OpenWrtBackend) setUCIOption(ctx context.Context, config, section, opti
 }
 
 func (b *OpenWrtBackend) deleteUCIOption(ctx context.Context, config, section, option string, commit bool, reloadScript string) error {
+	if err := b.deleteUCIOptionViaUbus(ctx, config, section, option, commit); err == nil {
+		return nil
+	}
+
 	key := fmt.Sprintf("%s.%s.%s", config, section, option)
 	if _, err := b.commandRunner(ctx, "uci", "-q", "delete", key); err != nil {
 		return err
@@ -598,6 +596,50 @@ func (b *OpenWrtBackend) deleteUCIOption(ctx context.Context, config, section, o
 		}
 	}
 	return b.reloadScript(ctx, reloadScript)
+}
+
+func (b *OpenWrtBackend) setUCIOptionViaUbus(ctx context.Context, config, section, option, value string, commit bool) error {
+	if b.ubusClient == nil {
+		return errors.New("ubus client unavailable")
+	}
+	ref := b.resolveUCISectionRef(config, section)
+	if ref == "" {
+		return errors.New("uci section unresolved")
+	}
+	if err := b.ubusClient.UCISet(ctx, config, ref, map[string]any{option: value}, b.ubusTimeout); err != nil {
+		return err
+	}
+	if !commit {
+		return nil
+	}
+	return b.commitUCIViaUbus(ctx, config)
+}
+
+func (b *OpenWrtBackend) deleteUCIOptionViaUbus(ctx context.Context, config, section, option string, commit bool) error {
+	if b.ubusClient == nil {
+		return errors.New("ubus client unavailable")
+	}
+	ref := b.resolveUCISectionRef(config, section)
+	if ref == "" {
+		return errors.New("uci section unresolved")
+	}
+	if err := b.ubusClient.UCIDelete(ctx, config, ref, option, b.ubusTimeout); err != nil {
+		return err
+	}
+	if !commit {
+		return nil
+	}
+	return b.commitUCIViaUbus(ctx, config)
+}
+
+func (b *OpenWrtBackend) commitUCIViaUbus(ctx context.Context, config string) error {
+	if err := b.ubusClient.UCICommit(ctx, config, b.ubusTimeout); err != nil {
+		return err
+	}
+	if err := b.ubusClient.UCIApply(ctx, false, b.ubusTimeout); err == nil {
+		return nil
+	}
+	return b.ubusClient.UCIReloadConfig(ctx, b.ubusTimeout)
 }
 
 func (b *OpenWrtBackend) reloadScript(ctx context.Context, script string) error {
@@ -1255,59 +1297,6 @@ func (b *OpenWrtBackend) readTextFile(path string) string {
 	return string(data)
 }
 
-func parseAssignmentFile(path string) (map[string]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	values := make(map[string]string)
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.Trim(strings.TrimSpace(value), `'"`)
-		values[key] = value
-	}
-	return values, nil
-}
-
-func sanitizeTCPImplementation(value string) string {
-	value = strings.TrimSpace(value)
-	switch strings.ToUpper(value) {
-	case "", "CUBIC":
-		if value == "" {
-			return "CUBIC"
-		}
-		return "CUBIC"
-	case "RENO":
-		return "Reno"
-	case "BIC":
-		return "BIC"
-	case "HYBLA":
-		return "Hybla"
-	case "WESTWOOD":
-		return "Westwood"
-	case "VEGAS":
-		return "Vegas"
-	case "SCALABLE":
-		return "Scalable"
-	case "LP":
-		return "LP"
-	case "VENO":
-		return "Veno"
-	case "BBR":
-		return "BBR"
-	default:
-		return "Other"
-	}
-}
-
 func guessOpenWrtManufacturer(board openWrtBoardInfo, release map[string]string, modelName string) string {
 	if modelName != "" {
 		if manufacturer := strings.Fields(modelName); len(manufacturer) > 0 {
@@ -1317,57 +1306,23 @@ func guessOpenWrtManufacturer(board openWrtBoardInfo, release map[string]string,
 	return firstNonEmpty(release["DISTRIB_ID"], board.Release.Distribution, "OpenWrt")
 }
 
-func boolToStatus(enabled bool) string {
-	if enabled {
-		return "Enabled"
-	}
-	return "Disabled"
-}
-
-func stringifyPrefixValue(value Value) (string, error) {
+func stringifyPrefixValue(value wusp.Value) (string, error) {
 	switch value.Tag {
-	case TagIP6Pfx:
-		if len(value.blob) != 17 {
-			return "", &ValidationError{Reason: "invalid IPv6 prefix blob"}
+	case wusp.TagIP6Pfx:
+		raw := value.AsBytes()
+		if len(raw) != 17 {
+			return "", &wusp.ValidationError{Reason: "invalid IPv6 prefix blob"}
 		}
-		mask := net.CIDRMask(int(value.blob[16]), 128)
+		mask := net.CIDRMask(int(raw[16]), 128)
 		return (&net.IPNet{
-			IP:   net.IP(append([]byte(nil), value.blob[:16]...)),
+			IP:   net.IP(append([]byte(nil), raw[:16]...)),
 			Mask: mask,
 		}).String(), nil
-	case TagString:
+	case wusp.TagString:
 		return value.AsString(), nil
 	default:
-		return "", &ValidationError{Reason: "unsupported prefix value type"}
+		return "", &wusp.ValidationError{Reason: "unsupported prefix value type"}
 	}
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func nonEmptyStrings(values ...string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			out = append(out, value)
-		}
-	}
-	return out
-}
-
-func coalesceString(value, fallback string) string {
-	if strings.TrimSpace(value) != "" {
-		return value
-	}
-	return fallback
 }
 
 func isZeroMAC(mac net.HardwareAddr) bool {
@@ -1386,67 +1341,4 @@ func defaultOpenWrtCommandRunner(ctx context.Context, name string, args ...strin
 		return output, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return output, nil
-}
-
-func (b *OpenWrtBackend) ubusCallHTTP(object, method string, timeout time.Duration) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:80", timeout)
-	if err != nil {
-		return nil, fmt.Errorf("ubus http: connect failed: %w", err)
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, err
-	}
-
-	req := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "call",
-		"params":  []any{"00000000000000000000000000000000", object, method, map[string]any{}},
-	}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	httpReq := fmt.Sprintf("POST /ubus HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
-	if _, err := conn.Write([]byte(httpReq)); err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 64*1024)
-	var response []byte
-	for {
-		n, readErr := conn.Read(buf)
-		if n > 0 {
-			response = append(response, buf[:n]...)
-		}
-		if readErr != nil {
-			break
-		}
-	}
-
-	bodyStart := strings.Index(string(response), "\r\n\r\n")
-	if bodyStart < 0 {
-		return nil, fmt.Errorf("ubus http: no response body")
-	}
-
-	var rpcResp struct {
-		Result []json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(response[bodyStart+4:], &rpcResp); err != nil {
-		return nil, fmt.Errorf("ubus http: parse response: %w", err)
-	}
-	if rpcResp.Error != nil {
-		return nil, fmt.Errorf("ubus http: error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
-	}
-	if len(rpcResp.Result) < 2 {
-		return nil, fmt.Errorf("ubus http: unexpected result length %d", len(rpcResp.Result))
-	}
-	return rpcResp.Result[1], nil
 }

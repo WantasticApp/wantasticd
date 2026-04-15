@@ -87,13 +87,18 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
-	ipcMutex            sync.RWMutex
-	closed              chan struct{}
-	log                 *Logger
-	statsHandler        func(*Peer, []byte)
-	wuspHandler         func(*Peer, []byte)
-	punchHandler        func(*Peer, []byte)
-	statsProvider       func() []byte
+	ipcMutex      sync.RWMutex
+	closed        chan struct{}
+	log           *Logger
+	statsHandler  func(*Peer, []byte)
+	wuspHandler   func(*Peer, []byte)
+	punchHandler  func(*Peer, []byte)
+	statsProvider func() []byte
+	wuspFragments struct {
+		sync.Mutex
+		nextID  atomic.Uint64
+		pending map[wuspFragmentKey]*wuspFragmentAssembly
+	}
 	p2pClient           *P2PClient
 	tunControlHandler   func(*Peer, []byte) // Handler for P2P TUN mode coordination (message type 7)
 	addPeerRouteHandler func(net.IP)        // Handler for dynamically adding P2P peer routes to TUN
@@ -327,6 +332,7 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	}
 	device.tun.mtu.Store(int32(mtu))
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+	device.wuspFragments.pending = make(map[wuspFragmentKey]*wuspFragmentAssembly)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 

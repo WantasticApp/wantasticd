@@ -17,6 +17,41 @@
 package wusp
 
 // ---------------------------------------------------------------------------
+// Device.WireGuard. object catalogue
+// ---------------------------------------------------------------------------
+
+var WireGuardObjects = []Object{
+	{
+		Path:         "Device.WireGuard.",
+		SinceVersion: "2.20",
+		Description:  "WireGuard service root object.",
+	},
+	{
+		Path:          "Device.WireGuard.Tunnel.{i}.",
+		MultiInstance: true,
+		SinceVersion:  "2.20",
+		Description:   "WireGuard tunnel interface table.",
+	},
+	{
+		Path:         "Device.WireGuard.Tunnel.{i}.Stats.",
+		SinceVersion: "2.20",
+		Description:  "Traffic counters for a WireGuard tunnel interface.",
+	},
+	{
+		Path:          "Device.WireGuard.Tunnel.{i}.Interface.{i}.",
+		MultiInstance: true,
+		SinceVersion:  "2.20",
+		Description:   "Stackable layer-3 interface rows exposed for a tunnel interface.",
+	},
+	{
+		Path:          "Device.WireGuard.Peer.{i}.",
+		MultiInstance: true,
+		SinceVersion:  "2.20",
+		Description:   "Global WireGuard peer table.",
+	},
+}
+
+// ---------------------------------------------------------------------------
 // Device.WireGuard. root parameters
 // ---------------------------------------------------------------------------
 
@@ -284,11 +319,11 @@ var WireGuardPeerParams = []Param{
 }
 
 // ---------------------------------------------------------------------------
-// Aggregated slice — included in AllDeviceParams via device.go init()
+// Aggregated slice — included in AllDeviceParams via broadband.go aggregation.
 // ---------------------------------------------------------------------------
 
 // AllWireGuardParams is the union of all Device.WireGuard.* parameter
-// definitions. Merged into AllDeviceParams at package init time.
+// definitions. Merged into AllDeviceParams as part of the runtime schema.
 var AllWireGuardParams = concat(
 	WireGuardRootParams,
 	WireGuardTunnelParams,

@@ -207,3 +207,102 @@ func TestUSPAgentSetterUnsupportedFallsBackToStore(t *testing.T) {
 		t.Fatalf("friendly name=%q want %q", got.Fields[0].Val.AsString(), "Office Router")
 	}
 }
+
+func TestUSPAgentAddGetInstancesOperateNotifyAndSupport(t *testing.T) {
+	operateCalls := 0
+	notifyCalls := 0
+
+	agent := NewUSPAgent(USPAgentOptions{
+		OperateHandler: func(_ context.Context, commandPath string, input *Message, metadata map[string]string) (*Message, error) {
+			operateCalls++
+			if commandPath != "Device.WUSP.Request.{i}." {
+				t.Fatalf("operate command path=%q", commandPath)
+			}
+			if metadata["command_key"] != "op-1" {
+				t.Fatalf("operate metadata=%v", metadata)
+			}
+			out := &Message{}
+			out.SetString("Device.WUSP.Request.1.Status", "Success")
+			if input != nil {
+				out.Fields = append(out.Fields, input.Fields...)
+			}
+			return out, nil
+		},
+		NotifyHandler: func(_ context.Context, eventPath string, payload *Message, metadata map[string]string) error {
+			notifyCalls++
+			if eventPath != "Device.WUSP.Subscription.{i}." {
+				t.Fatalf("notify event path=%q", eventPath)
+			}
+			if metadata["subscription_id"] != "sub-1" {
+				t.Fatalf("notify metadata=%v", metadata)
+			}
+			if payload == nil || len(payload.Fields) == 0 {
+				t.Fatal("notify payload missing")
+			}
+			return nil
+		},
+	})
+
+	instances, err := agent.Add("Device.WireGuard.Peer.{i}.", &Message{
+		Fields: []Field{
+			{Path: "Device.WireGuard.Peer.{i}.Alias", Val: String("peer-1")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if len(instances) != 1 || instances[0] != "Device.WireGuard.Peer.1." {
+		t.Fatalf("instances=%v want Device.WireGuard.Peer.1.", instances)
+	}
+
+	gotInstances, err := agent.GetInstances("Device.WireGuard.Peer.{i}.")
+	if err != nil {
+		t.Fatalf("GetInstances returned error: %v", err)
+	}
+	if len(gotInstances) != 1 || gotInstances[0] != "Device.WireGuard.Peer.1." {
+		t.Fatalf("GetInstances=%v want Device.WireGuard.Peer.1.", gotInstances)
+	}
+
+	countMsg, err := agent.Get("Device.WireGuard.PeerNumberOfEntries")
+	if err != nil {
+		t.Fatalf("Get(PeerNumberOfEntries) returned error: %v", err)
+	}
+	if got := countMsg.Fields[0].Val.AsUint(); got != 1 {
+		t.Fatalf("PeerNumberOfEntries=%d want=1", got)
+	}
+
+	operateOut, err := agent.Operate(context.Background(), "Device.WUSP.Request.{i}.", &Message{
+		Fields: []Field{{Path: "Device.WUSP.Request.1.Command", Val: String("Reboot")}},
+	}, map[string]string{"command_key": "op-1"})
+	if err != nil {
+		t.Fatalf("Operate returned error: %v", err)
+	}
+	if operateCalls != 1 {
+		t.Fatalf("operateCalls=%d want=1", operateCalls)
+	}
+	if operateOut == nil || len(operateOut.Fields) == 0 {
+		t.Fatal("Operate output missing")
+	}
+
+	if err := agent.Notify(context.Background(), "Device.WUSP.Subscription.{i}.", &Message{
+		Fields: []Field{{Path: "Device.WUSP.Subscription.1.ID", Val: String("sub-1")}},
+	}, map[string]string{"subscription_id": "sub-1"}); err != nil {
+		t.Fatalf("Notify returned error: %v", err)
+	}
+	if notifyCalls != 1 {
+		t.Fatalf("notifyCalls=%d want=1", notifyCalls)
+	}
+
+	supportedDM := agent.GetSupportedDM("Device.WireGuard.")
+	if supportedDM.RootDataModelVersion != BroadbandRootDataModelVersion {
+		t.Fatalf("RootDataModelVersion=%q want=%q", supportedDM.RootDataModelVersion, BroadbandRootDataModelVersion)
+	}
+	if len(supportedDM.Objects) == 0 || len(supportedDM.Params) == 0 {
+		t.Fatalf("supported DM missing objects/params: %+v", supportedDM)
+	}
+
+	protocol := agent.GetSupportedProtocol()
+	if protocol.Name == "" || protocol.RecommendedChunkSize == 0 {
+		t.Fatalf("protocol=%+v want populated protocol info", protocol)
+	}
+}

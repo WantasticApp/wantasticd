@@ -554,9 +554,17 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				}
 				continue
 			case MessageWUSPType:
-				device.log.Verbosef("%v - Received WUSP packet: %d bytes", peer, len(elem.packet))
+				payload, assembled, err := device.consumeWUSPPayload(peer, elem.packet)
+				if err != nil {
+					device.log.Verbosef("%v - Dropping malformed WUSP packet: %v", peer, err)
+					continue
+				}
+				if !assembled {
+					continue
+				}
+				device.log.Verbosef("%v - Received WUSP packet: %d bytes", peer, len(payload))
 				if device.wuspHandler != nil {
-					device.wuspHandler(peer, elem.packet)
+					device.wuspHandler(peer, payload)
 				}
 				continue
 			}

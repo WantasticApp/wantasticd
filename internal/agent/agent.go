@@ -23,6 +23,7 @@ type Agent struct {
 	device  *device.Device
 	updater *update.Manager
 	stats   *stats.Server
+	usp     *uspRuntime
 
 	mu      sync.RWMutex
 	running bool
@@ -50,11 +51,20 @@ func New(cfg *config.Config) (*Agent, error) {
 	statsServer := stats.NewServer(dev, version.Version)
 	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
 
+	uspRuntime, err := newUSPRuntime(cfg, dev)
+	if err != nil {
+		return nil, fmt.Errorf("create usp runtime: %w", err)
+	}
+	if uspRuntime != nil {
+		dev.SetWUSPHandler(uspRuntime.HandlePeerPacket)
+	}
+
 	agt := &Agent{
 		config:  cfg,
 		device:  dev,
 		updater: updater,
 		stats:   statsServer,
+		usp:     uspRuntime,
 		stopCh:  make(chan struct{}),
 	}
 	agt.apiServer = NewAPIServer(agt)

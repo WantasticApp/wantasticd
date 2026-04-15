@@ -713,10 +713,10 @@ func samplePathRef(path string) string {
 		return "Device.WireGuard.Peer.1."
 	case strings.Contains(path, "ManagementServer"):
 		return "Device.ManagementServer.ManageableDevice.1."
-	case strings.Contains(path, "LocalAgent.ControllerTrust.Role"):
-		return "Device.LocalAgent.ControllerTrust.Role.1."
-	case strings.Contains(path, "LocalAgent.Certificate"):
-		return "Device.LocalAgent.Certificate.1."
+	case strings.Contains(path, "WUSP.ControllerTrust.Role"), strings.Contains(path, "LocalAgent.ControllerTrust.Role"):
+		return "Device.WUSP.ControllerTrust.Role.1."
+	case strings.Contains(path, "WUSP.Certificate"), strings.Contains(path, "LocalAgent.Certificate"):
+		return "Device.WUSP.Certificate.1."
 	default:
 		return "Device.IP.Interface.1."
 	}

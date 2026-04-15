@@ -378,8 +378,8 @@ func (r *registry) PathForID(id uint16) (string, bool) {
 	return r.idToPath[id-1], true
 }
 
-// globalRegistry is set by init() so it is built after device.go's init()
-// has finished populating AllDeviceParams (including AllWireGuardParams).
+// globalRegistry is set by init() after the generated/imported model layer has
+// populated AllDeviceParams.
 var globalRegistry *registry
 
 func init() {

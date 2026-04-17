@@ -2,20 +2,16 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
-	"encoding/binary"
 	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
-	"math"
+	"go/format"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type paramType string
@@ -77,29 +73,6 @@ type object struct {
 	MultiInstance bool   `json:"multi_instance,omitempty"`
 	SinceVersion  string `json:"since_version"`
 	Description   string `json:"description,omitempty"`
-}
-
-type importedModelSummary struct {
-	ID           string `json:"id"`
-	FileName     string `json:"file_name"`
-	Name         string `json:"name"`
-	ModelVersion string `json:"model_version"`
-	Source       string `json:"source"`
-	SourceURL    string `json:"source_url"`
-	ObjectCount  int    `json:"object_count"`
-	ParamCount   int    `json:"param_count"`
-}
-
-type importedModelCatalog struct {
-	Summary importedModelSummary `json:"summary"`
-	Objects []object             `json:"objects"`
-	Params  []param              `json:"params"`
-}
-
-type importedCatalogPayload struct {
-	SourceRepo    string                 `json:"source_repo"`
-	ActiveModelID string                 `json:"active_model_id"`
-	Models        []importedModelCatalog `json:"models"`
 }
 
 type xmlDocument struct {
@@ -244,70 +217,53 @@ type modelParser struct {
 	cache     map[string]resolvedSyntax
 }
 
-var fileVersionPattern = regexp.MustCompile(`-(\d+)-(\d+)-(\d+)(?:-cwmp)?-full\.xml$`)
-
-const (
-	modelAssetMagic   = "WUSM"
-	modelAssetVersion = 1
-)
+// fileVersionPattern matches both -cwmp and -usp suffixed full.xml files.
+var fileVersionPattern = regexp.MustCompile(`-(\d+)-(\d+)-(\d+)(?:-(?:cwmp|usp))?-full\.xml$`)
 
 func main() {
-	sourceDir := flag.String("source", "", "directory containing BroadbandForum/cwmp-data-models XML files")
-	activeFile := flag.String("active", "tr-181-2-20-1-cwmp-full.xml", "active full.xml file to promote into the runtime schema")
-	out := flag.String("out", "", "path to write the gzipped binary model bundle")
+	sourcePath := flag.String("source", "", "path to a USP full.xml file")
+	out := flag.String("out", "", "path to write the generated Go source file")
+	pkg := flag.String("pkg", "wusp", "Go package name")
 	flag.Parse()
 
-	if strings.TrimSpace(*sourceDir) == "" {
+	if strings.TrimSpace(*sourcePath) == "" {
 		fatalf("missing -source")
 	}
 	if strings.TrimSpace(*out) == "" {
 		fatalf("missing -out")
 	}
 
-	fullFiles, err := filepath.Glob(filepath.Join(*sourceDir, "*-full.xml"))
+	objects, params, err := parseModelFile(*sourcePath)
 	if err != nil {
-		fatalf("glob full.xml files: %v", err)
-	}
-	sort.Strings(fullFiles)
-	if len(fullFiles) == 0 {
-		fatalf("no *-full.xml files found in %s", *sourceDir)
+		fatalf("parse %s: %v", *sourcePath, err)
 	}
 
-	var catalog importedCatalogPayload
-	catalog.SourceRepo = "https://github.com/BroadbandForum/cwmp-data-models"
-
-	for _, fullPath := range fullFiles {
-		modelCatalog, err := parseModelFile(fullPath)
-		if err != nil {
-			fatalf("parse %s: %v", filepath.Base(fullPath), err)
-		}
-		catalog.Models = append(catalog.Models, modelCatalog)
-		if filepath.Base(fullPath) == *activeFile {
-			catalog.ActiveModelID = modelCatalog.Summary.ID
-		}
+	src, err := generateGoSource(*pkg, *sourcePath, objects, params)
+	if err != nil {
+		fatalf("generate Go source: %v", err)
 	}
 
-	if strings.TrimSpace(catalog.ActiveModelID) == "" {
-		fatalf("active file %q not found under %s", *activeFile, *sourceDir)
+	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+		fatalf("mkdir: %v", err)
 	}
-
-	if err := writeGzippedModelBinary(*out, catalog); err != nil {
-		fatalf("write model bundle: %v", err)
+	if err := os.WriteFile(*out, src, 0o644); err != nil {
+		fatalf("write %s: %v", *out, err)
 	}
+	fmt.Fprintf(os.Stderr, "wrote %s (%d objects, %d params)\n", *out, len(objects), len(params))
 }
 
-func parseModelFile(path string) (importedModelCatalog, error) {
+func parseModelFile(path string) ([]object, []param, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return importedModelCatalog{}, err
+		return nil, nil, err
 	}
 
 	var doc xmlDocument
 	if err := xml.Unmarshal(data, &doc); err != nil {
-		return importedModelCatalog{}, err
+		return nil, nil, err
 	}
 	if len(doc.Models) == 0 {
-		return importedModelCatalog{}, errors.New("missing model element")
+		return nil, nil, errors.New("missing model element")
 	}
 
 	parser := modelParser{
@@ -322,27 +278,12 @@ func parseModelFile(path string) (importedModelCatalog, error) {
 	}
 
 	model := doc.Models[0]
-	fileName := filepath.Base(path)
-	modelVersion := inferFileVersion(fileName)
-
-	out := importedModelCatalog{
-		Summary: importedModelSummary{
-			ID:           fileName,
-			FileName:     fileName,
-			Name:         strings.TrimSpace(model.Name),
-			ModelVersion: modelVersion,
-			Source:       "BroadbandForum/cwmp-data-models " + fileName,
-			SourceURL:    "https://github.com/BroadbandForum/cwmp-data-models/blob/main/" + fileName,
-		},
-	}
-
+	var objects []object
+	var params []param
 	for _, objectNode := range model.Objects {
-		walkObject(model, objectNode, &parser, &out.Objects, &out.Params)
+		walkObject(model, objectNode, &parser, &objects, &params)
 	}
-
-	out.Summary.ObjectCount = len(out.Objects)
-	out.Summary.ParamCount = len(out.Params)
-	return out, nil
+	return objects, params, nil
 }
 
 func walkObject(model xmlModel, node xmlObject, parser *modelParser, objects *[]object, params *[]param) {
@@ -674,7 +615,7 @@ func choosePrimitiveStringType(s xmlStringSyntax) paramType {
 
 func specialTypeForDataType(name string, fallback paramType) paramType {
 	switch strings.TrimSpace(name) {
-	case "_AliasCommon", "_AliasCWMP", "Alias":
+	case "_AliasCommon", "_AliasCWMP", "_AliasUSP", "Alias":
 		return typeAlias
 	case "StatsCounter32", "StatsCounter64", "StatsCounter":
 		return typeStatsCounter
@@ -812,191 +753,179 @@ func isZeroSyntax(s xmlSyntax) bool {
 		s.Hidden == ""
 }
 
-func writeGzippedModelBinary(path string, value importedCatalogPayload) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+// typeConstName maps a paramType to the Go constant name used in models.go.
+func typeConstName(t paramType) string {
+	switch t {
+	case typeString:
+		return "TypeString"
+	case typeInt:
+		return "TypeInt"
+	case typeUnsignedInt:
+		return "TypeUnsignedInt"
+	case typeLong:
+		return "TypeLong"
+	case typeUnsignedLong:
+		return "TypeUnsignedLong"
+	case typeBoolean:
+		return "TypeBoolean"
+	case typeDateTime:
+		return "TypeDateTime"
+	case typeBase64:
+		return "TypeBase64"
+	case typeHexBinary:
+		return "TypeHexBinary"
+	case typeDecimal:
+		return "TypeDecimal"
+	case typeIPv4Address:
+		return "TypeIPv4Address"
+	case typeIPv6Address:
+		return "TypeIPv6Address"
+	case typeIPv4Prefix:
+		return "TypeIPv4Prefix"
+	case typeIPv6Prefix:
+		return "TypeIPv6Prefix"
+	case typeMACAddress:
+		return "TypeMACAddress"
+	case typeAlias:
+		return "TypeAlias"
+	case typeStatsCounter:
+		return "TypeStatsCounter"
+	case typePathRef:
+		return "TypePathRef"
+	case typeList:
+		return "TypeList"
+	default:
+		return fmt.Sprintf("ParamType(%q)", string(t))
 	}
-	encoded, err := encodeImportedCatalogBinary(value)
+}
+
+// accessConstName maps an access value to the Go constant name.
+func accessConstName(a access) string {
+	switch a {
+	case readOnly:
+		return "ReadOnly"
+	case readWrite:
+		return "ReadWrite"
+	case writeOnly:
+		return "WriteOnly"
+	default:
+		return fmt.Sprintf("Access(%q)", string(a))
+	}
+}
+
+// generateGoSource generates the Go source text for the model data.
+func generateGoSource(pkg, sourcePath string, objects []object, params []param) ([]byte, error) {
+	fileName := filepath.Base(sourcePath)
+	modelVersion := inferFileVersion(fileName)
+
+	var w bytes.Buffer
+
+	fmt.Fprintf(&w, "// Code generated by cmd/modelgen; DO NOT EDIT.\n")
+	fmt.Fprintf(&w, "//\n")
+	fmt.Fprintf(&w, "// Source: BroadbandForum/usp-data-models %s\n", fileName)
+	fmt.Fprintf(&w, "// URL: https://github.com/BroadbandForum/usp-data-models/blob/master/%s\n", fileName)
+	if modelVersion != "" {
+		fmt.Fprintf(&w, "// Model version: %s\n", modelVersion)
+	}
+	fmt.Fprintf(&w, "\n")
+	fmt.Fprintf(&w, "package %s\n\n", pkg)
+
+	// Objects slice
+	fmt.Fprintf(&w, "var uspModelObjects = []Object{\n")
+	for _, obj := range objects {
+		fmt.Fprintf(&w, "\t{\n")
+		fmt.Fprintf(&w, "\t\tPath: %s,\n", strconv.Quote(obj.Path))
+		if obj.MultiInstance {
+			fmt.Fprintf(&w, "\t\tMultiInstance: true,\n")
+		}
+		if obj.SinceVersion != "" {
+			fmt.Fprintf(&w, "\t\tSinceVersion: %s,\n", strconv.Quote(obj.SinceVersion))
+		}
+		if obj.Description != "" {
+			fmt.Fprintf(&w, "\t\tDescription: %s,\n", strconv.Quote(obj.Description))
+		}
+		fmt.Fprintf(&w, "\t},\n")
+	}
+	fmt.Fprintf(&w, "}\n\n")
+
+	// Params slice
+	fmt.Fprintf(&w, "var uspModelParams = []Param{\n")
+	for _, p := range params {
+		fmt.Fprintf(&w, "\t{\n")
+		fmt.Fprintf(&w, "\t\tPath: %s,\n", strconv.Quote(p.Path))
+		fmt.Fprintf(&w, "\t\tType: %s,\n", typeConstName(p.Type))
+		fmt.Fprintf(&w, "\t\tAccess: %s,\n", accessConstName(p.Access))
+		if p.SinceVersion != "" {
+			fmt.Fprintf(&w, "\t\tSinceVersion: %s,\n", strconv.Quote(p.SinceVersion))
+		}
+		if p.Description != "" {
+			fmt.Fprintf(&w, "\t\tDescription: %s,\n", strconv.Quote(p.Description))
+		}
+		if !isZeroLimits(p.Limits) {
+			fmt.Fprintf(&w, "\t\tLimits: Limits{\n")
+			if p.Limits.Min != nil {
+				fmt.Fprintf(&w, "\t\t\tMin: iptr(%d),\n", *p.Limits.Min)
+			}
+			if p.Limits.Max != nil {
+				fmt.Fprintf(&w, "\t\t\tMax: iptr(%d),\n", *p.Limits.Max)
+			}
+			if p.Limits.MinF != nil {
+				fmt.Fprintf(&w, "\t\t\tMinF: fptr(%v),\n", *p.Limits.MinF)
+			}
+			if p.Limits.MaxF != nil {
+				fmt.Fprintf(&w, "\t\t\tMaxF: fptr(%v),\n", *p.Limits.MaxF)
+			}
+			if p.Limits.MinLength != 0 {
+				fmt.Fprintf(&w, "\t\t\tMinLength: %d,\n", p.Limits.MinLength)
+			}
+			if p.Limits.MaxLength != 0 {
+				fmt.Fprintf(&w, "\t\t\tMaxLength: %d,\n", p.Limits.MaxLength)
+			}
+			if len(p.Limits.Enums) > 0 {
+				fmt.Fprintf(&w, "\t\t\tEnums: []string{")
+				for i, e := range p.Limits.Enums {
+					if i > 0 {
+						fmt.Fprintf(&w, ", ")
+					}
+					fmt.Fprintf(&w, "%s", strconv.Quote(e))
+				}
+				fmt.Fprintf(&w, "},\n")
+			}
+			if p.Limits.Pattern != "" {
+				fmt.Fprintf(&w, "\t\t\tPattern: %s,\n", strconv.Quote(p.Limits.Pattern))
+			}
+			if p.Limits.MinItems != 0 {
+				fmt.Fprintf(&w, "\t\t\tMinItems: %d,\n", p.Limits.MinItems)
+			}
+			if p.Limits.MaxItems != 0 {
+				fmt.Fprintf(&w, "\t\t\tMaxItems: %d,\n", p.Limits.MaxItems)
+			}
+			fmt.Fprintf(&w, "\t\t},\n")
+		}
+		fmt.Fprintf(&w, "\t},\n")
+	}
+	fmt.Fprintf(&w, "}\n")
+
+	formatted, err := format.Source(w.Bytes())
 	if err != nil {
-		return err
+		// Return the unformatted source alongside the error so the caller can
+		// write it for debugging.
+		return w.Bytes(), fmt.Errorf("gofmt: %w", err)
 	}
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	zw.Name = filepath.Base(path)
-	zw.ModTime = time.Unix(0, 0).UTC()
-	if _, err := zw.Write(encoded); err != nil {
-		_ = zw.Close()
-		return err
-	}
-	if err := zw.Close(); err != nil {
-		return err
-	}
-	return os.WriteFile(path, buf.Bytes(), 0o644)
+	return formatted, nil
 }
 
-func encodeImportedCatalogBinary(value importedCatalogPayload) ([]byte, error) {
-	writer := modelBinaryWriter{}
-	writer.writeRawString(modelAssetMagic)
-	writer.writeByte(modelAssetVersion)
-	writer.writeString(value.SourceRepo)
-	writer.writeString(value.ActiveModelID)
-	writer.writeUvarint(uint64(len(value.Models)))
-	for _, model := range value.Models {
-		writer.writeModelSummary(model.Summary)
-		writer.writeUvarint(uint64(len(model.Objects)))
-		for _, object := range model.Objects {
-			writer.writeObject(object)
-		}
-		writer.writeUvarint(uint64(len(model.Params)))
-		for _, param := range model.Params {
-			writer.writeParam(param)
-		}
-	}
-	return writer.bytes(), nil
-}
-
-type modelBinaryWriter struct {
-	buf []byte
-}
-
-func (w *modelBinaryWriter) bytes() []byte {
-	return w.buf
-}
-
-func (w *modelBinaryWriter) writeByte(value byte) {
-	w.buf = append(w.buf, value)
-}
-
-func (w *modelBinaryWriter) writeRawString(value string) {
-	w.buf = append(w.buf, value...)
-}
-
-func (w *modelBinaryWriter) writeUvarint(value uint64) {
-	var tmp [10]byte
-	n := binary.PutUvarint(tmp[:], value)
-	w.buf = append(w.buf, tmp[:n]...)
-}
-
-func (w *modelBinaryWriter) writeVarint(value int64) {
-	var tmp [10]byte
-	n := binary.PutVarint(tmp[:], value)
-	w.buf = append(w.buf, tmp[:n]...)
-}
-
-func (w *modelBinaryWriter) writeString(value string) {
-	w.writeUvarint(uint64(len(value)))
-	w.buf = append(w.buf, value...)
-}
-
-func (w *modelBinaryWriter) writeBool(value bool) {
-	if value {
-		w.writeUvarint(1)
-		return
-	}
-	w.writeUvarint(0)
-}
-
-func (w *modelBinaryWriter) writeStringList(values []string) {
-	w.writeUvarint(uint64(len(values)))
-	for _, value := range values {
-		w.writeString(value)
-	}
-}
-
-func (w *modelBinaryWriter) writeFloat64(value float64) {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(value))
-	w.buf = append(w.buf, tmp[:]...)
-}
-
-func (w *modelBinaryWriter) writeModelSummary(summary importedModelSummary) {
-	w.writeString(summary.ID)
-	w.writeString(summary.FileName)
-	w.writeString(summary.Name)
-	w.writeString(summary.ModelVersion)
-	w.writeString(summary.Source)
-	w.writeString(summary.SourceURL)
-}
-
-func (w *modelBinaryWriter) writeObject(object object) {
-	w.writeString(object.Path)
-	w.writeBool(object.MultiInstance)
-	w.writeString(object.SinceVersion)
-	w.writeString(object.Description)
-}
-
-func (w *modelBinaryWriter) writeParam(param param) {
-	w.writeString(param.Path)
-	w.writeString(string(param.Type))
-	w.writeString(string(param.Access))
-	w.writeString(param.SinceVersion)
-	w.writeString(param.Description)
-	w.writeLimits(param.Limits)
-}
-
-func (w *modelBinaryWriter) writeLimits(value limits) {
-	var flags uint64
-	if value.Min != nil {
-		flags |= 1 << 0
-	}
-	if value.Max != nil {
-		flags |= 1 << 1
-	}
-	if value.MinF != nil {
-		flags |= 1 << 2
-	}
-	if value.MaxF != nil {
-		flags |= 1 << 3
-	}
-	if value.MinLength != 0 {
-		flags |= 1 << 4
-	}
-	if value.MaxLength != 0 {
-		flags |= 1 << 5
-	}
-	if len(value.Enums) > 0 {
-		flags |= 1 << 6
-	}
-	if value.Pattern != "" {
-		flags |= 1 << 7
-	}
-	if value.MinItems != 0 {
-		flags |= 1 << 8
-	}
-	if value.MaxItems != 0 {
-		flags |= 1 << 9
-	}
-	w.writeUvarint(flags)
-	if value.Min != nil {
-		w.writeVarint(*value.Min)
-	}
-	if value.Max != nil {
-		w.writeVarint(*value.Max)
-	}
-	if value.MinF != nil {
-		w.writeFloat64(*value.MinF)
-	}
-	if value.MaxF != nil {
-		w.writeFloat64(*value.MaxF)
-	}
-	if value.MinLength != 0 {
-		w.writeUvarint(uint64(value.MinLength))
-	}
-	if value.MaxLength != 0 {
-		w.writeUvarint(uint64(value.MaxLength))
-	}
-	if len(value.Enums) > 0 {
-		w.writeStringList(value.Enums)
-	}
-	if value.Pattern != "" {
-		w.writeString(value.Pattern)
-	}
-	if value.MinItems != 0 {
-		w.writeUvarint(uint64(value.MinItems))
-	}
-	if value.MaxItems != 0 {
-		w.writeUvarint(uint64(value.MaxItems))
-	}
+func isZeroLimits(l limits) bool {
+	return l.Min == nil &&
+		l.Max == nil &&
+		l.MinF == nil &&
+		l.MaxF == nil &&
+		l.MinLength == 0 &&
+		l.MaxLength == 0 &&
+		len(l.Enums) == 0 &&
+		l.Pattern == "" &&
+		l.MinItems == 0 &&
+		l.MaxItems == 0
 }
 
 func fatalf(format string, args ...any) {

@@ -95,11 +95,18 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.config.AutoUpdate {
 		workerCount++
 	}
+	if a.usp != nil {
+		workerCount++
+	}
 	a.wg.Add(workerCount)
 
 	go a.runHealthCheck(ctx)
 	go a.runDNSCheck(ctx)
 	go a.runMetricsTicker(ctx)
+
+	if a.usp != nil {
+		go a.runWUSPInit(ctx)
+	}
 
 	if a.config.AutoUpdate {
 		log.Println("Auto-update enabled")
@@ -146,6 +153,11 @@ func (a *Agent) Stop() error {
 	}
 
 	return nil
+}
+
+func (a *Agent) runWUSPInit(ctx context.Context) {
+	defer a.wg.Done()
+	a.usp.runInit(ctx)
 }
 
 func (a *Agent) runMetricsTicker(ctx context.Context) {

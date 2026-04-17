@@ -145,6 +145,12 @@ func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPA
 		resp.Message = msg
 		return resp, nil
 	case USPAgentMethodNotify:
+		// Wire subscription management: controller registering or cancelling a
+		// subscription.
+		if IsSubscriptionRequest(req) {
+			return a.handleSubscriptionRequest(ctx, req)
+		}
+		// Regular controller-originated notify.
 		if err := a.Notify(ctx, req.ObjectPath, req.Message, req.Metadata); err != nil {
 			resp.Error = err.Error()
 			return resp, nil

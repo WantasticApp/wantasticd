@@ -29,6 +29,8 @@ func (t *fakeUSPTransport) SendWUSPToServer(data []byte) error {
 	return nil
 }
 
+func (t *fakeUSPTransport) IsServerConnected() bool { return true }
+
 func TestUSPRuntimeHandlesControllerRequest(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 
@@ -339,6 +341,160 @@ func TestUSPRuntimeTunnelTransferDownload(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("timeout waiting for streamed download frames")
 		}
+	}
+}
+
+// TestWUSPRetryDelay validates the grouped backoff schedule.
+func TestWUSPRetryDelay(t *testing.T) {
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		// Group 0: base 1s, doubles within group
+		{0, 1 * time.Second},
+		{1, 2 * time.Second},
+		{2, 4 * time.Second},
+		// Group 1: base 8s
+		{3, 8 * time.Second},
+		{4, 16 * time.Second},
+		{5, 32 * time.Second},
+		// Group 2: base 60s
+		{6, 60 * time.Second},
+		{7, 120 * time.Second},
+		{8, 240 * time.Second},
+		// Group 3+: capped at 5 min
+		{9, 5 * time.Minute},
+		{12, 5 * time.Minute},
+		{100, 5 * time.Minute},
+	}
+	for _, tc := range cases {
+		got := wuspRetryDelay(tc.attempt)
+		if got != tc.want {
+			t.Errorf("wuspRetryDelay(%d) = %v, want %v", tc.attempt, got, tc.want)
+		}
+	}
+}
+
+// TestUSPRuntimeOnBoardRequestEmit validates that initializeOnce emits a
+// well-formed OnBoardRequest frame over the transport.
+func TestUSPRuntimeOnBoardRequestEmit(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	transport := runtime.transport.(*fakeUSPTransport)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := runtime.initializeOnce(ctx)
+	if err != nil {
+		t.Fatalf("initializeOnce: %v", err)
+	}
+
+	var frame []byte
+	select {
+	case frame = <-transport.sendCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: no frame sent by initializeOnce")
+	}
+
+	// The frame must decode as a USPAgentRequest with Method == Notify and
+	// event_type == 6 (OnBoardRequest).
+	req, err := wusp.DecodeUSPAgentRequest(frame)
+	if err != nil {
+		t.Fatalf("DecodeUSPAgentRequest: %v", err)
+	}
+	if req.Method != wusp.USPAgentMethodNotify {
+		t.Fatalf("method=%v want Notify", req.Method)
+	}
+	if !wusp.IsEventNotifyRequest(req) {
+		t.Fatal("IsEventNotifyRequest returned false for OnBoardRequest frame")
+	}
+
+	event, err := wusp.DecodeEventFromRequest(req)
+	if err != nil {
+		t.Fatalf("DecodeEventFromRequest: %v", err)
+	}
+	if event.Type != wusp.USPEventTypeOnBoardRequest {
+		t.Fatalf("event.Type=%d want %d (OnBoardRequest)", event.Type, wusp.USPEventTypeOnBoardRequest)
+	}
+	if event.OnBoard == nil {
+		t.Fatal("event.OnBoard is nil")
+	}
+	if event.OnBoard.SerialNumber == "" {
+		t.Fatal("event.OnBoard.SerialNumber is empty")
+	}
+}
+
+// TestUSPRuntimeInitReady verifies that runInit signals initReady once the
+// first initializeOnce call succeeds.
+func TestUSPRuntimeInitReady(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+
+	if runtime.IsReady() {
+		t.Fatal("IsReady() returned true before runInit")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runtime.runInit(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-runtime.initReady:
+		// good
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: initReady never closed")
+	}
+
+	if !runtime.IsReady() {
+		t.Fatal("IsReady() returned false after runInit succeeded")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout: runInit goroutine did not exit after cancel")
+	}
+}
+
+// TestUSPRuntimeUnauthorizedPeerRejected verifies that frames from unknown
+// peers get an error response rather than being silently dropped, and that
+// frames from the authorised controller are processed normally.
+func TestUSPRuntimeUnauthorizedPeerRejected(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+
+	reqFrame, err := wusp.EncodeUSPAgentRequest(wusp.USPAgentRequest{
+		ID:     99,
+		Method: wusp.USPAgentMethodGet,
+		Paths:  []string{"Device.DeviceInfo.HostName"},
+	})
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest: %v", err)
+	}
+
+	var replyFrame []byte
+	err = runtime.handleFrameFromPeer("deadbeef0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", reqFrame, func(frame []byte) error {
+		replyFrame = append([]byte(nil), frame...)
+		return nil
+	})
+	// The function should return an error (unauthorized).
+	if err == nil {
+		t.Fatal("expected error for unauthorized peer, got nil")
+	}
+	// And it should have sent an error response frame.
+	if replyFrame == nil {
+		t.Fatal("expected error response frame for unauthorized peer")
+	}
+	resp, decErr := wusp.DecodeUSPAgentResponse(replyFrame)
+	if decErr != nil {
+		t.Fatalf("DecodeUSPAgentResponse(error response): %v", decErr)
+	}
+	if resp.Error == "" {
+		t.Fatal("expected non-empty Error in unauthorized response")
 	}
 }
 

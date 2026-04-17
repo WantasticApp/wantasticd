@@ -44,29 +44,6 @@ func TestLookupBroadbandDataModel(t *testing.T) {
 	}
 }
 
-func TestImportedCWMPCatalogAvailable(t *testing.T) {
-	models := ListImportedCWMPFullModels()
-	if len(models) == 0 {
-		t.Fatal("expected imported CWMP full models")
-	}
-
-	summary, ok := LookupImportedCWMPFullModel("tr-181-2-20-1-cwmp-full.xml")
-	if !ok {
-		t.Fatal("active imported model summary not found")
-	}
-	if summary.ParamCount == 0 || summary.ObjectCount == 0 {
-		t.Fatalf("unexpected empty imported summary: %+v", summary)
-	}
-
-	model, err := LoadImportedCWMPFullModel("tr-181-2-20-1-cwmp-full.xml")
-	if err != nil {
-		t.Fatalf("load imported model: %v", err)
-	}
-	if len(model.Objects) != summary.ObjectCount || len(model.Params) != summary.ParamCount {
-		t.Fatalf("loaded imported model counts mismatch: objects=%d/%d params=%d/%d", len(model.Objects), summary.ObjectCount, len(model.Params), summary.ParamCount)
-	}
-}
-
 func TestRuntimeDevicePathIndex(t *testing.T) {
 	device := RuntimeDevice()
 	if device == nil {

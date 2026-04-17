@@ -473,6 +473,12 @@ func (d *Device) SendWUSPToServer(data []byte) error {
 	return d.SendWUSP(d.config.Server.PublicKey, data)
 }
 
+// IsServerConnected reports whether there is an active (recent) WireGuard
+// handshake with the server peer. Satisfies the agent's uspTransport interface.
+func (d *Device) IsServerConnected() bool {
+	return d.HasActiveHandshake()
+}
+
 // SendStatsToServer pushes a stats message (Message Type 5) to the server peer.
 // Safe to call from any goroutine; no-ops if the device is not started or the
 // server peer is not found / not stats-enabled.
@@ -515,29 +521,49 @@ func (d *Device) GetStats() (map[string]any, error) {
 	}, nil
 }
 
+// activeHandshakeWindow is how old the last WireGuard handshake can be and still
+// be considered "active". Must be >= RejectAfterTime (300s in this build) so
+// that a session which hasn't re-keyed yet is not falsely declared dead.
+// We use 8 minutes: one full session (300s) plus one RekeyAfterTime (120s) of
+// slack so a delayed re-handshake doesn't trip the USP re-announce gate.
+const activeHandshakeWindow = 8 * time.Minute
+
 func (d *Device) HasActiveHandshake() bool {
 	d.mu.RLock()
 	wd := d.device
 	d.mu.RUnlock()
 	if wd == nil {
+		log.Printf("[WG] HasActiveHandshake: device not started")
 		return false
 	}
 
 	res, err := wd.IpcGet()
 	if err != nil {
+		log.Printf("[WG] HasActiveHandshake: IpcGet error: %v", err)
 		return false
 	}
 	lines := strings.Split(res, "\n")
+	peerCount := 0
 	for _, line := range lines {
+		if strings.HasPrefix(line, "public_key=") {
+			peerCount++
+		}
 		if strings.HasPrefix(line, "last_handshake_time_sec=") {
 			parts := strings.Split(line, "=")
 			if len(parts) == 2 {
-				ts, _ := strconv.ParseInt(parts[1], 10, 64)
-				if ts > 0 && time.Since(time.Unix(ts, 0)) < 3*time.Minute {
+				ts, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+				age := time.Since(time.Unix(ts, 0))
+				if ts > 0 && age < activeHandshakeWindow {
+					log.Printf("[WG] HasActiveHandshake: active (last handshake %s ago)", age.Round(time.Second))
 					return true
 				}
+				log.Printf("[WG] HasActiveHandshake: peer handshake ts=%d age=%s (window=%s)",
+					ts, age.Round(time.Second), activeHandshakeWindow)
 			}
 		}
+	}
+	if peerCount == 0 {
+		log.Printf("[WG] HasActiveHandshake: no peers configured in WireGuard device")
 	}
 	return false
 }

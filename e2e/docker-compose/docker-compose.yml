@@ -45,29 +45,6 @@ services:
       - NET_ADMIN
     restart: unless-stopped
 
-  client3:
-    privileged: true
-    build:
-      context: ../../
-      dockerfile: e2e/docker-compose/Dockerfile.dev
-    container_name: wantasticd-client3
-    command: [ "air", "-c", ".air-openwrt.toml" ]
-    volumes:
-      - ../../:/app
-      - ./configs/client3.conf:/etc/wantasticd/wg.conf:ro
-    environment:
-      - LOG_LEVEL=debug
-    extra_hosts:
-      - "wg.wantastic.local:host-gateway"
-    networks:
-      wantastic-e2e:
-        ipv4_address: 172.25.0.13
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    cap_add:
-      - NET_ADMIN
-    restart: unless-stopped
-
 networks:
   wantastic-e2e:
     driver: bridge

@@ -498,7 +498,9 @@ func validateUSPAgentRequest(req USPAgentRequest) error {
 	}
 	if req.ObjectCode == 0 && len(req.PathCodes) == 0 && len(req.Paths) == 0 {
 		switch req.Method {
-		case USPAgentMethodGet, USPAgentMethodDelete, USPAgentMethodGetInstances:
+		// USPAgentMethodGet with no paths is valid — it means "get all parameters"
+		// (full device snapshot). Only Delete and GetInstances require at least one path.
+		case USPAgentMethodDelete, USPAgentMethodGetInstances:
 			return &ValidationError{Reason: "request missing path selector"}
 		}
 	}

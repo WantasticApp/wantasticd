@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -101,6 +102,17 @@ type USPAgentOptions struct {
 	NotifyHandler   USPNotifyHandler
 	Collector       DataCollector
 	Setter          DataSetter
+
+	// EventSender delivers agent-originated Notify payloads to the controller
+	// over the WireGuard tunnel. When nil, only in-process USPSubscription
+	// handlers are called.
+	EventSender USPEventSender
+
+	// EventHandler is a global fallback called for every inbound agent-
+	// originated Notify when the controller is co-located (in-process). On the
+	// agent side this is unused — use USPAgent.Subscribe for per-subscription
+	// handlers.
+	EventHandler USPEventHandler
 }
 
 // USPAgent is a transport-agnostic in-process USP state surface.
@@ -117,6 +129,11 @@ type USPAgent struct {
 	collector       DataCollector
 	setter          DataSetter
 	values          map[string]Field
+
+	// Event subsystem
+	subscriptions map[string]USPSubscription // keyed by subscription ID
+	eventSender   USPEventSender
+	nextEventID   uint64 // accessed via sync/atomic
 }
 
 func NewUSPAgent(opts USPAgentOptions) *USPAgent {
@@ -129,6 +146,8 @@ func NewUSPAgent(opts USPAgentOptions) *USPAgent {
 		collector:       opts.Collector,
 		setter:          opts.Setter,
 		values:          make(map[string]Field),
+		subscriptions:   make(map[string]USPSubscription),
+		eventSender:     opts.EventSender,
 	}
 }
 
@@ -1171,4 +1190,193 @@ func objectCountParamPath(objectPath string) (string, bool) {
 		return "", false
 	}
 	return "", false
+}
+
+// ---------------------------------------------------------------------------
+// Event subscription management
+// ---------------------------------------------------------------------------
+
+// Subscribe registers an event subscription. If a subscription with the same
+// ID already exists it is replaced. Returns an error only when sub.ID is empty.
+func (a *USPAgent) Subscribe(sub USPSubscription) error {
+	if strings.TrimSpace(sub.ID) == "" {
+		return &ValidationError{Reason: "subscription id required"}
+	}
+	a.mu.Lock()
+	a.subscriptions[sub.ID] = sub
+	a.mu.Unlock()
+	return nil
+}
+
+// Unsubscribe removes a previously registered subscription. It is a no-op
+// when the ID is not found.
+func (a *USPAgent) Unsubscribe(id string) {
+	a.mu.Lock()
+	delete(a.subscriptions, id)
+	a.mu.Unlock()
+}
+
+// SetEventSender replaces the configured USPEventSender at runtime. Pass nil
+// to disable wire-based event delivery.
+func (a *USPAgent) SetEventSender(sender USPEventSender) {
+	a.mu.Lock()
+	a.eventSender = sender
+	a.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Event emission
+// ---------------------------------------------------------------------------
+
+// Emit dispatches event to every matching subscription handler and, if an
+// USPEventSender is configured, encodes and sends the event over the wire.
+//
+// Subscription handlers that match the event are called synchronously in the
+// goroutine that calls Emit. Long-running handlers should spawn their own
+// goroutine.
+func (a *USPAgent) Emit(ctx context.Context, event USPEvent) error {
+	a.mu.RLock()
+	matching := make([]USPSubscription, 0, len(a.subscriptions))
+	for _, sub := range a.subscriptions {
+		if subscriptionMatches(sub, event) {
+			matching = append(matching, sub)
+		}
+	}
+	sender := a.eventSender
+	a.mu.RUnlock()
+
+	// Call in-process handlers outside the lock.
+	for _, sub := range matching {
+		if sub.Handler == nil {
+			continue
+		}
+		ev := event
+		ev.SubscriptionID = sub.ID
+		if err := sub.Handler(ctx, ev); err != nil {
+			return err
+		}
+	}
+
+	// Wire delivery: send one notification per matching subscription so the
+	// controller can correlate by subscription_id. Fall back to a single
+	// untagged notification when there are no subscriptions.
+	if sender == nil {
+		return nil
+	}
+	if len(matching) == 0 {
+		return a.sendEventWire(ctx, sender, event)
+	}
+	for _, sub := range matching {
+		ev := event
+		ev.SubscriptionID = sub.ID
+		if err := a.sendEventWire(ctx, sender, ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *USPAgent) sendEventWire(ctx context.Context, sender USPEventSender, event USPEvent) error {
+	id := atomic.AddUint64(&a.nextEventID, 1)
+	req := EncodeEventToRequest(event, id)
+	encoded, err := EncodeUSPAgentRequest(req)
+	if err != nil {
+		return err
+	}
+	return sender.SendUSPNotify(ctx, encoded)
+}
+
+// EmitValueChange notifies the controller that paramPath changed to newValue.
+func (a *USPAgent) EmitValueChange(ctx context.Context, paramPath, newValue string) error {
+	return a.Emit(ctx, USPEvent{
+		Type:       USPEventTypeValueChange,
+		ObjPath:    paramPath,
+		ParamValue: newValue,
+	})
+}
+
+// EmitObjectCreation notifies the controller that a new object instance was
+// created at objPath. uniqueKeys carries the USP unique-key name→value pairs
+// that identify the new instance.
+func (a *USPAgent) EmitObjectCreation(ctx context.Context, objPath string, uniqueKeys map[string]string) error {
+	return a.Emit(ctx, USPEvent{
+		Type:    USPEventTypeObjectCreation,
+		ObjPath: objPath,
+		Params:  uniqueKeys,
+	})
+}
+
+// EmitObjectDeletion notifies the controller that the object instance at
+// objPath was deleted.
+func (a *USPAgent) EmitObjectDeletion(ctx context.Context, objPath string) error {
+	return a.Emit(ctx, USPEvent{
+		Type:    USPEventTypeObjectDeletion,
+		ObjPath: objPath,
+	})
+}
+
+// EmitOperationComplete reports the outcome of an asynchronous Operate request.
+// objPath is the command object path, commandName is the command (e.g.
+// "Reboot()"), commandKey is the key the controller assigned in the original
+// Operate request. outputArgs carries the command output on success; opErr
+// carries the failure detail on error (pass nil for success).
+func (a *USPAgent) EmitOperationComplete(ctx context.Context, objPath, commandName, commandKey string, outputArgs map[string]string, opErr *USPEventError) error {
+	return a.Emit(ctx, USPEvent{
+		Type:       USPEventTypeOperationComplete,
+		ObjPath:    objPath,
+		EventName:  commandName,
+		CommandKey: commandKey,
+		Params:     outputArgs,
+		Err:        opErr,
+	})
+}
+
+// EmitEvent sends a named custom event from objPath with arbitrary params.
+// eventName identifies the event within the object (e.g. "Boot!").
+func (a *USPAgent) EmitEvent(ctx context.Context, objPath, eventName string, params map[string]string) error {
+	return a.Emit(ctx, USPEvent{
+		Type:      USPEventTypeEvent,
+		ObjPath:   objPath,
+		EventName: eventName,
+		Params:    params,
+	})
+}
+
+// EmitOnBoardRequest announces agent identity to the controller during
+// initial onboarding. ObjPath is set to "Device." so the Notify wire
+// validator (which requires ObjectPath or ObjectCode for all Notify requests)
+// is satisfied.
+func (a *USPAgent) EmitOnBoardRequest(ctx context.Context, info USPOnBoardInfo) error {
+	return a.Emit(ctx, USPEvent{
+		Type:    USPEventTypeOnBoardRequest,
+		ObjPath: "Device.",
+		OnBoard: &info,
+	})
+}
+
+// handleSubscriptionRequest processes a wire-based subscribe/unsubscribe
+// request from the controller and returns the response.
+func (a *USPAgent) handleSubscriptionRequest(ctx context.Context, req USPAgentRequest) (USPAgentResponse, error) {
+	resp := USPAgentResponse{ID: req.ID, Method: req.Method}
+	action, sub := DecodeSubscriptionFromRequest(req)
+
+	if strings.TrimSpace(sub.ID) == "" {
+		resp.Error = "subscription id required"
+		return resp, nil
+	}
+
+	switch action {
+	case subActionAdd:
+		if err := a.Subscribe(sub); err != nil {
+			resp.Error = err.Error()
+			return resp, nil
+		}
+		resp.Metadata = map[string]string{subMetaID: sub.ID, subMetaStatus: "ok"}
+	case subActionRemove:
+		a.Unsubscribe(sub.ID)
+		resp.Metadata = map[string]string{subMetaID: sub.ID, subMetaStatus: "ok"}
+	default:
+		resp.Error = "unknown wusp subscription action"
+	}
+	return resp, nil
 }

@@ -576,21 +576,198 @@ Common causes:
 - `ObjectPath` does not end with `.`
 - method-specific required fields are absent (e.g., `Set` with no fields)
 
-## Recommended Controller Receive Loop
+## Event System
+
+WUSP carries USP-style notifications (TR-369 `Notify` message types) inside
+the existing WireGuard tunnel without Protocol Buffers. The encoding and
+decoding layers are not modified — events are structured Go values that sit
+above the already-decoded `USPAgentRequest` / `USPAgentResponse` types.
+
+### Event types
+
+| Type | ID | Equivalent TR-369 Notify |
+| --- | --- | --- |
+| `USPEventTypeEvent` | 1 | `Notify.Event` |
+| `USPEventTypeValueChange` | 2 | `Notify.ValueChange` |
+| `USPEventTypeObjectCreation` | 3 | `Notify.ObjectCreation` |
+| `USPEventTypeObjectDeletion` | 4 | `Notify.ObjectDeletion` |
+| `USPEventTypeOperationComplete` | 5 | `Notify.OperationComplete` |
+| `USPEventTypeOnBoardRequest` | 6 | `Notify.OnBoardRequest` |
+
+### USPEvent fields
+
+| Field | Used by type | Description |
+| --- | --- | --- |
+| `Type` | all | Event category |
+| `SubscriptionID` | all | Echoes the subscription ID when matched |
+| `ObjPath` | all | Source object or parameter path |
+| `EventName` | Event, OperationComplete | Event or command name |
+| `CommandKey` | OperationComplete | Controller-assigned key from original Operate |
+| `Params` | Event, ObjectCreation, OperationComplete | Key→value map (args, unique keys, output) |
+| `ParamValue` | ValueChange | New parameter value |
+| `Err` | OperationComplete | Non-nil when the operation failed |
+| `OnBoard` | OnBoardRequest | Agent identity (OUI, ProductClass, SerialNumber, …) |
+
+### Wire encoding
+
+Events travel as `USPAgentRequest` with `Method = USPAgentMethodNotify` (ID 7).
+All event metadata is packed into `Metadata` using stable string keys. Param
+maps use a flat `Message` (path → string Value). No encoding/decoding code was
+changed — `EncodeEventToRequest` / `DecodeEventFromRequest` work purely on the
+already-decoded struct layer.
+
+Stable metadata key names (part of the wire protocol, do not change):
+
+| Key | Carries |
+| --- | --- |
+| `event_type` | `USPEventType` as a decimal string |
+| `subscription_id` | Matched subscription ID |
+| `event_name` | Event or command name |
+| `command_key` | OperationComplete correlation key |
+| `param_value` | New value for ValueChange |
+| `error_code` | OperationComplete failure code |
+| `error_message` | OperationComplete failure message |
+| `oui` | OnBoardRequest OUI |
+| `product_class` | OnBoardRequest product class |
+| `serial_number` | OnBoardRequest serial number |
+| `protocol_versions` | OnBoardRequest agent USP versions |
+
+### Subscription system
+
+Subscriptions filter which events reach which handler. Each subscription has:
+- `ID` — unique controller-assigned identifier (echoed in every matched notification)
+- `Types` — event types to accept (empty = all)
+- `PathFilter` — `ObjPath` prefix list (empty = all paths)
+- `EventFilter` — event name list for `USPEventTypeEvent` (empty = all names)
+- `Handler` — in-process callback (optional; omit for wire-only delivery)
+
+### Agent-side event API
+
+```go
+// Register a subscription (in-process handler + optional wire delivery)
+agent.Subscribe(wusp.USPSubscription{
+    ID:         "sub-wg-changes",
+    Types:      []wusp.USPEventType{wusp.USPEventTypeValueChange},
+    PathFilter: []string{"Device.WireGuard."},
+    Handler: func(ctx context.Context, ev wusp.USPEvent) error {
+        log.Printf("param changed: %s = %s", ev.ObjPath, ev.ParamValue)
+        return nil
+    },
+})
+
+// Emit helpers — build and dispatch the event in one call
+agent.EmitValueChange(ctx, "Device.WireGuard.Peer.1.LastHandshakeTime", "2026-04-16T10:00:00Z")
+agent.EmitObjectCreation(ctx, "Device.WireGuard.Peer.2.", map[string]string{"Alias": "peer-2"})
+agent.EmitObjectDeletion(ctx, "Device.WireGuard.Peer.2.")
+agent.EmitOperationComplete(ctx,
+    "Device.",           // object path
+    "Reboot()",          // command name
+    "reboot-key-001",    // command key from original Operate
+    map[string]string{"status": "ok"},  // output args (nil on failure)
+    nil,                 // *USPEventError (nil = success)
+)
+agent.EmitEvent(ctx, "Device.DeviceInfo.", "Boot!", map[string]string{"cause": "power-on"})
+agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
+    OUI:                            "AABBCC",
+    ProductClass:                   "HomeRouter",
+    SerialNumber:                   "SN-001",
+    AgentSupportedProtocolVersions: "1.4",
+})
+
+// Wire delivery: configure a sender on the agent to push events to the controller
+agent.SetEventSender(myWireGuardEventSender)
+```
+
+### Wire-based event delivery (USPEventSender)
+
+Implement `USPEventSender` on the WireGuard transport layer. The interface
+receives the pre-encoded `USPAgentRequest` payload; the implementation handles
+fragmentation and tunnel delivery:
+
+```go
+type myTunnelSender struct{ tunnel *wireguard.Device }
+
+func (s *myTunnelSender) SendUSPNotify(ctx context.Context, data []byte) error {
+    msgID := atomic.AddUint64(&s.seq, 1)
+    frags, err := wusp.FragmentUSPControlPayload(data, msgID, wusp.WUSPMaxDatagramPayload)
+    if err != nil {
+        return err
+    }
+    for _, frag := range frags {
+        s.tunnel.SendMessageType8(frag)
+    }
+    return nil
+}
+```
+
+### Wire-based subscription management
+
+The controller can register subscriptions without an in-process Go call by
+sending a `Notify` request with subscription metadata. The agent's
+`HandleRequest` routes these automatically.
+
+**Subscribe:**
+
+```go
+req := wusp.EncodeSubscribeRequest(
+    nextID(),                              // unique request ID
+    "sub-wg",                             // subscription ID
+    []wusp.USPEventType{
+        wusp.USPEventTypeValueChange,
+        wusp.USPEventTypeObjectCreation,
+    },
+    []string{"Device.WireGuard."},        // path filter
+    nil,                                  // event name filter
+)
+// encode, fragment, send over tunnel
+encoded, _ := wusp.EncodeUSPAgentRequest(req)
+```
+
+**Unsubscribe:**
+
+```go
+req := wusp.EncodeUnsubscribeRequest(nextID(), "sub-wg")
+encoded, _ := wusp.EncodeUSPAgentRequest(req)
+```
+
+The agent responds with a `USPAgentResponse` carrying `Metadata["wusp_sub_status"] = "ok"`.
+
+### Controller-side event receive
+
+When the controller receives an inbound `USPAgentRequest` (Method = Notify):
+
+```go
+req, err := wusp.DecodeUSPAgentRequest(payload)
+if err != nil {
+    // malformed
+}
+if wusp.IsEventNotifyRequest(req) {
+    event, err := wusp.DecodeEventFromRequest(req)
+    if err == nil {
+        dispatchEvent(event)
+    }
+    return
+}
+if wusp.IsSubscriptionRequest(req) {
+    // controller acting as agent: handle subscription from a peer
+}
+// else: regular controller-originated Notify — should not arrive here
+```
+
+### Updated controller receive loop
 
 For every decrypted `Message Type 8` payload:
 
 1. try fragment decode
 2. if fragment, reassemble and restart decode on the reassembled bytes
-3. try stream decode
+3. try stream decode (`DecodeUSPTransferStreamFrame`)
 4. if stream, route to transfer session logic
-5. try response decode
+5. try response decode (`DecodeUSPAgentResponse`)
 6. if response, match by request ID
-7. try request decode
-8. if request, execute it if your controller supports agent-originated requests
-
-The current agent tolerates all-zero tail padding on decoded control frames, so
-controllers should do the same if they want symmetric behavior.
+7. try request decode (`DecodeUSPAgentRequest`)
+8. if request and `IsEventNotifyRequest` → `DecodeEventFromRequest` → dispatch
+9. if request and `IsSubscriptionRequest` → subscription management
+10. if request (other method) → execute if controller supports agent requests
 
 ## Go Integration
 

@@ -14,8 +14,8 @@ const (
 	// Device.RootDataModelVersion.
 	BroadbandRootDataModelVersion = "2.20"
 
-	BroadbandTR181Source     = "BroadbandForum/cwmp-data-models tr-181-2-20-1-cwmp-full.xml"
-	BroadbandTR181SourceURL  = "https://github.com/BroadbandForum/cwmp-data-models/blob/main/tr-181-2-20-1-cwmp-full.xml"
+	BroadbandTR181Source     = "BroadbandForum/usp-data-models tr-181-2-20-1-usp-full.xml"
+	BroadbandTR181SourceURL  = "https://github.com/BroadbandForum/usp-data-models/blob/master/tr-181-2-20-1-usp-full.xml"
 	BroadbandWireGuardSource = "BroadbandForum/device-data-model tr-181-2-wireguard.xml"
 )
 
@@ -35,7 +35,43 @@ type BroadbandDataModel struct {
 	ParamCount    int
 }
 
-var allImportedDeviceParams = cloneParams(runtimeDeviceParams)
+// SupplementalDeviceParams are Wantastic-specific parameters merged on top of
+// the imported BBF USP model.
+var SupplementalDeviceParams = []Param{
+	{
+		Path:         "Device.DeviceInfo.FriendlyName",
+		Type:         TypeString,
+		Access:       ReadWrite,
+		SinceVersion: "2.0",
+		Description:  "Human-friendly device name exposed by Wantastic backends when the underlying platform supports it.",
+		Limits:       Limits{MaxLength: 64},
+	},
+}
+
+// DeviceObjects is sourced from the generated USP model, excluding the
+// WireGuard subtree (which is provided by wireguard.go).
+var DeviceObjects = objectsWithoutPrefix(uspModelObjects, "Device.WireGuard.")
+
+var runtimeDeviceParams = concatUniqueParams(
+	paramsWithoutPrefix(uspModelParams, "Device.WireGuard."),
+	SupplementalDeviceParams,
+)
+
+var DeviceRootParams       = directParamsUnder(runtimeDeviceParams, "Device.")
+var DeviceInfoParams       = paramsWithPrefix(runtimeDeviceParams, "Device.DeviceInfo.")
+var DeviceTimeParams       = paramsWithPrefix(runtimeDeviceParams, "Device.Time.")
+var DeviceIPParams         = paramsWithPrefix(runtimeDeviceParams, "Device.IP.")
+var DeviceFirewallParams   = paramsWithPrefix(runtimeDeviceParams, "Device.Firewall.")
+var DeviceNATParams        = paramsWithPrefix(runtimeDeviceParams, "Device.NAT.")
+var DeviceBulkDataParams   = paramsWithPrefix(runtimeDeviceParams, "Device.BulkData.")
+var DeviceLocalAgentParams = directParamsUnder(runtimeDeviceParams, "Device.LocalAgent.")
+var DeviceWiFiParams       = paramsWithPrefix(runtimeDeviceParams, "Device.WiFi.")
+
+var ManagementServerObjects   = objectsWithPrefix(DeviceObjects, "Device.ManagementServer.")
+var AllManagementServerParams = paramsWithPrefix(runtimeDeviceParams, "Device.ManagementServer.")
+
+var LocalAgentExtraObjects = objectsWithPrefixExcluding(DeviceObjects, "Device.LocalAgent.", "Device.LocalAgent.")
+var AllLocalAgentSubParams = paramsWithPrefixExcludingDirect(runtimeDeviceParams, "Device.LocalAgent.")
 
 // AllDeviceObjects is the full runtime schema object registry consumed by the
 // WUSP supported-data-model surface.
@@ -49,7 +85,7 @@ var AllDeviceObjects = concatObjects(
 // tests. It stays centralized here so the package has one authoritative
 // aggregation point.
 var AllDeviceParams = concat(
-	allImportedDeviceParams,
+	runtimeDeviceParams,
 	AllWireGuardParams,
 	AllWUSPParams,
 )
@@ -58,12 +94,12 @@ var AllDeviceParams = concat(
 var BroadbandDataModels = []BroadbandDataModel{
 	newBroadbandDataModel(
 		"device",
-		"TR-181 Device (CWMP Full Import)",
+		"TR-181 Device (USP Full Import)",
 		BroadbandTR181ModelVersion,
 		BroadbandTR181Source,
 		BroadbandTR181SourceURL,
 		DeviceObjects,
-		allImportedDeviceParams,
+		runtimeDeviceParams,
 	),
 	newBroadbandDataModel(
 		"wireguard",

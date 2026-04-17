@@ -26,22 +26,39 @@ import (
 
 type uspTransport interface {
 	SendWUSPToServer([]byte) error
+	// IsServerConnected reports whether there is an active WireGuard handshake
+	// with the server peer. Used to gate OnBoardRequest sending so we don't
+	// fire into the void before the tunnel is up.
+	IsServerConnected() bool
 }
+
+// uspInitPending / uspInitReady are the two init-state values stored in
+// uspRuntime.initState via atomic load/store.
+const (
+	uspInitPending int32 = 0
+	uspInitReady   int32 = 1
+)
 
 type uspRuntime struct {
 	transport              uspTransport
 	agent                  *wusp.USPAgent
 	controllerPublicKeyHex string
+	deviceID               string
 	httpClient             *http.Client
 	transferDir            string
 
 	nextID  atomic.Uint64
 	pending sync.Map // map[uint64]chan wusp.USPAgentResponse
 	streams sync.Map // map[uint64]*uspTransferSession
+
+	// Initialization state machine.
+	initState atomic.Int32
+	initReady chan struct{} // closed once initState == uspInitReady
 }
 
 func newUSPRuntime(cfg *config.Config, transport uspTransport) (*uspRuntime, error) {
 	if cfg == nil {
+		log.Printf("[USP] WUSP disabled: no configuration provided")
 		return nil, nil
 	}
 
@@ -50,20 +67,29 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport) (*uspRuntime, err
 		return nil, err
 	}
 
+	if controllerPublicKeyHex == "" {
+		log.Printf("[USP] WARNING: Server.PublicKey not configured — WUSP accepts any WireGuard peer (open mode)")
+	} else {
+		log.Printf("[USP] Runtime initializing: deviceID=%q controllerKey=%q", cfg.DeviceID, controllerPublicKeyHex)
+	}
+
 	backend := platforms.NewBackend(platforms.Options{})
 	runtime := &uspRuntime{
 		transport:              transport,
 		controllerPublicKeyHex: controllerPublicKeyHex,
+		deviceID:               cfg.DeviceID,
 		httpClient: &http.Client{
 			Timeout: 2 * time.Minute,
 		},
 		transferDir: filepath.Join(os.TempDir(), "wantastic-usp"),
+		initReady:   make(chan struct{}),
 	}
 	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
 		Collector:       backend,
 		Setter:          backend,
 		UploadHandler:   runtime.handleUpload,
 		DownloadHandler: runtime.handleDownload,
+		EventSender:     runtime, // uspRuntime implements wusp.USPEventSender
 	})
 	if err := runtime.agent.Bootstrap(wusp.FillOptions{
 		Profile:   wusp.FillProfileRealistic,
@@ -80,11 +106,14 @@ func (r *uspRuntime) HandlePeerPacket(peer *wgdevice.Peer, data []byte) {
 	if peer == nil {
 		return
 	}
-	if err := r.handleFrameFromPeer(peer.PublicKeyHex(), data, func(frame []byte) error {
+	peerHex := peer.PublicKeyHex()
+	log.Printf("[USP] HandlePeerPacket: peer=%s bytes=%d", peerHex, len(data))
+	if err := r.handleFrameFromPeer(peerHex, data, func(frame []byte) error {
+		log.Printf("[USP] Sending WUSP response: peer=%s bytes=%d", peerHex, len(frame))
 		peer.SendWUSP(frame)
 		return nil
 	}); err != nil {
-		log.Printf("[USP] WUSP frame handling failed: %v", err)
+		log.Printf("[USP] WUSP frame handling failed: peer=%s err=%v", peerHex, err)
 	}
 }
 
@@ -94,10 +123,12 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 
 	if streamFrame, err := wusp.DecodeUSPTransferStreamFrame(data); err == nil {
+		log.Printf("[USP] handleFrameFromPeer: stream frame from peer=%s phase=%d", peerPublicKeyHex, streamFrame.Phase)
 		return r.handleTransferStreamFrame(peerPublicKeyHex, streamFrame)
 	}
 
 	if resp, err := wusp.DecodeUSPAgentResponse(data); err == nil {
+		log.Printf("[USP] handleFrameFromPeer: response id=%d method=%d from peer=%s", resp.ID, resp.Method, peerPublicKeyHex)
 		if !r.isControllerPeer(peerPublicKeyHex) {
 			return nil
 		}
@@ -109,11 +140,43 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 
 	req, err := wusp.DecodeUSPAgentRequest(data)
 	if err != nil {
-		return err
+		isCtrl := r.isControllerPeer(peerPublicKeyHex)
+		prefix := data[:min(4, len(data))]
+		if isCtrl {
+			// Controller sent something we can't decode — worth logging as a warning.
+			log.Printf("[USP] handleFrameFromPeer: failed to decode controller request peer=%s bytes=%d err=%v data[0:4]=%x",
+				peerPublicKeyHex, len(data), err, prefix)
+		} else {
+			// Non-controller peer sent something on the WUSP channel (type-8) that is
+			// not a valid WUSP payload — likely IP traffic from a P2P peer that has a
+			// different interpretation of message type 8. Drop silently.
+			log.Printf("[USP] handleFrameFromPeer: ignoring non-WUSP type-8 from non-controller peer=%s bytes=%d data[0:4]=%x (isController=false)",
+				peerPublicKeyHex, len(data), prefix)
+		}
+		return nil // don't propagate — not actionable, prevents HandlePeerPacket error spam
 	}
+
+	log.Printf("[USP] handleFrameFromPeer: request id=%d method=%d from peer=%s isController=%v",
+		req.ID, req.Method, peerPublicKeyHex, r.isControllerPeer(peerPublicKeyHex))
+
 	if !r.isControllerPeer(peerPublicKeyHex) {
+		// Authorization failed. Reply with an explicit error so the controller
+		// receives an immediate response instead of waiting for a probe timeout.
+		// Also log so the operator can diagnose key-mismatch issues.
+		log.Printf("[USP] Rejected request method=%d id=%d from peer %s (configured controller=%q)",
+			req.Method, req.ID, peerPublicKeyHex, r.controllerPublicKeyHex)
+		if reply != nil {
+			if frame, encErr := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+				ID:     req.ID,
+				Method: req.Method,
+				Error:  "unauthorized",
+			}); encErr == nil {
+				_ = reply(frame)
+			}
+		}
 		return fmt.Errorf("wusp request from unauthorized peer %s", peerPublicKeyHex)
 	}
+
 	if reply == nil {
 		return fmt.Errorf("missing reply transport for request %d", req.ID)
 	}
@@ -125,16 +188,20 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		return r.handleTransferControlRequest(ctx, peerPublicKeyHex, req, reply)
 	}
 
+	log.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)
 	resp, err := r.agent.HandleRequest(ctx, req)
 	if err != nil {
+		log.Printf("[USP] agent.HandleRequest failed: method=%d id=%d err=%v", req.Method, req.ID, err)
 		return err
 	}
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
 		return err
 	}
+	log.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
 	return reply(frame)
 }
+
 
 func (r *uspRuntime) CallController(ctx context.Context, req wusp.USPAgentRequest) (wusp.USPAgentResponse, error) {
 	if r == nil || r.transport == nil {
@@ -185,7 +252,13 @@ func (r *uspRuntime) dispatchResponse(resp wusp.USPAgentResponse) bool {
 }
 
 func (r *uspRuntime) isControllerPeer(peerPublicKeyHex string) bool {
-	return r.controllerPublicKeyHex != "" && strings.EqualFold(strings.TrimSpace(peerPublicKeyHex), r.controllerPublicKeyHex)
+	if r.controllerPublicKeyHex == "" {
+		// No controller key configured — accept requests from any WireGuard peer.
+		// WireGuard already authenticates peers at the cryptographic layer, so any
+		// packet that reaches this point came from a peer listed in our config.
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(peerPublicKeyHex), r.controllerPublicKeyHex)
 }
 
 func (r *uspRuntime) handleUpload(ctx context.Context, req wusp.USPTransferRequest) (wusp.USPTransferResult, error) {
@@ -457,4 +530,119 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// SendUSPNotify implements wusp.USPEventSender. It delivers encoded WUSP
+// Notify payloads (output of wusp.EncodeUSPAgentRequest) to the controller
+// over the tunnel. Notifications are fire-and-forget; no response is awaited.
+func (r *uspRuntime) SendUSPNotify(ctx context.Context, data []byte) error {
+	if r == nil || r.transport == nil {
+		return fmt.Errorf("usp transport unavailable")
+	}
+	return r.transport.SendWUSPToServer(data)
+}
+
+// IsReady reports whether WUSP initialization has completed successfully.
+func (r *uspRuntime) IsReady() bool {
+	return r != nil && r.initState.Load() == uspInitReady
+}
+
+// wuspRetryDelay returns the backoff duration for the given attempt number.
+// Attempts are grouped in sets of 3; each group uses a larger base delay and
+// the delay doubles within the group (expanding margin).
+//
+//	Group 0 (attempts 0-2):  1s → 2s → 4s
+//	Group 1 (attempts 3-5):  8s → 16s → 32s
+//	Group 2 (attempts 6-8):  60s → 120s → 240s
+//	Group 3+ (attempts 9+):  capped at 5 min
+func wuspRetryDelay(attempt int) time.Duration {
+	const maxDelay = 5 * time.Minute
+	groupBases := [3]time.Duration{
+		1 * time.Second,  // group 0
+		8 * time.Second,  // group 1
+		60 * time.Second, // group 2
+	}
+	group := attempt / 3
+	if group >= len(groupBases) {
+		return maxDelay
+	}
+	delay := groupBases[group] << uint(attempt%3) // base * 2^pos
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+// uspReannounceInterval is how often we re-send OnBoardRequest after the
+// initial successful send. Must be significantly less than activeHandshakeWindow
+// (8 min) so the tunnel is always considered live when the re-announce fires.
+// initial successful delivery. This handles controller restarts and clears
+// the Redis non-WUSP cache on the controller side.
+const uspReannounceInterval = 2 * time.Minute
+
+// runInit drives the WUSP initialization loop with grouped retry backoff.
+// After the first successful OnBoardRequest it keeps re-announcing at
+// uspReannounceInterval so the controller always knows this peer is alive
+// and WUSP-capable (handles controller restarts transparently).
+func (r *uspRuntime) runInit(ctx context.Context) {
+	log.Printf("[USP] Starting WUSP initialization")
+	for attempt := 0; ; attempt++ {
+		if err := r.initializeOnce(ctx); err == nil {
+			if !r.IsReady() {
+				r.initState.Store(uspInitReady)
+				close(r.initReady)
+				log.Printf("[USP] WUSP ready (attempt %d)", attempt+1)
+			} else {
+				log.Printf("[USP] WUSP re-announced OnBoardRequest to controller")
+			}
+			// Re-announce periodically. Reset backoff counter so the next
+			// failure (e.g. controller restart) uses fast initial retries again.
+			attempt = -1
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(uspReannounceInterval):
+			}
+		} else {
+			delay := wuspRetryDelay(attempt)
+			log.Printf("[USP] Init failed (attempt %d, group %d): %v — retry in %s",
+				attempt+1, attempt/3, err, delay)
+			select {
+			case <-ctx.Done():
+				log.Printf("[USP] Init cancelled: %v", ctx.Err())
+				return
+			case <-time.After(delay):
+			}
+		}
+	}
+}
+
+// initializeOnce performs one WUSP initialization attempt.
+//
+// WUSP is controller-initiated: the controller sends requests TO the device.
+// The device's role at startup is only to ANNOUNCE itself via OnBoardRequest
+// (a fire-and-forget notification). We must NOT send requests to the controller
+// (e.g. GetSupportedProtocol) — the controller doesn't act as a WUSP endpoint
+// that responds to device-originated requests, and doing so causes it to mark
+// the device as malfunctioning.
+//
+// We gate sending on an active WireGuard handshake because peer.SendWUSP drops
+// the packet silently when the peer goroutines haven't started yet, and returns
+// nil anyway (fire-and-forget). Without this check the init loop would declare
+// success immediately and never retry even though the packet was discarded.
+func (r *uspRuntime) initializeOnce(ctx context.Context) error {
+	connected := r.transport.IsServerConnected()
+	log.Printf("[USP] initializeOnce: server_connected=%v deviceID=%q", connected, r.deviceID)
+	if !connected {
+		return fmt.Errorf("wusp: server tunnel not up (no active WireGuard handshake)")
+	}
+	log.Printf("[USP] Sending OnBoardRequest to controller")
+	err := r.agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
+		SerialNumber:                   r.deviceID,
+		AgentSupportedProtocolVersions: wusp.WUSPModelVersion,
+	})
+	if err != nil {
+		log.Printf("[USP] OnBoardRequest emit failed: %v", err)
+	}
+	return err
 }

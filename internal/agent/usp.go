@@ -196,6 +196,18 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
+		// Encoding can fail if the platform backend returned a value whose
+		// TypeTag doesn't match the BBF TR-181 schema (e.g. string instead of
+		// list).  Send an error response so the controller gets an immediate
+		// reply rather than waiting for a round-trip timeout.
+		log.Printf("[USP] EncodeUSPAgentResponse failed: method=%d id=%d err=%v — sending error response", req.Method, req.ID, err)
+		if errFrame, encErr := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+			ID:     req.ID,
+			Method: req.Method,
+			Error:  err.Error(),
+		}); encErr == nil {
+			return reply(errFrame)
+		}
 		return err
 	}
 	log.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))

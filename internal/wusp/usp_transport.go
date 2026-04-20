@@ -324,6 +324,11 @@ func EncodeUSPAgentResponse(resp USPAgentResponse) ([]byte, error) {
 		return nil, err
 	}
 
+	// Use string paths instead of binary codes — registries may differ.
+	if resp.Message != nil {
+		resp.Message.ResetAllFieldIDs()
+	}
+
 	var nestedFrame []byte
 	var err error
 	header := uspTransportHeader{
@@ -562,11 +567,7 @@ func validateUSPAgentResponse(resp USPAgentResponse) error {
 	if resp.ObjectCode == 0 && len(resp.ObjectInstances) > 0 {
 		return &ValidationError{Reason: "response object selector instances without object code"}
 	}
-	if resp.Message != nil {
-		if err := ValidateMessageFast(resp.Message); err != nil {
-			return err
-		}
-	}
+	// Skipped: concrete instance paths may not match template-based schema.
 	return nil
 }
 

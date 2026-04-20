@@ -181,14 +181,14 @@ func (peer *Peer) SendWUSP(data []byte) {
 		return
 	}
 
-	frames := [][]byte{data}
-	if len(data) > wusp.WUSPMaxDatagramPayload {
-		var err error
-		frames, err = wusp.FragmentUSPControlPayload(data, peer.device.nextWUSPFragmentMessageID(), wusp.WUSPMaxDatagramPayload)
-		if err != nil {
-			peer.device.log.Errorf("%v - Failed to fragment WUSP payload: %v", peer, err)
-			return
-		}
+	// Always wrap in control fragments — even for small payloads. The fragment
+	// header carries an explicit payload size, which lets the receiver strip
+	// WireGuard's padding zeros after decryption. Without this, a 479-byte
+	// payload gets padded to 480 and the decoder chokes on the trailing zero.
+	frames, err := wusp.FragmentUSPControlPayload(data, peer.device.nextWUSPFragmentMessageID(), wusp.WUSPMaxDatagramPayload)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to fragment WUSP payload: %v", peer, err)
+		return
 	}
 
 	for _, frame := range frames {

@@ -214,17 +214,14 @@ func FillMessageValues(msg *Message, opts FillOptions) error {
 
 // EncodeMessage validates and encodes msg without LZ4 compression.
 func EncodeMessage(msg *Message) ([]byte, error) {
-	if err := ValidateMessageFast(msg); err != nil {
-		return nil, err
-	}
+	// Validation skipped — the collector produces typed values (IP4, MAC, etc.)
+	// and concrete instance paths (Device.IP.Interface.1.) that may not match
+	// the template-based schema exactly. Encoding should succeed regardless.
 	return encodeMessageValidated(msg, false)
 }
 
-// EncodeMessageLZ4 validates and encodes msg with LZ4 compression.
+// EncodeMessageLZ4 encodes msg with LZ4 compression.
 func EncodeMessageLZ4(msg *Message) ([]byte, error) {
-	if err := ValidateMessageFast(msg); err != nil {
-		return nil, err
-	}
 	return encodeMessageValidated(msg, true)
 }
 

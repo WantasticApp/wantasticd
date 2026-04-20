@@ -329,7 +329,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	appendField(msg, "Device.DeviceInfo.FriendlyName", wusp.String(friendlyName))
 	appendField(msg, "Device.DeviceInfo.MemoryStatus.Total", wusp.Uint(uint64(snapshot.memTotal)))
 	appendField(msg, "Device.DeviceInfo.MemoryStatus.Free", wusp.Uint(uint64(snapshot.memFree)))
-	appendField(msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", wusp.String(snapshot.tcpImplementation))
+	appendField(msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", wusp.List(wusp.String(snapshot.tcpImplementation)))
 	appendField(msg, "Device.Time.Enable", wusp.Bool(snapshot.timeEnabled))
 	if snapshot.timeStatus != "" {
 		appendField(msg, "Device.Time.Status", wusp.String(snapshot.timeStatus))
@@ -354,6 +354,11 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	}
 	appendField(msg, "Device.Firewall.Type", wusp.String("Stateful"))
 	b.appendWiFiFields(msg)
+
+	// Network interface details via getifaddrs (pure Go)
+	collectNetworkInterfacesStatic(msg)
+	collectCPUInfoStatic(ctx, b.commandRunner, msg)
+
 	return msg, nil
 }
 

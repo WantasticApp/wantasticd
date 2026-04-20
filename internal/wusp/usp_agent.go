@@ -517,10 +517,14 @@ func (a *USPAgent) getStored(paths ...string) (*Message, error) {
 		}
 
 		if isObjectPath(path) {
+			skipTemplates := !strings.Contains(path, "{i}")
 			matched := false
 			for key, field := range a.values {
 				if !strings.HasPrefix(key, path) {
 					continue
+				}
+				if skipTemplates && strings.Contains(key, "{i}") {
+					continue // skip template paths unless explicitly queried
 				}
 				if _, ok := seen[key]; ok {
 					continue
@@ -620,19 +624,19 @@ func filterValuesForPaths(values map[string]Field, paths ...string) (*Message, e
 		}
 
 		if isObjectPath(path) {
-			matched := false
+			skipTemplates := !strings.Contains(path, "{i}")
 			for _, field := range sortedStoredFields(values) {
-				if strings.HasPrefix(field.Path, path) {
-					if _, ok := seen[field.Path]; ok {
-						continue
-					}
-					out.Fields = append(out.Fields, cloneField(field))
-					seen[field.Path] = struct{}{}
-					matched = true
+				if !strings.HasPrefix(field.Path, path) {
+					continue
 				}
-			}
-			if !matched {
-				return nil, fmt.Errorf("%w: %s", ErrUSPPathNotFound, path)
+				if skipTemplates && strings.Contains(field.Path, "{i}") {
+					continue
+				}
+				if _, ok := seen[field.Path]; ok {
+					continue
+				}
+				out.Fields = append(out.Fields, cloneField(field))
+				seen[field.Path] = struct{}{}
 			}
 			continue
 		}

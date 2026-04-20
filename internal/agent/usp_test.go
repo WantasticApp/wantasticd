@@ -508,7 +508,7 @@ func newTestUSPRuntime(tb testing.TB) *uspRuntime {
 		},
 	}
 	transport := &fakeUSPTransport{sendCh: make(chan []byte, 4)}
-	runtime, err := newUSPRuntime(cfg, transport)
+	runtime, err := newUSPRuntime(cfg, transport, "test-0.0.0")
 	if err != nil {
 		tb.Fatalf("newUSPRuntime: %v", err)
 	}

@@ -6019,7 +6019,7 @@ var uspModelParams = []Param{
 		SinceVersion: "2.12",
 		Description:  "{{list}} Indicates the TCP congestion control mechanism(s) implemented. {{enum}} Tahoe, Reno, and New Reno are defined in {{bibref|RFC2582}}",
 		Limits: Limits{
-			Enums: []string{"Tahoe", "Reno", "New Reno", "Vegas"},
+			Enums: []string{"Tahoe", "Reno", "New Reno", "Vegas", "CUBIC", "BBR", "BIC", "Hybla", "Westwood", "Scalable", "LP", "Veno", "Other"},
 		},
 	},
 	{

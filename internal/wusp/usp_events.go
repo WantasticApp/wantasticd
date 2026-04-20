@@ -112,6 +112,8 @@ type USPOnBoardInfo struct {
 	OUI                            string
 	ProductClass                   string
 	SerialNumber                   string
+	Manufacturer                   string
+	SoftwareVersion                string
 	AgentSupportedProtocolVersions string
 }
 
@@ -177,6 +179,8 @@ const (
 	eventMetaOUI        = "oui"
 	eventMetaPC         = "product_class"
 	eventMetaSN         = "serial_number"
+	eventMetaMfg        = "manufacturer"
+	eventMetaSWVer      = "software_version"
 	eventMetaPV         = "protocol_versions"
 
 	// Wire subscription management keys (sent from controller → agent via Notify)
@@ -246,6 +250,12 @@ func EncodeEventToRequest(event USPEvent, id uint64) USPAgentRequest {
 			}
 			if ob.SerialNumber != "" {
 				meta[eventMetaSN] = ob.SerialNumber
+			}
+			if ob.Manufacturer != "" {
+				meta[eventMetaMfg] = ob.Manufacturer
+			}
+			if ob.SoftwareVersion != "" {
+				meta[eventMetaSWVer] = ob.SoftwareVersion
 			}
 			if ob.AgentSupportedProtocolVersions != "" {
 				meta[eventMetaPV] = ob.AgentSupportedProtocolVersions
@@ -339,6 +349,8 @@ func DecodeEventFromRequest(req USPAgentRequest) (USPEvent, error) {
 			OUI:                            req.Metadata[eventMetaOUI],
 			ProductClass:                   req.Metadata[eventMetaPC],
 			SerialNumber:                   req.Metadata[eventMetaSN],
+			Manufacturer:                   req.Metadata[eventMetaMfg],
+			SoftwareVersion:                req.Metadata[eventMetaSWVer],
 			AgentSupportedProtocolVersions: req.Metadata[eventMetaPV],
 		}
 	}

@@ -195,16 +195,8 @@ func validateUSPControlFragment(fragment USPControlFragment) error {
 }
 
 func compressUSPControlPayload(data []byte) ([]byte, bool) {
-	if len(data) < 512 {
-		return nil, false
-	}
-	state := uspControlLZ4Pool.Get().(*lz4State)
-	defer uspControlLZ4Pool.Put(state)
-	compressed := state.compress(data)
-	if len(compressed) == 0 || len(compressed) >= len(data) {
-		return nil, false
-	}
-	return compressed, true
+	// Disabled: LZ4 implementations differ between agent and controller.
+	return nil, false
 }
 
 func decompressUSPControlPayload(data []byte, rawSize int) ([]byte, error) {

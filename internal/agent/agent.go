@@ -51,7 +51,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	statsServer := stats.NewServer(dev, version.Version)
 	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
 
-	uspRuntime, err := newUSPRuntime(cfg, dev)
+	uspRuntime, err := newUSPRuntime(cfg, dev, version.Version)
 	if err != nil {
 		return nil, fmt.Errorf("create usp runtime: %w", err)
 	}

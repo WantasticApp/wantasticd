@@ -97,7 +97,7 @@ func TestLinuxBackendCollectAndSet(t *testing.T) {
 	assertStringField(t, msg, "Device.DeviceInfo.Manufacturer", "Wantastic")
 	assertStringField(t, msg, "Device.DeviceInfo.ModelName", "Mini Edge Box")
 	assertStringField(t, msg, "Device.DeviceInfo.FriendlyName", "Kitchen Node")
-	assertStringField(t, msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", "BBR")
+	assertListContains(t, msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", "BBR")
 	assertBoolField(t, msg, "Device.Time.Enable", true)
 	assertBoolField(t, msg, "Device.IP.IPv6Enable", true)
 	assertStringField(t, msg, "Device.DeviceInfo.ManufacturerOUI", "E05D54")
@@ -237,6 +237,20 @@ func assertUintField(t *testing.T, msg *wusp.Message, path string, want uint64) 
 	if got.AsUint() != want {
 		t.Fatalf("%s=%d want %d", path, got.AsUint(), want)
 	}
+}
+
+func assertListContains(t *testing.T, msg *wusp.Message, path, want string) {
+	t.Helper()
+	got, ok := msg.Get(path)
+	if !ok {
+		t.Fatalf("%s missing from message", path)
+	}
+	for _, item := range got.AsList() {
+		if item.AsString() == want {
+			return
+		}
+	}
+	t.Fatalf("%s list does not contain %q", path, want)
 }
 
 func containsCall(calls []string, want string) bool {

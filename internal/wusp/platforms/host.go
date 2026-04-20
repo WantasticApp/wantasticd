@@ -204,7 +204,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		msg.Set("Device.DeviceInfo.MemoryStatus.Free", wusp.Uint(memFree))
 	}
 	if tcpImplementation := b.readTCPImplementation(ctx); tcpImplementation != "" {
-		msg.Set("Device.DeviceInfo.NetworkProperties.TCPImplementation", wusp.String(tcpImplementation))
+		msg.Set("Device.DeviceInfo.NetworkProperties.TCPImplementation", wusp.List(wusp.String(tcpImplementation)))
 	}
 
 	if timeState.Known {
@@ -230,7 +230,116 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		msg.Set("Device.IP.InterfaceNumberOfEntries", wusp.Uint(uint64(interfaceCount)))
 	}
 
+	collectNetworkInterfacesStatic(msg)
+	collectCPUInfoStatic(ctx, b.commandRunner, msg)
+
 	return msg
+}
+
+// collectNetworkInterfacesStatic enumerates network interfaces via net.Interfaces()
+// (getifaddrs on Unix) and populates Device.IP.Interface.{n}. entries.
+func collectNetworkInterfacesStatic(msg *wusp.Message) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+	idx := 1
+	for _, iface := range ifaces {
+		// Skip loopback and interfaces with no hardware address
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if len(iface.HardwareAddr) == 0 {
+			continue
+		}
+
+		prefix := fmt.Sprintf("Device.IP.Interface.%d.", idx)
+		msg.Set(prefix+"Name", wusp.String(iface.Name))
+		msg.Set(prefix+"Enable", wusp.Bool(iface.Flags&net.FlagUp != 0))
+		msg.Set(prefix+"Status", wusp.String(ifaceStatus(iface.Flags)))
+		msg.Set(prefix+"Type", wusp.String(ifaceType(iface.Name)))
+		msg.Set(prefix+"MaxMTUSize", wusp.Uint(uint64(iface.MTU)))
+		if len(iface.HardwareAddr) == 6 {
+			msg.Set(prefix+"MACAddress", wusp.MAC(iface.HardwareAddr))
+		}
+
+		addrs, err := iface.Addrs()
+		if err == nil {
+			v4Idx, v6Idx := 1, 1
+			for _, addr := range addrs {
+				ipNet, ok := addr.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				if ip4 := ipNet.IP.To4(); ip4 != nil {
+					ipPrefix := fmt.Sprintf("%sIPv4Address.%d.", prefix, v4Idx)
+					msg.Set(ipPrefix+"IPAddress", wusp.IP4(ip4))
+					msg.Set(ipPrefix+"SubnetMask", wusp.IP4(net.IP(ipNet.Mask).To4()))
+					msg.Set(ipPrefix+"AddressingType", wusp.String("DHCP"))
+					v4Idx++
+				} else if ip6 := ipNet.IP.To16(); ip6 != nil {
+					ipPrefix := fmt.Sprintf("%sIPv6Address.%d.", prefix, v6Idx)
+					msg.Set(ipPrefix+"IPAddress", wusp.IP6(ip6))
+					ones, _ := ipNet.Mask.Size()
+					// Prefix is a PathRef in BBF TR-181, stored as a string like "fe80::/64"
+					msg.Set(ipPrefix+"Prefix", wusp.String(fmt.Sprintf("%s/%d", ipNet.IP.Mask(ipNet.Mask).String(), ones)))
+					v6Idx++
+				}
+			}
+		}
+		idx++
+	}
+}
+
+func ifaceStatus(flags net.Flags) string {
+	if flags&net.FlagUp != 0 && flags&net.FlagRunning != 0 {
+		return "Up"
+	}
+	if flags&net.FlagUp != 0 {
+		return "Dormant"
+	}
+	return "Down"
+}
+
+func ifaceType(name string) string {
+	switch {
+	case strings.HasPrefix(name, "en"):
+		return "Ethernet"
+	case strings.HasPrefix(name, "wl"):
+		return "WiFi"
+	case strings.HasPrefix(name, "awdl"), strings.HasPrefix(name, "llw"):
+		return "WiFi"
+	case strings.HasPrefix(name, "utun"), strings.HasPrefix(name, "tun"):
+		return "Tunnel"
+	case strings.HasPrefix(name, "bridge"):
+		return "Bridge"
+	case strings.HasPrefix(name, "lo"):
+		return "Loopback"
+	default:
+		return "Normal"
+	}
+}
+
+func collectCPUInfoStatic(ctx context.Context, runner func(context.Context, string, ...string) ([]byte, error), msg *wusp.Message) {
+	if runner == nil {
+		return
+	}
+	if out, err := runner(ctx, "uname", "-m"); err == nil {
+		arch := strings.TrimSpace(string(out))
+		if arch != "" {
+			msg.Set("Device.DeviceInfo.ProcessorNumberOfEntries", wusp.Uint(1))
+			msg.Set("Device.DeviceInfo.Processor.1.Architecture", wusp.String(arch))
+		}
+	}
+	if out, err := runner(ctx, "nproc"); err == nil {
+		if n, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); err == nil && n > 0 {
+			msg.Set("Device.DeviceInfo.Processor.1.MaxNumberOfEntries", wusp.Uint(n))
+		}
+	} else if out, err := runner(ctx, "sysctl", "-n", "hw.ncpu"); err == nil {
+		if n, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); err == nil && n > 0 {
+			msg.Set("Device.DeviceInfo.Processor.1.MaxNumberOfEntries", wusp.Uint(n))
+		}
+	}
 }
 
 func (b *hostBackend) readState() (hostState, error) {

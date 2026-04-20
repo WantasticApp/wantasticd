@@ -562,7 +562,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				if !assembled {
 					continue
 				}
-				device.log.Verbosef("%v - Received WUSP packet: %d bytes", peer, len(payload))
+				device.log.Verbosef("%v - Received WUSP packet: %d bytes, first4=%x", peer, len(payload), payload[:min(4, len(payload))])
 				if device.wuspHandler != nil {
 					// Dispatch in a goroutine so that a slow WUSP handler (e.g. GetAll
 					// collecting the full TR-181 tree) does not block the receive pipeline

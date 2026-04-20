@@ -44,6 +44,7 @@ type uspRuntime struct {
 	agent                  *wusp.USPAgent
 	controllerPublicKeyHex string
 	deviceID               string
+	softwareVersion        string
 	httpClient             *http.Client
 	transferDir            string
 
@@ -56,7 +57,7 @@ type uspRuntime struct {
 	initReady chan struct{} // closed once initState == uspInitReady
 }
 
-func newUSPRuntime(cfg *config.Config, transport uspTransport) (*uspRuntime, error) {
+func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion string) (*uspRuntime, error) {
 	if cfg == nil {
 		log.Printf("[USP] WUSP disabled: no configuration provided")
 		return nil, nil
@@ -78,6 +79,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport) (*uspRuntime, err
 		transport:              transport,
 		controllerPublicKeyHex: controllerPublicKeyHex,
 		deviceID:               cfg.DeviceID,
+		softwareVersion:        softwareVersion,
 		httpClient: &http.Client{
 			Timeout: 2 * time.Minute,
 		},
@@ -98,6 +100,23 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport) (*uspRuntime, err
 		Overwrite: true,
 	}); err != nil {
 		return nil, err
+	}
+	// Override WUSP-specific fields with actual values (Bootstrap fills
+	// them with synthetic path-derived placeholders).
+	wuspOverrides := map[string]wusp.Value{
+		"Device.WUSP.Enable":              wusp.Bool(true),
+		"Device.WUSP.Status":              wusp.String("Active"),
+		"Device.WUSP.ProtocolVersion":     wusp.String(wusp.WUSPModelVersion),
+		"Device.WUSP.MaxControlPayload":   wusp.Uint(uint64(wusp.WUSPMaxDatagramPayload)),
+		"Device.WUSP.TunnelOnly":          wusp.Bool(true),
+		"Device.WUSP.ReliableControl":     wusp.Bool(false),
+		"Device.WUSP.ControlCompression":  wusp.List(wusp.String("nested-message-lz4")),
+		"Device.WUSP.TransferCompression": wusp.List(wusp.String("stream-chunk-lz4")),
+	}
+	for path, val := range wuspOverrides {
+		if err := runtime.agent.Set(path, val); err != nil {
+			log.Printf("[USP] WARNING: Set(%s) failed: %v", path, err)
+		}
 	}
 	return runtime, nil
 }
@@ -586,10 +605,10 @@ func wuspRetryDelay(attempt int) time.Duration {
 }
 
 // uspReannounceInterval is how often we re-send OnBoardRequest after the
-// initial successful send. Must be significantly less than activeHandshakeWindow
-// (8 min) so the tunnel is always considered live when the re-announce fires.
-// initial successful delivery. This handles controller restarts and clears
-// the Redis non-WUSP cache on the controller side.
+// initial successful send. This handles controller restarts transparently —
+// the controller uses OnBoardRequest as the sole discovery mechanism for new
+// WUSP peers (no probing). Must be less than activeHandshakeWindow (8 min)
+// so the tunnel is always considered live when the re-announce fires.
 const uspReannounceInterval = 2 * time.Minute
 
 // runInit drives the WUSP initialization loop with grouped retry backoff.
@@ -651,6 +670,9 @@ func (r *uspRuntime) initializeOnce(ctx context.Context) error {
 	log.Printf("[USP] Sending OnBoardRequest to controller")
 	err := r.agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
 		SerialNumber:                   r.deviceID,
+		Manufacturer:                   "Wantastic",
+		ProductClass:                   "wantasticd",
+		SoftwareVersion:                r.softwareVersion,
 		AgentSupportedProtocolVersions: wusp.WUSPModelVersion,
 	})
 	if err != nil {

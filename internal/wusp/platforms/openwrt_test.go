@@ -92,7 +92,7 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	assertStringField(t, msg, "Device.DeviceInfo.FriendlyName", "Living Room AP")
 	assertStringField(t, msg, "Device.DeviceInfo.ProvisioningCode", "sp-tag-1")
 	assertStringField(t, msg, "Device.DeviceInfo.ManufacturerOUI", "E05D54")
-	assertStringField(t, msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", "BBR")
+	assertListContains(t, msg, "Device.DeviceInfo.NetworkProperties.TCPImplementation", "BBR")
 	assertBoolField(t, msg, "Device.Time.Enable", true)
 	assertUintField(t, msg, "Device.Time.ClientNumberOfEntries", 2)
 	assertUintField(t, msg, "Device.Time.ServerNumberOfEntries", 1)

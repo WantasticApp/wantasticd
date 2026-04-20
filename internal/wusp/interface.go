@@ -60,6 +60,8 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -241,6 +243,49 @@ func (v Value) AsString() string {
 // AsBytes returns the raw byte slice.
 func (v Value) AsBytes() []byte { return v.blob }
 
+// ValueToString renders any Value as a human-readable string regardless of type.
+func ValueToString(v Value) string {
+	switch v.Tag {
+	case TagNull:
+		return ""
+	case TagFalse:
+		return "false"
+	case TagTrue:
+		return "true"
+	case TagUint:
+		return strconv.FormatUint(v.AsUint(), 10)
+	case TagInt:
+		return strconv.FormatInt(v.AsInt(), 10)
+	case TagFloat:
+		return strconv.FormatFloat(v.AsFloat(), 'f', -1, 64)
+	case TagString:
+		return v.AsString()
+	case TagTime:
+		return v.AsTime().UTC().Format(time.RFC3339)
+	case TagIP4:
+		if ip := v.AsIP4(); ip != nil {
+			return ip.String()
+		}
+		return ""
+	case TagIP6:
+		if ip := v.AsIP6(); ip != nil {
+			return ip.String()
+		}
+		return ""
+	case TagMAC:
+		return net.HardwareAddr(v.blob).String()
+	case TagList:
+		items := v.AsList()
+		parts := make([]string, len(items))
+		for i, item := range items {
+			parts[i] = ValueToString(item)
+		}
+		return strings.Join(parts, ",")
+	default:
+		return v.AsString()
+	}
+}
+
 // AsTime returns the time.Time value.
 func (v Value) AsTime() time.Time { return time.Unix(0, v.ival) }
 
@@ -277,6 +322,17 @@ type Field struct {
 	id   uint16
 	Path string // always populated after decode
 	Val  Value
+}
+
+// ResetID clears the registry field ID so the encoder uses the string path.
+func (f *Field) ResetID() { f.id = 0 }
+
+// ResetAllFieldIDs clears registry IDs on every field so the encoder uses
+// string paths. Use when the receiver may have a different param registry.
+func (m *Message) ResetAllFieldIDs() {
+	for i := range m.Fields {
+		m.Fields[i].id = 0
+	}
 }
 
 // ---------------------------------------------------------------------------

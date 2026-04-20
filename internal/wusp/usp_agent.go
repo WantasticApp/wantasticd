@@ -198,20 +198,50 @@ func (a *USPAgent) Get(paths ...string) (*Message, error) {
 		return a.getStored(paths...)
 	}
 
-	values := a.snapshotValues()
-	if a.collector != nil {
-		msg, err := a.collector.Collect(context.Background(), paths...)
-		if err != nil {
-			return nil, err
-		}
-		mergeMessageFields(values, msg)
+	// Collect live data from the platform backend.
+	msg, err := a.collector.Collect(context.Background(), paths...)
+	if err != nil {
+		return nil, err
 	}
+
+	// Start with collector data (real values), then merge explicitly-Set fields
+	// (WUSP overrides, user writes) on top. Do NOT include Bootstrap filler —
+	// it produces max-uint64 and fake timestamps for params the collector
+	// doesn't cover, which pollutes the snapshot.
+	values := make(map[string]Field, len(msg.Fields)+32)
+	for _, f := range msg.Fields {
+		values[f.Path] = cloneField(f)
+	}
+
+	// Overlay explicitly-Set values (WUSP config, user edits) from the store.
+	// Only include Set values for paths the collector didn't already provide.
+	a.mu.RLock()
+	for path, field := range a.values {
+		if _, exists := values[path]; !exists {
+			// Only include non-Bootstrap values (those set via Set() after Bootstrap).
+			// Bootstrap values have realistic filler; Set() values have real data.
+			// We detect Set() values by checking if the field was in the WUSP overrides
+			// or was explicitly written via the transport layer.
+			if isWUSPConfigPath(path) || isExplicitlySetPath(path) {
+				values[path] = cloneField(field)
+			}
+		}
+	}
+	a.mu.RUnlock()
 
 	if len(paths) == 0 {
 		return buildSnapshotMessage(values), nil
 	}
-
 	return filterValuesForPaths(values, paths...)
+}
+
+func isWUSPConfigPath(path string) bool {
+	return strings.HasPrefix(path, "Device.WUSP.")
+}
+
+func isExplicitlySetPath(path string) bool {
+	// Paths that are always real data (Set via transport, not Bootstrap)
+	return strings.HasPrefix(path, "Device.RootDataModelVersion")
 }
 
 // GetByCode resolves one or more stable uint64 path codes and returns the

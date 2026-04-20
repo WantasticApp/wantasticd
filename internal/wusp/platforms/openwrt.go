@@ -260,6 +260,10 @@ func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value)
 		}
 		return b.setUCIOption(ctx, "firewall", "@defaults[0]", "disabled", disabled, true, firewallReloadScript)
 	default:
+		// Handle dynamic instance paths for WiFi (Device.WiFi.SSID.1.SSID, etc.)
+		if err := b.setWiFiParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
+			return err
+		}
 		return wusp.ErrUSPPathUnsupported
 	}
 }
@@ -295,6 +299,7 @@ const (
 	systemReloadScript   = "/etc/init.d/system"
 	networkReloadScript  = "/etc/init.d/network"
 	firewallReloadScript = "/etc/init.d/firewall"
+	wirelessReloadScript = "wifi"
 )
 
 func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) {
@@ -567,6 +572,53 @@ func (b *OpenWrtBackend) setTimeEnabled(ctx context.Context, enabled bool) error
 		return err
 	}
 	return nil
+}
+
+// setWiFiParam handles writable WiFi instance paths like:
+//   Device.WiFi.Radio.1.Enable        → wireless.radio0.disabled
+//   Device.WiFi.Radio.1.Channel       → wireless.radio0.channel
+//   Device.WiFi.SSID.1.SSID           → wireless.@wifi-iface[0].ssid
+//   Device.WiFi.SSID.1.Enable         → wireless.@wifi-iface[0].disabled
+//   Device.WiFi.AccessPoint.1.Enable  → wireless.@wifi-iface[0].disabled
+func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wusp.Value) error {
+	// Parse instance path: Device.WiFi.Radio.{n}.{param}
+	var objType, param string
+	var idx int
+	if _, err := fmt.Sscanf(path, "Device.WiFi.Radio.%d.%s", &idx, &param); err == nil {
+		objType = "radio"
+	} else if _, err := fmt.Sscanf(path, "Device.WiFi.SSID.%d.%s", &idx, &param); err == nil {
+		objType = "ssid"
+	} else if _, err := fmt.Sscanf(path, "Device.WiFi.AccessPoint.%d.%s", &idx, &param); err == nil {
+		objType = "ap"
+	} else {
+		return wusp.ErrUSPPathUnsupported
+	}
+
+	switch objType {
+	case "radio":
+		section := fmt.Sprintf("radio%d", idx-1) // Radio.1 → radio0
+		switch param {
+		case "Enable":
+			disabled := "1"
+			if value.AsBool() { disabled = "0" }
+			return b.setUCIOption(ctx, "wireless", section, "disabled", disabled, true, wirelessReloadScript)
+		case "Channel":
+			return b.setUCIOption(ctx, "wireless", section, "channel", wusp.ValueToString(value), true, wirelessReloadScript)
+		case "OperatingChannelBandwidth":
+			return b.setUCIOption(ctx, "wireless", section, "htmode", wusp.ValueToString(value), true, wirelessReloadScript)
+		}
+	case "ssid", "ap":
+		section := fmt.Sprintf("@wifi-iface[%d]", idx-1) // SSID.1 → @wifi-iface[0]
+		switch param {
+		case "SSID":
+			return b.setUCIOption(ctx, "wireless", section, "ssid", value.AsString(), true, wirelessReloadScript)
+		case "Enable":
+			disabled := "1"
+			if value.AsBool() { disabled = "0" }
+			return b.setUCIOption(ctx, "wireless", section, "disabled", disabled, true, wirelessReloadScript)
+		}
+	}
+	return wusp.ErrUSPPathUnsupported
 }
 
 func (b *OpenWrtBackend) setUCIOption(ctx context.Context, config, section, option, value string, commit bool, reloadScript string) error {

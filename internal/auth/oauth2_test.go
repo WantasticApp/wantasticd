@@ -162,20 +162,68 @@ func newPortalServer(t *testing.T, cfg portalConfig) (*httptest.Server, *atomic.
 
 	mux := http.NewServeMux()
 
-	// GET /api/agent/credentials
+	// /api/agent/credentials — GET returns OAuth2 creds, POST registers device
+	// (RegisterPath == CredentialsPath since the agent uses the same endpoint)
 	mux.HandleFunc(auth.CredentialsPath, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
+			if !verifyHMACHeaders(t, w, r) {
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"domain":    cfg.credDomain,
+				"client_id": cfg.credClientID,
+			})
+
+		case http.MethodPost:
+			if cfg.registerUnauthorized {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if cfg.registerForbidden {
+				http.Error(w, "peer limit exceeded", http.StatusForbidden)
+				return
+			}
+
+			bearer := r.Header.Get("Authorization")
+			if bearer != "Bearer "+testAccessToken {
+				http.Error(w, "bad token", http.StatusUnauthorized)
+				t.Errorf("register: Authorization: got %q, want %q", bearer, "Bearer "+testAccessToken)
+				return
+			}
+			if !verifyHMACHeaders(t, w, r) {
+				return
+			}
+
+			var regReq auth.RegisterRequest
+			if err := json.NewDecoder(r.Body).Decode(&regReq); err != nil {
+				http.Error(w, "bad body", http.StatusBadRequest)
+				t.Errorf("decode register request: %v", err)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+
+			if cfg.registerMissingConfig {
+				json.NewEncoder(w).Encode(map[string]string{
+					"token":      testSessionToken,
+					"server_url": testGRPCServerURL,
+				})
+				return
+			}
+
+			ciphertext := encryptForToken(t, testAccessToken, regReq.Nonce, []byte(testWireGuardConfig))
+			json.NewEncoder(w).Encode(auth.RegisterResponse{
+				EncryptedConfig: ciphertext,
+				Token:           testSessionToken,
+				ServerURL:       testGRPCServerURL,
+				HandoffURL:      testHandoffURL,
+			})
+
+		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
 		}
-		if !verifyHMACHeaders(t, w, r) {
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"domain":    cfg.credDomain,
-			"client_id": cfg.credClientID,
-		})
 	})
 
 	// POST /oauth/device/code
@@ -214,7 +262,6 @@ func newPortalServer(t *testing.T, cfg portalConfig) (*httptest.Server, *atomic.
 
 		n := pollCount.Add(1)
 		if n <= cfg.pendingPolls {
-			// Still pending.
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": "authorization_pending"})
 			return
@@ -222,61 +269,6 @@ func newPortalServer(t *testing.T, cfg portalConfig) (*httptest.Server, *atomic.
 		json.NewEncoder(w).Encode(map[string]string{
 			"access_token": testAccessToken,
 			"token_type":   "Bearer",
-		})
-	})
-
-	// POST /api/agent/register
-	mux.HandleFunc(auth.RegisterPath, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		if cfg.registerUnauthorized {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if cfg.registerForbidden {
-			http.Error(w, "peer limit exceeded", http.StatusForbidden)
-			return
-		}
-
-		// Verify bearer token.
-		bearer := r.Header.Get("Authorization")
-		if bearer != "Bearer "+testAccessToken {
-			http.Error(w, "bad token", http.StatusUnauthorized)
-			t.Errorf("register: Authorization: got %q, want %q", bearer, "Bearer "+testAccessToken)
-			return
-		}
-		if !verifyHMACHeaders(t, w, r) {
-			return
-		}
-
-		// Decode request to get nonce.
-		var regReq auth.RegisterRequest
-		if err := json.NewDecoder(r.Body).Decode(&regReq); err != nil {
-			http.Error(w, "bad body", http.StatusBadRequest)
-			t.Errorf("decode register request: %v", err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-
-		if cfg.registerMissingConfig {
-			json.NewEncoder(w).Encode(map[string]string{
-				"token":      testSessionToken,
-				"server_url": testGRPCServerURL,
-			})
-			return
-		}
-
-		// Encrypt the test WireGuard config with the request's nonce.
-		ciphertext := encryptForToken(t, testAccessToken, regReq.Nonce, []byte(testWireGuardConfig))
-		json.NewEncoder(w).Encode(auth.RegisterResponse{
-			EncryptedConfig: ciphertext,
-			Token:           testSessionToken,
-			ServerURL:       testGRPCServerURL,
-			HandoffURL:      testHandoffURL,
 		})
 	})
 

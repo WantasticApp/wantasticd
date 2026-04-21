@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const RegisterPath = "/api/agent/register"
+const RegisterPath = "/api/agent/credentials"
 
 // RegisterRequest is the JSON body sent to POST /api/agent/register.
 type RegisterRequest struct {

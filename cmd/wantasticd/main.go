@@ -53,13 +53,22 @@ func handleLogin() {
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
 	token := loginCmd.String("token", "", "Direct access token (skips browser auth)")
 	portalURL := loginCmd.String("portal-url", "https://"+auth.DefaultOAuth2Domain, "Portal base URL")
+	server := loginCmd.String("server", "", "Server hostname (shorthand for --portal-url https://HOST)")
 	dev := loginCmd.Bool("dev", false, "Use local dev portal (https://"+auth.DefaultOAuth2DevDomain+")")
 	loginCmd.Parse(os.Args[2:])
 
-	if *dev && *portalURL == "https://"+auth.DefaultOAuth2Domain {
-		*portalURL = "https://" + auth.DefaultOAuth2DevDomain
+	// --server sets portal URL and disables TLS verification (local/dev servers
+	// use self-signed certs or IP addresses without SANs).
+	if *server != "" {
+		*portalURL = "https://" + *server
 		auth.SetInsecureSkipVerify()
-		log.Println("Dev mode: TLS verification disabled")
+	}
+
+	if *dev {
+		if *server == "" {
+			*portalURL = "https://" + auth.DefaultOAuth2DevDomain
+		}
+		auth.SetInsecureSkipVerify()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
@@ -76,16 +85,18 @@ func handleLogin() {
 		log.Fatalf("Login failed: %v", err)
 	}
 
-	if cfg.HandoffURL != "" {
-		log.Printf("Device registered. Open your console to confirm: %s", cfg.HandoffURL)
-	}
+	// Log key config details so we can diagnose connection issues
+	log.Printf("Login successful: endpoint=%s:%d, address=%v",
+		cfg.Server.Endpoint, cfg.Server.Port, cfg.Interface.Addresses)
 
-	configDir := "/etc/wantastic"
-	configPath := configDir + "/config.conf"
-	if err := os.MkdirAll(configDir, 0700); err != nil {
-		log.Printf("Warning: failed to create config directory %s: %v", configDir, err)
-		configPath = "wantastic.conf"
-		log.Printf("Falling back to local file: %s", configPath)
+	configPath := "/etc/wantastic/config.conf"
+	// Check if /etc/wantastic already exists as a plain file (e.g. from bulk_install).
+	// If so, use it directly instead of trying to create a subdirectory.
+	if info, err := os.Stat("/etc/wantastic"); err == nil && !info.IsDir() {
+		configPath = "/etc/wantastic"
+	} else if err := os.MkdirAll("/etc/wantastic", 0700); err != nil {
+		// Can't create directory — fall back to flat file
+		configPath = "/etc/wantastic"
 	}
 
 	if err := cfg.SaveToFile(configPath); err != nil {
@@ -147,16 +158,17 @@ func handleConnect() {
 		if connectCmd.NArg() > 0 {
 			*configPath = connectCmd.Arg(0)
 		} else {
-			// Use default if not specified
-			*configPath = "/etc/wantastic/config.conf"
-			if _, err := os.Stat(*configPath); os.IsNotExist(err) {
-				// Check for old default for backward compatibility or local fallback
-				altPath := "wantastic.conf"
-				if _, err := os.Stat(altPath); err == nil {
-					*configPath = altPath
-				} else {
-					// If neither exists, and no flag provided, we can't proceed but let's try to load default anyway
-					// and let LoadFromFile error out with a nice message if it fails
+			// Try paths in priority order: dir-based, flat file, local fallback
+			candidates := []string{
+				"/etc/wantastic/config.conf",
+				"/etc/wantastic",
+				"wantastic.conf",
+			}
+			*configPath = candidates[0] // default if none found
+			for _, p := range candidates {
+				if _, err := os.Stat(p); err == nil {
+					*configPath = p
+					break
 				}
 			}
 		}

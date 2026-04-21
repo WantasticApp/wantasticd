@@ -20,9 +20,16 @@ import (
 func StartHTTPDeviceFlow(ctx context.Context, portalBaseURL, clientID string) (*DeviceCode, error) {
 	endpoint := strings.TrimRight(portalBaseURL, "/") + DeviceCodePath
 
+	// Include the device ID so the JWT access token carries the real machine
+	// fingerprint, enabling duplicate-detection during registration.
+	deviceID, _ := HashedDeviceID()
+
 	form := url.Values{}
 	form.Set("client_id", clientID)
 	form.Set("scope", "openid profile email")
+	if deviceID != "" {
+		form.Set("device_id", deviceID)
+	}
 
 	const maxAttempts = 5
 	var lastStatus int

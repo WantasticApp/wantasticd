@@ -369,7 +369,7 @@ func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 			}
 		}
 
-		if ips, err := getInterfaceIPs(ifaceName); err == nil {
+		if ips := getInterfaceIPs(ifaceName); len(ips) > 0 {
 			iface.IPs = ips
 		}
 

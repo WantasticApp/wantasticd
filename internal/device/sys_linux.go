@@ -7,54 +7,44 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
-	"os/exec"
+
+	"wantastic-agent/internal/netctl"
 )
 
-// setupTUNInterface configures the TUN interface with the assigned IP address
+var ctl = netctl.New()
+
 func setupTUNInterface(tunName string, addrs []netip.Prefix) error {
 	if len(addrs) == 0 {
 		return fmt.Errorf("no addresses provided for tun interface")
 	}
 
-	// Wait for the interface to properly show up (WireGuard creates it, but it might flutter)
-	// Usually ip link set up does this
-	cmd := exec.Command("ip", "link", "set", "dev", tunName, "up")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ip link set up failed: %v, output: %s", err, out)
+	if err := ctl.LinkSetUp(tunName); err != nil {
+		return fmt.Errorf("set link up: %w", err)
 	}
 
 	for _, addr := range addrs {
-		addrStr := addr.String()
-		log.Printf("[TUN] Assigning IP %s to interface %s", addrStr, tunName)
-		cmd := exec.Command("ip", "addr", "add", addrStr, "dev", tunName)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			// ignore "File exists" if it was already assigned
-			return fmt.Errorf("ip addr add failed: %v, output: %s", err, out)
+		log.Printf("[TUN] Assigning IP %s to interface %s", addr.String(), tunName)
+		if err := ctl.AddrAdd(tunName, addr); err != nil {
+			return fmt.Errorf("add addr %s: %w", addr, err)
 		}
 	}
 	return nil
 }
 
-// addRouteOS adds a system route dynamically pointing to the TUN interface
 func addRouteOS(tunName string, network string) error {
-	log.Printf("[TUN] Adding Linux route %s via %s", network, tunName)
-	cmd := exec.Command("ip", "route", "add", network, "dev", tunName)
-	out, err := cmd.CombinedOutput()
+	prefix, err := netip.ParsePrefix(network)
 	if err != nil {
-		return fmt.Errorf("ip route add failed: %v, output: %s", err, out)
+		return fmt.Errorf("invalid prefix %s: %w", network, err)
 	}
-	return nil
+	log.Printf("[TUN] Adding Linux route %s via %s", network, tunName)
+	return ctl.RouteReplace(tunName, prefix)
 }
 
-// removeRouteOS removes a system route dynamically
 func removeRouteOS(tunName string, network string) error {
-	log.Printf("[TUN] Removing Linux route %s via %s", network, tunName)
-	cmd := exec.Command("ip", "route", "del", network, "dev", tunName)
-	out, err := cmd.CombinedOutput()
+	prefix, err := netip.ParsePrefix(network)
 	if err != nil {
-		return fmt.Errorf("ip route del failed: %v, output: %s", err, out)
+		return fmt.Errorf("invalid prefix %s: %w", network, err)
 	}
-	return nil
+	log.Printf("[TUN] Removing Linux route %s via %s", network, tunName)
+	return ctl.RouteDel(tunName, prefix)
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"wantastic-agent/internal/iwinfo"
+	"wantastic-agent/internal/netctl"
 	"wantastic-agent/internal/wusp"
 	"wantastic-agent/internal/wusp/platforms/ubus"
 )
@@ -605,7 +606,8 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 		case "Channel":
 			return b.setUCIOption(ctx, "wireless", section, "channel", wusp.ValueToString(value), true, wirelessReloadScript)
 		case "OperatingChannelBandwidth":
-			return b.setUCIOption(ctx, "wireless", section, "htmode", wusp.ValueToString(value), true, wirelessReloadScript)
+			htmode := bandwidthToHTMode(wusp.ValueToString(value), section, b, ctx)
+			return b.setUCIOption(ctx, "wireless", section, "htmode", htmode, true, wirelessReloadScript)
 		}
 	case "ssid", "ap":
 		section := fmt.Sprintf("@wifi-iface[%d]", idx-1) // SSID.1 → @wifi-iface[0]
@@ -1285,6 +1287,137 @@ func wifiBandwidthFromConfig(config map[string]any) string {
 	default:
 		return "Unknown"
 	}
+}
+
+// ── WiFi capability discovery via sysfs ─────────────────────────────────────
+//
+// Reads hardware capabilities directly from the kernel's sysfs virtual
+// filesystem — no external commands needed. Works on Linux 4.x+ with
+// cfg80211/mac80211 drivers (including ath10k, ath11k, mt76, …).
+//
+// Key paths:
+//   /sys/class/net/<ifname>/cfg80211_htcaps   → HT (802.11n) capability tags
+//   /sys/class/net/<ifname>/cfg80211_vhtcaps  → VHT (802.11ac) capability tags
+//   /sys/class/net/<ifname>/phy80211/name     → phy name (e.g. "phy0")
+//   /sys/class/net/<ifname>/operstate         → "up" / "down"
+
+// radioToIfname finds the first network interface belonging to a UCI radio section.
+func (b *OpenWrtBackend) radioToIfname(section string) string {
+	if data, err := b.ubusCaller("network.wireless", "status", b.ubusTimeout); err == nil {
+		var radios map[string]openWrtWirelessRadioStatus
+		if json.Unmarshal(data, &radios) == nil {
+			if radio, ok := radios[section]; ok && len(radio.Interfaces) > 0 {
+				return radio.Interfaces[0].IfName
+			}
+		}
+	}
+	// Fallback: scan sysfs for matching phy
+	targetPhy := strings.Replace(section, "radio", "phy", 1)
+	entries, _ := os.ReadDir(b.netClassDir)
+	for _, entry := range entries {
+		if data, err := os.ReadFile(b.netClassDir + "/" + entry.Name() + "/phy80211/name"); err == nil {
+			if strings.TrimSpace(string(data)) == targetPhy {
+				return entry.Name()
+			}
+		}
+	}
+	return ""
+}
+
+var netCtl = netctl.New()
+
+// bandwidthToHTMode converts a TR-181 OperatingChannelBandwidth value to a UCI
+// htmode by querying hardware capabilities via netctl and selecting the best match.
+func bandwidthToHTMode(bw, section string, b *OpenWrtBackend, ctx context.Context) string {
+	bw = strings.TrimSpace(bw)
+
+	// Pass through raw htmode values
+	upper := strings.ToUpper(bw)
+	if strings.HasPrefix(upper, "HT") || strings.HasPrefix(upper, "VHT") ||
+		strings.HasPrefix(upper, "HE") || strings.HasPrefix(upper, "EHT") {
+		return upper
+	}
+
+	// Get supported modes via netctl (reads sysfs or nl80211)
+	ifname := b.radioToIfname(section)
+	var supported []string
+	if ifname != "" {
+		if caps, err := netCtl.WiFiGetCapabilities(ifname); err == nil {
+			supported = caps.SupportedHTModes
+		}
+	}
+
+	// Normalize: "Auto", "20MHz", "80MHz" → width string
+	width := strings.ToLower(strings.TrimSuffix(bw, "MHz"))
+
+	if width == "auto" {
+		return pickBestAutoMode(supported)
+	}
+	return pickModeForWidth(supported, width)
+}
+
+// pickBestAutoMode selects the widest supported mode, preferring the newest
+// generation (EHT > HE > VHT > HT). Caps at 80 MHz to avoid DFS issues.
+func pickBestAutoMode(supported []string) string {
+	type ranked struct {
+		mode  string
+		gen   int // 0=HT, 1=VHT, 2=HE, 3=EHT
+		width int
+	}
+
+	var best ranked
+	for _, mode := range supported {
+		r := ranked{mode: mode}
+		for _, p := range []struct {
+			prefix string
+			gen    int
+		}{{"EHT", 3}, {"HE", 2}, {"VHT", 1}, {"HT", 0}} {
+			if strings.HasPrefix(mode, p.prefix) {
+				r.gen = p.gen
+				r.width, _ = strconv.Atoi(strings.TrimPrefix(mode, p.prefix))
+				break
+			}
+		}
+		// Cap at 80 for auto to avoid DFS/compatibility issues
+		ew := r.width
+		if ew > 80 {
+			ew = 80
+		}
+		bew := best.width
+		if bew > 80 {
+			bew = 80
+		}
+		if r.gen > best.gen || (r.gen == best.gen && ew > bew) {
+			best = r
+		}
+	}
+
+	if best.mode != "" {
+		prefix := [4]string{"HT", "VHT", "HE", "EHT"}[best.gen]
+		w := best.width
+		if w > 80 {
+			w = 80
+		}
+		return fmt.Sprintf("%s%d", prefix, w)
+	}
+	return "HT20"
+}
+
+// pickModeForWidth finds the best supported mode for a specific bandwidth width.
+// Prefers newest generation (EHT > HE > VHT > HT).
+func pickModeForWidth(supported []string, width string) string {
+	for _, prefix := range []string{"EHT", "HE", "VHT", "HT"} {
+		candidate := prefix + width
+		for _, mode := range supported {
+			if strings.EqualFold(mode, candidate) {
+				return mode
+			}
+		}
+	}
+	if len(supported) == 0 {
+		return "HT" + width
+	}
+	return supported[len(supported)-1] // widest/newest from the sorted list
 }
 
 func configString(config map[string]any, keys ...string) string {

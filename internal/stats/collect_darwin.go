@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"wantastic-agent/internal/iwinfo"
 )
 
 var loggedLocationWarning sync.Once
@@ -221,22 +223,13 @@ func collectWiFiStatistics() ([]WiFiInterfaceInfo, bool) {
 	return interfaces, connected
 }
 
-// getSSIDFromAirport attempts to get the SSID using the deprecated airport utility
-// which often bypasses redaction if system_profiler is restricted.
+// getSSIDFromAirport gets SSID via iwinfo (which uses airport CLI or CoreWLAN).
 func getSSIDFromAirport() (string, error) {
-	out, err := exec.Command("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport", "-I").Output()
+	info, err := iwinfo.GetInfo("en0")
 	if err != nil {
 		return "", err
 	}
-
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "SSID: ") {
-			return strings.TrimPrefix(trimmed, "SSID: "), nil
-		}
-	}
-	return "", nil
+	return info.SSID, nil
 }
 
 // getHostUptime returns the host device uptime in seconds
@@ -290,7 +283,7 @@ func collectNetworkInterfaceStatistics() ([]InterfaceInfo, uint64, uint64) {
 		}
 
 		// IPs
-		if ips, err := getInterfaceIPs(netIface.Name); err == nil {
+		if ips := getInterfaceIPs(netIface.Name); len(ips) > 0 {
 			iface.IPs = ips
 		}
 
@@ -371,8 +364,8 @@ func collectSystemMemory() (uint64, uint64) {
 	}
 
 	var pagesActive, pagesWired, pagesCompressed uint64
-	lines := strings.Split(string(vmOut), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(vmOut), "\n")
+	for line := range lines {
 		fields := strings.Split(line, ":")
 		if len(fields) != 2 {
 			continue

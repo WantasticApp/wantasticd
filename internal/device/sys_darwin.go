@@ -7,83 +7,39 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
-	"os/exec"
+
+	"wantastic-agent/internal/netctl"
 )
 
-// setupTUNInterface configures the TUN interface with the assigned IP address
+var ctl = netctl.New()
+
 func setupTUNInterface(tunName string, addrs []netip.Prefix) error {
 	if len(addrs) == 0 {
 		return fmt.Errorf("no addresses provided for tun interface")
 	}
-
 	for _, addr := range addrs {
-		if addr.Addr().Is4() {
-			ipStr := addr.Addr().String()
-			log.Printf("[TUN] Assigning IPv4 %s to interface %s", ipStr, tunName)
-			// macOS requires a point-to-point destination. We use the same IP for both sides.
-			cmd := exec.Command("ifconfig", tunName, "inet", ipStr, ipStr, "netmask", "255.255.255.255", "up")
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("ifconfig failed: %v, output: %s", err, out)
-			}
-		} else if addr.Addr().Is6() {
-			ipStr := addr.Addr().String()
-			prefixLen := fmt.Sprintf("prefixlen %d", addr.Bits())
-			log.Printf("[TUN] Assigning IPv6 %s to interface %s", ipStr, tunName)
-			cmd := exec.Command("ifconfig", tunName, "inet6", ipStr, prefixLen, "up")
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("ifconfig ipv6 failed: %v, output: %s", err, out)
-			}
+		log.Printf("[TUN] Assigning IP %s to interface %s", addr.String(), tunName)
+		if err := ctl.AddrAdd(tunName, addr); err != nil {
+			return fmt.Errorf("add addr %s: %w", addr, err)
 		}
 	}
 	return nil
 }
 
-// addRouteOS adds a system route pointing to the TUN interface.
-// It deletes any existing route for the same destination first so the
-// operation is idempotent across daemon restarts (stale routes from a
-// previous run pointing to a now-dead utun index are removed automatically).
 func addRouteOS(tunName string, network string) error {
 	prefix, err := netip.ParsePrefix(network)
 	if err != nil {
-		return fmt.Errorf("invalid network prefix %s: %w", network, err)
+		return fmt.Errorf("invalid prefix %s: %w", network, err)
 	}
-
-	family := "-inet"
-	if prefix.Addr().Is6() {
-		family = "-inet6"
-	}
-
-	// Remove any stale route for this destination (ignore errors — it may not exist).
-	exec.Command("route", "-q", "-n", "delete", family, network).Run()
-
-	log.Printf("[TUN] Adding macOS route %s via %s", network, tunName)
-	cmd := exec.Command("route", "-n", "add", family, network, "-interface", tunName)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("route add failed: %v, output: %s", err, out)
-	}
-	return nil
+	log.Printf("[TUN] Adding route %s via %s", network, tunName)
+	return ctl.RouteReplace(tunName, prefix)
 }
 
-// removeRouteOS removes a system route dynamically
 func removeRouteOS(tunName string, network string) error {
 	prefix, err := netip.ParsePrefix(network)
 	if err != nil {
-		return fmt.Errorf("invalid network prefix %s: %w", network, err)
+		return fmt.Errorf("invalid prefix %s: %w", network, err)
 	}
-
-	family := "-inet"
-	if prefix.Addr().Is6() {
-		family = "-inet6"
-	}
-
-	log.Printf("[TUN] Removing macOS route %s via %s", network, tunName)
-	cmd := exec.Command("route", "-n", "delete", family, network, "-interface", tunName)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("route delete failed: %v, output: %s", err, out)
-	}
-	return nil
+	log.Printf("[TUN] Removing route %s via %s", network, tunName)
+	return ctl.RouteDel(tunName, prefix)
 }

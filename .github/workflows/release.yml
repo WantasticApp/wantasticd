@@ -114,10 +114,13 @@ jobs:
     - name: Upload Release Asset
       run: |
         if [ "${{ matrix.goos }}" = "windows" ]; then
-          gh release upload ${{ github.ref_name }} wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip --clobber
+          ASSET="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
         else
-          gh release upload ${{ github.ref_name }} wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz --clobber
+          ASSET="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
         fi
+        # Delete existing asset if present (idempotent re-runs)
+        gh release delete-asset ${{ github.ref_name }} "$ASSET" -y 2>/dev/null || true
+        gh release upload ${{ github.ref_name }} "$ASSET"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

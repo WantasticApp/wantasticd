@@ -28,7 +28,30 @@ func setupTUNInterface(tunName string, addrs []netip.Prefix) error {
 			return fmt.Errorf("add addr %s: %w", addr, err)
 		}
 	}
+
+	// Ensure the firewall allows traffic on the WireGuard TUN interface.
+	// On OpenWrt/embedded Linux, the default fw3/fw4 drops traffic on interfaces
+	// not assigned to a zone. These rules allow all tunnel traffic (ICMP, TCP, UDP).
+	allowTUNFirewall(tunName)
+
 	return nil
+}
+
+// allowTUNFirewall adds iptables INPUT/OUTPUT ACCEPT rules for the TUN interface.
+// Idempotent — uses netctl.FirewallEnsureRule which checks before adding.
+// Non-fatal: if iptables is unavailable (e.g. nftables-only system), we log and continue.
+func allowTUNFirewall(tunName string) {
+	rules := []netctl.FirewallRule{
+		{Table: "filter", Chain: "INPUT", Args: []string{"-i", tunName, "-j", "ACCEPT"}},
+		{Table: "filter", Chain: "OUTPUT", Args: []string{"-o", tunName, "-j", "ACCEPT"}},
+		{Table: "filter", Chain: "FORWARD", Args: []string{"-i", tunName, "-j", "ACCEPT"}},
+		{Table: "filter", Chain: "FORWARD", Args: []string{"-o", tunName, "-j", "ACCEPT"}},
+	}
+	for _, rule := range rules {
+		if err := ctl.FirewallEnsureRule(rule); err != nil {
+			log.Printf("[TUN] Warning: could not add firewall rule (%s %s %v): %v", rule.Table, rule.Chain, rule.Args, err)
+		}
+	}
 }
 
 func addRouteOS(tunName string, network string) error {

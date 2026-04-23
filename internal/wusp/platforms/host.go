@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 )
 
@@ -232,6 +233,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 
 	collectNetworkInterfacesStatic(msg)
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
+	collectCellularStatic(msg)
 
 	return msg
 }
@@ -339,6 +341,94 @@ func collectCPUInfoStatic(ctx context.Context, runner func(context.Context, stri
 		if n, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); err == nil && n > 0 {
 			msg.Set("Device.DeviceInfo.Processor.1.MaxNumberOfEntries", wusp.Uint(n))
 		}
+	}
+}
+
+// collectCellularStatic discovers and queries cellular modems, populating
+// Device.Cellular.Interface.{n}. TR-181 params (IMEI, signal, registration, etc.)
+func collectCellularStatic(msg *wusp.Message) {
+	ctl := modemPkg.New()
+	defer ctl.Close()
+
+	devices, err := ctl.Discover()
+	if err != nil || len(devices) == 0 {
+		return
+	}
+
+	ifaceIdx := 0
+	for _, dev := range devices {
+		info, err := ctl.GetInfo(dev)
+		if err != nil || info == nil {
+			continue
+		}
+		ifaceIdx++
+		prefix := fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)
+
+		msg.Set(prefix+"Enable", wusp.Bool(true))
+		msg.Set(prefix+"Status", wusp.String("Up"))
+
+		if info.IMEI != "" {
+			msg.Set(prefix+"IMEI", wusp.String(info.IMEI))
+		}
+		if info.Model != "" {
+			msg.Set(prefix+"Model", wusp.String(info.Model))
+		}
+		if info.Manufacturer != "" {
+			msg.Set(prefix+"Manufacturer", wusp.String(info.Manufacturer))
+		}
+		if info.Revision != "" {
+			msg.Set(prefix+"FirmwareVersion", wusp.String(info.Revision))
+		}
+
+		// Network registration
+		msg.Set(prefix+"NetworkInUse", wusp.String(info.Operator))
+		msg.Set(prefix+"CurrentAccessTechnology", wusp.String(info.Technology.String()))
+		msg.Set(prefix+"RegistrationStatus", wusp.String(info.Status.String()))
+		if info.CellID > 0 {
+			msg.Set(prefix+"CellID", wusp.Uint(uint64(info.CellID)))
+		}
+		if info.TAC > 0 {
+			msg.Set(prefix+"TAC", wusp.Uint(uint64(info.TAC)))
+		}
+
+		// Signal quality
+		sig := info.Signal
+		if sig.RSSI != 0 {
+			msg.Set(prefix+"RSSI", wusp.Int(int64(sig.RSSI)))
+		}
+		if sig.RSRP != 0 {
+			msg.Set(prefix+"RSRP", wusp.Int(int64(sig.RSRP)))
+		}
+		if sig.RSRQ != 0 {
+			msg.Set(prefix+"RSRQ", wusp.Int(int64(sig.RSRQ)))
+		}
+		if sig.SINR != 0 {
+			msg.Set(prefix+"SINR", wusp.Int(int64(sig.SINR)))
+		}
+
+		// SIM / USIM
+		if info.IMSI != "" {
+			msg.Set(prefix+"USIM.IMSI", wusp.String(info.IMSI))
+		}
+		if info.ICCID != "" {
+			msg.Set(prefix+"USIM.ICCID", wusp.String(info.ICCID))
+		}
+		if info.MSISDN != "" {
+			msg.Set(prefix+"USIM.MSISDN", wusp.String(info.MSISDN))
+		}
+		msg.Set(prefix+"USIM.Status", wusp.String(info.SIMStatus.String()))
+
+		// Traffic stats
+		if info.TxBytes > 0 {
+			msg.Set(prefix+"Stats.BytesSent", wusp.Uint(info.TxBytes))
+		}
+		if info.RxBytes > 0 {
+			msg.Set(prefix+"Stats.BytesReceived", wusp.Uint(info.RxBytes))
+		}
+	}
+
+	if ifaceIdx > 0 {
+		msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(uint64(ifaceIdx)))
 	}
 }
 

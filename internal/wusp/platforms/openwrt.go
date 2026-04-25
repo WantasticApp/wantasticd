@@ -610,7 +610,12 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 			return b.setUCIOption(ctx, "wireless", section, "htmode", htmode, true, wirelessReloadScript)
 		}
 	case "ssid", "ap":
-		section := fmt.Sprintf("@wifi-iface[%d]", idx-1) // SSID.1 → @wifi-iface[0]
+		// Resolve the UCI section name for this SSID/AP index by iterating
+		// the ubus wireless status in the same order as the collector.
+		section := b.resolveWiFiIfaceSection(idx)
+		if section == "" {
+			section = fmt.Sprintf("@wifi-iface[%d]", idx-1) // fallback to positional
+		}
 		switch param {
 		case "SSID":
 			return b.setUCIOption(ctx, "wireless", section, "ssid", value.AsString(), true, wirelessReloadScript)
@@ -621,6 +626,42 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 		}
 	}
 	return wusp.ErrUSPPathUnsupported
+}
+
+// resolveWiFiIfaceSection maps a WUSP SSID/AP index (1-based) to the actual UCI
+// section name (e.g. "default_radio0") by iterating ubus wireless status in the
+// same order as the collector. This ensures Set operations target the correct section.
+func (b *OpenWrtBackend) resolveWiFiIfaceSection(ssidIndex int) string {
+	radios := b.readWirelessRadioStatus()
+	if len(radios) == 0 {
+		return ""
+	}
+
+	// Sort radio keys to match collector order
+	radioKeys := make([]string, 0, len(radios))
+	for k := range radios {
+		radioKeys = append(radioKeys, k)
+	}
+	sort.Strings(radioKeys)
+
+	count := 0
+	for _, key := range radioKeys {
+		radio := radios[key]
+		// Sort interfaces by section name (matches collector)
+		ifaces := append([]openWrtWirelessIfaceStatus(nil), radio.Interfaces...)
+		sort.SliceStable(ifaces, func(i, j int) bool {
+			left := firstNonEmpty(ifaces[i].Section, ifaces[i].IfName)
+			right := firstNonEmpty(ifaces[j].Section, ifaces[j].IfName)
+			return left < right
+		})
+		for _, iface := range ifaces {
+			count++
+			if count == ssidIndex {
+				return iface.Section
+			}
+		}
+	}
+	return ""
 }
 
 func (b *OpenWrtBackend) setUCIOption(ctx context.Context, config, section, option, value string, commit bool, reloadScript string) error {
@@ -705,6 +746,14 @@ func (b *OpenWrtBackend) reloadScript(ctx context.Context, script string) error 
 	if script == "" {
 		return nil
 	}
+
+	// "wifi" is a standalone command (not an init script) — run without args.
+	// Init scripts like /etc/init.d/network take "reload" as an argument.
+	if script == "wifi" {
+		_, err := b.commandRunner(ctx, "wifi")
+		return err
+	}
+
 	if _, err := os.Stat(script); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil

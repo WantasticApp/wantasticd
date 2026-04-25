@@ -21,3 +21,4 @@ wantasticd-linux
 bulk_install.sh
 .claude/
 *.conf
+test.rsc

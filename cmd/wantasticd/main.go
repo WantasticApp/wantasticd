@@ -103,6 +103,19 @@ func handleLogin() {
 		log.Fatalf("Failed to save configuration: %v", err)
 	}
 	log.Println("Configuration saved to", configPath)
+
+	// Auto-connect after successful login.
+	// On headless/embedded devices (OpenWrt), login is typically the only
+	// interactive step — the user expects the tunnel to come up immediately.
+	log.Println("Starting connection...")
+
+	ensureSystemDNS()
+	cfg.Interface.TUNMode = true
+	cfg.Interface.TUNName = autoTUNName()
+
+	runner.RunServiceHook(func(ctx context.Context) {
+		runAgent(ctx, configPath, false, false, cfg.Interface.TUNName, false)
+	})
 }
 
 func runAgentWithConfig(cfg *config.Config) {

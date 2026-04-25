@@ -234,6 +234,8 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	collectNetworkInterfacesStatic(msg)
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
 	collectCellularStatic(msg)
+	collectGPSStatic(msg)
+	collectMeshStatic(msg)
 
 	return msg
 }
@@ -1098,6 +1100,14 @@ func coalesceString(value, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func readFileQuiet(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
+func readDirQuiet(path string) ([]os.DirEntry, error) {
+	return os.ReadDir(path)
 }
 
 func readTextFile(path string) string {

@@ -57,8 +57,6 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
-
-	SendStatsEnabled atomic.Bool // Enable sending custom MessageType 5
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {

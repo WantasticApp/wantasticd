@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"wantastic-agent/internal/stats"
 	"wantastic-agent/internal/update"
 
 	"wantastic-agent/internal/config"
@@ -22,7 +21,6 @@ type Agent struct {
 	config  *config.Config
 	device  *device.Device
 	updater *update.Manager
-	stats   *stats.Server
 	usp     *uspRuntime
 
 	mu      sync.RWMutex
@@ -48,9 +46,6 @@ func New(cfg *config.Config) (*Agent, error) {
 
 	updater := update.NewManager(version.Version)
 
-	statsServer := stats.NewServer(dev, version.Version)
-	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
-
 	uspRuntime, err := newUSPRuntime(cfg, dev, version.Version)
 	if err != nil {
 		return nil, fmt.Errorf("create usp runtime: %w", err)
@@ -63,7 +58,6 @@ func New(cfg *config.Config) (*Agent, error) {
 		config:  cfg,
 		device:  dev,
 		updater: updater,
-		stats:   statsServer,
 		usp:     uspRuntime,
 		stopCh:  make(chan struct{}),
 	}
@@ -85,13 +79,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("start device: %w", err)
 	}
 
-	if a.config.Verbose {
-		if err := a.stats.Start(); err != nil {
-			log.Printf("Warning: failed to start stats server: %v", err)
-		}
-	}
-
-	workerCount := 3 // HealthCheck + DNSCheck + MetricsTicker
+	workerCount := 2 // HealthCheck + DNSCheck
 	if a.config.AutoUpdate {
 		workerCount++
 	}
@@ -102,7 +90,6 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	go a.runHealthCheck(ctx)
 	go a.runDNSCheck(ctx)
-	go a.runMetricsTicker(ctx)
 
 	if a.usp != nil {
 		go a.runWUSPInit(ctx)
@@ -140,10 +127,6 @@ func (a *Agent) Stop() error {
 
 	a.wg.Wait()
 
-	if a.stats != nil {
-		a.stats.Stop()
-	}
-
 	if err := a.device.Stop(); err != nil {
 		log.Printf("Error stopping device: %v", err)
 	}
@@ -158,24 +141,6 @@ func (a *Agent) Stop() error {
 func (a *Agent) runWUSPInit(ctx context.Context) {
 	defer a.wg.Done()
 	a.usp.runInit(ctx)
-}
-
-func (a *Agent) runMetricsTicker(ctx context.Context) {
-	defer a.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.stopCh:
-			return
-		case <-ticker.C:
-			a.device.SendStatsToServer()
-		}
-	}
 }
 
 func (a *Agent) runHealthCheck(ctx context.Context) {

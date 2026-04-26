@@ -755,13 +755,38 @@ func (a *USPAgent) storeFields(fields []Field, alreadyValidated bool) error {
 	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	for _, field := range fields {
 		field.Path = strings.TrimSpace(field.Path)
 		if id, ok := globalRegistry.IDFor(field.Path); ok {
 			field.id = id
 		}
 		a.values[field.Path] = cloneField(field)
+	}
+	sender := a.eventSender
+	a.mu.Unlock()
+
+	// Emit one ValueChange Notify per modified field so any subscribed
+	// controller (and, transitively, any open WUSP dashboard) sees the new
+	// value within milliseconds — no polling needed. Fire-and-forget; a Set
+	// must not fail just because the wire push couldn't be delivered.
+	if sender != nil && len(fields) > 0 {
+		ctx := context.Background()
+		for _, field := range fields {
+			ev := USPEvent{
+				Type:       USPEventTypeValueChange,
+				EventName:  "ValueChange",
+				ObjPath:    field.Path,
+				ParamValue: ValueToString(field.Val),
+			}
+			// Emit goes through subscription matching; if there's no
+			// matching subscription it still wires a single untagged
+			// notification, which the controller routes via OnEvent.
+			if err := a.Emit(ctx, ev); err != nil {
+				// Non-fatal: the Set itself succeeded; we just couldn't
+				// push the live update.
+				_ = err
+			}
+		}
 	}
 	return nil
 }

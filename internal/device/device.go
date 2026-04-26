@@ -40,10 +40,8 @@ type Device struct {
 
 	PortForwarder func(string, int) bool
 
-	statsProvider func() []byte
-	statsHook     func(*wgdevice.Peer, []byte)
-	wuspHook      func(*wgdevice.Peer, []byte)
-	punchHook     func(*wgdevice.Peer, []byte)
+	wuspHook  func(*wgdevice.Peer, []byte)
+	punchHook func(*wgdevice.Peer, []byte)
 
 	peerHostnamesMu sync.RWMutex
 	peerHostnames   map[string]string
@@ -114,14 +112,10 @@ func (d *Device) Start() error {
 
 	wd := wgdevice.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 	wd.DisableSomeRoamingForBrokenMobileSemantics()
-	wd.SetStatsHandler(d.handleStats)
 	wd.SetWUSPHandler(d.handleWUSP)
 	wd.SetPunchHandler(d.handlePunch)
 	wd.SetTUNControlHandler(d.handleTUNControl)
 	wd.SetAddPeerRouteHandler(d.addPeerRoute)
-	if d.statsProvider != nil {
-		wd.SetStatsProvider(d.statsProvider)
-	}
 	d.device = wd
 
 	if err := d.applyConfig(); err != nil {
@@ -309,19 +303,6 @@ func (d *Device) applyConfig() error {
 		return err
 	}
 
-	// Restore custom stats enabling for the server peer if configured
-	if d.config.Server.SendStats && d.config.Server.PublicKey != "" {
-		if pubKey, err := base64ToHex(d.config.Server.PublicKey); err == nil {
-			if pk, err := hex.DecodeString(pubKey); err == nil && len(pk) == 32 {
-				var noiseKey [32]byte
-				copy(noiseKey[:], pk)
-				if peer := d.device.LookupPeer(noiseKey); peer != nil {
-					peer.SendStatsEnabled.Store(true)
-				}
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -341,12 +322,6 @@ func (d *Device) GetPublicKey() string {
 	return base64.StdEncoding.EncodeToString(pub[:])
 }
 
-func (d *Device) SetStatsHandler(handler func(*wgdevice.Peer, []byte)) {
-	d.mu.Lock()
-	d.statsHook = handler
-	d.mu.Unlock()
-}
-
 func (d *Device) SetWUSPHandler(handler func(*wgdevice.Peer, []byte)) {
 	d.mu.Lock()
 	d.wuspHook = handler
@@ -357,16 +332,6 @@ func (d *Device) SetPunchHandler(handler func(*wgdevice.Peer, []byte)) {
 	d.mu.Lock()
 	d.punchHook = handler
 	d.mu.Unlock()
-}
-
-func (d *Device) SetStatsProvider(provider func() []byte) {
-	d.statsProvider = provider
-	// If device is already running, apply immediately
-	d.mu.RLock()
-	if d.device != nil {
-		d.device.SetStatsProvider(provider)
-	}
-	d.mu.RUnlock()
 }
 
 // addRoute adds a system route dynamically
@@ -477,41 +442,6 @@ func (d *Device) SendWUSPToServer(data []byte) error {
 // handshake with the server peer. Satisfies the agent's uspTransport interface.
 func (d *Device) IsServerConnected() bool {
 	return d.HasActiveHandshake()
-}
-
-// SendStatsToServer pushes a stats message (Message Type 5) to the server peer.
-// Safe to call from any goroutine; no-ops if the device is not started or the
-// server peer is not found / not stats-enabled.
-func (d *Device) SendStatsToServer() {
-	if !d.config.Server.SendStats || d.config.Server.PublicKey == "" {
-		return
-	}
-
-	pubHex, err := base64ToHex(d.config.Server.PublicKey)
-	if err != nil {
-		return
-	}
-	pkBytes, err := hex.DecodeString(pubHex)
-	if err != nil || len(pkBytes) != 32 {
-		return
-	}
-
-	var noiseKey [32]byte
-	copy(noiseKey[:], pkBytes)
-
-	d.mu.RLock()
-	wd := d.device
-	d.mu.RUnlock()
-	if wd == nil {
-		return
-	}
-
-	peer := wd.LookupPeer(noiseKey)
-	if peer == nil {
-		return
-	}
-
-	go peer.SendStats()
 }
 
 func (d *Device) GetStats() (map[string]any, error) {

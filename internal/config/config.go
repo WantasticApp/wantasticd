@@ -86,7 +86,6 @@ type Server struct {
 	PublicKey           string   `json:"public_key"`
 	AllowedIPs          []string `json:"allowed_ips"`
 	PersistentKeepalive int      `json:"persistent_keepalive"`
-	SendStats           bool     `json:"send_stats"`
 }
 
 type Interface struct {
@@ -255,9 +254,6 @@ func parseTraditionalWireGuardConfig(configData string) (Config, error) {
 	if cfg.DeviceID == "" {
 		cfg.GenerateDeviceID()
 	}
-
-	// Default to sending stats for traditional configs (users can opt-out if we add a flag later)
-	cfg.Server.SendStats = true
 
 	return cfg, nil
 }

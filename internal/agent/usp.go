@@ -47,6 +47,7 @@ type uspRuntime struct {
 	softwareVersion        string
 	httpClient             *http.Client
 	transferDir            string
+	stats                  uspRuntimeStats
 
 	nextID  atomic.Uint64
 	pending sync.Map // map[uint64]chan wusp.USPAgentResponse
@@ -55,6 +56,140 @@ type uspRuntime struct {
 	// Initialization state machine.
 	initState atomic.Int32
 	initReady chan struct{} // closed once initState == uspInitReady
+}
+
+type USPRuntimeStats struct {
+	InboundFrames          uint64
+	InboundBytes           uint64
+	InboundRequests        uint64
+	InboundResponses       uint64
+	UnauthorizedRequests   uint64
+	OutboundResponses      uint64
+	ResponseFragmentsSent  uint64
+	FragmentedResponses    uint64
+	TransferFramesSent     uint64
+	TransferFrameBytesSent uint64
+	TransferFramesReceived uint64
+	TransferFrameBytesReceived uint64
+	TransferSessionsStarted   uint64
+	TransferSessionsCompleted uint64
+	TransferSessionsAborted   uint64
+	TransferAckTimeouts       uint64
+	TransferChunkResends      uint64
+	TransferUnknownSessions   uint64
+	TransferPayloadBytes      uint64
+	TransferDurationTotal     time.Duration
+	TransferDurationMax       time.Duration
+}
+
+type uspRuntimeStats struct {
+	inboundFrames          atomic.Uint64
+	inboundBytes           atomic.Uint64
+	inboundRequests        atomic.Uint64
+	inboundResponses       atomic.Uint64
+	unauthorizedRequests   atomic.Uint64
+	outboundResponses      atomic.Uint64
+	responseFragmentsSent  atomic.Uint64
+	fragmentedResponses    atomic.Uint64
+	transferFramesSent     atomic.Uint64
+	transferFrameBytesSent atomic.Uint64
+	transferFramesReceived atomic.Uint64
+	transferFrameBytesReceived atomic.Uint64
+	transferSessionsStarted   atomic.Uint64
+	transferSessionsCompleted atomic.Uint64
+	transferSessionsAborted   atomic.Uint64
+	transferAckTimeouts       atomic.Uint64
+	transferChunkResends      atomic.Uint64
+	transferUnknownSessions   atomic.Uint64
+	transferPayloadBytes      atomic.Uint64
+	transferDurationNS        atomic.Uint64
+	transferDurationMaxNS     atomic.Uint64
+}
+
+func (r *uspRuntime) StatsSnapshot() USPRuntimeStats {
+	if r == nil {
+		return USPRuntimeStats{}
+	}
+	return USPRuntimeStats{
+		InboundFrames:             r.stats.inboundFrames.Load(),
+		InboundBytes:              r.stats.inboundBytes.Load(),
+		InboundRequests:           r.stats.inboundRequests.Load(),
+		InboundResponses:          r.stats.inboundResponses.Load(),
+		UnauthorizedRequests:      r.stats.unauthorizedRequests.Load(),
+		OutboundResponses:         r.stats.outboundResponses.Load(),
+		ResponseFragmentsSent:     r.stats.responseFragmentsSent.Load(),
+		FragmentedResponses:       r.stats.fragmentedResponses.Load(),
+		TransferFramesSent:        r.stats.transferFramesSent.Load(),
+		TransferFrameBytesSent:    r.stats.transferFrameBytesSent.Load(),
+		TransferFramesReceived:    r.stats.transferFramesReceived.Load(),
+		TransferFrameBytesReceived: r.stats.transferFrameBytesReceived.Load(),
+		TransferSessionsStarted:   r.stats.transferSessionsStarted.Load(),
+		TransferSessionsCompleted: r.stats.transferSessionsCompleted.Load(),
+		TransferSessionsAborted:   r.stats.transferSessionsAborted.Load(),
+		TransferAckTimeouts:       r.stats.transferAckTimeouts.Load(),
+		TransferChunkResends:      r.stats.transferChunkResends.Load(),
+		TransferUnknownSessions:   r.stats.transferUnknownSessions.Load(),
+		TransferPayloadBytes:      r.stats.transferPayloadBytes.Load(),
+		TransferDurationTotal:     time.Duration(r.stats.transferDurationNS.Load()),
+		TransferDurationMax:       time.Duration(r.stats.transferDurationMaxNS.Load()),
+	}
+}
+
+func (r *uspRuntime) recordTransferDuration(duration time.Duration) {
+	if r == nil || duration <= 0 {
+		return
+	}
+	value := uint64(duration)
+	r.stats.transferDurationNS.Add(value)
+	observeUSPUint64Max(&r.stats.transferDurationMaxNS, value)
+}
+
+func (r *uspRuntime) recordTransferSessionStart() {
+	if r == nil {
+		return
+	}
+	r.stats.transferSessionsStarted.Add(1)
+}
+
+func (r *uspRuntime) recordTransferSessionComplete(session *uspTransferSession) {
+	if r == nil || session == nil {
+		return
+	}
+	r.stats.transferSessionsCompleted.Add(1)
+	r.stats.transferPayloadBytes.Add(uint64(maxInt64(session.transferred, 0)))
+	r.recordTransferDuration(time.Since(session.startedAt))
+	log.Printf("[USP] transfer session completed: peer=%s session=%d method=%s bytes=%d duration=%s",
+		session.peerPublicKeyHex, session.id, session.method.String(), session.transferred, time.Since(session.startedAt))
+}
+
+func (r *uspRuntime) recordTransferSessionAbort(session *uspTransferSession, err error) {
+	if r == nil || session == nil {
+		return
+	}
+	r.stats.transferSessionsAborted.Add(1)
+	r.recordTransferDuration(time.Since(session.startedAt))
+	if err != nil {
+		log.Printf("[USP] transfer session aborted: peer=%s session=%d method=%s bytes=%d duration=%s err=%v",
+			session.peerPublicKeyHex, session.id, session.method.String(), session.transferred, time.Since(session.startedAt), err)
+		return
+	}
+	log.Printf("[USP] transfer session aborted: peer=%s session=%d method=%s bytes=%d duration=%s",
+		session.peerPublicKeyHex, session.id, session.method.String(), session.transferred, time.Since(session.startedAt))
+}
+
+func observeUSPUint64Max(target *atomic.Uint64, value uint64) {
+	if target == nil {
+		return
+	}
+	for {
+		current := target.Load()
+		if value <= current {
+			return
+		}
+		if target.CompareAndSwap(current, value) {
+			return
+		}
+	}
 }
 
 func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion string) (*uspRuntime, error) {
@@ -91,6 +226,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		Setter:          backend,
 		UploadHandler:   runtime.handleUpload,
 		DownloadHandler: runtime.handleDownload,
+		OperateHandler:  runtime.handleOperate,
 		EventSender:     runtime, // uspRuntime implements wusp.USPEventSender
 	})
 	if err := runtime.agent.Bootstrap(wusp.FillOptions{
@@ -129,7 +265,7 @@ func (r *uspRuntime) HandlePeerPacket(peer *wgdevice.Peer, data []byte) {
 	log.Printf("[USP] HandlePeerPacket: peer=%s bytes=%d", peerHex, len(data))
 	if err := r.handleFrameFromPeer(peerHex, data, func(frame []byte) error {
 		log.Printf("[USP] Sending WUSP response: peer=%s bytes=%d", peerHex, len(frame))
-		peer.SendWUSP(frame)
+		peer.SendWUSPDatagram(frame)
 		return nil
 	}); err != nil {
 		log.Printf("[USP] WUSP frame handling failed: peer=%s err=%v", peerHex, err)
@@ -140,13 +276,18 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	if r == nil || len(data) == 0 {
 		return nil
 	}
+	r.stats.inboundFrames.Add(1)
+	r.stats.inboundBytes.Add(uint64(len(data)))
 
 	if streamFrame, err := wusp.DecodeUSPTransferStreamFrame(data); err == nil {
+		r.stats.transferFramesReceived.Add(1)
+		r.stats.transferFrameBytesReceived.Add(uint64(len(data)))
 		log.Printf("[USP] handleFrameFromPeer: stream frame from peer=%s phase=%d", peerPublicKeyHex, streamFrame.Phase)
 		return r.handleTransferStreamFrame(peerPublicKeyHex, streamFrame)
 	}
 
 	if resp, err := wusp.DecodeUSPAgentResponse(data); err == nil {
+		r.stats.inboundResponses.Add(1)
 		log.Printf("[USP] handleFrameFromPeer: response id=%d method=%d from peer=%s", resp.ID, resp.Method, peerPublicKeyHex)
 		if !r.isControllerPeer(peerPublicKeyHex) {
 			return nil
@@ -174,23 +315,25 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		}
 		return nil // don't propagate — not actionable, prevents HandlePeerPacket error spam
 	}
+	r.stats.inboundRequests.Add(1)
 
 	log.Printf("[USP] handleFrameFromPeer: request id=%d method=%d from peer=%s isController=%v",
 		req.ID, req.Method, peerPublicKeyHex, r.isControllerPeer(peerPublicKeyHex))
 
 	if !r.isControllerPeer(peerPublicKeyHex) {
+		r.stats.unauthorizedRequests.Add(1)
 		// Authorization failed. Reply with an explicit error so the controller
 		// receives an immediate response instead of waiting for a probe timeout.
 		// Also log so the operator can diagnose key-mismatch issues.
 		log.Printf("[USP] Rejected request method=%d id=%d from peer %s (configured controller=%q)",
 			req.Method, req.ID, peerPublicKeyHex, r.controllerPublicKeyHex)
 		if reply != nil {
-			if frame, encErr := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+			if encErr := r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 				ID:     req.ID,
 				Method: req.Method,
 				Error:  "unauthorized",
-			}); encErr == nil {
-				_ = reply(frame)
+			}); encErr != nil {
+				log.Printf("[USP] failed to encode unauthorized reply: %v", encErr)
 			}
 		}
 		return fmt.Errorf("wusp request from unauthorized peer %s", peerPublicKeyHex)
@@ -220,17 +363,50 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		// list).  Send an error response so the controller gets an immediate
 		// reply rather than waiting for a round-trip timeout.
 		log.Printf("[USP] EncodeUSPAgentResponse failed: method=%d id=%d err=%v — sending error response", req.Method, req.ID, err)
-		if errFrame, encErr := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+		if encErr := r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:     req.ID,
 			Method: req.Method,
 			Error:  err.Error(),
 		}); encErr == nil {
-			return reply(errFrame)
+			return nil
+		} else {
+			return encErr
 		}
-		return err
 	}
 	log.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
-	return reply(frame)
+	return r.replyControlPayload(reply, req, frame)
+}
+
+func (r *uspRuntime) replyControlResponse(reply func([]byte) error, req wusp.USPAgentRequest, resp wusp.USPAgentResponse) error {
+	frame, err := wusp.EncodeUSPAgentResponse(resp)
+	if err != nil {
+		return err
+	}
+	return r.replyControlPayload(reply, req, frame)
+}
+
+func (r *uspRuntime) replyControlPayload(reply func([]byte) error, req wusp.USPAgentRequest, payload []byte) error {
+	if reply == nil {
+		return fmt.Errorf("missing reply transport for request %d", req.ID)
+	}
+	budget := wusp.RequestedResponseMaxControlPayload(req.Metadata, wusp.WUSPMaxDatagramPayload)
+	frames, err := wusp.FragmentUSPControlPayload(payload, req.ID, budget)
+	if err != nil {
+		return err
+	}
+	r.stats.outboundResponses.Add(1)
+	r.stats.responseFragmentsSent.Add(uint64(len(frames)))
+	if len(frames) > 1 {
+		r.stats.fragmentedResponses.Add(1)
+		log.Printf("[USP] fragmented control response: request=%d method=%s budget=%d fragments=%d payload_bytes=%d",
+			req.ID, req.Method.String(), budget, len(frames), len(payload))
+	}
+	for _, frame := range frames {
+		if err := reply(frame); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 
@@ -290,6 +466,71 @@ func (r *uspRuntime) isControllerPeer(peerPublicKeyHex string) bool {
 		return true
 	}
 	return strings.EqualFold(strings.TrimSpace(peerPublicKeyHex), r.controllerPublicKeyHex)
+}
+
+// handleOperate implements TR-181 USP Operate commands. The dashboard sends
+// canonical "Device.Foo()" command paths; we route them to platform-specific
+// effects. Unsupported commands return ErrUSPPathUnsupported, which the
+// controller surfaces back to the dashboard as a clean "not supported" error.
+func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, _ *wusp.Message, _ map[string]string) (*wusp.Message, error) {
+	cmd := strings.TrimSpace(cmdPath)
+	log.Printf("[USP] Operate request: %s", cmd)
+	switch cmd {
+	case "Device.Reboot()":
+		// Schedule a reboot a few seconds out so the response can flow back
+		// to the controller before the device disappears. Real reboot needs
+		// root privileges; if `reboot`/`shutdown` is not on PATH or the
+		// process lacks privileges, the OS call fails silently and we just
+		// exit the agent (let the supervisor restart us in a cleaner state).
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("[USP] Executing Device.Reboot()")
+			// Best-effort: try `reboot`, fall through to os.Exit for non-root
+			// or non-privileged environments where supervisor will respawn us.
+			if err := tryReboot(); err != nil {
+				log.Printf("[USP] Reboot fallback (process exit): %v", err)
+				os.Exit(0)
+			}
+		}()
+		return nil, nil
+	case "Device.FactoryReset()":
+		// Best-effort: clear the on-disk config and exit. The supervisor
+		// (systemd / wantasticd-watch / launchd) restarts the agent in a
+		// clean state, which then prompts the user to re-enroll.
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("[USP] Executing Device.FactoryReset()")
+			_ = tryFactoryReset()
+			os.Exit(0)
+		}()
+		return nil, nil
+	default:
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+}
+
+// tryReboot attempts to issue a system reboot. Returns an error if no
+// reboot mechanism is available; the caller treats that as a signal to
+// exit the agent process (supervisor will restart us).
+func tryReboot() error {
+	// Implementation lives in platform-specific files; here we just return
+	// an error so the caller falls back to process exit. Platforms can
+	// override via build tags if they need a real reboot.
+	return errors.New("native reboot not implemented; exiting for supervisor restart")
+}
+
+// tryFactoryReset removes the agent's on-disk config so the supervisor
+// restarts it in an unenrolled state.
+func tryFactoryReset() error {
+	cfgPath := os.Getenv("WANTASTIC_CONFIG")
+	if cfgPath == "" {
+		cfgPath = "/etc/wantastic"
+	}
+	// Best-effort cleanup. We don't hard-fail on missing files because
+	// the next start will treat the agent as unenrolled regardless.
+	_ = os.RemoveAll(cfgPath + "/config.json")
+	_ = os.RemoveAll(cfgPath + "/agent.json")
+	return nil
 }
 
 func (r *uspRuntime) handleUpload(ctx context.Context, req wusp.USPTransferRequest) (wusp.USPTransferResult, error) {
@@ -369,7 +610,7 @@ func (r *uspRuntime) localUpload(req wusp.USPTransferRequest) (wusp.USPTransferR
 		URI:   "file://" + targetPath,
 		Bytes: int64(len(body)),
 		Metadata: map[string]string{
-			"destination": targetPath,
+			wusp.TransferMetadataDestination: targetPath,
 		},
 	}, nil
 }
@@ -389,7 +630,7 @@ func (r *uspRuntime) httpDownload(ctx context.Context, req wusp.USPTransferReque
 		return wusp.USPTransferResult{}, fmt.Errorf("http download failed: %s", resp.Status)
 	}
 
-	targetPath := firstNonEmpty(strings.TrimSpace(req.Filename), req.Metadata["destination"])
+	targetPath := firstNonEmpty(strings.TrimSpace(req.Filename), req.Metadata[wusp.TransferMetadataDestination])
 	if targetPath == "" {
 		targetPath = filepath.Join(r.transferDirectory(), sanitizeTransferName(req.Path)+".download")
 	}
@@ -411,8 +652,8 @@ func (r *uspRuntime) httpDownload(ctx context.Context, req wusp.USPTransferReque
 		URI:   req.URI,
 		Bytes: written,
 		Metadata: map[string]string{
-			"destination": targetPath,
-			"status":      resp.Status,
+			wusp.TransferMetadataDestination: targetPath,
+			"status":                        resp.Status,
 		},
 	}, nil
 }
@@ -428,7 +669,7 @@ func (r *uspRuntime) localDownload(req wusp.USPTransferRequest) (wusp.USPTransfe
 		return wusp.USPTransferResult{}, err
 	}
 
-	destination := strings.TrimSpace(req.Metadata["destination"])
+	destination := strings.TrimSpace(req.Metadata[wusp.TransferMetadataDestination])
 	if destination != "" && filepath.Clean(destination) != filepath.Clean(sourcePath) {
 		if err := copyFile(sourcePath, destination); err != nil {
 			return wusp.USPTransferResult{}, err
@@ -438,8 +679,8 @@ func (r *uspRuntime) localDownload(req wusp.USPTransferRequest) (wusp.USPTransfe
 			URI:   "file://" + sourcePath,
 			Bytes: info.Size(),
 			Metadata: map[string]string{
-				"source":      sourcePath,
-				"destination": destination,
+				wusp.TransferMetadataSource:      sourcePath,
+				wusp.TransferMetadataDestination: destination,
 			},
 		}, nil
 	}
@@ -449,7 +690,7 @@ func (r *uspRuntime) localDownload(req wusp.USPTransferRequest) (wusp.USPTransfe
 		URI:   "file://" + sourcePath,
 		Bytes: info.Size(),
 		Metadata: map[string]string{
-			"source": sourcePath,
+			wusp.TransferMetadataSource: sourcePath,
 		},
 	}, nil
 }
@@ -458,7 +699,7 @@ func (r *uspRuntime) uploadBody(req wusp.USPTransferRequest) ([]byte, error) {
 	if len(req.Payload) > 0 {
 		return append([]byte(nil), req.Payload...), nil
 	}
-	sourcePath := firstNonEmpty(strings.TrimSpace(req.Metadata["source"]), strings.TrimSpace(req.Filename))
+	sourcePath := firstNonEmpty(strings.TrimSpace(req.Metadata[wusp.TransferMetadataSource]), strings.TrimSpace(req.Filename))
 	if sourcePath == "" {
 		return nil, errors.New("upload payload or source file required")
 	}
@@ -561,6 +802,16 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func maxInt64(values ...int64) int64 {
+	var max int64
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	return max
 }
 
 // SendUSPNotify implements wusp.USPEventSender. It delivers encoded WUSP

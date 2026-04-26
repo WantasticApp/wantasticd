@@ -58,11 +58,8 @@ func BenchmarkUSPRuntimeTunnelTransferUpload100MB(b *testing.B) {
 				if err := runtime.handleFrameFromPeer(runtime.controllerPublicKeyHex, reqFrame, replyFn); err != nil {
 					b.Fatalf("handleFrameFromPeer(upload control) returned error: %v", err)
 				}
-				resp, err := wusp.DecodeUSPAgentResponse(controlRespFrame)
-				if err != nil {
-					b.Fatalf("DecodeUSPAgentResponse(upload) returned error: %v", err)
-				}
-				sessionID, err := strconv.ParseUint(resp.Transfer.Metadata["session_id"], 10, 64)
+				resp := decodeControlResponseDatagram(b, controlRespFrame)
+				sessionID, err := strconv.ParseUint(resp.Transfer.Metadata[wusp.TransferMetadataSessionID], 10, 64)
 				if err != nil {
 					b.Fatalf("ParseUint(session_id) returned error: %v", err)
 				}
@@ -188,11 +185,8 @@ func BenchmarkUSPRuntimeTunnelTransferDownload100MB(b *testing.B) {
 				}
 
 				first := <-replyCh
-				resp, err := wusp.DecodeUSPAgentResponse(first)
-				if err != nil {
-					b.Fatalf("DecodeUSPAgentResponse(download) returned error: %v", err)
-				}
-				sessionID, err := strconv.ParseUint(resp.Transfer.Metadata["session_id"], 10, 64)
+				resp := decodeControlResponseDatagram(b, first)
+				sessionID, err := strconv.ParseUint(resp.Transfer.Metadata[wusp.TransferMetadataSessionID], 10, 64)
 				if err != nil {
 					b.Fatalf("ParseUint(session_id) returned error: %v", err)
 				}

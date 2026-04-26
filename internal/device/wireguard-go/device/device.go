@@ -90,10 +90,8 @@ type Device struct {
 	ipcMutex      sync.RWMutex
 	closed        chan struct{}
 	log           *Logger
-	statsHandler  func(*Peer, []byte)
 	wuspHandler   func(*Peer, []byte)
 	punchHandler  func(*Peer, []byte)
-	statsProvider func() []byte
 	wuspFragments struct {
 		sync.Mutex
 		nextID  atomic.Uint64
@@ -104,20 +102,12 @@ type Device struct {
 	addPeerRouteHandler func(net.IP)        // Handler for dynamically adding P2P peer routes to TUN
 }
 
-func (device *Device) SetStatsHandler(handler func(*Peer, []byte)) {
-	device.statsHandler = handler
-}
-
 func (device *Device) SetWUSPHandler(handler func(*Peer, []byte)) {
 	device.wuspHandler = handler
 }
 
 func (device *Device) SetPunchHandler(handler func(*Peer, []byte)) {
 	device.punchHandler = handler
-}
-
-func (device *Device) SetStatsProvider(provider func() []byte) {
-	device.statsProvider = provider
 }
 
 func (device *Device) SetTUNControlHandler(handler func(*Peer, []byte)) {

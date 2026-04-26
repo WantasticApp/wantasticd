@@ -52,10 +52,7 @@ func TestUSPRuntimeHandlesControllerRequest(t *testing.T) {
 		t.Fatalf("handleFrameFromPeer: %v", err)
 	}
 
-	resp, err := wusp.DecodeUSPAgentResponse(respFrame)
-	if err != nil {
-		t.Fatalf("DecodeUSPAgentResponse: %v", err)
-	}
+	resp := decodeControlResponseDatagram(t, respFrame)
 	if resp.Error != "" {
 		t.Fatalf("response error=%q", resp.Error)
 	}
@@ -207,11 +204,8 @@ func TestUSPRuntimeTunnelTransferUpload(t *testing.T) {
 	if len(replyFrames) != 1 {
 		t.Fatalf("replyFrames=%d want=1", len(replyFrames))
 	}
-	resp, err := wusp.DecodeUSPAgentResponse(replyFrames[0])
-	if err != nil {
-		t.Fatalf("DecodeUSPAgentResponse(upload) returned error: %v", err)
-	}
-	sessionID, err := strconv.ParseUint(resp.Transfer.Metadata["session_id"], 10, 64)
+	resp := decodeControlResponseDatagram(t, replyFrames[0])
+	sessionID, err := strconv.ParseUint(resp.Transfer.Metadata[wusp.TransferMetadataSessionID], 10, 64)
 	if err != nil {
 		t.Fatalf("ParseUint(session_id) returned error: %v", err)
 	}
@@ -302,11 +296,8 @@ func TestUSPRuntimeTunnelTransferDownload(t *testing.T) {
 	}
 
 	first := <-replyCh
-	resp, err := wusp.DecodeUSPAgentResponse(first)
-	if err != nil {
-		t.Fatalf("DecodeUSPAgentResponse(download) returned error: %v", err)
-	}
-	sessionID, err := strconv.ParseUint(resp.Transfer.Metadata["session_id"], 10, 64)
+	resp := decodeControlResponseDatagram(t, first)
+	sessionID, err := strconv.ParseUint(resp.Transfer.Metadata[wusp.TransferMetadataSessionID], 10, 64)
 	if err != nil {
 		t.Fatalf("ParseUint(session_id) returned error: %v", err)
 	}
@@ -489,10 +480,7 @@ func TestUSPRuntimeUnauthorizedPeerRejected(t *testing.T) {
 	if replyFrame == nil {
 		t.Fatal("expected error response frame for unauthorized peer")
 	}
-	resp, decErr := wusp.DecodeUSPAgentResponse(replyFrame)
-	if decErr != nil {
-		t.Fatalf("DecodeUSPAgentResponse(error response): %v", decErr)
-	}
+	resp := decodeControlResponseDatagram(t, replyFrame)
 	if resp.Error == "" {
 		t.Fatal("expected non-empty Error in unauthorized response")
 	}

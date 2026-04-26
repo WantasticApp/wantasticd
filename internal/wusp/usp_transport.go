@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -16,6 +17,59 @@ const (
 	uspTransportKindRequest  = 1
 	uspTransportKindResponse = 2
 )
+
+const (
+	MetadataKeyResponseMaxControlPayload = "wusp.response_max_control_payload"
+	TransferMetadataSource               = "source"
+	TransferMetadataDestination          = "destination"
+	TransferMetadataSessionID            = "session_id"
+	TransferMetadataChunkSize            = "chunk_size"
+	TransferMetadataTransport            = "transport"
+)
+
+func CloneMetadata(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func WithResponseMaxControlPayload(metadata map[string]string, maxPayload int) map[string]string {
+	out := CloneMetadata(metadata)
+	if maxPayload <= 0 {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]string, 1)
+	}
+	out[MetadataKeyResponseMaxControlPayload] = strconv.Itoa(maxPayload)
+	return out
+}
+
+func RequestedResponseMaxControlPayload(metadata map[string]string, fallback int) int {
+	if fallback <= 0 {
+		fallback = WUSPMaxDatagramPayload
+	}
+	if len(metadata) == 0 {
+		return fallback
+	}
+	value := strings.TrimSpace(metadata[MetadataKeyResponseMaxControlPayload])
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < uspControlFragmentHeaderSize+1 {
+		return fallback
+	}
+	if parsed > WUSPMaxDatagramPayload {
+		return WUSPMaxDatagramPayload
+	}
+	return parsed
+}
 
 // USPAgentMethod identifies one USP operation carried over the WUSP control transport.
 type USPAgentMethod uint8
@@ -33,6 +87,36 @@ const (
 	USPAgentMethodUpload
 	USPAgentMethodDownload
 )
+
+// String returns the canonical name of the USP method for logs/dashboards.
+func (m USPAgentMethod) String() string {
+	switch m {
+	case USPAgentMethodGet:
+		return "Get"
+	case USPAgentMethodSet:
+		return "Set"
+	case USPAgentMethodAdd:
+		return "Add"
+	case USPAgentMethodDelete:
+		return "Delete"
+	case USPAgentMethodGetInstances:
+		return "GetInstances"
+	case USPAgentMethodOperate:
+		return "Operate"
+	case USPAgentMethodNotify:
+		return "Notify"
+	case USPAgentMethodGetSupportedDM:
+		return "GetSupportedDM"
+	case USPAgentMethodGetSupportedProtocol:
+		return "GetSupportedProtocol"
+	case USPAgentMethodUpload:
+		return "Upload"
+	case USPAgentMethodDownload:
+		return "Download"
+	default:
+		return fmt.Sprintf("Method(%d)", uint8(m))
+	}
+}
 
 type uspTransportHeader struct {
 	Version uint8

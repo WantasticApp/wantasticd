@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,13 +20,16 @@ const (
 	uspRecommendedChunkSize = wusp.USPRecommendedChunkSize
 	uspTransferWindowSize   = 8
 	uspTransferAckTimeout   = 2 * time.Second
+	uspTransferStartGrace   = 25 * time.Millisecond
 )
 
 type uspTransferSession struct {
+	runtime          *uspRuntime
 	id               uint64
 	requestID        uint64
 	method           wusp.USPAgentMethod
 	peerPublicKeyHex string
+	startedAt        time.Time
 	send             func([]byte) error
 	path             string
 	file             *os.File
@@ -38,12 +42,12 @@ type uspTransferSession struct {
 
 func (r *uspRuntime) handleTransferControlRequest(ctx context.Context, peerPublicKeyHex string, req wusp.USPAgentRequest, reply func([]byte) error) error {
 	if req.Transfer == nil {
-		frame, _ := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+		_ = r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:     req.ID,
 			Method: req.Method,
 			Error:  "transfer request missing transfer block",
 		})
-		return reply(frame)
+		return nil
 	}
 	if reply == nil {
 		return fmt.Errorf("missing reply transport for transfer request %d", req.ID)
@@ -53,47 +57,52 @@ func (r *uspRuntime) handleTransferControlRequest(ctx context.Context, peerPubli
 	case wusp.USPAgentMethodUpload:
 		session, result, err := r.startUploadSession(req, peerPublicKeyHex, reply)
 		if err != nil {
-			frame, _ := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+			_ = r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 				ID:     req.ID,
 				Method: req.Method,
 				Error:  err.Error(),
 			})
-			return reply(frame)
+			return nil
 		}
 		r.streams.Store(session.id, session)
-		frame, err := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+		r.recordTransferSessionStart()
+		if err := r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
 			Transfer: &result,
-		})
-		if err != nil {
+		}); err != nil {
+			r.streams.Delete(session.id)
+			r.recordTransferSessionAbort(session, err)
 			return err
 		}
-		return reply(frame)
+		return nil
 	case wusp.USPAgentMethodDownload:
 		session, result, err := r.startDownloadSession(req, peerPublicKeyHex, reply)
 		if err != nil {
-			frame, _ := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+			_ = r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 				ID:     req.ID,
 				Method: req.Method,
 				Error:  err.Error(),
 			})
-			return reply(frame)
+			return nil
 		}
 		r.streams.Store(session.id, session)
-		frame, err := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+		r.recordTransferSessionStart()
+		if err := r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
 			Transfer: &result,
-		})
-		if err != nil {
-			return err
-		}
-		if err := reply(frame); err != nil {
+		}); err != nil {
 			r.streams.Delete(session.id)
+			r.recordTransferSessionAbort(session, err)
 			return err
 		}
-		go r.streamDownloadSession(context.Background(), session, req.Transfer)
+		go func() {
+			streamCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			time.Sleep(uspTransferStartGrace)
+			r.streamDownloadSession(streamCtx, session, req.Transfer)
+		}()
 		return nil
 	default:
 		return fmt.Errorf("unsupported transfer method %d", req.Method)
@@ -101,7 +110,7 @@ func (r *uspRuntime) handleTransferControlRequest(ctx context.Context, peerPubli
 }
 
 func (r *uspRuntime) startUploadSession(req wusp.USPAgentRequest, peerPublicKeyHex string, send func([]byte) error) (*uspTransferSession, wusp.USPTransferResult, error) {
-	targetPath := firstNonEmpty(localPathFromURI(req.Transfer.URI), strings.TrimSpace(req.Transfer.Metadata["destination"]), strings.TrimSpace(req.Transfer.Filename))
+	targetPath := firstNonEmpty(localPathFromURI(req.Transfer.URI), strings.TrimSpace(req.Transfer.Metadata[wusp.TransferMetadataDestination]), strings.TrimSpace(req.Transfer.Filename))
 	if targetPath == "" {
 		targetPath = filepath.Join(r.transferDirectory(), sanitizeTransferName(req.Transfer.Path)+".upload")
 	}
@@ -114,10 +123,12 @@ func (r *uspRuntime) startUploadSession(req wusp.USPAgentRequest, peerPublicKeyH
 	}
 	totalSize := parseTransferSize(req.Transfer.Metadata["size"])
 	session := &uspTransferSession{
+		runtime:          r,
 		id:               r.nextID.Add(1),
 		requestID:        req.ID,
 		method:           req.Method,
 		peerPublicKeyHex: peerPublicKeyHex,
+		startedAt:        time.Now(),
 		send:             send,
 		path:             targetPath,
 		file:             file,
@@ -131,17 +142,17 @@ func (r *uspRuntime) startUploadSession(req wusp.USPAgentRequest, peerPublicKeyH
 		URI:   "file://" + targetPath,
 		Bytes: 0,
 		Metadata: map[string]string{
-			"transport":   "wg-stream",
-			"session_id":  strconv.FormatUint(session.id, 10),
-			"chunk_size":  strconv.Itoa(uspRecommendedChunkSize),
-			"destination": targetPath,
+			wusp.TransferMetadataTransport:   "wg-stream",
+			wusp.TransferMetadataSessionID:   strconv.FormatUint(session.id, 10),
+			wusp.TransferMetadataChunkSize:   strconv.Itoa(uspRecommendedChunkSize),
+			wusp.TransferMetadataDestination: targetPath,
 		},
 	}
 	return session, result, nil
 }
 
 func (r *uspRuntime) startDownloadSession(req wusp.USPAgentRequest, peerPublicKeyHex string, send func([]byte) error) (*uspTransferSession, wusp.USPTransferResult, error) {
-	sourcePath := firstNonEmpty(localPathFromURI(req.Transfer.URI), strings.TrimSpace(req.Transfer.Metadata["source"]), strings.TrimSpace(req.Transfer.Filename))
+	sourcePath := firstNonEmpty(localPathFromURI(req.Transfer.URI), strings.TrimSpace(req.Transfer.Metadata[wusp.TransferMetadataSource]), strings.TrimSpace(req.Transfer.Filename))
 	if sourcePath == "" {
 		return nil, wusp.USPTransferResult{}, fmt.Errorf("download source not provided for tunnel transfer")
 	}
@@ -150,10 +161,12 @@ func (r *uspRuntime) startDownloadSession(req wusp.USPAgentRequest, peerPublicKe
 		return nil, wusp.USPTransferResult{}, err
 	}
 	session := &uspTransferSession{
+		runtime:          r,
 		id:               r.nextID.Add(1),
 		requestID:        req.ID,
 		method:           req.Method,
 		peerPublicKeyHex: peerPublicKeyHex,
+		startedAt:        time.Now(),
 		send:             send,
 		path:             sourcePath,
 		totalSize:        info.Size(),
@@ -165,10 +178,10 @@ func (r *uspRuntime) startDownloadSession(req wusp.USPAgentRequest, peerPublicKe
 		URI:   "file://" + sourcePath,
 		Bytes: info.Size(),
 		Metadata: map[string]string{
-			"transport":  "wg-stream",
-			"session_id": strconv.FormatUint(session.id, 10),
-			"chunk_size": strconv.Itoa(uspRecommendedChunkSize),
-			"source":     sourcePath,
+			wusp.TransferMetadataTransport: "wg-stream",
+			wusp.TransferMetadataSessionID: strconv.FormatUint(session.id, 10),
+			wusp.TransferMetadataChunkSize: strconv.Itoa(uspRecommendedChunkSize),
+			wusp.TransferMetadataSource:    sourcePath,
 		},
 	}
 	return session, result, nil
@@ -177,13 +190,16 @@ func (r *uspRuntime) startDownloadSession(req wusp.USPAgentRequest, peerPublicKe
 func (r *uspRuntime) handleTransferStreamFrame(peerPublicKeyHex string, frame wusp.USPTransferStreamFrame) error {
 	value, ok := r.streams.Load(frame.SessionID)
 	if !ok {
+		r.stats.transferUnknownSessions.Add(1)
 		return fmt.Errorf("unknown transfer stream session %d", frame.SessionID)
 	}
 	session, ok := value.(*uspTransferSession)
 	if !ok {
+		r.stats.transferUnknownSessions.Add(1)
 		return fmt.Errorf("invalid transfer session %d", frame.SessionID)
 	}
 	if !strings.EqualFold(session.peerPublicKeyHex, peerPublicKeyHex) {
+		r.stats.transferUnknownSessions.Add(1)
 		return fmt.Errorf("transfer stream session %d from unauthorized peer", frame.SessionID)
 	}
 
@@ -262,7 +278,7 @@ func (r *uspRuntime) handleUploadStreamFrame(session *uspTransferSession, frame 
 		}
 		session.writer = nil
 		r.streams.Delete(session.id)
-		return session.sendStream(wusp.USPTransferStreamFrame{
+		frame := wusp.USPTransferStreamFrame{
 			SessionID:   session.id,
 			RequestID:   session.requestID,
 			Method:      session.method,
@@ -272,9 +288,15 @@ func (r *uspRuntime) handleUploadStreamFrame(session *uspTransferSession, frame 
 			TotalSize:   uint64(maxInt64(session.totalSize, session.transferred)),
 			Final:       true,
 			Metadata: map[string]string{
-				"destination": session.path,
+				wusp.TransferMetadataDestination: session.path,
 			},
-		})
+		}
+		if err := session.sendStream(frame); err != nil {
+			r.recordTransferSessionAbort(session, err)
+			return err
+		}
+		r.recordTransferSessionComplete(session)
+		return nil
 	case wusp.USPTransferStreamAbort:
 		if session.writer != nil {
 			_ = session.writer.Flush()
@@ -286,6 +308,7 @@ func (r *uspRuntime) handleUploadStreamFrame(session *uspTransferSession, frame 
 		}
 		r.streams.Delete(session.id)
 		_ = os.Remove(session.path)
+		r.recordTransferSessionAbort(session, fmt.Errorf("upload stream aborted by peer"))
 		return nil
 	default:
 		return nil
@@ -307,6 +330,7 @@ func (r *uspRuntime) streamDownloadSession(ctx context.Context, session *uspTran
 	source, err := os.Open(session.path)
 	if err != nil {
 		r.streams.Delete(session.id)
+		r.recordTransferSessionAbort(session, err)
 		return
 	}
 	defer source.Close()
@@ -343,6 +367,7 @@ func (r *uspRuntime) streamDownloadSession(ctx context.Context, session *uspTran
 				}
 				pending[frame.Sequence] = uspTransferPendingChunk{frame: frame, size: n}
 				if err := session.sendStream(frame); err != nil {
+					r.recordTransferSessionAbort(session, err)
 					return
 				}
 				session.nextSequence++
@@ -351,6 +376,7 @@ func (r *uspRuntime) streamDownloadSession(ctx context.Context, session *uspTran
 				goto waitPending
 			}
 			if readErr != nil {
+				r.recordTransferSessionAbort(session, readErr)
 				return
 			}
 		}
@@ -361,7 +387,15 @@ func (r *uspRuntime) streamDownloadSession(ctx context.Context, session *uspTran
 		}
 		ackSequence, err := session.waitForAnyAck(ctx)
 		if err != nil {
-			if !resendPendingChunks(session, pending) {
+			r.stats.transferAckTimeouts.Add(1)
+			resent, ok := resendPendingChunks(session, pending)
+			if resent > 0 {
+				r.stats.transferChunkResends.Add(uint64(resent))
+				log.Printf("[USP] resending pending transfer chunks: peer=%s session=%d method=%s chunks=%d",
+					session.peerPublicKeyHex, session.id, session.method.String(), resent)
+			}
+			if !ok {
+				r.recordTransferSessionAbort(session, err)
 				return
 			}
 			continue
@@ -369,7 +403,7 @@ func (r *uspRuntime) streamDownloadSession(ctx context.Context, session *uspTran
 		session.transferred += releaseAckedPendingChunks(pending, ackSequence)
 	}
 
-	_ = session.sendStream(wusp.USPTransferStreamFrame{
+	if err := session.sendStream(wusp.USPTransferStreamFrame{
 		SessionID:   session.id,
 		RequestID:   session.requestID,
 		Method:      session.method,
@@ -379,9 +413,13 @@ func (r *uspRuntime) streamDownloadSession(ctx context.Context, session *uspTran
 		TotalSize:   uint64(maxInt64(session.totalSize, session.transferred)),
 		Final:       true,
 		Metadata: map[string]string{
-			"source": session.path,
+			wusp.TransferMetadataSource: session.path,
 		},
-	})
+	}); err != nil {
+		r.recordTransferSessionAbort(session, err)
+		return
+	}
+	r.recordTransferSessionComplete(session)
 }
 
 func (s *uspTransferSession) sendStream(frame wusp.USPTransferStreamFrame) error {
@@ -391,6 +429,10 @@ func (s *uspTransferSession) sendStream(frame wusp.USPTransferStreamFrame) error
 	payload, err := wusp.EncodeUSPTransferStreamFrame(frame)
 	if err != nil {
 		return err
+	}
+	if s.runtime != nil {
+		s.runtime.stats.transferFramesSent.Add(1)
+		s.runtime.stats.transferFrameBytesSent.Add(uint64(len(payload)))
 	}
 	return s.send(payload)
 }
@@ -405,16 +447,6 @@ func parseTransferSize(value string) int64 {
 		return 0
 	}
 	return n
-}
-
-func maxInt64(values ...int64) int64 {
-	var max int64
-	for _, value := range values {
-		if value > max {
-			max = value
-		}
-	}
-	return max
 }
 
 type uspTransferPendingChunk struct {
@@ -434,18 +466,20 @@ func (s *uspTransferSession) waitForAnyAck(ctx context.Context) (uint32, error) 
 	}
 }
 
-func resendPendingChunks(session *uspTransferSession, pending map[uint32]uspTransferPendingChunk) bool {
+func resendPendingChunks(session *uspTransferSession, pending map[uint32]uspTransferPendingChunk) (int, bool) {
 	sequences := make([]uint32, 0, len(pending))
 	for sequence := range pending {
 		sequences = append(sequences, sequence)
 	}
 	slices.Sort(sequences)
+	resent := 0
 	for _, sequence := range sequences {
 		if err := session.sendStream(pending[sequence].frame); err != nil {
-			return false
+			return resent, false
 		}
+		resent++
 	}
-	return true
+	return resent, true
 }
 
 func releaseAckedPendingChunks(pending map[uint32]uspTransferPendingChunk, ackSequence uint32) int64 {

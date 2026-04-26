@@ -121,6 +121,11 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	}
 }
 
+// TestOpenWrtBackendSetAndDelete verifies that Set/Delete mutate the on-disk
+// /etc/config/* files directly (no uci CLI, no ubus). The historical version
+// of this test asserted the ubus-first behaviour; that path is now a fallback
+// only — file writes are authoritative because uci/ubus may be missing on
+// stripped builds (LEDE forks, GL.iNet, custom firmwares).
 func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")
@@ -140,16 +145,10 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode ubus request: %v", err)
 		}
-		if len(req.Params) != 4 {
-			t.Fatalf("ubus params len=%d want 4", len(req.Params))
-		}
-
 		var object, method string
-		if err := json.Unmarshal(req.Params[1], &object); err != nil {
-			t.Fatalf("Decode ubus object: %v", err)
-		}
-		if err := json.Unmarshal(req.Params[2], &method); err != nil {
-			t.Fatalf("Decode ubus method: %v", err)
+		if len(req.Params) >= 3 {
+			_ = json.Unmarshal(req.Params[1], &object)
+			_ = json.Unmarshal(req.Params[2], &method)
 		}
 		ubusCalls = append(ubusCalls, object+"."+method)
 
@@ -158,10 +157,17 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	}))
 	defer server.Close()
 
+	hostnamePath := filepath.Join(root, "proc", "hostname")
+	etcHostnamePath := filepath.Join(root, "etc", "hostname")
+	tzPath := filepath.Join(root, "etc", "TZ")
+
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		UCIConfigDir: configDir,
-		StatePath:    filepath.Join(root, "state.json"),
-		UbusURL:      server.URL,
+		UCIConfigDir:    configDir,
+		StatePath:       filepath.Join(root, "state.json"),
+		HostnamePath:    hostnamePath,
+		EtcHostnamePath: etcHostnamePath,
+		TZPath:          tzPath,
+		UbusURL:         server.URL,
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			calls = append(calls, strings.TrimSpace(name+" "+strings.Join(args, " ")))
 			return nil, nil
@@ -188,6 +194,68 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 		t.Fatalf("Delete(friendly name) returned error: %v", err)
 	}
 
+	// /proc/sys/kernel/hostname mirror was written directly — no `hostname`
+	// CLI shell-out needed.
+	procData, err := os.ReadFile(hostnamePath)
+	if err != nil {
+		t.Fatalf("read hostname proc mirror: %v", err)
+	}
+	if got := strings.TrimSpace(string(procData)); got != "mesh-node-1" {
+		t.Fatalf("proc hostname=%q want %q", got, "mesh-node-1")
+	}
+
+	// /etc/hostname is the persistent file every non-procd init reads at
+	// boot (BusyBox, Alpine, Debian, containers). Without this, a reboot
+	// would revert the hostname even if UCI was updated.
+	etcData, err := os.ReadFile(etcHostnamePath)
+	if err != nil {
+		t.Fatalf("read /etc/hostname mirror: %v", err)
+	}
+	if got := strings.TrimSpace(string(etcData)); got != "mesh-node-1" {
+		t.Fatalf("/etc/hostname=%q want %q", got, "mesh-node-1")
+	}
+
+	// /etc/config/system now contains `option hostname 'mesh-node-1'` AND
+	// the timeserver section was updated in place.
+	systemData, err := os.ReadFile(filepath.Join(configDir, "system"))
+	if err != nil {
+		t.Fatalf("read system config: %v", err)
+	}
+	systemText := string(systemData)
+	if !strings.Contains(systemText, "option hostname 'mesh-node-1'") {
+		t.Fatalf("system config missing hostname:\n%s", systemText)
+	}
+	if !strings.Contains(systemText, "option enabled '1'") {
+		t.Fatalf("system config missing time enabled='1':\n%s", systemText)
+	}
+	if !strings.Contains(systemText, "option enable_server '1'") {
+		t.Fatalf("system config missing time enable_server='1':\n%s", systemText)
+	}
+
+	// /etc/config/firewall didn't exist before — Set(Device.Firewall.Enable)
+	// should have created it with a `config defaults` block.
+	firewallData, err := os.ReadFile(filepath.Join(configDir, "firewall"))
+	if err != nil {
+		t.Fatalf("read firewall config: %v", err)
+	}
+	firewallText := string(firewallData)
+	if !strings.Contains(firewallText, "config defaults") {
+		t.Fatalf("firewall config missing defaults section:\n%s", firewallText)
+	}
+	if !strings.Contains(firewallText, "option disabled '1'") {
+		t.Fatalf("firewall config missing disabled='1':\n%s", firewallText)
+	}
+
+	// /etc/config/network's existing `globals` section was updated with the
+	// new ULA prefix.
+	networkData, err := os.ReadFile(filepath.Join(configDir, "network"))
+	if err != nil {
+		t.Fatalf("read network config: %v", err)
+	}
+	if !strings.Contains(string(networkData), "option ula_prefix 'fd12:3456:789a::/48'") {
+		t.Fatalf("network config missing ula_prefix:\n%s", networkData)
+	}
+
 	state, err := backend.readState()
 	if err != nil {
 		t.Fatalf("readState returned error: %v", err)
@@ -196,38 +264,180 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 		t.Fatalf("friendly name state=%q want empty", state.FriendlyName)
 	}
 
-	wantCalls := []string{
-		"hostname mesh-node-1",
-	}
-	for _, want := range wantCalls {
-		if !containsCall(calls, want) {
-			t.Fatalf("missing command %q in %v", want, calls)
+	// File-first contract: NO `hostname` shell-out, NO ubus calls — both are
+	// only fallbacks for when the file write itself fails.
+	for _, c := range calls {
+		if strings.HasPrefix(c, "hostname ") || strings.HasPrefix(c, "uci ") {
+			t.Fatalf("unexpected legacy CLI call %q (file write should win)", c)
 		}
+	}
+	if len(ubusCalls) != 0 {
+		t.Fatalf("unexpected ubus calls %v (file write should win)", ubusCalls)
+	}
+}
+
+// TestOpenWrtHostnameDirectWrite locks the contract that hostname persistence
+// uses a direct os.WriteFile path instead of tmp+rename. This matters for
+// container runtimes (Docker, Podman, LXC) where /etc/hostname is a bind mount
+// from /var/lib/<runtime>/containers/<id>/hostname — a rename(2) onto the
+// bind-mount target returns EBUSY/EXDEV and historically caused every Set to
+// silently fail inside containers.
+//
+// We pre-create /etc/hostname with a sentinel value and verify a Set
+// overwrites that exact inode (no .tmp file lingers, the rename path was
+// never taken).
+func TestOpenWrtHostnameDirectWrite(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "system"), "config system\n")
+
+	hostnamePath := filepath.Join(root, "proc", "hostname")
+	etcHostnamePath := filepath.Join(root, "etc", "hostname")
+	// Pre-create the file (simulating Docker's pre-mounted /etc/hostname).
+	mustWriteFile(t, etcHostnamePath, "container-default\n")
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir:    configDir,
+		StatePath:       filepath.Join(root, "state.json"),
+		HostnamePath:    hostnamePath,
+		EtcHostnamePath: etcHostnamePath,
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, errors.New("no shell-out allowed")
+		},
+	})
+
+	if err := backend.Set(context.Background(), "Device.DeviceInfo.HostName", wusp.String("via-direct-write")); err != nil {
+		t.Fatalf("Set(hostname): %v", err)
 	}
 
-	wantUbusCalls := []string{
-		"uci.set",
-		"uci.commit",
-		"uci.apply",
-		"uci.set",
-		"uci.set",
-		"uci.commit",
-		"uci.apply",
-		"uci.set",
-		"uci.commit",
-		"uci.apply",
-		"uci.set",
-		"uci.commit",
-		"uci.apply",
+	got, err := os.ReadFile(etcHostnamePath)
+	if err != nil {
+		t.Fatalf("read /etc/hostname: %v", err)
 	}
-	if len(ubusCalls) != len(wantUbusCalls) {
-		t.Fatalf("ubusCalls=%v want %v", ubusCalls, wantUbusCalls)
+	if want := "via-direct-write\n"; string(got) != want {
+		t.Fatalf("/etc/hostname=%q want %q", got, want)
 	}
-	for i := range wantUbusCalls {
-		if ubusCalls[i] != wantUbusCalls[i] {
-			t.Fatalf("ubusCalls[%d]=%q want %q", i, ubusCalls[i], wantUbusCalls[i])
+
+	// The rename-based path would have left an /etc/hostname.tmp behind on
+	// failure; a direct WriteFile leaves no temp file. This is the canary
+	// that locks the no-rename invariant.
+	if _, err := os.Stat(etcHostnamePath + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no leftover %s.tmp; stat err=%v", etcHostnamePath, err)
+	}
+}
+
+// TestOpenWrtHostnamePersistenceErrorSurfaces guarantees a failed /etc/hostname
+// write propagates back to the caller (which transitively becomes the agent's
+// Set response error visible in the dashboard) instead of silently succeeding.
+// Historical behaviour discarded the error and let the dashboard show the new
+// kernel hostname while /etc/hostname stayed stale — exactly the "lying
+// transmission protocol" the user observed.
+func TestOpenWrtHostnamePersistenceErrorSurfaces(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "system"), "config system\n")
+
+	// Point /etc/hostname at a *directory* — WriteFile against a directory
+	// returns EISDIR, simulating any unwritable destination (RO bind mount,
+	// permission denied, missing dir without MkdirAll rights).
+	etcHostnamePath := filepath.Join(root, "etc", "hostname")
+	if err := os.MkdirAll(etcHostnamePath, 0o755); err != nil {
+		t.Fatalf("mkdir hostname-as-dir: %v", err)
+	}
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir:    configDir,
+		StatePath:       filepath.Join(root, "state.json"),
+		HostnamePath:    filepath.Join(root, "proc", "hostname"),
+		EtcHostnamePath: etcHostnamePath,
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	err := backend.Set(context.Background(), "Device.DeviceInfo.HostName", wusp.String("would-be-lost"))
+	if err == nil {
+		t.Fatal("expected persistence error to propagate, got nil — agent would silently lie about success")
+	}
+	if !strings.Contains(err.Error(), "hostname") {
+		t.Fatalf("expected error to mention hostname path, got %v", err)
+	}
+}
+
+// TestOpenWrtUCIRewrite locks the line-oriented UCI editor's invariants:
+// existing comments and ordering are preserved, options are replaced in
+// place, missing sections are appended, and empty values delete options.
+func TestOpenWrtUCIRewrite(t *testing.T) {
+	t.Run("replace existing option preserves comments", func(t *testing.T) {
+		input := "# top comment\nconfig system\n\t# preserved\n\toption hostname 'old'\n\toption timezone 'UTC'\n"
+		got, err := uciRewrite([]byte(input), "@system[0]", "hostname", "new")
+		if err != nil {
+			t.Fatalf("uciRewrite: %v", err)
 		}
-	}
+		want := "# top comment\nconfig system\n\t# preserved\n\toption hostname 'new'\n\toption timezone 'UTC'\n"
+		if string(got) != want {
+			t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+		}
+	})
+
+	t.Run("insert missing option in existing section", func(t *testing.T) {
+		input := "config system\n\toption timezone 'UTC'\n"
+		got, err := uciRewrite([]byte(input), "@system[0]", "hostname", "router")
+		if err != nil {
+			t.Fatalf("uciRewrite: %v", err)
+		}
+		want := "config system\n\toption timezone 'UTC'\n\toption hostname 'router'\n"
+		if string(got) != want {
+			t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+		}
+	})
+
+	t.Run("append missing section to empty file", func(t *testing.T) {
+		got, err := uciRewrite(nil, "@defaults[0]", "disabled", "1")
+		if err != nil {
+			t.Fatalf("uciRewrite: %v", err)
+		}
+		want := "config defaults\n\toption disabled '1'\n"
+		if string(got) != want {
+			t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+		}
+	})
+
+	t.Run("named section ref matches by name", func(t *testing.T) {
+		input := "config globals 'globals'\n"
+		got, err := uciRewrite([]byte(input), "globals", "ula_prefix", "fd00::/48")
+		if err != nil {
+			t.Fatalf("uciRewrite: %v", err)
+		}
+		want := "config globals 'globals'\n\toption ula_prefix 'fd00::/48'\n"
+		if string(got) != want {
+			t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+		}
+	})
+
+	t.Run("empty value deletes option", func(t *testing.T) {
+		input := "config system\n\toption hostname 'old'\n\toption timezone 'UTC'\n"
+		got, err := uciRewrite([]byte(input), "@system[0]", "hostname", "")
+		if err != nil {
+			t.Fatalf("uciRewrite: %v", err)
+		}
+		want := "config system\n\toption timezone 'UTC'\n"
+		if string(got) != want {
+			t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+		}
+	})
+
+	t.Run("value with embedded quotes is escaped", func(t *testing.T) {
+		input := "config system\n"
+		got, err := uciRewrite([]byte(input), "@system[0]", "description", "Bob's router")
+		if err != nil {
+			t.Fatalf("uciRewrite: %v", err)
+		}
+		want := "config system\n\toption description 'Bob'\\''s router'\n"
+		if string(got) != want {
+			t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+		}
+	})
 }
 
 func assertTimeField(t *testing.T, msg *wusp.Message, path string, want time.Time) {

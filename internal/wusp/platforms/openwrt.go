@@ -24,6 +24,9 @@ type OpenWrtBackendOptions struct {
 	UCIConfigDir          string
 	StatePath             string
 	HostnamePath          string
+	EtcHostnamePath       string
+	TZPath                string
+	ZoneInfoDir           string
 	UptimePath            string
 	MemInfoPath           string
 	IPv6DisablePath       string
@@ -45,6 +48,9 @@ type OpenWrtBackend struct {
 	uciConfigDir          string
 	statePath             string
 	hostnamePath          string
+	etcHostnamePath       string
+	tzPath                string
+	zoneInfoDir           string
 	uptimePath            string
 	memInfoPath           string
 	ipv6DisablePath       string
@@ -160,6 +166,9 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		uciConfigDir:          coalesceString(opts.UCIConfigDir, "/etc/config"),
 		statePath:             coalesceString(opts.StatePath, "/etc/wantastic/usp-openwrt.json"),
 		hostnamePath:          coalesceString(opts.HostnamePath, "/proc/sys/kernel/hostname"),
+		etcHostnamePath:       coalesceString(opts.EtcHostnamePath, "/etc/hostname"),
+		tzPath:                coalesceString(opts.TZPath, "/etc/TZ"),
+		zoneInfoDir:           coalesceString(opts.ZoneInfoDir, "/usr/share/zoneinfo"),
 		uptimePath:            coalesceString(opts.UptimePath, "/proc/uptime"),
 		memInfoPath:           coalesceString(opts.MemInfoPath, "/proc/meminfo"),
 		ipv6DisablePath:       coalesceString(opts.IPv6DisablePath, "/proc/sys/net/ipv6/conf/all/disable_ipv6"),
@@ -550,14 +559,18 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 	appendField(msg, "Device.WiFi.EndPointNumberOfEntries", wusp.Uint(uint64(endPointCount)))
 }
 
+// setHostname persists the hostname via UCI and applies it live by writing
+// /proc/sys/kernel/hostname directly. The kernel sysctl path needs no daemon —
+// a single write updates the running hostname for the whole system, which lets
+// us drop the legacy `hostname` CLI shell-out (which is missing on stripped
+// builds). The applyUCIChange tier inside setUCIOption already mirrors the
+// /proc write; the explicit call here is defensive in case a caller bypasses
+// applyUCIChange in the future.
 func (b *OpenWrtBackend) setHostname(ctx context.Context, hostname string) error {
 	if err := b.setUCIOption(ctx, "system", "@system[0]", "hostname", hostname, true, systemReloadScript); err != nil {
 		return err
 	}
-	if _, err := b.commandRunner(ctx, "hostname", hostname); err != nil {
-		return err
-	}
-	return nil
+	return b.writeProcSysHostname(hostname)
 }
 
 func (b *OpenWrtBackend) setTimeEnabled(ctx context.Context, enabled bool) error {
@@ -664,38 +677,523 @@ func (b *OpenWrtBackend) resolveWiFiIfaceSection(ssidIndex int) string {
 	return ""
 }
 
+// setUCIOption persists an option=value into /etc/config/<config> and best-effort
+// applies it live. Order of preference is **file edit first**: stripped-down
+// OpenWrt builds may ship without `uci`, without `ubus`, or with a procd that
+// doesn't restart cleanly. The plain config file is the source of truth that
+// every UCI consumer (system, network, firewall, fw3/fw4, netifd, hostapd via
+// /sbin/wifi) reads at startup, so writing it directly keeps every variant
+// (LEDE, OpenWrt, OpenWisp, GL.iNet, Turris, etc.) happy.
+//
+// After the file is durable we still try ubus → uci CLI → init.d reload to
+// pick up the change at runtime; failures from the apply tier are NOT propagated
+// because the persistent change has already succeeded — at worst the new value
+// takes effect on next reboot.
 func (b *OpenWrtBackend) setUCIOption(ctx context.Context, config, section, option, value string, commit bool, reloadScript string) error {
-	if err := b.setUCIOptionViaUbus(ctx, config, section, option, value, commit); err == nil {
-		return nil
+	if err := b.writeUCIOptionViaFile(config, section, option, value); err != nil {
+		// Fall back to ubus / CLI ONLY when the direct file write fails (RO
+		// filesystem, missing /etc/config dir on a non-OpenWrt POSIX target,
+		// etc.). This mirrors the historical behaviour for those edge cases.
+		if ubusErr := b.setUCIOptionViaUbus(ctx, config, section, option, value, commit); ubusErr == nil {
+			b.applyUCIChange(ctx, config, section, option, value, reloadScript)
+			return nil
+		}
+		key := fmt.Sprintf("%s.%s.%s=%s", config, section, option, value)
+		if _, cliErr := b.commandRunner(ctx, "uci", "set", key); cliErr != nil {
+			return fmt.Errorf("wusp openwrt setUCIOption %s.%s.%s: file=%v cli=%v", config, section, option, err, cliErr)
+		}
+		if commit {
+			if _, cliErr := b.commandRunner(ctx, "uci", "commit", config); cliErr != nil {
+				return cliErr
+			}
+		}
+		return b.reloadScript(ctx, reloadScript)
 	}
 
-	key := fmt.Sprintf("%s.%s.%s=%s", config, section, option, value)
-	if _, err := b.commandRunner(ctx, "uci", "set", key); err != nil {
-		return err
-	}
+	// File write succeeded — apply at runtime on a best-effort basis.
 	if commit {
-		if _, err := b.commandRunner(ctx, "uci", "commit", config); err != nil {
-			return err
-		}
+		b.applyUCIChange(ctx, config, section, option, value, reloadScript)
 	}
-	return b.reloadScript(ctx, reloadScript)
+	return nil
 }
 
 func (b *OpenWrtBackend) deleteUCIOption(ctx context.Context, config, section, option string, commit bool, reloadScript string) error {
-	if err := b.deleteUCIOptionViaUbus(ctx, config, section, option, commit); err == nil {
-		return nil
-	}
-
-	key := fmt.Sprintf("%s.%s.%s", config, section, option)
-	if _, err := b.commandRunner(ctx, "uci", "-q", "delete", key); err != nil {
-		return err
+	if err := b.writeUCIOptionViaFile(config, section, option, ""); err != nil {
+		if ubusErr := b.deleteUCIOptionViaUbus(ctx, config, section, option, commit); ubusErr == nil {
+			if commit {
+				_ = b.reloadScript(ctx, reloadScript)
+			}
+			return nil
+		}
+		key := fmt.Sprintf("%s.%s.%s", config, section, option)
+		if _, cliErr := b.commandRunner(ctx, "uci", "-q", "delete", key); cliErr != nil {
+			return fmt.Errorf("wusp openwrt deleteUCIOption %s.%s.%s: file=%v cli=%v", config, section, option, err, cliErr)
+		}
+		if commit {
+			if _, cliErr := b.commandRunner(ctx, "uci", "commit", config); cliErr != nil {
+				return cliErr
+			}
+		}
+		return b.reloadScript(ctx, reloadScript)
 	}
 	if commit {
-		if _, err := b.commandRunner(ctx, "uci", "commit", config); err != nil {
-			return err
+		b.applyUCIChange(ctx, config, section, option, "", reloadScript)
+	}
+	return nil
+}
+
+// applyUCIChange best-effort propagates a config change to running services
+// without depending on the OpenWrt-specific `uci` / `ubus` tools. Each tier
+// fails open — a missing tool just drops to the next tier, and "no tier
+// applied" is fine because the on-disk file is already authoritative.
+//
+// References for the live-apply paths:
+//   - hostname:  /proc/sys/kernel/hostname (kernel.org sysctl docs)
+//   - timezone:  /etc/TZ (BusyBox libc reads this on every libc time call)
+//   - reload:    /etc/init.d/<svc> reload (procd-based, the canonical apply)
+func (b *OpenWrtBackend) applyUCIChange(ctx context.Context, config, section, option, value, reloadScript string) {
+	switch {
+	case config == "system" && option == "hostname":
+		_ = b.writeProcSysHostname(value)
+	case config == "system" && option == "timezone":
+		_ = b.writeEtcTZ(value)
+	}
+	_ = b.reloadScript(ctx, reloadScript)
+}
+
+// writeUCIOptionViaFile rewrites /etc/config/<config> in place, setting
+// option=value inside the section addressed by sectionRef. An empty value
+// deletes the option line. If the section doesn't exist yet, a fresh
+// `config <type> [name]` block is appended to the file.
+//
+// The rewrite is line-oriented: every byte that doesn't belong to the
+// targeted option line is preserved verbatim (comments, blank lines,
+// whitespace, ordering), so users diffing /etc/config/* see only their
+// actual change.
+//
+// Section reference forms accepted:
+//   - `@type[index]` — positional (zero-based), as emitted by `resolveUCISectionRef`
+//   - `name`         — named section (`config <type> 'name'`)
+//   - `type`         — bare type, resolves to first section of that type
+func (b *OpenWrtBackend) writeUCIOptionViaFile(config, sectionRef, option, value string) error {
+	if strings.TrimSpace(option) == "" {
+		return errors.New("uci: empty option name")
+	}
+	path := filepath.Join(b.uciConfigDir, config)
+	original, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	updated, err := uciRewrite(original, sectionRef, option, value)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, updated, 0o644)
+}
+
+// writeProcSysHostname propagates a hostname change to BOTH the live kernel
+// (/proc/sys/kernel/hostname) and the canonical persistent file (/etc/hostname).
+// Writing both is required because they serve different consumers:
+//
+//   - /proc/sys/kernel/hostname — sysctl-backed, a single direct write updates
+//     the running hostname instantly with no daemon involvement
+//     (kernel.org sysctl docs).
+//   - /etc/hostname — read at boot by every non-procd init (BusyBox, Alpine,
+//     Debian, Ubuntu, systemd, OpenWrt-without-procd-running, containers).
+//     Without this, a reboot would revert the hostname even if /etc/config/system
+//     was updated, because no init script consumed the UCI value.
+//
+// Both targets are written with a direct `os.WriteFile` rather than the
+// tmp+rename atomic pattern. Rationale:
+//
+//   - procfs (/proc/sys/kernel/hostname) doesn't support rename-onto
+//     operations — sysctl pseudo-files accept writes only via O_WRONLY on
+//     the entry itself.
+//   - /etc/hostname is a bind-mount target inside Docker / Podman / LXC
+//     containers (mounted from /var/lib/docker/containers/<id>/hostname).
+//     `rename(2)` over a bind-mount returns EBUSY/EXDEV, so the historical
+//     atomic-rename approach silently lost every Set inside containers.
+//     A direct write hits the same inode the runtime mounted, so the value
+//     becomes visible to the host and any other shell namespace.
+//
+// Errors from either target are aggregated so a single missing/RO path
+// doesn't mask a genuine failure on the other one — important on systems
+// where /etc/hostname is missing entirely (some embedded builds) but the
+// kernel write must still succeed.
+func (b *OpenWrtBackend) writeProcSysHostname(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	var errs []string
+	if b.hostnamePath != "" {
+		if err := writeAndVerify(b.hostnamePath, value); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", b.hostnamePath, err))
 		}
 	}
-	return b.reloadScript(ctx, reloadScript)
+	if b.etcHostnamePath != "" {
+		// Clean up any *.tmp orphan left behind by an older agent build whose
+		// atomic-rename approach failed against a bind-mounted /etc/hostname
+		// (Docker/Podman/LXC mount it from /var/lib/<runtime>/containers/<id>).
+		// Stale .tmp files are confusing during live debugging — a `cat
+		// /etc/hostname.tmp` shows the value the old code *tried* to set,
+		// which looks like the agent silently took effect when in fact the
+		// rename(2) returned EBUSY and the change never landed.
+		_ = os.Remove(b.etcHostnamePath + ".tmp")
+		if err := writeAndVerify(b.etcHostnamePath, value); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", b.etcHostnamePath, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("wusp openwrt setHostname persistence: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// writeAndVerify writes value+"\n" to path with a direct WriteFile (no rename
+// — important for procfs and bind-mounted destinations) and reads it back to
+// confirm the bytes actually landed. The readback catches the silent-failure
+// modes that otherwise produce "agent says success but file unchanged":
+//
+//   - read-only bind mount (rare but possible with `-v src:/etc/hostname:ro`)
+//   - file replaced by an external process between our write and the dashboard
+//     re-reading (race rare in practice but cheap to detect)
+//   - tmpfs `noexec`-style attribute oddities on stripped containers
+//
+// Parent-directory creation is best-effort: on real systems /proc and /etc
+// always exist, so MkdirAll is a no-op; in test rigs it lets the caller point
+// at a synthesized path under t.TempDir() without preflight.
+func writeAndVerify(path, value string) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	body := []byte(value + "\n")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return err
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		// Some pseudo-files (e.g. /proc/sys/kernel/hostname under unusual
+		// container configs) accept writes but reject reads from this path —
+		// treat the write as authoritative and skip the verify.
+		return nil
+	}
+	gotTrimmed := strings.TrimRight(string(got), "\n")
+	if gotTrimmed != value {
+		return fmt.Errorf("readback mismatch: wrote %q, file now contains %q (RO bind-mount or external writer?)",
+			value, gotTrimmed)
+	}
+	return nil
+}
+
+func (b *OpenWrtBackend) writeEtcTZ(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || b.tzPath == "" {
+		return nil
+	}
+	// /etc/TZ holds the POSIX TZ string that BusyBox libc consults on every
+	// time call. UCI stores either the IANA name (e.g. "America/New_York")
+	// or the POSIX form (e.g. "EST5EDT,M3.2.0,M11.1.0"). We try to upgrade
+	// IANA → POSIX by reading the trailing TZ line of the matching tzdata
+	// file (the IANA Time Zone Database appends the POSIX form as the last
+	// line of every binary tzfile, per RFC 8536 §3.2). On failure we just
+	// write the raw value — at worst the live apply is approximate until
+	// /etc/init.d/system reload runs.
+	posix := value
+	if b.zoneInfoDir != "" && !looksLikePOSIXTZ(value) {
+		if extracted, ok := readTrailingTZ(filepath.Join(b.zoneInfoDir, value)); ok {
+			posix = extracted
+		}
+	}
+	return atomicWriteFile(b.tzPath, []byte(posix+"\n"), 0o644)
+}
+
+// atomicWriteFile writes data to a sibling temp file then renames over the
+// target. Safe on overlay filesystems (jffs2/squashfs+overlay) as long as both
+// paths land in the same overlay branch — which is the case for /etc/config/*
+// and /etc/TZ on every OpenWrt build, since first-write triggers a copy-up
+// before our temp file is created.
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// uciRewrite is the pure-function core of the file-based UCI editor — no
+// filesystem, no I/O. Kept package-level so it's easy to unit-test the
+// preserve-comments / replace-option / append-section logic.
+func uciRewrite(original []byte, sectionRef, option, value string) ([]byte, error) {
+	option = strings.TrimSpace(option)
+	if option == "" {
+		return nil, errors.New("uci: empty option name")
+	}
+
+	lines := splitLinesPreserving(string(original))
+	headerIdx, sectionEnd, err := findUCISection(lines, sectionRef)
+	if err != nil {
+		return nil, err
+	}
+
+	if headerIdx < 0 {
+		// Section missing entirely — append a fresh block.
+		appended := appendUCISection(lines, sectionRef, option, value)
+		return []byte(strings.Join(appended, "")), nil
+	}
+
+	rewritten := replaceOrInsertOption(lines, headerIdx, sectionEnd, option, value)
+	return []byte(strings.Join(rewritten, "")), nil
+}
+
+// splitLinesPreserving splits text on '\n' but keeps the newline as part of
+// each element except for a trailing empty line (so re-joining round-trips).
+func splitLinesPreserving(text string) []string {
+	if text == "" {
+		return nil
+	}
+	out := make([]string, 0, strings.Count(text, "\n")+1)
+	for {
+		nl := strings.IndexByte(text, '\n')
+		if nl < 0 {
+			if text != "" {
+				out = append(out, text)
+			}
+			return out
+		}
+		out = append(out, text[:nl+1])
+		text = text[nl+1:]
+	}
+}
+
+// findUCISection scans the line stream for the section addressed by sectionRef.
+// Returns (headerLineIndex, oneAfterLastBodyLineIndex, nil) if found, or
+// (-1, -1, nil) if not found. Errors only on malformed sectionRef.
+//
+// sectionRef forms:
+//   - `@type[idx]` — zero-based positional index of the type
+//   - `name`       — matches `config <type> 'name'` or `config <type> name`
+//   - `type`       — first section of that type
+func findUCISection(lines []string, sectionRef string) (int, int, error) {
+	sectionRef = strings.TrimSpace(sectionRef)
+	if sectionRef == "" {
+		return -1, -1, errors.New("uci: empty section ref")
+	}
+
+	wantType, wantName, wantIdx, indexed := parseUCISectionRef(sectionRef)
+
+	headerIdx := -1
+	typeCounts := map[string]int{}
+	for i, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if !strings.HasPrefix(trimmed, "config ") && trimmed != "config" {
+			continue
+		}
+		secType, secName := parseConfigHeader(trimmed)
+		idx := typeCounts[secType]
+		typeCounts[secType] = idx + 1
+
+		switch {
+		case indexed:
+			if secType == wantType && idx == wantIdx {
+				headerIdx = i
+			}
+		case wantName != "":
+			if secName == wantName {
+				headerIdx = i
+			}
+		case wantType != "":
+			if secType == wantType && headerIdx == -1 {
+				headerIdx = i
+			}
+		}
+		if headerIdx == i {
+			break
+		}
+	}
+	if headerIdx < 0 {
+		return -1, -1, nil
+	}
+
+	// Body extends from the line after the header until the next `config `
+	// header or EOF.
+	end := len(lines)
+	for j := headerIdx + 1; j < len(lines); j++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[j]), "config ") {
+			end = j
+			break
+		}
+	}
+	return headerIdx, end, nil
+}
+
+// parseUCISectionRef extracts (type, name, index, isIndexed) from a section
+// reference string. Mirrors fallbackUCISectionRef's accepted forms.
+func parseUCISectionRef(ref string) (string, string, int, bool) {
+	if strings.HasPrefix(ref, "@") {
+		// @type[idx]
+		open := strings.IndexByte(ref, '[')
+		close := strings.IndexByte(ref, ']')
+		if open > 1 && close > open {
+			t := ref[1:open]
+			idx, err := strconv.Atoi(ref[open+1 : close])
+			if err == nil {
+				return t, "", idx, true
+			}
+		}
+		return strings.TrimPrefix(ref, "@"), "", 0, false
+	}
+	// Could be a named section ("globals") or a bare type ("system"). The
+	// caller can't tell them apart syntactically, so we return both
+	// candidates and let findUCISection match either.
+	return ref, ref, 0, false
+}
+
+// parseConfigHeader splits a `config <type> ['name']` header line.
+func parseConfigHeader(line string) (string, string) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != "config" {
+		return "", ""
+	}
+	t := strings.Trim(fields[1], `'"`)
+	if len(fields) >= 3 {
+		name := strings.Trim(strings.Join(fields[2:], " "), `'"`)
+		return t, name
+	}
+	return t, ""
+}
+
+// replaceOrInsertOption walks the section body [headerIdx+1, sectionEnd) and
+// either replaces the existing `option <name> ...` line with a fresh one, or
+// inserts a new line just before the section ends if the option wasn't there.
+// An empty value deletes the line instead.
+func replaceOrInsertOption(lines []string, headerIdx, sectionEnd int, option, value string) []string {
+	indent := detectSectionIndent(lines, headerIdx, sectionEnd)
+	for i := headerIdx + 1; i < sectionEnd; i++ {
+		stripped := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(stripped, "option ") {
+			continue
+		}
+		name, _, ok := parseUCIAssignment(stripped, "option")
+		if !ok || name != option {
+			continue
+		}
+		if value == "" {
+			// delete: drop the line entirely
+			out := make([]string, 0, len(lines)-1)
+			out = append(out, lines[:i]...)
+			out = append(out, lines[i+1:]...)
+			return out
+		}
+		lines[i] = indent + "option " + option + " " + uciQuote(value) + "\n"
+		return lines
+	}
+	if value == "" {
+		return lines // nothing to delete
+	}
+	// Insert just before sectionEnd. Trim a trailing blank line if any so the
+	// new option lands inside the section block, not after a separator.
+	insertAt := sectionEnd
+	for insertAt > headerIdx+1 && strings.TrimSpace(lines[insertAt-1]) == "" {
+		insertAt--
+	}
+	newLine := indent + "option " + option + " " + uciQuote(value) + "\n"
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:insertAt]...)
+	out = append(out, newLine)
+	out = append(out, lines[insertAt:]...)
+	return out
+}
+
+// detectSectionIndent returns the leading whitespace used by the existing
+// option/list lines in this section. Defaults to a single tab (OpenWrt's
+// canonical UCI style) when the section has no body yet.
+func detectSectionIndent(lines []string, headerIdx, sectionEnd int) string {
+	for i := headerIdx + 1; i < sectionEnd; i++ {
+		s := lines[i]
+		trimmed := strings.TrimLeft(s, " \t")
+		if !strings.HasPrefix(trimmed, "option ") && !strings.HasPrefix(trimmed, "list ") {
+			continue
+		}
+		return s[:len(s)-len(trimmed)]
+	}
+	return "\t"
+}
+
+// appendUCISection adds a fresh `config <type> [name]` block at the end of
+// the file with a single option line. Used when the requested section ref
+// doesn't exist anywhere in the file yet.
+func appendUCISection(lines []string, sectionRef, option, value string) []string {
+	wantType, wantName, _, indexed := parseUCISectionRef(sectionRef)
+	header := "config " + wantType
+	if !indexed && wantName != "" && wantName != wantType {
+		header += " " + uciQuote(wantName)
+	}
+	header += "\n"
+	body := ""
+	if value != "" {
+		body = "\toption " + option + " " + uciQuote(value) + "\n"
+	}
+	// Ensure separation from any prior content.
+	if len(lines) > 0 && !strings.HasSuffix(lines[len(lines)-1], "\n") {
+		lines[len(lines)-1] += "\n"
+	}
+	if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+		lines = append(lines, "\n")
+	}
+	lines = append(lines, header)
+	if body != "" {
+		lines = append(lines, body)
+	}
+	return lines
+}
+
+// uciQuote single-quotes a value, escaping embedded single quotes the way the
+// shell-style UCI parser expects (close-quote, escaped-quote, reopen-quote).
+// Empty strings serialize to '' so the option line stays valid.
+func uciQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+// looksLikePOSIXTZ heuristically detects whether a UCI timezone value is
+// already a POSIX TZ string (e.g. "EST5EDT,M3.2.0,M11.1.0", "UTC0") rather
+// than an IANA name (e.g. "America/New_York"). POSIX TZ strings never contain
+// a slash or a space; IANA names always contain a slash unless they are one
+// of the legacy aliases ("UTC", "GMT") which we treat as POSIX-safe too.
+func looksLikePOSIXTZ(value string) bool {
+	if strings.ContainsAny(value, "/ ") {
+		return false
+	}
+	return true
+}
+
+// readTrailingTZ extracts the POSIX TZ string appended to a tzdata binary
+// file by the IANA Time Zone Database. RFC 8536 §3.2 mandates that v2+
+// tzfiles end with `\n<POSIX-TZ>\n`, so reading the file's last line is
+// the canonical way to recover the POSIX form when only the IANA name is
+// known. Falls back to (false) on parse error so the caller can use the
+// raw IANA value.
+func readTrailingTZ(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) < 2 {
+		return "", false
+	}
+	// Strip a trailing newline, then take everything after the prior newline.
+	if data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+	}
+	nl := strings.LastIndexByte(string(data), '\n')
+	if nl < 0 {
+		return "", false
+	}
+	tz := strings.TrimSpace(string(data[nl+1:]))
+	if tz == "" {
+		return "", false
+	}
+	return tz, true
 }
 
 func (b *OpenWrtBackend) setUCIOptionViaUbus(ctx context.Context, config, section, option, value string, commit bool) error {

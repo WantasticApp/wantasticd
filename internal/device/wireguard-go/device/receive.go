@@ -142,7 +142,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check if transport
 
-			case MessageTransportType, MessageStatsType, MessageWUSPType:
+			case MessageTransportType, MessageWUSPType:
 
 				// check size
 
@@ -547,12 +547,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
 			switch elem.msgType {
-			case MessageStatsType:
-				device.log.Verbosef("%v - Received stats packet: %d bytes", peer, len(elem.packet))
-				if device.statsHandler != nil {
-					device.statsHandler(peer, elem.packet)
-				}
-				continue
 			case MessageWUSPType:
 				payload, assembled, err := device.consumeWUSPPayload(peer, elem.packet)
 				if err != nil {

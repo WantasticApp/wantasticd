@@ -89,11 +89,7 @@ func ctrlRequest(t testing.TB, rt *uspRuntime, req wusp.USPAgentRequest) wusp.US
 		t.Fatalf("ctrlRequest: agent produced no reply frame for method=%d id=%d", req.Method, req.ID)
 	}
 
-	resp, err := wusp.DecodeUSPAgentResponse(captured)
-	if err != nil {
-		t.Fatalf("ctrlRequest: DecodeUSPAgentResponse(method=%d id=%d): %v", req.Method, req.ID, err)
-	}
-	return resp
+	return decodeControlResponseDatagram(t, captured)
 }
 
 // ── GetSupportedProtocol ─────────────────────────────────────────────────────
@@ -363,11 +359,7 @@ func TestIntegration_ConcurrentRequestIDCorrelation(t *testing.T) {
 				return
 			}
 
-			resp, decErr := wusp.DecodeUSPAgentResponse(captured)
-			if decErr != nil {
-				results <- result{reqID: reqID, err: fmt.Sprintf("decode: %v", decErr)}
-				return
-			}
+			resp := decodeControlResponseDatagram(t, captured)
 			results <- result{reqID: reqID, respID: resp.ID}
 		}(uint64(50000 + i))
 	}
@@ -416,10 +408,7 @@ func TestIntegration_UnauthorizedPeerGetsErrorResponse(t *testing.T) {
 	if len(replyFrame) == 0 {
 		t.Fatal("expected an error response frame, got none")
 	}
-	resp, decErr := wusp.DecodeUSPAgentResponse(replyFrame)
-	if decErr != nil {
-		t.Fatalf("DecodeUSPAgentResponse(rejection frame): %v", decErr)
-	}
+	resp := decodeControlResponseDatagram(t, replyFrame)
 	if resp.Error == "" {
 		t.Fatal("rejection response has empty Error field")
 	}

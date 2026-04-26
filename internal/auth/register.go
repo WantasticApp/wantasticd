@@ -113,7 +113,7 @@ func RegisterDevice(ctx context.Context, portalBaseURL, accessToken, hashedDevic
 	case http.StatusOK, http.StatusCreated:
 		// success — decode below
 	case http.StatusUnauthorized:
-		return nil, 0, fmt.Errorf("registration rejected (401): invalid or expired access token")
+		return nil, 0, fmt.Errorf("registration rejected (401): invalid or expired login token")
 	case http.StatusForbidden:
 		return nil, 0, ErrPeerLimitExceeded
 	default:

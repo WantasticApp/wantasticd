@@ -6,15 +6,20 @@
 # Usage:
 #   curl -sSL https://get.wantastic.app/install.sh | sh
 #   curl -sSL https://get.wantastic.app/install.sh | sh -s -- --token <TOKEN>
+#   curl -sSL https://get.wantastic.app/install.sh | sh -s -- --portal-url https://console.wantastic.app --token <TOKEN>
 set -e
 
 BASE_URL="https://get.wantastic.app"
 INSTALL_TOKEN=""
+INSTALL_PORTAL_URL=""
+INSTALL_SERVER=""
 DO_LOGIN=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --token|-t) INSTALL_TOKEN="$2"; DO_LOGIN=1; shift 2 ;;
+    --portal-url|-u) INSTALL_PORTAL_URL="$2"; shift 2 ;;
+    --server) INSTALL_SERVER="$2"; shift 2 ;;
     --login)    DO_LOGIN=1; shift ;;
     *) shift ;;
   esac
@@ -146,11 +151,26 @@ if [ "$DO_LOGIN" = "1" ]; then
   else
     echo ""
     echo "=== Logging in ==="
-    LOGIN_ARGS=""
-    [ -n "$INSTALL_TOKEN" ] && LOGIN_ARGS="--token $INSTALL_TOKEN"
+    run_login() {
+      if [ -n "$INSTALL_SERVER" ] && [ -n "$INSTALL_PORTAL_URL" ]; then
+        echo "Warning: both --server and --portal-url were provided; using --portal-url."
+      fi
+      if [ -n "$INSTALL_PORTAL_URL" ] && [ -n "$INSTALL_TOKEN" ]; then
+        "$INSTALL_PATH" login --portal-url "$INSTALL_PORTAL_URL" --token "$INSTALL_TOKEN"
+      elif [ -n "$INSTALL_PORTAL_URL" ]; then
+        "$INSTALL_PATH" login --portal-url "$INSTALL_PORTAL_URL"
+      elif [ -n "$INSTALL_SERVER" ] && [ -n "$INSTALL_TOKEN" ]; then
+        "$INSTALL_PATH" login --server "$INSTALL_SERVER" --token "$INSTALL_TOKEN"
+      elif [ -n "$INSTALL_SERVER" ]; then
+        "$INSTALL_PATH" login --server "$INSTALL_SERVER"
+      elif [ -n "$INSTALL_TOKEN" ]; then
+        "$INSTALL_PATH" login --token "$INSTALL_TOKEN"
+      else
+        "$INSTALL_PATH" login
+      fi
+    }
 
-    # shellcheck disable=SC2086
-    if "$INSTALL_PATH" login $LOGIN_ARGS; then
+    if run_login; then
       echo "Login successful. Config saved to $CONFIG_FILE"
     else
       echo ""

@@ -364,6 +364,194 @@ func TestOpenWrtHostnamePersistenceErrorSurfaces(t *testing.T) {
 	}
 }
 
+// TestOpenWrtFirewallCollector verifies that /etc/config/firewall is fully
+// projected into the TR-181 Device.Firewall.Chain.1.Rule.{i}.* table. The
+// fixture is the stock OpenWrt SNAPSHOT firewall config the user reported
+// against — defaults + 2 zones + 1 forwarding + 9 rules + 0 redirects
+// + 1 include = 12 emitted Rule rows (the include is intentionally skipped).
+//
+// Asserts the dashboard-visible bits: count, target enums, protocol→IANA
+// mapping, IPv4/IPv6 family split, port-range parsing, and Device.Firewall.Config
+// derivation from the input policy.
+func TestOpenWrtFirewallCollector(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+
+	// Stock OpenWrt SNAPSHOT firewall config (the exact bytes the user pasted).
+	mustWriteFile(t, filepath.Join(configDir, "firewall"), `config defaults
+	option syn_flood	1
+	option input		ACCEPT
+	option output		ACCEPT
+	option forward		REJECT
+
+config zone
+	option name		lan
+	list   network		'lan'
+	option input		ACCEPT
+	option output		ACCEPT
+	option forward		ACCEPT
+
+config zone
+	option name		wan
+	list   network		'wan'
+	list   network		'wan6'
+	option input		REJECT
+	option output		ACCEPT
+	option forward		REJECT
+	option masq		1
+	option mtu_fix		1
+
+config forwarding
+	option src		lan
+	option dest		wan
+
+config rule
+	option name		Allow-DHCP-Renew
+	option src		wan
+	option proto		udp
+	option dest_port	68
+	option target		ACCEPT
+	option family		ipv4
+
+config rule
+	option name		Allow-Ping
+	option src		wan
+	option proto		icmp
+	option icmp_type	echo-request
+	option family		ipv4
+	option target		ACCEPT
+
+config rule
+	option name		Allow-IPSec-ESP
+	option src		wan
+	option dest		lan
+	option proto		esp
+	option target		ACCEPT
+
+config rule
+	option name		Allow-ISAKMP
+	option src		wan
+	option dest		lan
+	option dest_port	500
+	option proto		udp
+	option target		ACCEPT
+
+config rule
+	option name		Support-UDP-Traceroute
+	option src		wan
+	option dest_port	33434:33689
+	option proto		udp
+	option family		ipv4
+	option target		REJECT
+	option enabled		false
+
+config include
+	option path /etc/firewall.user
+`)
+	mustWriteFile(t, filepath.Join(configDir, "system"), "config system\n")
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		StatePath:    filepath.Join(root, "state.json"),
+		HostnamePath: filepath.Join(root, "proc", "hostname"),
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendFirewallFields(msg)
+
+	// Global firewall fields
+	if v, ok := msg.Get("Device.Firewall.Config"); !ok || v.AsString() != "Low-Security" {
+		t.Fatalf("Device.Firewall.Config=%v want Low-Security (input policy=ACCEPT)", v)
+	}
+	if v, ok := msg.Get("Device.Firewall.ChainNumberOfEntries"); !ok || v.AsUint() != 1 {
+		t.Fatalf("ChainNumberOfEntries=%v want 1", v)
+	}
+	if v, ok := msg.Get("Device.Firewall.Chain.1.Name"); !ok || v.AsString() != "openwrt" {
+		t.Fatalf("Chain.1.Name=%v want openwrt", v)
+	}
+
+	// Two zones + one forwarding + five rules = 8 entries.
+	// (defaults and include are not emitted as rules.)
+	if v, ok := msg.Get("Device.Firewall.Chain.1.RuleNumberOfEntries"); !ok || v.AsUint() != 8 {
+		t.Fatalf("RuleNumberOfEntries=%v want 8", v)
+	}
+
+	// Rule 1 = zone:lan
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.1.Description"); v.AsString() != "zone:lan" {
+		t.Fatalf("Rule.1.Description=%q want zone:lan", v.AsString())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.1.Target"); v.AsString() != "Accept" {
+		t.Fatalf("Rule.1.Target=%q want Accept", v.AsString())
+	}
+
+	// Rule 2 = zone:wan, target=Reject (input policy=REJECT)
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.2.Target"); v.AsString() != "Reject" {
+		t.Fatalf("Rule.2.Target=%q want Reject", v.AsString())
+	}
+
+	// Rule 3 = forwarding lan→wan
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.3.Description"); v.AsString() != "fwd:lan->wan" {
+		t.Fatalf("Rule.3.Description=%q want fwd:lan->wan", v.AsString())
+	}
+
+	// Rule 4 = Allow-DHCP-Renew (udp, dest_port 68, ipv4)
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.4.Description"); v.AsString() != "Allow-DHCP-Renew" {
+		t.Fatalf("Rule.4.Description=%q want Allow-DHCP-Renew", v.AsString())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.4.Protocol"); v.AsInt() != 17 {
+		t.Fatalf("Rule.4.Protocol=%d want 17 (udp)", v.AsInt())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.4.DestPort"); v.AsInt() != 68 {
+		t.Fatalf("Rule.4.DestPort=%d want 68", v.AsInt())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.4.IPVersion"); v.AsInt() != 4 {
+		t.Fatalf("Rule.4.IPVersion=%d want 4", v.AsInt())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.4.Target"); v.AsString() != "Accept" {
+		t.Fatalf("Rule.4.Target=%q want Accept", v.AsString())
+	}
+
+	// Rule 5 = Allow-Ping (icmp)
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.5.Protocol"); v.AsInt() != 1 {
+		t.Fatalf("Rule.5.Protocol=%d want 1 (icmp)", v.AsInt())
+	}
+
+	// Rule 6 = Allow-IPSec-ESP (esp = IANA 50)
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.6.Protocol"); v.AsInt() != 50 {
+		t.Fatalf("Rule.6.Protocol=%d want 50 (esp)", v.AsInt())
+	}
+
+	// Rule 7 = Allow-ISAKMP (udp port 500)
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.7.DestPort"); v.AsInt() != 500 {
+		t.Fatalf("Rule.7.DestPort=%d want 500", v.AsInt())
+	}
+
+	// Rule 8 = Support-UDP-Traceroute (port range 33434:33689, target REJECT, disabled)
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.8.DestPort"); v.AsInt() != 33434 {
+		t.Fatalf("Rule.8.DestPort=%d want 33434", v.AsInt())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.8.DestPortRangeMax"); v.AsInt() != 33689 {
+		t.Fatalf("Rule.8.DestPortRangeMax=%d want 33689", v.AsInt())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.8.Target"); v.AsString() != "Reject" {
+		t.Fatalf("Rule.8.Target=%q want Reject", v.AsString())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.8.Enable"); v.AsBool() != false {
+		t.Fatalf("Rule.8.Enable=%v want false (option enabled=false)", v.AsBool())
+	}
+	if v, _ := msg.Get("Device.Firewall.Chain.1.Rule.8.Status"); v.AsString() != "Disabled" {
+		t.Fatalf("Rule.8.Status=%q want Disabled", v.AsString())
+	}
+
+	// `config include` produces no rule.
+	if _, ok := msg.Get("Device.Firewall.Chain.1.Rule.9.Target"); ok {
+		t.Fatal("Rule.9 should not exist (config include is skipped)")
+	}
+}
+
 // TestOpenWrtUCIRewrite locks the line-oriented UCI editor's invariants:
 // existing comments and ordering are preserved, options are replaced in
 // place, missing sections are appended, and empty values delete options.

@@ -368,6 +368,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 		appendField(msg, "Device.Firewall.LastChange", wusp.Time(snapshot.firewallLastChange))
 	}
 	appendField(msg, "Device.Firewall.Type", wusp.String("Stateful"))
+	b.appendFirewallFields(msg)
 	b.appendWiFiFields(msg)
 
 	// Network interface details via getifaddrs (pure Go)
@@ -1522,6 +1523,312 @@ func (b *OpenWrtBackend) readFirewallEnabled(ctx context.Context) bool {
 	default:
 		return true
 	}
+}
+
+// appendFirewallFields walks /etc/config/firewall and projects every section
+// into the TR-181 Device.Firewall.Chain.1.Rule.{i}.* table. We deliberately
+// keep ONE chain (named "openwrt") because OpenWrt's UCI firewall doesn't
+// expose internal iptables/nftables chains as a first-class concept — zones,
+// forwardings, rules and redirects all live in the same flat config and feed
+// the kernel chains the firewall script materialises at apply time.
+//
+// Mapping (UCI section → TR-181 Rule):
+//
+//	config defaults    → Device.Firewall.Config (global policy hint)
+//	config zone        → Rule with Description="zone:<name>", target=input policy
+//	config forwarding  → Rule with Description="fwd:<src>->dest", target=Accept
+//	config rule        → Rule with full criteria (proto/src_ip/dest_port/...)
+//	config redirect    → Rule with Description="redirect:<name>", target=TargetChain
+//	config include     → skipped (script include, not a rule)
+//
+// The schema fields (`Target` enum, `Protocol` int, `IPVersion` int, port
+// ranges, etc.) follow BBF TR-181 §Device.Firewall.Chain.{i}.Rule.{i}. exactly,
+// so any TR-369 / USP controller that already understands TR-181 can read
+// these without an OpenWrt-specific extension.
+//
+// Errors from the parser are non-fatal — a missing/unreadable file just
+// produces no Rule rows so the existing Enable/Type fields stay coherent.
+func (b *OpenWrtBackend) appendFirewallFields(msg *wusp.Message) {
+	parsed, err := b.readUCIConfig("firewall")
+	if err != nil {
+		return
+	}
+
+	const chainPrefix = "Device.Firewall.Chain.1."
+	defaultPolicy := ""
+	rules := make([]openWrtFirewallRule, 0, len(parsed.Sections))
+
+	for _, section := range parsed.Sections {
+		switch section.Type {
+		case "defaults":
+			defaultPolicy = strings.ToUpper(strings.TrimSpace(section.Options["input"]))
+		case "zone":
+			name := firstNonEmpty(section.Options["name"], section.Name)
+			rules = append(rules, openWrtFirewallRule{
+				Description: "zone:" + name,
+				Target:      mapFirewallTarget(section.Options["input"]),
+				Enabled:     parseOpenWrtBool(section.Options["enabled"], true),
+			})
+		case "forwarding":
+			src := strings.TrimSpace(section.Options["src"])
+			dest := strings.TrimSpace(section.Options["dest"])
+			rules = append(rules, openWrtFirewallRule{
+				Description: "fwd:" + src + "->" + dest,
+				Target:      "Accept",
+				Enabled:     parseOpenWrtBool(section.Options["enabled"], true),
+			})
+		case "rule":
+			rules = append(rules, openWrtRuleFromUCISection(section))
+		case "redirect":
+			name := firstNonEmpty(section.Options["name"], section.Name, "redirect")
+			rules = append(rules, openWrtFirewallRule{
+				Description: "redirect:" + name,
+				Target:      "TargetChain", // NAT rather than a filter verdict
+				Enabled:     parseOpenWrtBool(section.Options["enabled"], true),
+				Protocol:    mapFirewallProtocol(section.Options["proto"]),
+				DestPort:    parseFirewallPortLow(section.Options["src_dport"]),
+				DestPortMax: parseFirewallPortHigh(section.Options["src_dport"]),
+				IPVersion:   mapFirewallFamily(section.Options["family"]),
+			})
+		}
+	}
+
+	// Global firewall fields.
+	if defaultPolicy != "" {
+		appendField(msg, "Device.Firewall.Config", wusp.String(mapFirewallConfigLevel(defaultPolicy)))
+	}
+	appendField(msg, "Device.Firewall.ChainNumberOfEntries", wusp.Uint(1))
+
+	// Single chain header.
+	appendField(msg, chainPrefix+"Enable", wusp.Bool(true))
+	appendField(msg, chainPrefix+"Name", wusp.String("openwrt"))
+	appendField(msg, chainPrefix+"Creator", wusp.String("Defaults"))
+	appendField(msg, chainPrefix+"RuleNumberOfEntries", wusp.Uint(uint64(len(rules))))
+
+	for i, r := range rules {
+		base := fmt.Sprintf("%sRule.%d.", chainPrefix, i+1)
+		appendField(msg, base+"Enable", wusp.Bool(r.Enabled))
+		status := "Enabled"
+		if !r.Enabled {
+			status = "Disabled"
+		}
+		appendField(msg, base+"Status", wusp.String(status))
+		appendField(msg, base+"Order", wusp.String(strconv.Itoa(i+1)))
+		if r.Description != "" {
+			appendField(msg, base+"Description", wusp.String(r.Description))
+		}
+		if r.Target != "" {
+			appendField(msg, base+"Target", wusp.String(r.Target))
+		}
+		appendField(msg, base+"Protocol", wusp.Int(int64(r.Protocol)))
+		appendField(msg, base+"IPVersion", wusp.Int(int64(r.IPVersion)))
+		if r.SourceIP != "" {
+			appendField(msg, base+"SourceIP", wusp.String(r.SourceIP))
+		}
+		if r.SourceMask != "" {
+			appendField(msg, base+"SourceMask", wusp.String(r.SourceMask))
+		}
+		if r.DestIP != "" {
+			appendField(msg, base+"DestIP", wusp.String(r.DestIP))
+		}
+		if r.DestMask != "" {
+			appendField(msg, base+"DestMask", wusp.String(r.DestMask))
+		}
+		if r.SourceMAC != "" {
+			appendField(msg, base+"SourceMAC", wusp.String(r.SourceMAC))
+		}
+		appendField(msg, base+"SourcePort", wusp.Int(int64(r.SourcePort)))
+		appendField(msg, base+"SourcePortRangeMax", wusp.Int(int64(r.SourcePortMax)))
+		appendField(msg, base+"DestPort", wusp.Int(int64(r.DestPort)))
+		appendField(msg, base+"DestPortRangeMax", wusp.Int(int64(r.DestPortMax)))
+		appendField(msg, base+"Log", wusp.Bool(r.Log))
+	}
+}
+
+// openWrtFirewallRule is the intermediate per-rule struct fed to TR-181
+// emission. Defaults below match TR-181's "criterion not used" convention:
+// -1 for numeric matchers, empty string for textual ones.
+type openWrtFirewallRule struct {
+	Description   string
+	Target        string // TR-181 enum: Accept | Drop | Reject | Return | TargetChain
+	Enabled       bool
+	Protocol      int    // IANA protocol number, -1 = any
+	IPVersion     int    // 4 | 6 | -1 = any
+	SourceIP      string // bare address (no /mask)
+	SourceMask    string // CIDR bits or dotted netmask
+	DestIP        string
+	DestMask      string
+	SourceMAC     string
+	SourcePort    int // -1 = any
+	SourcePortMax int // -1 = single port
+	DestPort      int
+	DestPortMax   int
+	Log           bool
+}
+
+func openWrtRuleFromUCISection(section openWrtUCISection) openWrtFirewallRule {
+	srcIP, srcMask := splitFirewallCIDR(section.Options["src_ip"])
+	dstIP, dstMask := splitFirewallCIDR(section.Options["dest_ip"])
+	return openWrtFirewallRule{
+		Description:   firstNonEmpty(section.Options["name"], section.Name),
+		Target:        mapFirewallTarget(section.Options["target"]),
+		Enabled:       parseOpenWrtBool(section.Options["enabled"], true),
+		Protocol:      mapFirewallProtocol(section.Options["proto"]),
+		IPVersion:     mapFirewallFamily(section.Options["family"]),
+		SourceIP:      srcIP,
+		SourceMask:    srcMask,
+		DestIP:        dstIP,
+		DestMask:      dstMask,
+		SourceMAC:     strings.TrimSpace(section.Options["src_mac"]),
+		SourcePort:    parseFirewallPortLow(section.Options["src_port"]),
+		SourcePortMax: parseFirewallPortHigh(section.Options["src_port"]),
+		DestPort:      parseFirewallPortLow(section.Options["dest_port"]),
+		DestPortMax:   parseFirewallPortHigh(section.Options["dest_port"]),
+		Log:           parseOpenWrtBool(section.Options["log"], false),
+	}
+}
+
+// mapFirewallTarget canonicalises UCI's case-insensitive target strings to the
+// TR-181 enum values listed in §Device.Firewall.Chain.{i}.Rule.{i}.Target.
+func mapFirewallTarget(raw string) string {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "ACCEPT":
+		return "Accept"
+	case "DROP":
+		return "Drop"
+	case "REJECT":
+		return "Reject"
+	case "RETURN":
+		return "Return"
+	case "":
+		return ""
+	default:
+		// User-defined chain name → TR-181 represents this with Target=TargetChain
+		// and TargetChain set to the path. We don't have a path so leave Target
+		// as TargetChain so the dashboard sees a non-empty value.
+		return "TargetChain"
+	}
+}
+
+// mapFirewallProtocol returns the IANA protocol number for a UCI `option proto`
+// value. UCI accepts both names ("tcp", "udp", "icmp", ...) and numbers; we
+// preserve numbers when given and fall back to -1 (= "any") for "all"/empty/
+// unknown so the TR-181 ProtocolExclude convention (-1 = unused) holds.
+//
+// IANA Protocol Numbers Registry: https://www.iana.org/assignments/protocol-numbers/
+func mapFirewallProtocol(raw string) int {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "", "all", "any":
+		return -1
+	case "icmp":
+		return 1
+	case "igmp":
+		return 2
+	case "tcp":
+		return 6
+	case "udp":
+		return 17
+	case "gre":
+		return 47
+	case "esp":
+		return 50
+	case "ah":
+		return 51
+	case "icmpv6", "ipv6-icmp":
+		return 58
+	case "ospf":
+		return 89
+	case "sctp":
+		return 132
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 255 {
+		return n
+	}
+	return -1
+}
+
+// mapFirewallFamily returns 4/6/-1 for UCI's `option family` field.
+// TR-181 §IPVersion uses -1 to mean "any", matching the Min/Max bounds in the
+// schema (Min=-1, Max=-1 in the gen file we saw — appears to be a TR-181
+// quirk; we still use -1 to mean "any" for consistency with Protocol).
+func mapFirewallFamily(raw string) int {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "ipv4", "4":
+		return 4
+	case "ipv6", "6":
+		return 6
+	default:
+		return -1
+	}
+}
+
+// mapFirewallConfigLevel projects OpenWrt's defaults `input` policy to the
+// TR-181 Device.Firewall.Config enum:
+//
+//	REJECT/DROP input → "High-Security" (default-deny)
+//	ACCEPT input      → "Low-Security"  (default-allow)
+//	disabled          → "Off"
+//
+// Anything else is treated as "Advanced" so the dashboard can still display
+// something meaningful.
+func mapFirewallConfigLevel(inputPolicy string) string {
+	switch strings.ToUpper(strings.TrimSpace(inputPolicy)) {
+	case "REJECT", "DROP":
+		return "High-Security"
+	case "ACCEPT":
+		return "Low-Security"
+	case "":
+		return "Off"
+	default:
+		return "Advanced"
+	}
+}
+
+// splitFirewallCIDR splits "192.168.1.0/24" into ("192.168.1.0", "24") and
+// "fc00::/6" into ("fc00::", "6"). Bare addresses come back with empty mask.
+func splitFirewallCIDR(raw string) (string, string) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", ""
+	}
+	if i := strings.Index(v, "/"); i > 0 {
+		return v[:i], v[i+1:]
+	}
+	return v, ""
+}
+
+// parseFirewallPortLow / parseFirewallPortHigh handle UCI's three port
+// notations: "" → (-1, -1), "80" → (80, -1), "1000:2000" → (1000, 2000).
+// Out-of-range or non-numeric values produce -1 so the TR-181 "criterion
+// not used" convention holds.
+func parseFirewallPortLow(raw string) int {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return -1
+	}
+	if i := strings.Index(v, ":"); i > 0 {
+		v = v[:i]
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > 65535 {
+		return -1
+	}
+	return n
+}
+
+func parseFirewallPortHigh(raw string) int {
+	v := strings.TrimSpace(raw)
+	i := strings.Index(v, ":")
+	if i < 0 {
+		return -1
+	}
+	v = v[i+1:]
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > 65535 {
+		return -1
+	}
+	return n
 }
 
 func (b *OpenWrtBackend) readInterfaceCount() int {

@@ -10,6 +10,7 @@ require (
 	github.com/mdlayher/genetlink v1.3.2
 	github.com/mdlayher/netlink v1.8.0
 	github.com/mdlayher/wifi v0.7.2
+	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/prometheus/procfs v0.19.2
 	github.com/stratoberry/go-gpsd v1.3.0
 	golang.org/x/crypto v0.47.0
@@ -32,7 +33,6 @@ require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
-	github.com/mdp/qrterminal/v3 v3.2.1 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/stretchr/testify v1.5.1 // indirect
 	golang.org/x/sync v0.19.0 // indirect

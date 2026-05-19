@@ -166,40 +166,15 @@ func (a *Agent) runHealthCheck(ctx context.Context) {
 func (a *Agent) runDNSCheck(ctx context.Context) {
 	defer a.wg.Done()
 
-	// Only run on Linux
 	if runtime.GOOS != "linux" {
 		return
 	}
 
-	checkDNS := func() {
-		// Read /etc/resolv.conf
-		content, err := os.ReadFile("/etc/resolv.conf")
-		if err != nil {
-			return
-		}
-		s := string(content)
+	// Initial assertion + periodic re-assertion. Frequent enough to recover
+	// quickly from external rewrites (DHCP, netifd, container restarts).
+	a.assertResolvConf()
 
-		// Check if reliable DNS exists
-		if !strings.Contains(s, "1.1.1.1") && !strings.Contains(s, "8.8.8.8") {
-			// Append if running as root/privileged
-			f, err := os.OpenFile("/etc/resolv.conf", os.O_APPEND|os.O_WRONLY, 0644)
-			if err != nil {
-				// Likely permission denied if not root; silent fail is okay as we can't do anything
-				return
-			}
-			defer f.Close()
-
-			log.Println("DNS Worker: Adding reliable nameservers (1.1.1.1, 8.8.8.8) to /etc/resolv.conf")
-			if _, err := f.WriteString("\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"); err != nil {
-				log.Printf("Warning: DNS worker failed to update resolv.conf: %v", err)
-			}
-		}
-	}
-
-	// Initial check
-	checkDNS()
-
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -209,9 +184,105 @@ func (a *Agent) runDNSCheck(ctx context.Context) {
 		case <-a.stopCh:
 			return
 		case <-ticker.C:
-			checkDNS()
+			a.assertResolvConf()
 		}
 	}
+}
+
+// assertResolvConf rewrites /etc/resolv.conf so that the DNS servers declared
+// in wg.conf (Interface.DNS — typically the core server reachable through the
+// WireGuard tunnel) are listed first, followed by any pre-existing nameservers
+// and a public fallback (1.1.1.1 / 8.8.8.8) for bootstrap before the handshake
+// completes. The function is idempotent and safe to run repeatedly.
+func (a *Agent) assertResolvConf() {
+	const path = "/etc/resolv.conf"
+
+	configured := a.config.Interface.DNS
+
+	existing := readResolvNameservers(path)
+
+	desired := make([]string, 0, len(configured)+len(existing)+2)
+	seen := make(map[string]struct{})
+	add := func(ns string) {
+		ns = strings.TrimSpace(ns)
+		if ns == "" {
+			return
+		}
+		if _, ok := seen[ns]; ok {
+			return
+		}
+		seen[ns] = struct{}{}
+		desired = append(desired, ns)
+	}
+
+	for _, ns := range configured {
+		add(ns)
+	}
+	for _, ns := range existing {
+		add(ns)
+	}
+	add("1.1.1.1")
+	add("8.8.8.8")
+
+	if resolvNameserversEqual(existing, desired) {
+		return
+	}
+
+	var b strings.Builder
+	b.WriteString("# Managed by wantasticd — primary servers come from wg.conf DNS=\n")
+	for _, ns := range desired {
+		b.WriteString("nameserver ")
+		b.WriteString(ns)
+		b.WriteByte('\n')
+	}
+	b.WriteString("options timeout:1 attempts:1\n")
+
+	// /etc/resolv.conf may be a symlink (OpenWrt → /tmp/resolv.conf.d/...) or
+	// a Docker bind mount (rm fails with EBUSY). Only unlink if it's a
+	// symlink; otherwise overwrite in place.
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		_ = os.Remove(path)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0644); err != nil {
+		log.Printf("DNS Worker: failed to update %s: %v", path, err)
+		return
+	}
+	if len(configured) > 0 {
+		log.Printf("DNS Worker: %s reasserted with primary DNS=%v", path, configured)
+	} else {
+		log.Printf("DNS Worker: %s reasserted (no DNS in wg.conf — fallback only)", path)
+	}
+}
+
+func readResolvNameservers(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			out = append(out, fields[1])
+		}
+	}
+	return out
+}
+
+func resolvNameserversEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Agent) runUpdateChecker(ctx context.Context) {

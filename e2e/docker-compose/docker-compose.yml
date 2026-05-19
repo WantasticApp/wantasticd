@@ -13,6 +13,8 @@ services:
       - LOG_LEVEL=debug
     extra_hosts:
       - "wg.wantastic.local:host-gateway"
+    ports:
+      - "8081:80"
     networks:
       wantastic-e2e:
         ipv4_address: 172.25.0.11
@@ -36,6 +38,8 @@ services:
       - LOG_LEVEL=debug
     extra_hosts:
       - "wg.wantastic.local:host-gateway"
+    ports:
+      - "8082:80"
     networks:
       wantastic-e2e:
         ipv4_address: 172.25.0.12

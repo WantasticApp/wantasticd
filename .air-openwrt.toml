@@ -5,8 +5,10 @@ root = "."
 tmp_dir = "tmp"
 
 [build]
-# The E2E docker setup uses openwrt/rootfs:x86-64-23.05.0 which is linux/amd64
-cmd = "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o ./tmp/wantasticd ./cmd/wantasticd"
+# The E2E docker setup uses openwrt/rootfs:aarch64_generic-23.05.5 (linux/arm64).
+# Build runs INSIDE the container (mounted via docker-compose volumes), so we
+# don't need to set GOOS/GOARCH — Go's defaults match the container's arch.
+cmd = "CGO_ENABLED=0 go build -trimpath -o ./tmp/wantasticd ./cmd/wantasticd"
 
 # Copy the binary into the running wantasticd-client1 container and restart it
 # bin refers to the build output

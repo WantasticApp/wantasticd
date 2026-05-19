@@ -1,23 +1,83 @@
-FROM golang:1.24-alpine AS builder
+# =============================================================================
+# Dev image: real openwrt/rootfs:x86-64-23.05.5 + LuCI + Go 1.24 + air
+#
+# Multi-stage:
+#   1. golang:1.24-bookworm — Go toolchain, build static air, prefetch modules.
+#   2. openwrt/rootfs:x86-64-23.05.5 — real OpenWrt with LuCI + uhttpd, then
+#      we drop in the static Go toolchain and air from stage 1.
+#
+# Why this works across glibc → musl:
+#   - Go's `go` binary is statically linked, runs unchanged on musl.
+#   - air is built with CGO_ENABLED=0 (static).
+#   - .air-openwrt.toml builds wantasticd with CGO_ENABLED=0 (static).
+# =============================================================================
 
-RUN apk add --no-cache curl && curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh | sh -s -- -b /go/bin
+# ---------- Stage 1: Go toolchain, air, prefetched module cache ----------
+FROM golang:1.24-bookworm AS gobuild
 
-FROM openwrt/rootfs:armvirt-64
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy Go and Air from alpine
-COPY --from=builder /usr/local/go /usr/local/go
-COPY --from=builder /go/bin/air /usr/local/bin/air
-ENV PATH="/usr/local/go/bin:${PATH}"
-# add 8.8.8.8 in /etc/resolv.conf to ensure network access for opkg
-# OpenWrt requires /var/lock for opkg to work correctly in some containerized environments
-RUN mkdir -p /var/lock
-# Install original packages + LuCI + uhttpd (the official web server for LuCI)
-RUN opkg update && \
-    opkg install iperf3 iputils-ping dropbear curl ca-bundle tar luci uhttpd || \
-    echo "WARNING: opkg install failed (network/feed issue) — continuing without optional packages"
+# Static air binary. Air's master branch now requires Go 1.25 which we don't
+# have, so we use the upstream install script — it grabs a pre-built static
+# binary from the release page and doesn't need a Go compile step.
+RUN mkdir -p /out && \
+    curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh \
+        | sh -s -- -b /out
 
-# Enable uhttpd on boot (so LuCI starts automatically)
-RUN /etc/init.d/uhttpd enable || true
+# Pre-warm module cache. Runtime networking inside the container is often
+# unable to reach proxy.golang.org over IPv6, so we fetch everything here.
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go env -w GOFLAGS="-mod=mod" && go mod download
+
+# ---------- Stage 2: OpenWrt rootfs with LuCI + Go + air ----------
+# armvirt-64 (linux/arm64) is the arm64 OpenWrt rootfs that pulls cleanly on
+# Apple Silicon. The aarch64_generic tag is published only as plain linux/arm64
+# (no v8 variant), which Docker Desktop / OrbStack on M-series Macs can't match.
+FROM --platform=linux/aarch64_generic openwrt/rootfs:aarch64_generic-23.05.6
+
+# Make DNS work during the build so opkg can fetch package feeds.
+# OpenWrt symlinks /etc/resolv.conf → /tmp/resolv.conf.d/resolv.conf.auto,
+# and at build time that target's parent doesn't exist, so a write fails
+# with "Read-only file system". Remove the symlink first, then create a
+# regular file in its place.
+RUN mkdir -p /var/lock /var/run /var/state /tmp/state /tmp/resolv.conf.d && \
+    rm -f /etc/resolv.conf && \
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+
+# Install LuCI + uhttpd + the dev tools we need. Retry once because the
+# OpenWrt feed servers occasionally rate-limit / time out on first hit.
+RUN (opkg update && \
+     opkg install \
+        luci luci-light luci-base luci-mod-admin-full \
+        rpcd rpcd-mod-file rpcd-mod-luci rpcd-mod-rpcsys rpcd-mod-iwinfo \
+        uhttpd uhttpd-mod-ubus \
+        dropbear iperf3 iputils-ping \
+        ca-bundle curl tar \
+        iwinfo wpad-basic-mbedtls) || \
+    (sleep 3 && opkg update && \
+     opkg install \
+        luci-light \
+        rpcd rpcd-mod-file rpcd-mod-luci rpcd-mod-rpcsys \
+        uhttpd uhttpd-mod-ubus \
+        dropbear iperf3 iputils-ping \
+        ca-bundle curl tar \
+        iwinfo) || \
+    echo "WARNING: opkg install failed; entrypoint has fallbacks"
+
+# Drop in Go toolchain, air, and pre-warmed module cache from stage 1.
+COPY --from=gobuild /usr/local/go /usr/local/go
+COPY --from=gobuild /out/air /usr/local/bin/air
+COPY --from=gobuild /go/pkg/mod /root/go/pkg/mod
+
+ENV PATH="/usr/local/go/bin:${PATH}" \
+    GOPATH=/root/go \
+    GOMODCACHE=/root/go/pkg/mod \
+    GOFLAGS=-mod=mod \
+    GOPROXY=off \
+    CGO_ENABLED=0
 
 WORKDIR /app
 COPY e2e/docker-compose/entrypoint.sh /entrypoint.sh

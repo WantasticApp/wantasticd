@@ -29,6 +29,17 @@ func TestDetectKindOpenWrt(t *testing.T) {
 	}
 }
 
+func TestEnsureStateParentDirRejectsFileParent(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "wantastic")
+	mustWriteFile(t, parent, "config")
+
+	err := ensureStateParentDir(filepath.Join(parent, "usp-host.json"))
+	if err == nil || !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("ensureStateParentDir()=%v want not-directory error", err)
+	}
+}
+
 func TestLinuxBackendCollectAndSet(t *testing.T) {
 	root := t.TempDir()
 	netClassDir := filepath.Join(root, "sys", "class", "net", "eth0")
@@ -119,12 +130,12 @@ func TestAndroidBackendCollect(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, "uptime"), "100.0 0.0\n")
 
 	backend := NewAndroidBackend(Options{
-		StatePath:      filepath.Join(root, "state.json"),
-		BuildPropPath:  filepath.Join(root, "build.prop"),
-		MemInfoPath:    filepath.Join(root, "meminfo"),
-		UptimePath:     filepath.Join(root, "uptime"),
-		CommandRunner:  func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("disabled") },
-		Now:            func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		StatePath:       filepath.Join(root, "state.json"),
+		BuildPropPath:   filepath.Join(root, "build.prop"),
+		MemInfoPath:     filepath.Join(root, "meminfo"),
+		UptimePath:      filepath.Join(root, "uptime"),
+		CommandRunner:   func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("disabled") },
+		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
 		IPv6DisablePath: filepath.Join(root, "ipv6_disable"),
 	})
 
@@ -148,11 +159,11 @@ func TestNewBackendONU(t *testing.T) {
 	}
 
 	backend := NewBackend(Options{
-		BuildPropPath:   filepath.Join(root, "missing.prop"),
+		BuildPropPath:      filepath.Join(root, "missing.prop"),
 		OpenWrtReleasePath: filepath.Join(root, "missing.openwrt"),
-		DeviceModelPath: modelPath,
-		StatePath:       filepath.Join(root, "state.json"),
-		CommandRunner:   func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("disabled") },
+		DeviceModelPath:    modelPath,
+		StatePath:          filepath.Join(root, "state.json"),
+		CommandRunner:      func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("disabled") },
 	})
 	if _, ok := backend.(*hostBackend); !ok {
 		t.Fatalf("NewBackend() type=%T want *hostBackend", backend)
@@ -173,16 +184,16 @@ func TestNewBackendOpenWrtWrapper(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, "serial"), "OWRT123\n")
 
 	backend := NewBackend(Options{
-		UCIConfigDir:          configDir,
-		StatePath:             filepath.Join(root, "state.json"),
-		OpenWrtReleasePath:    openwrtRelease,
-		HostnamePath:          filepath.Join(root, "hostname"),
-		UptimePath:            filepath.Join(root, "uptime"),
-		MemInfoPath:           filepath.Join(root, "meminfo"),
-		SerialNumberPath:      filepath.Join(root, "serial"),
-		CommandRunner:         func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("disabled") },
-		UbusCaller:            func(string, string, time.Duration) ([]byte, error) { return nil, errors.New("disabled") },
-		Now:                   func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		UCIConfigDir:       configDir,
+		StatePath:          filepath.Join(root, "state.json"),
+		OpenWrtReleasePath: openwrtRelease,
+		HostnamePath:       filepath.Join(root, "hostname"),
+		UptimePath:         filepath.Join(root, "uptime"),
+		MemInfoPath:        filepath.Join(root, "meminfo"),
+		SerialNumberPath:   filepath.Join(root, "serial"),
+		CommandRunner:      func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("disabled") },
+		UbusCaller:         func(string, string, time.Duration) ([]byte, error) { return nil, errors.New("disabled") },
+		Now:                func() time.Time { return time.Unix(1700000000, 0).UTC() },
 	})
 
 	if _, ok := backend.(*OpenWrtBackend); !ok {

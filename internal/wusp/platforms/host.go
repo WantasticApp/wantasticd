@@ -654,7 +654,7 @@ func (b *hostBackend) updateState(update func(*hostState)) error {
 }
 
 func (b *hostBackend) writeState(state hostState) error {
-	if err := os.MkdirAll(filepath.Dir(b.statePath), 0o755); err != nil {
+	if err := ensureStateParentDir(b.statePath); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -1140,9 +1140,9 @@ func defaultStatePath(kind Kind) string {
 	case KindAndroid:
 		return "/data/local/tmp/wantastic-usp.json"
 	case KindONU:
-		return "/etc/wantastic/usp-onu.json"
+		return defaultWantasticStatePath("usp-onu.json")
 	default:
-		return "/etc/wantastic/usp-host.json"
+		return defaultWantasticStatePath("usp-host.json")
 	}
 }
 

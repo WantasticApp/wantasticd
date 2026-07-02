@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -108,9 +107,6 @@ func handleGenKey() {
 }
 
 func defaultClaimKeyPath() string {
-	if info, err := os.Stat("/etc/wantastic"); err == nil && !info.IsDir() {
-		return "/etc/wantastic-device-claim-key.json"
-	}
 	return auth.PersistentFilePath("device-claim-key.json")
 }
 
@@ -204,10 +200,8 @@ func writeClaimKeyFile(path string, keyFile *claimKeyFile) error {
 	if err != nil {
 		return fmt.Errorf("marshal key file: %w", err)
 	}
-	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("create key directory: %w", err)
-		}
+	if err := auth.EnsureParentDir(path, 0o700); err != nil {
+		return fmt.Errorf("create key directory: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("write key file: %w", err)
@@ -231,10 +225,7 @@ func loadClaimKeyFile(path string) (*claimKeyFile, error) {
 }
 
 func ensureConfigDir(path string) error {
-	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		return os.MkdirAll(dir, 0700)
-	}
-	return nil
+	return auth.EnsureParentDir(path, 0o700)
 }
 
 func handleLogin() {
@@ -277,14 +268,9 @@ func handleLogin() {
 	log.Printf("Login successful: endpoint=%s:%d, address=%v",
 		cfg.Server.Endpoint, cfg.Server.Port, cfg.Interface.Addresses)
 
-	configPath := "/etc/wantastic/config.conf"
-	// Check if /etc/wantastic already exists as a plain file (e.g. from bulk_install).
-	// If so, use it directly instead of trying to create a subdirectory.
-	if info, err := os.Stat("/etc/wantastic"); err == nil && !info.IsDir() {
-		configPath = "/etc/wantastic"
-	} else if err := os.MkdirAll("/etc/wantastic", 0700); err != nil {
-		// Can't create directory — fall back to flat file
-		configPath = "/etc/wantastic"
+	configPath := auth.DefaultConfigPath()
+	if err := ensureConfigDir(configPath); err != nil {
+		log.Fatalf("Failed to prepare config path: %v", err)
 	}
 
 	if err := cfg.SaveToFile(configPath); err != nil {
@@ -369,12 +355,7 @@ func handleConnect() {
 		if connectCmd.NArg() > 0 {
 			*configPath = connectCmd.Arg(0)
 		} else {
-			// Try paths in priority order: dir-based, flat file, local fallback
-			candidates := []string{
-				"/etc/wantastic/config.conf",
-				"/etc/wantastic",
-				"wantastic.conf",
-			}
+			candidates := auth.ConfigPathCandidates()
 			*configPath = candidates[0] // default if none found
 			for _, p := range candidates {
 				if _, err := os.Stat(p); err == nil {

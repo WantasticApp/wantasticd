@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -9,11 +10,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
 	fwEnvPublicKey = "wantastic_public_key"
 	fwEnvSerial    = "wantastic_serial_number"
+	fwEnvTimeout   = 2 * time.Second
 )
 
 // PersistentDir returns the best cross-platform directory for device identity
@@ -33,6 +36,11 @@ func PersistentDir() string {
 			return filepath.Join(dir, "Wantastic")
 		}
 	case "linux":
+		if os.Geteuid() != 0 {
+			if dir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+				return filepath.Join(dir, "wantastic")
+			}
+		}
 		if info, err := os.Stat("/usrdata"); err == nil && info.IsDir() {
 			return "/usrdata/wantastic/etc"
 		}
@@ -45,7 +53,74 @@ func PersistentDir() string {
 }
 
 func PersistentFilePath(name string) string {
-	return filepath.Join(PersistentDir(), name)
+	return PersistentPath(name)
+}
+
+// PersistentPath returns a file path under PersistentDir. If the configured
+// persistent location is a flat file such as legacy /etc/wantastic, the file is
+// placed beside it as /etc/wantastic-<name> instead of trying to create a child.
+func PersistentPath(name string) string {
+	dir := PersistentDir()
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		return filepath.Join(filepath.Dir(dir), filepath.Base(dir)+"-"+name)
+	}
+	return filepath.Join(dir, name)
+}
+
+// DefaultConfigPath is the preferred config file for this platform.
+func DefaultConfigPath() string {
+	if dir := strings.TrimSpace(os.Getenv("WANTASTIC_CONFIG_DIR")); dir != "" {
+		return filepath.Join(dir, "config.conf")
+	}
+	if path := strings.TrimSpace(os.Getenv("WANTASTIC_CONFIG")); path != "" {
+		return path
+	}
+	if runtime.GOOS == "linux" {
+		if info, err := os.Stat("/etc/wantastic"); err == nil && !info.IsDir() {
+			return "/etc/wantastic"
+		}
+	}
+	return PersistentPath("config.conf")
+}
+
+// ConfigPathCandidates returns config paths in read preference order.
+func ConfigPathCandidates() []string {
+	seen := make(map[string]bool)
+	var candidates []string
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		candidates = append(candidates, path)
+	}
+	add(os.Getenv("WANTASTIC_CONFIG"))
+	add(DefaultConfigPath())
+	add(PersistentPath("config.conf"))
+	if runtime.GOOS == "linux" {
+		add("/usrdata/wantastic/etc/config.conf")
+		add("/etc/wantastic/config.conf")
+		add("/etc/wantastic")
+	}
+	add("wantastic.conf")
+	return candidates
+}
+
+// EnsureParentDir creates the parent directory for path, with a clear error if
+// the parent already exists as a file.
+func EnsureParentDir(path string, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("parent %s is not a directory", dir)
+		}
+		return nil
+	}
+	return os.MkdirAll(dir, perm)
 }
 
 // PersistentSerialNumber returns a durable WUSP serial number. It reads
@@ -102,7 +177,7 @@ func newSerialNumber() (string, error) {
 }
 
 func writePersistentFile(path, value string, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := EnsureParentDir(path, 0o700); err != nil {
 		return fmt.Errorf("create persistent directory: %w", err)
 	}
 	return os.WriteFile(path, []byte(value), perm)
@@ -117,10 +192,16 @@ func readTextFile(path string) string {
 }
 
 func readFWEnv(name string) string {
-	if _, err := exec.LookPath("fw_printenv"); err != nil {
+	if !fwEnvEnabled() {
 		return ""
 	}
-	out, err := exec.Command("fw_printenv", "-n", name).Output()
+	tool, err := exec.LookPath("fw_printenv")
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), fwEnvTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, tool, "-n", name).Output()
 	if err != nil {
 		return ""
 	}
@@ -128,11 +209,23 @@ func readFWEnv(name string) string {
 }
 
 func writeFWEnv(name, value string) {
-	if strings.TrimSpace(value) == "" {
+	if !fwEnvEnabled() || strings.TrimSpace(value) == "" {
 		return
 	}
-	if _, err := exec.LookPath("fw_setenv"); err != nil {
+	tool, err := exec.LookPath("fw_setenv")
+	if err != nil {
 		return
 	}
-	_ = exec.Command("fw_setenv", name, value).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), fwEnvTimeout)
+	defer cancel()
+	_ = exec.CommandContext(ctx, tool, name, value).Run()
+}
+
+func fwEnvEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WANTASTIC_FWENV"))) {
+	case "0", "false", "no", "off", "disabled":
+		return false
+	default:
+		return true
+	}
 }

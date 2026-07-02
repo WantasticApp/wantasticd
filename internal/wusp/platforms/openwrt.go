@@ -164,7 +164,7 @@ var _ wusp.DataBackend = (*OpenWrtBackend)(nil)
 func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	backend := &OpenWrtBackend{
 		uciConfigDir:          coalesceString(opts.UCIConfigDir, "/etc/config"),
-		statePath:             coalesceString(opts.StatePath, "/etc/wantastic/usp-openwrt.json"),
+		statePath:             coalesceString(opts.StatePath, defaultWantasticStatePath("usp-openwrt.json")),
 		hostnamePath:          coalesceString(opts.HostnamePath, "/proc/sys/kernel/hostname"),
 		etcHostnamePath:       coalesceString(opts.EtcHostnamePath, "/etc/hostname"),
 		tzPath:                coalesceString(opts.TZPath, "/etc/TZ"),
@@ -590,11 +590,12 @@ func (b *OpenWrtBackend) setTimeEnabled(ctx context.Context, enabled bool) error
 }
 
 // setWiFiParam handles writable WiFi instance paths like:
-//   Device.WiFi.Radio.1.Enable        → wireless.radio0.disabled
-//   Device.WiFi.Radio.1.Channel       → wireless.radio0.channel
-//   Device.WiFi.SSID.1.SSID           → wireless.@wifi-iface[0].ssid
-//   Device.WiFi.SSID.1.Enable         → wireless.@wifi-iface[0].disabled
-//   Device.WiFi.AccessPoint.1.Enable  → wireless.@wifi-iface[0].disabled
+//
+//	Device.WiFi.Radio.1.Enable        → wireless.radio0.disabled
+//	Device.WiFi.Radio.1.Channel       → wireless.radio0.channel
+//	Device.WiFi.SSID.1.SSID           → wireless.@wifi-iface[0].ssid
+//	Device.WiFi.SSID.1.Enable         → wireless.@wifi-iface[0].disabled
+//	Device.WiFi.AccessPoint.1.Enable  → wireless.@wifi-iface[0].disabled
 func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wusp.Value) error {
 	// Parse instance path: Device.WiFi.Radio.{n}.{param}
 	var objType, param string
@@ -615,7 +616,9 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 		switch param {
 		case "Enable":
 			disabled := "1"
-			if value.AsBool() { disabled = "0" }
+			if value.AsBool() {
+				disabled = "0"
+			}
 			return b.setUCIOption(ctx, "wireless", section, "disabled", disabled, true, wirelessReloadScript)
 		case "Channel":
 			return b.setUCIOption(ctx, "wireless", section, "channel", wusp.ValueToString(value), true, wirelessReloadScript)
@@ -635,7 +638,9 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 			return b.setUCIOption(ctx, "wireless", section, "ssid", value.AsString(), true, wirelessReloadScript)
 		case "Enable":
 			disabled := "1"
-			if value.AsBool() { disabled = "0" }
+			if value.AsBool() {
+				disabled = "0"
+			}
 			return b.setUCIOption(ctx, "wireless", section, "disabled", disabled, true, wirelessReloadScript)
 		}
 	}
@@ -1154,7 +1159,7 @@ func appendUCISection(lines []string, sectionRef, option, value string) []string
 
 // uciQuote single-quotes a value, escaping embedded single quotes the way the
 // shell-style UCI parser expects (close-quote, escaped-quote, reopen-quote).
-// Empty strings serialize to '' so the option line stays valid.
+// Empty strings serialize to ” so the option line stays valid.
 func uciQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
@@ -1288,7 +1293,7 @@ func (b *OpenWrtBackend) readState() (openWrtState, error) {
 }
 
 func (b *OpenWrtBackend) writeState(state openWrtState) error {
-	if err := os.MkdirAll(filepath.Dir(b.statePath), 0o755); err != nil {
+	if err := ensureStateParentDir(b.statePath); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(state, "", "  ")

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
 	"wantastic-agent/internal/wusp"
@@ -59,51 +60,51 @@ type uspRuntime struct {
 }
 
 type USPRuntimeStats struct {
-	InboundFrames          uint64
-	InboundBytes           uint64
-	InboundRequests        uint64
-	InboundResponses       uint64
-	UnauthorizedRequests   uint64
-	OutboundResponses      uint64
-	ResponseFragmentsSent  uint64
-	FragmentedResponses    uint64
-	TransferFramesSent     uint64
-	TransferFrameBytesSent uint64
-	TransferFramesReceived uint64
+	InboundFrames              uint64
+	InboundBytes               uint64
+	InboundRequests            uint64
+	InboundResponses           uint64
+	UnauthorizedRequests       uint64
+	OutboundResponses          uint64
+	ResponseFragmentsSent      uint64
+	FragmentedResponses        uint64
+	TransferFramesSent         uint64
+	TransferFrameBytesSent     uint64
+	TransferFramesReceived     uint64
 	TransferFrameBytesReceived uint64
-	TransferSessionsStarted   uint64
-	TransferSessionsCompleted uint64
-	TransferSessionsAborted   uint64
-	TransferAckTimeouts       uint64
-	TransferChunkResends      uint64
-	TransferUnknownSessions   uint64
-	TransferPayloadBytes      uint64
-	TransferDurationTotal     time.Duration
-	TransferDurationMax       time.Duration
+	TransferSessionsStarted    uint64
+	TransferSessionsCompleted  uint64
+	TransferSessionsAborted    uint64
+	TransferAckTimeouts        uint64
+	TransferChunkResends       uint64
+	TransferUnknownSessions    uint64
+	TransferPayloadBytes       uint64
+	TransferDurationTotal      time.Duration
+	TransferDurationMax        time.Duration
 }
 
 type uspRuntimeStats struct {
-	inboundFrames          atomic.Uint64
-	inboundBytes           atomic.Uint64
-	inboundRequests        atomic.Uint64
-	inboundResponses       atomic.Uint64
-	unauthorizedRequests   atomic.Uint64
-	outboundResponses      atomic.Uint64
-	responseFragmentsSent  atomic.Uint64
-	fragmentedResponses    atomic.Uint64
-	transferFramesSent     atomic.Uint64
-	transferFrameBytesSent atomic.Uint64
-	transferFramesReceived atomic.Uint64
+	inboundFrames              atomic.Uint64
+	inboundBytes               atomic.Uint64
+	inboundRequests            atomic.Uint64
+	inboundResponses           atomic.Uint64
+	unauthorizedRequests       atomic.Uint64
+	outboundResponses          atomic.Uint64
+	responseFragmentsSent      atomic.Uint64
+	fragmentedResponses        atomic.Uint64
+	transferFramesSent         atomic.Uint64
+	transferFrameBytesSent     atomic.Uint64
+	transferFramesReceived     atomic.Uint64
 	transferFrameBytesReceived atomic.Uint64
-	transferSessionsStarted   atomic.Uint64
-	transferSessionsCompleted atomic.Uint64
-	transferSessionsAborted   atomic.Uint64
-	transferAckTimeouts       atomic.Uint64
-	transferChunkResends      atomic.Uint64
-	transferUnknownSessions   atomic.Uint64
-	transferPayloadBytes      atomic.Uint64
-	transferDurationNS        atomic.Uint64
-	transferDurationMaxNS     atomic.Uint64
+	transferSessionsStarted    atomic.Uint64
+	transferSessionsCompleted  atomic.Uint64
+	transferSessionsAborted    atomic.Uint64
+	transferAckTimeouts        atomic.Uint64
+	transferChunkResends       atomic.Uint64
+	transferUnknownSessions    atomic.Uint64
+	transferPayloadBytes       atomic.Uint64
+	transferDurationNS         atomic.Uint64
+	transferDurationMaxNS      atomic.Uint64
 }
 
 func (r *uspRuntime) StatsSnapshot() USPRuntimeStats {
@@ -111,27 +112,27 @@ func (r *uspRuntime) StatsSnapshot() USPRuntimeStats {
 		return USPRuntimeStats{}
 	}
 	return USPRuntimeStats{
-		InboundFrames:             r.stats.inboundFrames.Load(),
-		InboundBytes:              r.stats.inboundBytes.Load(),
-		InboundRequests:           r.stats.inboundRequests.Load(),
-		InboundResponses:          r.stats.inboundResponses.Load(),
-		UnauthorizedRequests:      r.stats.unauthorizedRequests.Load(),
-		OutboundResponses:         r.stats.outboundResponses.Load(),
-		ResponseFragmentsSent:     r.stats.responseFragmentsSent.Load(),
-		FragmentedResponses:       r.stats.fragmentedResponses.Load(),
-		TransferFramesSent:        r.stats.transferFramesSent.Load(),
-		TransferFrameBytesSent:    r.stats.transferFrameBytesSent.Load(),
-		TransferFramesReceived:    r.stats.transferFramesReceived.Load(),
+		InboundFrames:              r.stats.inboundFrames.Load(),
+		InboundBytes:               r.stats.inboundBytes.Load(),
+		InboundRequests:            r.stats.inboundRequests.Load(),
+		InboundResponses:           r.stats.inboundResponses.Load(),
+		UnauthorizedRequests:       r.stats.unauthorizedRequests.Load(),
+		OutboundResponses:          r.stats.outboundResponses.Load(),
+		ResponseFragmentsSent:      r.stats.responseFragmentsSent.Load(),
+		FragmentedResponses:        r.stats.fragmentedResponses.Load(),
+		TransferFramesSent:         r.stats.transferFramesSent.Load(),
+		TransferFrameBytesSent:     r.stats.transferFrameBytesSent.Load(),
+		TransferFramesReceived:     r.stats.transferFramesReceived.Load(),
 		TransferFrameBytesReceived: r.stats.transferFrameBytesReceived.Load(),
-		TransferSessionsStarted:   r.stats.transferSessionsStarted.Load(),
-		TransferSessionsCompleted: r.stats.transferSessionsCompleted.Load(),
-		TransferSessionsAborted:   r.stats.transferSessionsAborted.Load(),
-		TransferAckTimeouts:       r.stats.transferAckTimeouts.Load(),
-		TransferChunkResends:      r.stats.transferChunkResends.Load(),
-		TransferUnknownSessions:   r.stats.transferUnknownSessions.Load(),
-		TransferPayloadBytes:      r.stats.transferPayloadBytes.Load(),
-		TransferDurationTotal:     time.Duration(r.stats.transferDurationNS.Load()),
-		TransferDurationMax:       time.Duration(r.stats.transferDurationMaxNS.Load()),
+		TransferSessionsStarted:    r.stats.transferSessionsStarted.Load(),
+		TransferSessionsCompleted:  r.stats.transferSessionsCompleted.Load(),
+		TransferSessionsAborted:    r.stats.transferSessionsAborted.Load(),
+		TransferAckTimeouts:        r.stats.transferAckTimeouts.Load(),
+		TransferChunkResends:       r.stats.transferChunkResends.Load(),
+		TransferUnknownSessions:    r.stats.transferUnknownSessions.Load(),
+		TransferPayloadBytes:       r.stats.transferPayloadBytes.Load(),
+		TransferDurationTotal:      time.Duration(r.stats.transferDurationNS.Load()),
+		TransferDurationMax:        time.Duration(r.stats.transferDurationMaxNS.Load()),
 	}
 }
 
@@ -203,17 +204,24 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		return nil, err
 	}
 
+	wuspSerial := cfg.DeviceID
+	if serial, serialErr := auth.PersistentSerialNumber(); serialErr == nil && strings.TrimSpace(serial) != "" {
+		wuspSerial = strings.TrimSpace(serial)
+	} else if serialErr != nil {
+		log.Printf("[USP] persistent serial unavailable, using config device ID: %v", serialErr)
+	}
+
 	if controllerPublicKeyHex == "" {
 		log.Printf("[USP] WARNING: Server.PublicKey not configured — WUSP accepts any WireGuard peer (open mode)")
 	} else {
-		log.Printf("[USP] Runtime initializing: deviceID=%q controllerKey=%q", cfg.DeviceID, controllerPublicKeyHex)
+		log.Printf("[USP] Runtime initializing: deviceID=%q serial=%q controllerKey=%q", cfg.DeviceID, wuspSerial, controllerPublicKeyHex)
 	}
 
 	backend := platforms.NewBackend(platforms.Options{})
 	runtime := &uspRuntime{
 		transport:              transport,
 		controllerPublicKeyHex: controllerPublicKeyHex,
-		deviceID:               cfg.DeviceID,
+		deviceID:               wuspSerial,
 		softwareVersion:        softwareVersion,
 		httpClient: &http.Client{
 			Timeout: 2 * time.Minute,
@@ -231,7 +239,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	})
 	if err := runtime.agent.Bootstrap(wusp.FillOptions{
 		Profile:   wusp.FillProfileRealistic,
-		DeviceID:  cfg.DeviceID,
+		DeviceID:  wuspSerial,
 		Timestamp: time.Now().UTC(),
 		Overwrite: true,
 	}); err != nil {
@@ -408,7 +416,6 @@ func (r *uspRuntime) replyControlPayload(reply func([]byte) error, req wusp.USPA
 	}
 	return nil
 }
-
 
 func (r *uspRuntime) CallController(ctx context.Context, req wusp.USPAgentRequest) (wusp.USPAgentResponse, error) {
 	if r == nil || r.transport == nil {
@@ -653,7 +660,7 @@ func (r *uspRuntime) httpDownload(ctx context.Context, req wusp.USPTransferReque
 		Bytes: written,
 		Metadata: map[string]string{
 			wusp.TransferMetadataDestination: targetPath,
-			"status":                        resp.Status,
+			"status":                         resp.Status,
 		},
 	}, nil
 }

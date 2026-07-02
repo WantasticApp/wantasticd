@@ -3,14 +3,18 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -22,6 +26,9 @@ import (
 	"wantastic-agent/internal/agent"
 	"wantastic-agent/pkg/runner"
 	"wantastic-agent/pkg/version"
+
+	"github.com/mdp/qrterminal/v3"
+	"golang.org/x/crypto/curve25519"
 )
 
 func main() {
@@ -29,8 +36,13 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+	if os.Args[1] == "--wait-claim" || os.Args[1] == "-wc" {
+		os.Args = append([]string{os.Args[0], "connect"}, os.Args[1:]...)
+	}
 
 	switch os.Args[1] {
+	case "genkey":
+		handleGenKey()
 	case "login":
 		handleLogin()
 	case "connect":
@@ -47,6 +59,182 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+type claimKeyFile struct {
+	PrivateKey string `json:"private_key"`
+	PublicKey  string `json:"public_key"`
+	ServerURL  string `json:"server_url"`
+	ClaimURL   string `json:"claim_url"`
+	CreatedAt  string `json:"created_at"`
+}
+
+func handleGenKey() {
+	genCmd := flag.NewFlagSet("genkey", flag.ExitOnError)
+	outPath := genCmd.String("out", defaultClaimKeyPath(), "Path to save/reuse the device claim key JSON")
+	serverURL := genCmd.String("server-url", "", "Wantastic server URL/domain used in the claim QR")
+	server := genCmd.String("server", "", "Wantastic server domain shorthand for --server-url")
+	portalURL := genCmd.String("portal-url", "", "Deprecated alias for --server-url")
+	force := genCmd.Bool("force", false, "Generate a new key even if --out already exists")
+	printQR := genCmd.Bool("qr", true, "Print a terminal QR code for the claim URL")
+	showPrivate := genCmd.Bool("show-private", false, "Print the private key to stdout")
+	genCmd.Parse(os.Args[2:])
+
+	claimServerURL := resolveClaimServerURL(*serverURL, *server, *portalURL)
+	keyFile, reused, err := loadOrCreateClaimKey(*outPath, claimServerURL, *force)
+	if err != nil {
+		log.Fatalf("genkey failed: %v", err)
+	}
+
+	if reused {
+		fmt.Printf("Reused existing device claim key: %s\n", *outPath)
+	} else {
+		fmt.Printf("Generated device claim key: %s\n", *outPath)
+	}
+	fmt.Printf("Public key: %s\n", keyFile.PublicKey)
+	fmt.Printf("Server URL: %s\n", keyFile.ServerURL)
+	fmt.Printf("Claim URL: %s\n", keyFile.ClaimURL)
+	if *showPrivate {
+		fmt.Printf("Private key: %s\n", keyFile.PrivateKey)
+	}
+	if *printQR {
+		fmt.Println()
+		qrterminal.GenerateWithConfig(keyFile.ClaimURL, qrterminal.Config{
+			Level:      qrterminal.L,
+			Writer:     os.Stdout,
+			HalfBlocks: true,
+		})
+	}
+}
+
+func defaultClaimKeyPath() string {
+	if info, err := os.Stat("/etc/wantastic"); err == nil && !info.IsDir() {
+		return "/etc/wantastic-device-claim-key.json"
+	}
+	return auth.PersistentFilePath("device-claim-key.json")
+}
+
+func loadOrCreateClaimKey(path, portalBaseURL string, force bool) (*claimKeyFile, bool, error) {
+	if !force {
+		if data, err := os.ReadFile(path); err == nil {
+			var existing claimKeyFile
+			if err := json.Unmarshal(data, &existing); err != nil {
+				return nil, false, fmt.Errorf("parse existing key file: %w", err)
+			}
+			if existing.PrivateKey == "" || existing.PublicKey == "" {
+				return nil, false, fmt.Errorf("existing key file missing private_key or public_key")
+			}
+			existing.ServerURL = normalizeClaimServerURL(portalBaseURL)
+			existing.ClaimURL = buildClaimURL(portalBaseURL, existing.PublicKey)
+			if err := auth.PersistPublicKey(existing.PublicKey); err != nil {
+				return nil, false, fmt.Errorf("persist public key: %w", err)
+			}
+			return &existing, true, nil
+		} else if !os.IsNotExist(err) {
+			return nil, false, fmt.Errorf("read key file: %w", err)
+		}
+	}
+
+	privateKey, publicKey, err := generateWireGuardKeyPair()
+	if err != nil {
+		return nil, false, err
+	}
+	keyFile := &claimKeyFile{
+		PrivateKey: privateKey,
+		PublicKey:  publicKey,
+		ServerURL:  normalizeClaimServerURL(portalBaseURL),
+		ClaimURL:   buildClaimURL(portalBaseURL, publicKey),
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := writeClaimKeyFile(path, keyFile); err != nil {
+		return nil, false, err
+	}
+	if err := auth.PersistPublicKey(publicKey); err != nil {
+		return nil, false, fmt.Errorf("persist public key: %w", err)
+	}
+	return keyFile, false, nil
+}
+
+func generateWireGuardKeyPair() (string, string, error) {
+	privateBytes := make([]byte, 32)
+	if _, err := rand.Read(privateBytes); err != nil {
+		return "", "", fmt.Errorf("generate private key: %w", err)
+	}
+	privateBytes[0] &= 248
+	privateBytes[31] = (privateBytes[31] & 127) | 64
+
+	publicBytes, err := curve25519.X25519(privateBytes, curve25519.Basepoint)
+	if err != nil {
+		return "", "", fmt.Errorf("derive public key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(privateBytes), base64.StdEncoding.EncodeToString(publicBytes), nil
+}
+
+func buildClaimURL(portalBaseURL, publicKey string) string {
+	base := normalizeClaimServerURL(portalBaseURL)
+	return base + "/#desktop?claim_public_key=" + url.QueryEscape(strings.TrimSpace(publicKey)) + "&wantastic_server=" + url.QueryEscape(base)
+}
+
+func resolveClaimServerURL(serverURL, server, portalURL string) string {
+	for _, value := range []string{serverURL, server, portalURL} {
+		if strings.TrimSpace(value) != "" {
+			return normalizeClaimServerURL(value)
+		}
+	}
+	return "https://" + auth.DefaultOAuth2Domain
+}
+
+func normalizeClaimServerURL(portalBaseURL string) string {
+	base := strings.TrimRight(strings.TrimSpace(portalBaseURL), "/")
+	if base == "" {
+		return "https://" + auth.DefaultOAuth2Domain
+	}
+	if !strings.HasPrefix(strings.ToLower(base), "http://") &&
+		!strings.HasPrefix(strings.ToLower(base), "https://") {
+		base = "https://" + base
+	}
+	if parsed, err := url.Parse(base); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return parsed.Scheme + "://" + parsed.Host
+	}
+	return base
+}
+
+func writeClaimKeyFile(path string, keyFile *claimKeyFile) error {
+	data, err := json.MarshalIndent(keyFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal key file: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("create key directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("write key file: %w", err)
+	}
+	return nil
+}
+
+func loadClaimKeyFile(path string) (*claimKeyFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key file: %w", err)
+	}
+	var keyFile claimKeyFile
+	if err := json.Unmarshal(data, &keyFile); err != nil {
+		return nil, fmt.Errorf("parse key file: %w", err)
+	}
+	if strings.TrimSpace(keyFile.PrivateKey) == "" || strings.TrimSpace(keyFile.PublicKey) == "" {
+		return nil, fmt.Errorf("key file missing private_key or public_key")
+	}
+	return &keyFile, nil
+}
+
+func ensureConfigDir(path string) error {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		return os.MkdirAll(dir, 0700)
+	}
+	return nil
 }
 
 func handleLogin() {
@@ -149,6 +337,13 @@ func runAgentWithConfig(cfg *config.Config) {
 func handleConnect() {
 	connectCmd := flag.NewFlagSet("connect", flag.ExitOnError)
 	configPath := connectCmd.String("config", "", "Path to configuration file")
+	claimKeyPath := connectCmd.String("claim-key", defaultClaimKeyPath(), "Path to device claim key JSON")
+	serverURL := connectCmd.String("server-url", "", "Wantastic server URL/domain used while waiting for claim")
+	server := connectCmd.String("server", "", "Wantastic server domain shorthand for --server-url")
+	portalURL := connectCmd.String("portal-url", "", "Deprecated alias for --server-url")
+	waitClaim := connectCmd.Bool("wait-claim", false, "Wait until the factory claim public key is claimed, then connect")
+	waitClaimShort := connectCmd.Bool("wc", false, "Alias for --wait-claim")
+	claimPoll := connectCmd.Duration("claim-poll", 10*time.Second, "How often to poll for claim completion")
 	verbose := connectCmd.Bool("v", false, "Enable verbose logging and debug output")
 	autoUpdate := connectCmd.Bool("auto-update", false, "Enable automatic self-updates")
 
@@ -162,6 +357,9 @@ func handleConnect() {
 	connectCmd.Parse(os.Args[2:])
 
 	useTray = *flagTray
+	if *waitClaimShort {
+		*waitClaim = true
+	}
 
 	// Auto-determine TUN name based on platform
 	tunName := autoTUNName()
@@ -188,8 +386,74 @@ func handleConnect() {
 	}
 
 	runner.RunServiceHook(func(ctx context.Context) {
+		if *waitClaim {
+			runWaitClaim(ctx, *claimKeyPath, *configPath, resolveClaimServerURL(*serverURL, *server, *portalURL), *claimPoll, *verbose, *autoUpdate, tunName, useTray)
+			return
+		}
 		runAgent(ctx, *configPath, *verbose, *autoUpdate, tunName, useTray)
 	})
+}
+
+func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL string, pollInterval time.Duration, verbose bool, autoUpdate bool, tunName string, useTray bool) {
+	if pollInterval <= 0 {
+		pollInterval = 10 * time.Second
+	}
+	keyFile, err := loadClaimKeyFile(claimKeyPath)
+	if err != nil {
+		log.Fatalf("Failed to load claim key: %v", err)
+	}
+	if serverURL == "" {
+		serverURL = keyFile.ServerURL
+	}
+	serverURL = resolveClaimServerURL(serverURL, "", "")
+	log.Printf("Waiting for Wantastic device claim: public_key=%s server=%s", keyFile.PublicKey, serverURL)
+	log.Printf("Claim URL: %s", buildClaimURL(serverURL, keyFile.PublicKey))
+
+	hashedDeviceID, err := auth.HashedDeviceID()
+	if err != nil {
+		log.Fatalf("Failed to get device id: %v", err)
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		pollCtx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
+		claim, fetchErr := auth.FetchClaimConfig(pollCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
+		cancel()
+		if fetchErr == nil && claim != nil && claim.Claimed {
+			cfg, cfgErr := config.LoadFromClaimConfig(serverURL, keyFile.PrivateKey, keyFile.PublicKey, claim)
+			if cfgErr != nil {
+				log.Printf("Claim found but config is not ready: %v", cfgErr)
+			} else {
+				cfg.Interface.TUNMode = true
+				cfg.Interface.TUNName = tunName
+				if verbose || os.Getenv("DEBUG_LEVEL") == "debug" {
+					cfg.Verbose = true
+				}
+				cfg.AutoUpdate = autoUpdate
+				if err := ensureConfigDir(configPath); err != nil {
+					log.Fatalf("Failed to prepare config path: %v", err)
+				}
+				if err := cfg.SaveToFile(configPath); err != nil {
+					log.Fatalf("Failed to save claimed configuration: %v", err)
+				}
+				log.Printf("Device claimed. Configuration saved to %s", configPath)
+				runAgent(parentCtx, configPath, verbose, autoUpdate, tunName, useTray)
+				return
+			}
+		} else if fetchErr != nil {
+			log.Printf("Claim not ready: %v", fetchErr)
+		} else {
+			log.Printf("Claim not ready yet")
+		}
+
+		select {
+		case <-parentCtx.Done():
+			log.Println("Stopped waiting for claim")
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUpdate bool, tunName string, useTray bool) {
@@ -416,6 +680,7 @@ func handlePeers() {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "Usage: %s <command> [arguments]\n", os.Args[0])
 	fmt.Fprintln(os.Stderr, "\nAvailable commands:")
+	fmt.Fprintln(os.Stderr, "  genkey     Generate a fixed device claim key and QR URL")
 	fmt.Fprintln(os.Stderr, "  login      Authenticate and configure client")
 	fmt.Fprintln(os.Stderr, "  connect    Connect using a configuration file")
 	fmt.Fprintln(os.Stderr, "  update     Self-update to the latest version")

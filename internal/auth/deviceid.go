@@ -6,23 +6,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/denisbrodbeck/machineid"
 )
 
-// fallbackIDPath is where we persist a generated UUID when machineid is
+// fallbackIDFile is where we persist a generated ID when machineid is
 // unavailable, so the fingerprint stays stable across runs.
-const fallbackIDPath = "/etc/wantastic/.device-id"
+const fallbackIDFile = ".device-id"
 
 // HashedDeviceID returns a privacy-preserving, stable device fingerprint.
 // It computes HMAC-SHA256(SharedSecret, normalized_hardware_id).
 //
 // Algorithm:
 //  1. Try machineid.ID() (platform-native machine identifier)
-//  2. If unavailable, load/generate a random UUID stored at fallbackIDPath
+//  2. If unavailable, load/generate an ID stored at fallbackIDFile
 //  3. Normalize: trim whitespace, lowercase
 //  4. Hash: HMAC-SHA256(SharedSecret, normalized_id)
 //  5. Encode: hex string
@@ -43,12 +41,16 @@ func HashedDeviceID() (string, error) {
 // persistentFallbackID loads the stored fallback ID or generates and persists
 // a new random one.
 func persistentFallbackID() (string, error) {
-	data, err := os.ReadFile(fallbackIDPath)
-	if err == nil {
-		id := strings.TrimSpace(string(data))
-		if id != "" {
+	path := PersistentFilePath(fallbackIDFile)
+	if id := strings.TrimSpace(readTextFile(path)); id != "" {
+		return id, nil
+	}
+	if serial, err := PersistentSerialNumber(); err == nil && strings.TrimSpace(serial) != "" {
+		id := "serial:" + strings.TrimSpace(serial)
+		if writeErr := writePersistentFile(path, id+"\n", 0o600); writeErr == nil {
 			return id, nil
 		}
+		return id, nil
 	}
 
 	// Generate 16 random bytes and hex-encode them as a stable identifier.
@@ -60,8 +62,6 @@ func persistentFallbackID() (string, error) {
 
 	// Best-effort persist. If the directory or file isn't writable (e.g.
 	// non-root), just use the in-memory value for this session.
-	if mkErr := os.MkdirAll(filepath.Dir(fallbackIDPath), 0700); mkErr == nil {
-		_ = os.WriteFile(fallbackIDPath, []byte(id+"\n"), 0600)
-	}
+	_ = writePersistentFile(path, id+"\n", 0o600)
 	return id, nil
 }

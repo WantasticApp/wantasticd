@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"wantastic-agent/internal/auth"
@@ -279,6 +280,70 @@ func LoadFromToken(ctx context.Context, portalURL, token string) (*Config, error
 	return registerAndDecryptConfig(ctx, portalURL, token)
 }
 
+func LoadFromClaimConfig(portalURL, privateKey, publicKey string, claim *auth.ClaimConfig) (*Config, error) {
+	if claim == nil {
+		return nil, fmt.Errorf("claim config missing")
+	}
+	if !claim.Claimed {
+		return nil, fmt.Errorf("device has not been claimed yet")
+	}
+	if strings.TrimSpace(claim.ServerKey) == "" {
+		return nil, fmt.Errorf("claim config missing server_key")
+	}
+	if strings.TrimSpace(claim.AssignedIP) == "" {
+		return nil, fmt.Errorf("claim config missing assigned_ip")
+	}
+	address, err := netip.ParsePrefix(strings.TrimSpace(claim.AssignedIP))
+	if err != nil {
+		return nil, fmt.Errorf("parse assigned_ip: %w", err)
+	}
+	endpointHost := strings.TrimSpace(claim.Endpoint)
+	endpointPort := claim.ListenPort
+	if host, port, splitErr := net.SplitHostPort(endpointHost); splitErr == nil {
+		endpointHost = strings.Trim(host, "[]")
+		if parsedPort, scanErr := strconv.Atoi(port); scanErr == nil && parsedPort > 0 {
+			endpointPort = parsedPort
+		}
+	}
+	if endpointPort == 0 {
+		endpointPort = 51820
+	}
+	mtu := claim.MTU
+	if mtu == 0 {
+		mtu = 1420
+	}
+	keepalive := claim.PersistentKeepalive
+	if keepalive == 0 {
+		keepalive = 25
+	}
+
+	cfg := &Config{
+		PrivateKey: strings.TrimSpace(privateKey),
+		PublicKey:  strings.TrimSpace(publicKey),
+		Server: Server{
+			Endpoint:            endpointHost,
+			Port:                endpointPort,
+			PublicKey:           strings.TrimSpace(claim.ServerKey),
+			AllowedIPs:          claim.AllowedIPs,
+			PersistentKeepalive: keepalive,
+		},
+		Interface: Interface{
+			Addresses:  []netip.Prefix{address},
+			ListenPort: 0,
+			MTU:        mtu,
+			DNS:        claim.DNSServers,
+		},
+		Auth: Auth{
+			PortalURL: portalURL,
+		},
+	}
+	cfg.GenerateDeviceID()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
 // registerAndDecryptConfig calls POST /api/agent/register over HTTPS, decrypts
 // the returned WireGuard config, and returns a ready-to-use Config.
 //
@@ -418,7 +483,12 @@ func (c *Config) GenerateDeviceID() {
 
 		if !useMac {
 			log.Printf("Warning: no stable hardware identifier (machine-id or MAC) found.")
-			log.Printf("Falling back to a random device ID. This device may be re-registered if the configuration is lost.")
+			if serial, serialErr := auth.PersistentSerialNumber(); serialErr == nil && strings.TrimSpace(serial) != "" {
+				hash := sha256.Sum256([]byte("serial:" + strings.TrimSpace(serial)))
+				c.DeviceID = hex.EncodeToString(hash[:])
+				return
+			}
+			log.Printf("Falling back to a random device ID. This device may be re-registered if the persistent identity store is unavailable.")
 			c.DeviceID = uuid.New().String()
 			return
 		}

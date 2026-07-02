@@ -39,6 +39,7 @@ const (
 // Well-known HTTP paths on the portal.
 const (
 	CredentialsPath = "/api/agent/credentials"
+	ClaimConfigPath = "/api/agent/claim-config"
 	DeviceCodePath  = "/oauth/device/code"
 	TokenPath       = "/oauth/token"
 	HandoffPath     = "/api/device-handoff"
@@ -58,6 +59,19 @@ var ErrUserDenied = errors.New("authorization was denied by the user")
 type Credentials struct {
 	Domain   string `json:"domain"`
 	ClientID string `json:"client_id"`
+}
+
+type ClaimConfig struct {
+	Claimed             bool     `json:"claimed"`
+	PublicKey           string   `json:"public_key"`
+	AssignedIP          string   `json:"assigned_ip"`
+	ServerKey           string   `json:"server_key"`
+	Endpoint            string   `json:"endpoint"`
+	AllowedIPs          []string `json:"allowed_ips"`
+	DNSServers          []string `json:"dns_servers"`
+	PersistentKeepalive int      `json:"persistent_keepalive"`
+	MTU                 int      `json:"mtu"`
+	ListenPort          int      `json:"listen_port"`
 }
 
 // PortalBaseURL returns the full HTTPS base URL for the portal domain.

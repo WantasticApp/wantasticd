@@ -81,6 +81,42 @@ irm https://get.wantastic.app/install.ps1 | iex
 
 After installation the agent needs credentials in `/etc/wantastic` to connect. There are three ways to authenticate:
 
+### Factory claim QR
+
+For sold devices, generate a stable WireGuard key and claim QR before shipping:
+
+```sh
+wantasticd genkey --out /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
+```
+
+The command saves the private key locally, prints the public key, and renders a QR code for:
+
+```text
+https://console.wantastic.app/#desktop?claim_public_key=<PUBLIC_KEY>
+```
+
+For a self-hosted Wantastic server, pass your own domain:
+
+```sh
+wantasticd genkey --out /etc/wantastic/device-claim-key.json --server-url https://wantastic.example.com
+```
+
+Anyone with that QR can claim the device into their signed-in Wantastic team on that server. Keep the generated JSON file on the device image and do not print the private key unless you are in a secure factory workflow.
+
+On the sold device, start the agent in claim-waiting mode. It keeps polling the configured server and connects automatically once the QR/public key is claimed:
+
+```sh
+wantasticd --wait-claim --claim-key /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
+```
+
+The short form is also supported:
+
+```sh
+wantasticd -wc --claim-key /etc/wantastic/device-claim-key.json --server-url https://wantastic.example.com
+```
+
+---
+
 ### 1. Interactive browser login
 
 ```sh

@@ -77,9 +77,9 @@ func ctrlRequest(t testing.TB, rt *uspRuntime, req wusp.USPAgentRequest) wusp.US
 		t.Fatalf("ctrlRequest: EncodeUSPAgentRequest(method=%d id=%d): %v", req.Method, req.ID, err)
 	}
 
-	var captured []byte
+	var captured [][]byte
 	err = rt.handleFrameFromPeer(rt.controllerPublicKeyHex, encoded, func(frame []byte) error {
-		captured = append([]byte(nil), frame...)
+		captured = append(captured, append([]byte(nil), frame...))
 		return nil
 	})
 	if err != nil {
@@ -89,7 +89,7 @@ func ctrlRequest(t testing.TB, rt *uspRuntime, req wusp.USPAgentRequest) wusp.US
 		t.Fatalf("ctrlRequest: agent produced no reply frame for method=%d id=%d", req.Method, req.ID)
 	}
 
-	return decodeControlResponseDatagram(t, captured)
+	return decodeControlResponseDatagrams(t, captured)
 }
 
 // ── GetSupportedProtocol ─────────────────────────────────────────────────────
@@ -430,19 +430,19 @@ func TestIntegration_WireFormatRoundTrip(t *testing.T) {
 		req  wusp.USPAgentRequest
 	}{
 		{"GetSupportedProtocol", wusp.USPAgentRequest{
-			ID:     1, Method: wusp.USPAgentMethodGetSupportedProtocol,
+			ID: 1, Method: wusp.USPAgentMethodGetSupportedProtocol,
 		}},
 		{"GetSupportedDM", wusp.USPAgentRequest{
-			ID:     2, Method: wusp.USPAgentMethodGetSupportedDM, Paths: []string{},
+			ID: 2, Method: wusp.USPAgentMethodGetSupportedDM, Paths: []string{},
 		}},
 		{"GetSpecificPath", wusp.USPAgentRequest{
-			ID:     3, Method: wusp.USPAgentMethodGet, Paths: []string{"Device.DeviceInfo.HostName"},
+			ID: 3, Method: wusp.USPAgentMethodGet, Paths: []string{"Device.DeviceInfo.HostName"},
 		}},
 		{"GetAll", wusp.USPAgentRequest{
-			ID:     4, Method: wusp.USPAgentMethodGet, Paths: []string{},
+			ID: 4, Method: wusp.USPAgentMethodGet, Paths: []string{},
 		}},
 		{"SetProvisioningCode", wusp.USPAgentRequest{
-			ID:     5, Method: wusp.USPAgentMethodSet,
+			ID: 5, Method: wusp.USPAgentMethodSet,
 			Message: func() *wusp.Message {
 				m := wusp.NewMessage()
 				m.Set("Device.DeviceInfo.ProvisioningCode", wusp.String("wire-test"))

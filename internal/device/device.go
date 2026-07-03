@@ -426,7 +426,9 @@ func (d *Device) SendWUSP(peerPubKey string, data []byte) error {
 		return fmt.Errorf("peer not found: %s", peerPubKey)
 	}
 
-	peer.SendWUSP(data)
+	if err := peer.SendWUSP(data); err != nil {
+		return fmt.Errorf("send WUSP to peer %s: %w", peerPubKey, err)
+	}
 	return nil
 }
 

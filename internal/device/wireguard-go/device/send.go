@@ -8,6 +8,7 @@ package device
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -113,14 +114,14 @@ func (peer *Peer) SendTUNControl(data []byte) {
 	peer.SendStagedPackets()
 }
 
-func (peer *Peer) SendWUSP(data []byte) {
-	peer.SendWUSPFragmented(data, wusp.WUSPMaxDatagramPayload)
+func (peer *Peer) SendWUSP(data []byte) error {
+	return peer.SendWUSPFragmented(data, wusp.WUSPMaxDatagramPayload)
 }
 
-func (peer *Peer) SendWUSPFragmented(data []byte, maxDatagramPayload int) {
+func (peer *Peer) SendWUSPFragmented(data []byte, maxDatagramPayload int) error {
 	if !peer.isRunning.Load() {
 		peer.device.log.Verbosef("%v - SendWUSP: Peer not running", peer)
-		return
+		return fmt.Errorf("peer not running")
 	}
 
 	// Always wrap in control fragments — even for small payloads. The fragment
@@ -130,7 +131,7 @@ func (peer *Peer) SendWUSPFragmented(data []byte, maxDatagramPayload int) {
 	frames, err := wusp.FragmentUSPControlPayload(data, peer.device.nextWUSPFragmentMessageID(), maxDatagramPayload)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to fragment WUSP payload: %v", peer, err)
-		return
+		return err
 	}
 
 	// Queue ALL fragments before calling SendStagedPackets — this prevents
@@ -138,7 +139,7 @@ func (peer *Peer) SendWUSPFragmented(data []byte, maxDatagramPayload int) {
 	for _, frame := range frames {
 		if len(frame) > wusp.WUSPMaxDatagramPayload {
 			peer.device.log.Errorf("%v - WUSP payload too large: %d (Max %d)", peer, len(frame), wusp.WUSPMaxDatagramPayload)
-			return
+			return fmt.Errorf("wusp payload too large: %d", len(frame))
 		}
 
 		elemsContainer := peer.device.GetOutboundElementsContainer()
@@ -154,16 +155,17 @@ func (peer *Peer) SendWUSPFragmented(data []byte, maxDatagramPayload int) {
 	}
 	peer.SendStagedPackets()
 	peer.device.log.Verbosef("%v - Sending %d WUSP packet(s)", peer, len(frames))
+	return nil
 }
 
-func (peer *Peer) SendWUSPDatagram(data []byte) {
+func (peer *Peer) SendWUSPDatagram(data []byte) error {
 	if !peer.isRunning.Load() {
 		peer.device.log.Verbosef("%v - SendWUSPDatagram: Peer not running", peer)
-		return
+		return fmt.Errorf("peer not running")
 	}
 	if len(data) > wusp.WUSPMaxDatagramPayload {
 		peer.device.log.Errorf("%v - WUSP datagram too large: %d (Max %d)", peer, len(data), wusp.WUSPMaxDatagramPayload)
-		return
+		return fmt.Errorf("wusp datagram too large: %d", len(data))
 	}
 
 	elemsContainer := peer.device.GetOutboundElementsContainer()
@@ -174,6 +176,7 @@ func (peer *Peer) SendWUSPDatagram(data []byte) {
 	elemsContainer.elems = append(elemsContainer.elems, elem)
 	peer.queue.staged <- elemsContainer
 	peer.SendStagedPackets()
+	return nil
 }
 
 func (peer *Peer) releaseStagedWUSPPackets(elemsContainer *QueueOutboundElementsContainer) {

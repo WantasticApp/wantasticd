@@ -273,8 +273,7 @@ func (r *uspRuntime) HandlePeerPacket(peer *wgdevice.Peer, data []byte) {
 	log.Printf("[USP] HandlePeerPacket: peer=%s bytes=%d", peerHex, len(data))
 	if err := r.handleFrameFromPeer(peerHex, data, func(frame []byte) error {
 		log.Printf("[USP] Sending WUSP response: peer=%s bytes=%d", peerHex, len(frame))
-		peer.SendWUSPDatagram(frame)
-		return nil
+		return peer.SendWUSPDatagram(frame)
 	}); err != nil {
 		log.Printf("[USP] WUSP frame handling failed: peer=%s err=%v", peerHex, err)
 	}
@@ -356,6 +355,15 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 
 	if req.Method == wusp.USPAgentMethodUpload || req.Method == wusp.USPAgentMethodDownload {
 		return r.handleTransferControlRequest(ctx, peerPublicKeyHex, req, reply)
+	}
+
+	if req.Method == wusp.USPAgentMethodGetSupportedProtocol {
+		log.Printf("[USP] Replying GetSupportedProtocol directly: id=%d", req.ID)
+		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{
+			ID:       req.ID,
+			Method:   req.Method,
+			Protocol: r.agent.GetSupportedProtocol(),
+		})
 	}
 
 	log.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)

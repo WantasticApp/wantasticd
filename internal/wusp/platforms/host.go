@@ -411,6 +411,9 @@ func collectCellularStatic(msg *wusp.Message) {
 		if sig.RSRQ != 0 {
 			msg.Set(prefix+"RSRQ", wusp.Int(int64(sig.RSRQ)))
 		}
+		if sig.SINR != 0 {
+			msg.Set(prefix+"SINR", wusp.Int(int64(sig.SINR)))
+		}
 
 		// SIM / USIM
 		if validDigitString(info.IMSI, 14, 15) {

@@ -3,6 +3,7 @@ package platforms
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,7 +12,8 @@ import (
 	"github.com/stratoberry/go-gpsd"
 )
 
-// collectGPSStatic populates Device.DeviceInfo.Location.1.* from gpsd or /tmp/gps_info.txt.
+// collectGPSStatic populates the standard TR-181 Device.DeviceInfo.Location
+// object from gpsd or common OpenWrt GPS status files.
 func collectGPSStatic(msg *wusp.Message) {
 	info := gpsFromGPSD()
 	if info == nil {
@@ -25,25 +27,10 @@ func collectGPSStatic(msg *wusp.Message) {
 
 	prefix := "Device.DeviceInfo.Location.1."
 	msg.Set(prefix+"Source", wusp.String("GPS"))
-
-	// TR-181 Location uses PIDF-LO XML in DataObject, but for simplicity
-	// we store coordinates as individual params that the controller can read.
-	// The raw lat/lon/alt are stored as vendor extensions under X_WANTASTIC_
-	msg.Set(prefix+"X_WANTASTIC_Latitude", wusp.String(fmt.Sprintf("%.6f", info.lat)))
-	msg.Set(prefix+"X_WANTASTIC_Longitude", wusp.String(fmt.Sprintf("%.6f", info.lon)))
-	if info.alt != 0 {
-		msg.Set(prefix+"X_WANTASTIC_Altitude", wusp.String(fmt.Sprintf("%.1f", info.alt)))
-	}
-	if info.speed > 0 {
-		msg.Set(prefix+"X_WANTASTIC_Speed", wusp.String(fmt.Sprintf("%.1f", info.speed)))
-	}
-	if info.satellites > 0 {
-		msg.Set(prefix+"X_WANTASTIC_Satellites", wusp.Uint(uint64(info.satellites)))
-	}
-	msg.Set(prefix+"X_WANTASTIC_Fix", wusp.String(info.fix))
 	if !info.timestamp.IsZero() {
-		msg.Set(prefix+"AcquiredTime", wusp.String(info.timestamp.UTC().Format(time.RFC3339)))
+		msg.Set(prefix+"AcquiredTime", wusp.Time(info.timestamp.UTC()))
 	}
+	msg.Set(prefix+"DataObject", wusp.String(formatLocationDataObject(info)))
 }
 
 type gpsInfo struct {
@@ -104,18 +91,109 @@ func gpsFromGPSD() *gpsInfo {
 }
 
 func gpsFromFile() *gpsInfo {
-	data, err := os.ReadFile("/tmp/gps_info.txt")
-	if err != nil {
-		return nil
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "latitude=") {
-			line = strings.ReplaceAll(line, "- ", "-")
-			var lat, lon, alt float64
-			if _, err := fmt.Sscanf(line, "latitude=%f, longitude=%f, altitude=%f", &lat, &lon, &alt); err == nil {
-				return &gpsInfo{lat: lat, lon: lon, alt: alt, fix: "2D", timestamp: time.Now()}
-			}
+	for _, path := range []string{"/tmp/gps_info.txt", "/tmp/gpsdata", "/var/run/gps_info.txt"} {
+		if info := gpsFromStatusFile(path); info != nil {
+			return info
 		}
 	}
 	return nil
+}
+
+func gpsFromStatusFile(path string) *gpsInfo {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return parseGPSStatus(string(data), time.Now())
+}
+
+func parseGPSStatus(data string, fallbackTime time.Time) *gpsInfo {
+	values := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "- ", "-"))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "latitude=") {
+			var lat, lon, alt float64
+			if _, err := fmt.Sscanf(line, "latitude=%f, longitude=%f, altitude=%f", &lat, &lon, &alt); err == nil {
+				return &gpsInfo{lat: lat, lon: lon, alt: alt, fix: "2D", timestamp: fallbackTime}
+			}
+		}
+		if key, val, ok := strings.Cut(line, "="); ok {
+			values[strings.ToLower(strings.TrimSpace(key))] = strings.Trim(strings.TrimSpace(val), `"'`)
+		}
+	}
+
+	lat, latOK := parseFloatValue(values, "lat", "latitude")
+	lon, lonOK := parseFloatValue(values, "lon", "lng", "longitude")
+	if !latOK || !lonOK || (lat == 0 && lon == 0) {
+		return nil
+	}
+	alt, _ := parseFloatValue(values, "alt", "altitude", "height")
+	speed, _ := parseFloatValue(values, "speed")
+	satellites, _ := parseIntValue(values, "satellites", "sats", "used")
+	timestamp := fallbackTime
+	if raw := firstValue(values, "time", "timestamp", "acquiredtime"); raw != "" {
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			timestamp = parsed
+		}
+	}
+	fix := firstValue(values, "fix", "mode", "status")
+	if fix == "" {
+		fix = "2D"
+	}
+	return &gpsInfo{
+		lat:        lat,
+		lon:        lon,
+		alt:        alt,
+		speed:      speed,
+		satellites: satellites,
+		fix:        fix,
+		timestamp:  timestamp,
+	}
+}
+
+func parseFloatValue(values map[string]string, keys ...string) (float64, bool) {
+	raw := firstValue(values, keys...)
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSuffix(raw, "m"), 64)
+	return parsed, err == nil
+}
+
+func parseIntValue(values map[string]string, keys ...string) (int, bool) {
+	raw := firstValue(values, keys...)
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(raw)
+	return parsed, err == nil
+}
+
+func firstValue(values map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if val := strings.TrimSpace(values[key]); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func formatLocationDataObject(info *gpsInfo) string {
+	timestamp := info.timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	altitude := ""
+	if info.alt != 0 {
+		altitude = fmt.Sprintf(" %.1f", info.alt)
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><presence xmlns="urn:ietf:params:xml:ns:pidf" entity="pres:wantasticd"><tuple id="gps"><status><geopriv xmlns="urn:ietf:params:xml:ns:pidf:geopriv10"><location-info><Point xmlns="http://www.opengis.net/gml" srsName="urn:ogc:def:crs:EPSG::4979"><pos>%.6f %.6f%s</pos></Point></location-info><usage-rules/><method>GPS</method></geopriv></status><timestamp>%s</timestamp></tuple></presence>`,
+		info.lat,
+		info.lon,
+		altitude,
+		timestamp.UTC().Format(time.RFC3339),
+	)
 }

@@ -374,6 +374,8 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	// Network interface details via getifaddrs (pure Go)
 	collectNetworkInterfacesStatic(msg)
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
+	collectCellularStatic(msg)
+	collectGPSStatic(msg)
 
 	return msg, nil
 }

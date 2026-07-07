@@ -68,15 +68,6 @@ if [ "$OS" = "linux" ]; then
   fi
 fi
 
-# ── DNS (Linux) ───────────────────────────────────────────────────────────────
-if [ "$OS" = "linux" ]; then
-  if ! grep -qE "nameserver[[:space:]]+(1\.1\.1\.1|8\.8\.8\.8)" /etc/resolv.conf 2>/dev/null; then
-    echo "Adding reliable DNS to /etc/resolv.conf…"
-    printf '\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' >> /etc/resolv.conf 2>/dev/null || \
-      echo "  Warning: could not update /etc/resolv.conf"
-  fi
-fi
-
 # ── download helpers ──────────────────────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -138,8 +129,28 @@ chmod +x "${INSTALL_PATH}.new"
 mv -f "${INSTALL_PATH}.new" "$INSTALL_PATH"
 echo "wantasticd $VERSION installed."
 
-# ── config (/etc/wantastic — never overwritten if it exists) ─────────────────
-CONFIG_FILE="/etc/wantastic"
+# ── config (never overwritten if it exists) ──────────────────────────────────
+if [ -n "${WANTASTIC_CONFIG:-}" ]; then
+  CONFIG_FILE="$WANTASTIC_CONFIG"
+elif [ -n "${WANTASTIC_CONFIG_DIR:-}" ]; then
+  CONFIG_FILE="${WANTASTIC_CONFIG_DIR%/}/config.conf"
+elif [ "$OS" = "linux" ] && [ -f "/etc/wantastic" ] && [ ! -d "/etc/wantastic" ]; then
+  CONFIG_FILE="/etc/wantastic"
+elif [ "$OS" = "linux" ] && [ -d "/usrdata" ]; then
+  CONFIG_FILE="/usrdata/wantastic/etc/config.conf"
+elif [ "$OS" = "darwin" ]; then
+  CONFIG_FILE="/Library/Application Support/Wantastic/config.conf"
+else
+  CONFIG_FILE="/etc/wantastic/config.conf"
+fi
+
+CONFIG_DIR=$(dirname "$CONFIG_FILE")
+mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+quote_sh() {
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+INSTALL_PATH_Q=$(quote_sh "$INSTALL_PATH")
+CONFIG_FILE_Q=$(quote_sh "$CONFIG_FILE")
 
 if [ ! -f "$CONFIG_FILE" ]; then
   touch "$CONFIG_FILE" 2>/dev/null && chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -212,7 +223,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_PATH} connect --config ${CONFIG_FILE}
+ExecStart=${INSTALL_PATH} connect --config "${CONFIG_FILE}"
 Restart=on-failure
 RestartSec=5
 KillMode=process
@@ -235,7 +246,7 @@ STOP=10
 USE_PROCD=1
 start_service() {
   procd_open_instance
-  procd_set_param command ${INSTALL_PATH} connect --config ${CONFIG_FILE}
+  procd_set_param command ${INSTALL_PATH_Q} connect --config ${CONFIG_FILE_Q}
   procd_set_param respawn 3600 5 0
   procd_set_param stdout 1
   procd_set_param stderr 1
@@ -254,7 +265,7 @@ install_service_openrc() {
 #!/sbin/openrc-run
 description="Wantastic Overlay Networking Daemon"
 command="${INSTALL_PATH}"
-command_args="connect --config ${CONFIG_FILE}"
+command_args="connect --config ${CONFIG_FILE_Q}"
 command_background=true
 pidfile=/run/wantasticd.pid
 depend() { need net; }
@@ -277,7 +288,7 @@ install_service_sysv() {
 PIDFILE=/var/run/wantasticd.pid
 case "\$1" in
   start) start-stop-daemon --start --background --make-pidfile \
-           --pidfile \$PIDFILE --exec ${INSTALL_PATH} -- connect --config ${CONFIG_FILE} ;;
+           --pidfile \$PIDFILE --exec ${INSTALL_PATH_Q} -- connect --config ${CONFIG_FILE_Q} ;;
   stop)  start-stop-daemon --stop --pidfile \$PIDFILE; rm -f \$PIDFILE ;;
   restart) \$0 stop; sleep 1; \$0 start ;;
   *) echo "Usage: \$0 {start|stop|restart}"; exit 1 ;;
@@ -297,7 +308,7 @@ install_service_busybox() {
   # Minimal embedded: respawn via /etc/inittab
   INIT_SCRIPT=/etc/init.d/wantasticd
   printf '#!/bin/sh\nexec %s connect --config %s\n' \
-    "$INSTALL_PATH" "$CONFIG_FILE" > "$INIT_SCRIPT"
+    "$INSTALL_PATH_Q" "$CONFIG_FILE_Q" > "$INIT_SCRIPT"
   chmod +x "$INIT_SCRIPT"
   if ! grep -q "wantasticd" /etc/inittab 2>/dev/null; then
     printf '::respawn:%s\n' "$INIT_SCRIPT" >> /etc/inittab

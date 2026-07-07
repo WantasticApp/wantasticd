@@ -22,3 +22,4 @@ bulk_install.sh
 .claude/
 *.conf
 test.rsc
+device-claim-key.json

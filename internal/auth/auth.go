@@ -40,6 +40,7 @@ const (
 const (
 	CredentialsPath = "/api/agent/credentials"
 	ClaimConfigPath = "/api/agent/claim-config"
+	ClaimWaitPath   = "/api/agent/claim-wait"
 	DeviceCodePath  = "/oauth/device/code"
 	TokenPath       = "/oauth/token"
 	HandoffPath     = "/api/device-handoff"
@@ -109,9 +110,12 @@ var httpClient = &http.Client{
 	Timeout: 15 * time.Second,
 }
 
+var insecureSkipVerify bool
+
 // SetInsecureSkipVerify replaces the shared HTTP client with one that skips
 // TLS certificate verification. Only call this in dev mode.
 func SetInsecureSkipVerify() {
+	insecureSkipVerify = true
 	httpClient = &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{

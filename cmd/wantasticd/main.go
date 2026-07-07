@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -20,6 +19,7 @@ import (
 	"time"
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
+	platformdns "wantastic-agent/internal/platform/dns"
 	"wantastic-agent/internal/update"
 
 	"wantastic-agent/internal/agent"
@@ -283,7 +283,7 @@ func handleLogin() {
 	// interactive step — the user expects the tunnel to come up immediately.
 	log.Println("Starting connection...")
 
-	ensureSystemDNS()
+	platformdns.EnsureBootstrap(ctx)
 	cfg.Interface.TUNMode = true
 	cfg.Interface.TUNName = autoTUNName()
 
@@ -398,33 +398,25 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
+		claim, waitErr := auth.WaitClaimConfig(parentCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
+		if waitErr == nil && claim != nil && claim.Claimed {
+			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray) {
+				return
+			}
+		} else if waitErr != nil && parentCtx.Err() == nil {
+			log.Printf("Claim websocket unavailable, falling back to signed polling: %v", waitErr)
+		}
+
 		pollCtx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
 		claim, fetchErr := auth.FetchClaimConfig(pollCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
 		cancel()
 		if fetchErr == nil && claim != nil && claim.Claimed {
-			cfg, cfgErr := config.LoadFromClaimConfig(serverURL, keyFile.PrivateKey, keyFile.PublicKey, claim)
-			if cfgErr != nil {
-				log.Printf("Claim found but config is not ready: %v", cfgErr)
-			} else {
-				cfg.Interface.TUNMode = true
-				cfg.Interface.TUNName = tunName
-				if verbose || os.Getenv("DEBUG_LEVEL") == "debug" {
-					cfg.Verbose = true
-				}
-				cfg.AutoUpdate = autoUpdate
-				if err := ensureConfigDir(configPath); err != nil {
-					log.Fatalf("Failed to prepare config path: %v", err)
-				}
-				if err := cfg.SaveToFile(configPath); err != nil {
-					log.Fatalf("Failed to save claimed configuration: %v", err)
-				}
-				log.Printf("Device claimed. Configuration saved to %s", configPath)
-				runAgent(parentCtx, configPath, verbose, autoUpdate, tunName, useTray)
+			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray) {
 				return
 			}
-		} else if fetchErr != nil {
-			log.Printf("Claim not ready: %v", fetchErr)
-		} else {
+		} else if fetchErr != nil && parentCtx.Err() == nil {
+			log.Printf("Claim polling not ready: %v", fetchErr)
+		} else if parentCtx.Err() == nil {
 			log.Printf("Claim not ready yet")
 		}
 
@@ -435,6 +427,29 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		case <-ticker.C:
 		}
 	}
+}
+
+func applyClaimedConfig(parentCtx context.Context, configPath, serverURL string, keyFile *claimKeyFile, claim *auth.ClaimConfig, verbose bool, autoUpdate bool, tunName string, useTray bool) bool {
+	cfg, cfgErr := config.LoadFromClaimConfig(serverURL, keyFile.PrivateKey, keyFile.PublicKey, claim)
+	if cfgErr != nil {
+		log.Printf("Claim found but config is not ready: %v", cfgErr)
+		return false
+	}
+	cfg.Interface.TUNMode = true
+	cfg.Interface.TUNName = tunName
+	if verbose || os.Getenv("DEBUG_LEVEL") == "debug" {
+		cfg.Verbose = true
+	}
+	cfg.AutoUpdate = autoUpdate
+	if err := ensureConfigDir(configPath); err != nil {
+		log.Fatalf("Failed to prepare config path: %v", err)
+	}
+	if err := cfg.SaveToFile(configPath); err != nil {
+		log.Fatalf("Failed to save claimed configuration: %v", err)
+	}
+	log.Printf("Device claimed. Configuration saved to %s", configPath)
+	runAgent(parentCtx, configPath, verbose, autoUpdate, tunName, useTray)
+	return true
 }
 
 func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUpdate bool, tunName string, useTray bool) {
@@ -455,8 +470,9 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 
 	cfg.AutoUpdate = autoUpdate
 
-	// Ensure system has working public DNS before connecting.
-	ensureSystemDNS()
+	// Ensure bootstrap DNS resolution is sane before connecting. The platform
+	// DNS package avoids direct resolver-file writes unless that is safe.
+	platformdns.EnsureBootstrap(ctx)
 
 	// Enforce TUN mode config natively
 	cfg.Interface.TUNMode = true
@@ -491,55 +507,6 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 		log.Fatalf("Failed to stop agent: %v", err)
 	}
 	log.Println("Agent stopped successfully")
-}
-
-// ensureSystemDNS checks /etc/resolv.conf for a reliable public DNS server
-// (1.1.1.1 or 8.8.8.8) and appends both if neither is present. This prevents
-// WireGuard endpoint resolution failures on devices with missing or broken DNS.
-// No-op on non-Linux platforms.
-func ensureSystemDNS() {
-	if runtime.GOOS != "linux" {
-		return
-	}
-	const resolvConf = "/etc/resolv.conf"
-	data, err := os.ReadFile(resolvConf)
-	if err != nil {
-		return
-	}
-	content := string(data)
-	has1111 := strings.Contains(content, "1.1.1.1")
-	has8888 := strings.Contains(content, "8.8.8.8")
-	if has1111 || has8888 {
-		return
-	}
-
-	// Neither reliable DNS present — check existing nameservers still respond.
-	hasWorking := false
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "nameserver") {
-			parts := strings.Fields(line)
-			if len(parts) == 2 {
-				if _, err := net.LookupHost("one.one.one.one"); err == nil {
-					hasWorking = true
-					break
-				}
-			}
-		}
-	}
-	if hasWorking {
-		return
-	}
-
-	log.Println("No reliable DNS found — adding 1.1.1.1 and 8.8.8.8 to /etc/resolv.conf")
-	f, err := os.OpenFile(resolvConf, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Warning: could not update /etc/resolv.conf: %v", err)
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString("\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 }
 
 func printVersion() {

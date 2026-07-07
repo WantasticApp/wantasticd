@@ -32,6 +32,9 @@ func PersistentDir() string {
 			return filepath.Join(dir, "Wantastic")
 		}
 	case "darwin":
+		if os.Geteuid() == 0 {
+			return filepath.Join(string(os.PathSeparator), "Library", "Application Support", "Wantastic")
+		}
 		if dir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
 			return filepath.Join(dir, "Wantastic")
 		}

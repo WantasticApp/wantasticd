@@ -83,7 +83,9 @@ After installation the agent needs credentials in `/etc/wantastic` to connect. T
 
 ### Factory claim QR
 
-For sold devices, generate a stable WireGuard key and claim QR before shipping:
+For sold devices, generate a stable WireGuard key and claim QR. By default this
+command keeps running forever, waits for the customer claim, writes the final
+config, and connects automatically:
 
 ```sh
 wantasticd genkey --out /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
@@ -103,16 +105,16 @@ wantasticd genkey --out /etc/wantastic/device-claim-key.json --server-url https:
 
 Anyone with that QR can claim the device into their signed-in Wantastic team on that server. Keep the generated JSON file on the device image and do not print the private key unless you are in a secure factory workflow.
 
-On the sold device, start the agent in claim-waiting mode. It keeps polling the configured server and connects automatically once the QR/public key is claimed:
+To generate the key and exit without waiting, pass `--no-wait`:
 
 ```sh
-wantasticd --wait-claim --claim-key /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
+wantasticd genkey --no-wait --out /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
 ```
 
-The short form is also supported:
+If a config has not been claimed yet, `connect` also enters claim-waiting mode automatically when the claim key exists:
 
 ```sh
-wantasticd -wc --claim-key /etc/wantastic/device-claim-key.json --server-url https://wantastic.example.com
+wantasticd connect --claim-key /etc/wantastic/device-claim-key.json --server-url https://wantastic.example.com
 ```
 
 ---

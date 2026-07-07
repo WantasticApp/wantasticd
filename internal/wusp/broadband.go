@@ -46,6 +46,13 @@ var SupplementalDeviceParams = []Param{
 		Description:  "Human-friendly device name exposed by Wantastic backends when the underlying platform supports it.",
 		Limits:       Limits{MaxLength: 64},
 	},
+	{
+		Path:         "Device.Cellular.Interface.{i}.SINR",
+		Type:         TypeInt,
+		Access:       ReadOnly,
+		SinceVersion: "2.20",
+		Description:  "Wantastic runtime cellular signal-to-interference-plus-noise ratio in dB, collected from LTE/NR modem telemetry when the platform exposes it.",
+	},
 }
 
 // DeviceObjects is sourced from the generated USP model, excluding the
@@ -57,17 +64,17 @@ var runtimeDeviceParams = concatUniqueParams(
 	SupplementalDeviceParams,
 )
 
-var DeviceRootParams       = directParamsUnder(runtimeDeviceParams, "Device.")
-var DeviceInfoParams       = paramsWithPrefix(runtimeDeviceParams, "Device.DeviceInfo.")
-var DeviceTimeParams       = paramsWithPrefix(runtimeDeviceParams, "Device.Time.")
-var DeviceIPParams         = paramsWithPrefix(runtimeDeviceParams, "Device.IP.")
-var DeviceFirewallParams   = paramsWithPrefix(runtimeDeviceParams, "Device.Firewall.")
-var DeviceNATParams        = paramsWithPrefix(runtimeDeviceParams, "Device.NAT.")
-var DeviceBulkDataParams   = paramsWithPrefix(runtimeDeviceParams, "Device.BulkData.")
+var DeviceRootParams = directParamsUnder(runtimeDeviceParams, "Device.")
+var DeviceInfoParams = paramsWithPrefix(runtimeDeviceParams, "Device.DeviceInfo.")
+var DeviceTimeParams = paramsWithPrefix(runtimeDeviceParams, "Device.Time.")
+var DeviceIPParams = paramsWithPrefix(runtimeDeviceParams, "Device.IP.")
+var DeviceFirewallParams = paramsWithPrefix(runtimeDeviceParams, "Device.Firewall.")
+var DeviceNATParams = paramsWithPrefix(runtimeDeviceParams, "Device.NAT.")
+var DeviceBulkDataParams = paramsWithPrefix(runtimeDeviceParams, "Device.BulkData.")
 var DeviceLocalAgentParams = directParamsUnder(runtimeDeviceParams, "Device.LocalAgent.")
-var DeviceWiFiParams       = paramsWithPrefix(runtimeDeviceParams, "Device.WiFi.")
+var DeviceWiFiParams = paramsWithPrefix(runtimeDeviceParams, "Device.WiFi.")
 
-var ManagementServerObjects   = objectsWithPrefix(DeviceObjects, "Device.ManagementServer.")
+var ManagementServerObjects = objectsWithPrefix(DeviceObjects, "Device.ManagementServer.")
 var AllManagementServerParams = paramsWithPrefix(runtimeDeviceParams, "Device.ManagementServer.")
 
 var LocalAgentExtraObjects = objectsWithPrefixExcluding(DeviceObjects, "Device.LocalAgent.", "Device.LocalAgent.")

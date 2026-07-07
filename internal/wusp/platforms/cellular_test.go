@@ -63,6 +63,7 @@ func TestCellularRepresentativeMessageValidates(t *testing.T) {
 	msg.Set(prefix+"RSSI", wusp.Int(-61))
 	msg.Set(prefix+"RSRP", wusp.Int(-91))
 	msg.Set(prefix+"RSRQ", wusp.Int(-8))
+	msg.Set(prefix+"SINR", wusp.Int(16))
 	msg.Set(prefix+"Mode", wusp.String("Unknown"))
 	msg.Set(prefix+"SIMReferenceList", wusp.List())
 	msg.Set(prefix+"Stats.BytesSent", wusp.Uint(1))

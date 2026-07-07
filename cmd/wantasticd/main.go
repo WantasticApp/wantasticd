@@ -71,13 +71,21 @@ type claimKeyFile struct {
 func handleGenKey() {
 	genCmd := flag.NewFlagSet("genkey", flag.ExitOnError)
 	outPath := genCmd.String("out", defaultClaimKeyPath(), "Path to save/reuse the device claim key JSON")
+	configPath := genCmd.String("config", auth.DefaultConfigPath(), "Path to save claimed configuration")
 	serverURL := genCmd.String("server-url", "", "Wantastic server URL/domain used in the claim QR")
 	server := genCmd.String("server", "", "Wantastic server domain shorthand for --server-url")
 	portalURL := genCmd.String("portal-url", "", "Deprecated alias for --server-url")
 	force := genCmd.Bool("force", false, "Generate a new key even if --out already exists")
 	printQR := genCmd.Bool("qr", true, "Print a terminal QR code for the claim URL")
 	showPrivate := genCmd.Bool("show-private", false, "Print the private key to stdout")
+	noWait := genCmd.Bool("no-wait", false, "Generate the key and exit without waiting for claim")
+	claimPoll := genCmd.Duration("claim-poll", 10*time.Second, "How often to poll for claim completion when websocket wait is unavailable")
+	verbose := genCmd.Bool("v", false, "Enable verbose logging and debug output after claim")
+	autoUpdate := genCmd.Bool("auto-update", false, "Enable automatic self-updates after claim")
+	useTray := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+	flagTray := genCmd.Bool("tray", useTray, "Enable system tray GUI after claim")
 	genCmd.Parse(os.Args[2:])
+	useTray = *flagTray
 
 	claimServerURL := resolveClaimServerURL(*serverURL, *server, *portalURL)
 	keyFile, reused, err := loadOrCreateClaimKey(*outPath, claimServerURL, *force)
@@ -104,6 +112,15 @@ func handleGenKey() {
 			HalfBlocks: true,
 		})
 	}
+	if *noWait {
+		return
+	}
+
+	tunName := autoTUNName()
+	log.Println("Waiting for claim. Press Ctrl+C to stop.")
+	runner.RunServiceHook(func(ctx context.Context) {
+		runWaitClaim(ctx, *outPath, *configPath, claimServerURL, *claimPoll, *verbose, *autoUpdate, tunName, useTray)
+	})
 }
 
 func defaultClaimKeyPath() string {
@@ -123,7 +140,7 @@ func loadOrCreateClaimKey(path, portalBaseURL string, force bool) (*claimKeyFile
 			existing.ServerURL = normalizeClaimServerURL(portalBaseURL)
 			existing.ClaimURL = buildClaimURL(portalBaseURL, existing.PublicKey)
 			if err := auth.PersistPublicKey(existing.PublicKey); err != nil {
-				return nil, false, fmt.Errorf("persist public key: %w", err)
+				log.Printf("Warning: could not persist public key copy: %v", err)
 			}
 			return &existing, true, nil
 		} else if !os.IsNotExist(err) {
@@ -146,7 +163,7 @@ func loadOrCreateClaimKey(path, portalBaseURL string, force bool) (*claimKeyFile
 		return nil, false, err
 	}
 	if err := auth.PersistPublicKey(publicKey); err != nil {
-		return nil, false, fmt.Errorf("persist public key: %w", err)
+		log.Printf("Warning: could not persist public key copy: %v", err)
 	}
 	return keyFile, false, nil
 }
@@ -365,6 +382,14 @@ func handleConnect() {
 			}
 		}
 	}
+	if _, err := os.Stat(*configPath); err != nil {
+		if os.IsNotExist(err) && claimKeyExists(*claimKeyPath) {
+			log.Printf("Config not found at %s; waiting for claim using %s", *configPath, *claimKeyPath)
+			*waitClaim = true
+		} else if os.IsNotExist(err) && !*waitClaim {
+			log.Fatalf("Config not found at %s. Run `wantasticd genkey --out %s` to create a claim key and wait for claim, or pass --wait-claim with an existing key.", *configPath, *claimKeyPath)
+		}
+	}
 
 	runner.RunServiceHook(func(ctx context.Context) {
 		if *waitClaim {
@@ -373,6 +398,14 @@ func handleConnect() {
 		}
 		runAgent(ctx, *configPath, *verbose, *autoUpdate, tunName, useTray)
 	})
+}
+
+func claimKeyExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL string, pollInterval time.Duration, verbose bool, autoUpdate bool, tunName string, useTray bool) {

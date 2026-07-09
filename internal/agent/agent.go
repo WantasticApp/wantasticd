@@ -98,7 +98,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		log.Println("Auto-update enabled")
 		go a.runUpdateChecker(ctx)
 	} else {
-		log.Println("Auto-update disabled (use --auto-update to enable)")
+		log.Println("Auto-update disabled")
 	}
 
 	if err := a.apiServer.Start(); err != nil {

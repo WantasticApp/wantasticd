@@ -68,6 +68,28 @@ type claimKeyFile struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+type autoUpdateFlags struct {
+	autoUpdate   *bool
+	noAutoUpdate *bool
+}
+
+func registerAutoUpdateFlags(fs *flag.FlagSet, enableHelp, disableHelp string) autoUpdateFlags {
+	return autoUpdateFlags{
+		autoUpdate:   fs.Bool("auto-update", true, enableHelp),
+		noAutoUpdate: fs.Bool("no-auto-update", false, disableHelp),
+	}
+}
+
+func (f autoUpdateFlags) Enabled() bool {
+	if f.noAutoUpdate != nil && *f.noAutoUpdate {
+		return false
+	}
+	if f.autoUpdate == nil {
+		return true
+	}
+	return *f.autoUpdate
+}
+
 func handleGenKey() {
 	genCmd := flag.NewFlagSet("genkey", flag.ExitOnError)
 	outPath := genCmd.String("out", defaultClaimKeyPath(), "Path to save/reuse the device claim key JSON")
@@ -81,11 +103,12 @@ func handleGenKey() {
 	noWait := genCmd.Bool("no-wait", false, "Generate the key and exit without waiting for claim")
 	claimPoll := genCmd.Duration("claim-poll", 10*time.Second, "How often to poll for claim completion when websocket wait is unavailable")
 	verbose := genCmd.Bool("v", false, "Enable verbose logging and debug output after claim")
-	autoUpdate := genCmd.Bool("auto-update", false, "Enable automatic self-updates after claim")
+	autoUpdateFlags := registerAutoUpdateFlags(genCmd, "Enable automatic self-updates after claim (default on)", "Disable automatic self-updates after claim")
 	useTray := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 	flagTray := genCmd.Bool("tray", useTray, "Enable system tray GUI after claim")
 	genCmd.Parse(os.Args[2:])
 	useTray = *flagTray
+	autoUpdate := autoUpdateFlags.Enabled()
 
 	claimServerURL := resolveClaimServerURL(*serverURL, *server, *portalURL)
 	keyFile, reused, err := loadOrCreateClaimKey(*outPath, claimServerURL, *force)
@@ -119,7 +142,7 @@ func handleGenKey() {
 	tunName := autoTUNName()
 	log.Println("Waiting for claim. Press Ctrl+C to stop.")
 	runner.RunServiceHook(func(ctx context.Context) {
-		runWaitClaim(ctx, *outPath, *configPath, claimServerURL, *claimPoll, *verbose, *autoUpdate, tunName, useTray)
+		runWaitClaim(ctx, *outPath, *configPath, claimServerURL, *claimPoll, *verbose, autoUpdate, tunName, useTray)
 	})
 }
 
@@ -251,7 +274,9 @@ func handleLogin() {
 	portalURL := loginCmd.String("portal-url", "https://"+auth.DefaultOAuth2Domain, "Portal base URL")
 	server := loginCmd.String("server", "", "Server hostname (shorthand for --portal-url https://HOST)")
 	dev := loginCmd.Bool("dev", false, "Use local dev portal (https://"+auth.DefaultOAuth2DevDomain+")")
+	autoUpdateFlags := registerAutoUpdateFlags(loginCmd, "Enable automatic self-updates after login (default on)", "Disable automatic self-updates after login")
 	loginCmd.Parse(os.Args[2:])
+	autoUpdate := autoUpdateFlags.Enabled()
 
 	// --server sets portal URL and disables TLS verification (local/dev servers
 	// use self-signed certs or IP addresses without SANs).
@@ -284,6 +309,7 @@ func handleLogin() {
 	// Log key config details so we can diagnose connection issues
 	log.Printf("Login successful: endpoint=%s:%d, address=%v",
 		cfg.Server.Endpoint, cfg.Server.Port, cfg.Interface.Addresses)
+	cfg.AutoUpdate = autoUpdate
 
 	configPath := auth.DefaultConfigPath()
 	if err := ensureConfigDir(configPath); err != nil {
@@ -305,7 +331,7 @@ func handleLogin() {
 	cfg.Interface.TUNName = autoTUNName()
 
 	runner.RunServiceHook(func(ctx context.Context) {
-		runAgent(ctx, configPath, false, false, cfg.Interface.TUNName, false)
+		runAgent(ctx, configPath, false, autoUpdate, cfg.Interface.TUNName, false)
 	})
 }
 
@@ -348,7 +374,7 @@ func handleConnect() {
 	waitClaimShort := connectCmd.Bool("wc", false, "Alias for --wait-claim")
 	claimPoll := connectCmd.Duration("claim-poll", 10*time.Second, "How often to poll for claim completion")
 	verbose := connectCmd.Bool("v", false, "Enable verbose logging and debug output")
-	autoUpdate := connectCmd.Bool("auto-update", false, "Enable automatic self-updates")
+	autoUpdateFlags := registerAutoUpdateFlags(connectCmd, "Enable automatic self-updates (default on)", "Disable automatic self-updates")
 
 	useTray := false
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
@@ -360,6 +386,7 @@ func handleConnect() {
 	connectCmd.Parse(os.Args[2:])
 
 	useTray = *flagTray
+	autoUpdate := autoUpdateFlags.Enabled()
 	if *waitClaimShort {
 		*waitClaim = true
 	}
@@ -393,10 +420,10 @@ func handleConnect() {
 
 	runner.RunServiceHook(func(ctx context.Context) {
 		if *waitClaim {
-			runWaitClaim(ctx, *claimKeyPath, *configPath, resolveClaimServerURL(*serverURL, *server, *portalURL), *claimPoll, *verbose, *autoUpdate, tunName, useTray)
+			runWaitClaim(ctx, *claimKeyPath, *configPath, resolveClaimServerURL(*serverURL, *server, *portalURL), *claimPoll, *verbose, autoUpdate, tunName, useTray)
 			return
 		}
-		runAgent(ctx, *configPath, *verbose, *autoUpdate, tunName, useTray)
+		runAgent(ctx, *configPath, *verbose, autoUpdate, tunName, useTray)
 	})
 }
 

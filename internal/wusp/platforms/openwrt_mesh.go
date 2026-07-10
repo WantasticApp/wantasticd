@@ -18,6 +18,11 @@ type openWrtRealTopo struct {
 	root     *meshNode
 }
 
+type openWrtMeshLinkHint struct {
+	source string
+	target string
+}
+
 func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wusp.Message) {
 	data, err := b.readOpenWrtRealTopo(ctx)
 	if err != nil || len(bytes.TrimSpace(data)) == 0 {
@@ -230,6 +235,7 @@ func parseOpenWrtRealTopo(data []byte) (openWrtRealTopo, bool) {
 	raw = unwrapOpenWrtRealTopo(raw)
 	protocol := findOpenWrtMeshProtocol(raw)
 	root := meshNodeFromAny(raw, "", 0)
+	applyOpenWrtLinkHints(root, raw)
 	if root == nil && protocol == "" {
 		return openWrtRealTopo{}, false
 	}
@@ -368,6 +374,139 @@ func meshNodeFromMap(payload map[string]any, hint string, depth int) *meshNode {
 		node.id = node.mac
 	}
 	return node
+}
+
+func applyOpenWrtLinkHints(root *meshNode, raw any) {
+	if root == nil {
+		return
+	}
+	links := extractOpenWrtMeshLinkHints(raw)
+	if len(links) == 0 {
+		return
+	}
+	nodes := flattenMeshForest(normalizedMeshRoots(root))
+	byKey := make(map[string]*meshNode, len(nodes)*4)
+	for _, node := range nodes {
+		for _, key := range meshIdentityKeys(node) {
+			if _, exists := byKey[key]; !exists {
+				byKey[key] = node
+			}
+		}
+	}
+	for _, link := range links {
+		source := lookupOpenWrtMeshHintNode(link.source, byKey)
+		target := lookupOpenWrtMeshHintNode(link.target, byKey)
+		if source == nil || target == nil || source == target {
+			continue
+		}
+		if target.parentMAC == "" {
+			target.parentMAC = source.mac
+		}
+		if target.parentID == "" {
+			target.parentID = meshNodeID(source, 1)
+		}
+	}
+}
+
+func lookupOpenWrtMeshHintNode(value string, byKey map[string]*meshNode) *meshNode {
+	for _, key := range meshIdentityKeys(&meshNode{id: value, mac: value, name: value, ip: value}) {
+		if node := byKey[key]; node != nil {
+			return node
+		}
+	}
+	return nil
+}
+
+func extractOpenWrtMeshLinkHints(raw any) []openWrtMeshLinkHint {
+	switch value := raw.(type) {
+	case map[string]any:
+		hints := make([]openWrtMeshLinkHint, 0)
+		if hint, ok := openWrtMeshLinkHintFromMap(value); ok {
+			hints = append(hints, hint)
+		}
+		for key, item := range value {
+			if isOpenWrtMeshLinkCollectionKey(key) {
+				hints = append(hints, extractOpenWrtMeshLinkHints(item)...)
+				continue
+			}
+			switch item.(type) {
+			case map[string]any, []any:
+				hints = append(hints, extractOpenWrtMeshLinkHints(item)...)
+			}
+		}
+		return hints
+	case []any:
+		hints := make([]openWrtMeshLinkHint, 0, len(value))
+		for _, item := range value {
+			hints = append(hints, extractOpenWrtMeshLinkHints(item)...)
+		}
+		return hints
+	default:
+		return nil
+	}
+}
+
+func openWrtMeshLinkHintFromMap(payload map[string]any) (openWrtMeshLinkHint, bool) {
+	parent := firstMeshIdentityCI(payload,
+		"parent", "parent_id", "parentId", "parent_node", "parentNode",
+		"parent_mac", "parentMac", "parent_mac_address", "parentMacAddress",
+		"parent_al_mac", "parentAlMac", "uplink", "uplink_id", "uplinkId",
+		"uplink_mac", "uplinkMac", "upstream", "upstream_id", "upstreamId",
+		"upstream_mac", "upstreamMac", "backhaul_parent", "backhaulParent",
+		"backhaul_parent_mac", "backhaulParentMAC",
+	)
+	if parent != "" {
+		child := firstMeshIdentityCI(payload,
+			"id", "node_id", "nodeId", "device_id", "deviceId", "al_id", "alId", "ieee1905_id",
+			"mac", "macaddr", "mac_address", "macAddress", "al_mac", "alMac", "backhaul_mac", "backhaulMac",
+			"child", "child_id", "childId", "child_mac", "childMac", "slave", "slave_mac", "agent", "agent_mac",
+		)
+		if child != "" && child != parent {
+			return openWrtMeshLinkHint{source: parent, target: child}, true
+		}
+	}
+
+	source := firstMeshIdentityCI(payload,
+		"source", "source_id", "sourceId", "source_mac", "sourceMac",
+		"src", "src_id", "srcId", "src_mac", "srcMac",
+		"from", "from_id", "fromId", "from_mac", "fromMac",
+		"local", "local_id", "localId", "local_mac", "localMac",
+	)
+	target := firstMeshIdentityCI(payload,
+		"target", "target_id", "targetId", "target_mac", "targetMac",
+		"dst", "dst_id", "dstId", "dst_mac", "dstMac",
+		"to", "to_id", "toId", "to_mac", "toMac",
+		"remote", "remote_id", "remoteId", "remote_mac", "remoteMac",
+		"neighbor", "neighbor_id", "neighborId", "neighbor_mac", "neighborMac",
+		"neighbour", "neighbour_id", "neighbourId", "neighbour_mac", "neighbourMac",
+		"child", "child_id", "childId", "child_mac", "childMac",
+	)
+	if source == "" || target == "" || source == target {
+		return openWrtMeshLinkHint{}, false
+	}
+	return openWrtMeshLinkHint{source: source, target: target}, true
+}
+
+func firstMeshIdentityCI(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := lookupAnyCI(payload, key)
+		if !ok {
+			continue
+		}
+		if text := strings.TrimSpace(stringFromAny(value)); text != "" {
+			return text
+		}
+		if nested, ok := value.(map[string]any); ok {
+			if text := firstStringCI(nested,
+				"id", "node_id", "nodeId", "device_id", "deviceId", "al_id", "alId", "ieee1905_id",
+				"mac", "macaddr", "mac_address", "macAddress", "al_mac", "alMac", "backhaul_mac", "backhaulMac",
+				"hostname", "name", "ip", "ipaddr", "ip_address", "ipAddress",
+			); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 func meshChildrenFromAny(raw any, hint string, depth int) []*meshNode {
@@ -571,6 +710,18 @@ func isOpenWrtMeshCollectionKey(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(key)) {
 	case "devices", "nodes", "children", "child", "childs", "agents", "ap_devices", "apdevices",
 		"mesh_nodes", "meshnodes", "downlink_devices", "downlinkdevices", "connected_devices", "connecteddevices":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOpenWrtMeshLinkCollectionKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "links", "link", "edges", "edge", "connections", "connection",
+		"topology_links", "topologylinks", "topo_links", "topolinks",
+		"backhaul_links", "backhaullinks", "uplinks", "uplink_links", "upstream_links",
+		"neighbor_links", "neighborlinks", "neighbour_links", "neighbourlinks":
 		return true
 	default:
 		return false

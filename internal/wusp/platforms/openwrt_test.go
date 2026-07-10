@@ -245,6 +245,88 @@ func TestOpenWrtBackendCollectMeshTopologyFallsBackToCLI(t *testing.T) {
 	}
 }
 
+func TestOpenWrtBackendCollectMeshTopologyRootsFlatDevices(t *testing.T) {
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, errors.New("cli disabled in test")
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "device" && method == "getRealTopo" {
+				return []byte(`{
+					"mesh_protocol":"easymesh",
+					"devices":{
+						"02:00:00:4b:e9:21":{"hostname":"G1TK7EY001160","ip":"192.168.200.1"},
+						"02:00:00:4b:e9:2a":{"hostname":"G1TK7EY001177","ip":"192.168.200.109"},
+						"02:00:00:4b:e5:16":{"hostname":"G1TK7EY000012","ip":"192.168.200.193"}
+					}
+				}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+		Now: func() time.Time {
+			return time.Unix(1700000500, 0).UTC()
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Hostname", "G1TK7EY001160")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Role", "Controller")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.HopCount", 0)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress", "02:00:00:4b:e9:21")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 1)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress", "02:00:00:4b:e9:21")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetMACAddress", "02:00:00:4b:e5:16")
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(flat rooted mesh topology): %v", err)
+	}
+}
+
+func TestOpenWrtBackendCollectMeshTopologyUsesLinkHints(t *testing.T) {
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, errors.New("cli disabled in test")
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "device" && method == "getRealTopo" {
+				return []byte(`{
+					"mesh_type":"openmesh",
+					"devices":{
+						"02:00:00:00:20:01":{"hostname":"controller","ip":"192.168.200.1"},
+						"02:00:00:00:20:02":{"hostname":"middle","ip":"192.168.200.2"},
+						"02:00:00:00:20:03":{"hostname":"leaf","ip":"192.168.200.3"}
+					},
+					"links":[
+						{"source_mac":"02:00:00:00:20:01","target_mac":"02:00:00:00:20:02"},
+						{"source_mac":"02:00:00:00:20:02","target_mac":"02:00:00:00:20:03"}
+					]
+				}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+		Now: func() time.Time {
+			return time.Unix(1700000600, 0).UTC()
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentNode", "Device.WUSP_MeshTelemetry.Node.2.")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.HopCount", 2)
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(link hinted mesh topology): %v", err)
+	}
+}
+
 func TestOpenWrtBackendCollectMeshConfigFromUCI(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")

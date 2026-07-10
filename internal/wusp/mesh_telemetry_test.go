@@ -11,6 +11,12 @@ func TestWUSPMeshTelemetryModelRegistered(t *testing.T) {
 		access Access
 	}{
 		{"Device.WUSP_MeshTelemetry.Link.1.PacketLoss", TypeDecimal, ReadOnly},
+		{"Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress", TypeMACAddress, ReadOnly},
+		{"Device.WUSP_MeshTelemetry.Link.1.TargetMACAddress", TypeMACAddress, ReadOnly},
+		{"Device.WUSP_MeshTelemetry.Node.1.MACAddress", TypeMACAddress, ReadOnly},
+		{"Device.WUSP_MeshTelemetry.Node.1.ParentNode", TypePathRef, ReadOnly},
+		{"Device.WUSP_MeshTelemetry.Node.1.ParentMACAddress", TypeMACAddress, ReadOnly},
+		{"Device.WUSP_MeshTelemetry.Node.1.HopCount", TypeUnsignedInt, ReadOnly},
 		{"Device.WUSP_MeshTelemetry.Protocol.1.Name", TypeString, ReadOnly},
 		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshID", TypeString, ReadWrite},
 		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.Key", TypeString, WriteOnly},
@@ -50,7 +56,12 @@ func TestWUSPMeshTelemetryModelRegistered(t *testing.T) {
 func TestWUSPMeshTelemetryValuesValidate(t *testing.T) {
 	tests := []string{
 		"Device.WUSP_MeshTelemetry.Enable",
+		"Device.WUSP_MeshTelemetry.Node.1.MACAddress",
+		"Device.WUSP_MeshTelemetry.Node.1.ParentNode",
+		"Device.WUSP_MeshTelemetry.Node.1.ParentMACAddress",
+		"Device.WUSP_MeshTelemetry.Node.1.HopCount",
 		"Device.WUSP_MeshTelemetry.Node.1.Role",
+		"Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress",
 		"Device.WUSP_MeshTelemetry.Link.1.SignalQuality",
 		"Device.WUSP_MeshTelemetry.Route.1.NextHopNode",
 		"Device.WUSP_MeshTelemetry.Protocol.1.StandardMultiAPReference",

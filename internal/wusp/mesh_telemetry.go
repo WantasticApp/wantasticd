@@ -181,11 +181,32 @@ var WUSPMeshTelemetryNodeParams = []Param{
 		Limits:       Limits{MaxLength: 128},
 	},
 	{
+		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.MACAddress",
+		Type:         TypeMACAddress,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "Primary mesh, IEEE 1905 AL, or backhaul MAC address for this node when known.",
+	},
+	{
 		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.PeerReference",
 		Type:         TypePathRef,
 		Access:       ReadOnly,
 		SinceVersion: "1.0",
 		Description:  "Path reference to the peer represented by this telemetry node.",
+	},
+	{
+		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.ParentNode",
+		Type:         TypePathRef,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "Path reference to the parent mesh node that provides this node's upstream/backhaul path.",
+	},
+	{
+		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.ParentMACAddress",
+		Type:         TypeMACAddress,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "MAC address of the parent mesh node when the source topology reports parent identity by MAC.",
 	},
 	{
 		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.Role",
@@ -228,6 +249,14 @@ var WUSPMeshTelemetryNodeParams = []Param{
 		Limits:       Limits{MaxLength: 128},
 	},
 	{
+		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.HopCount",
+		Type:         TypeUnsignedInt,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "Number of parent/backhaul hops from the controller or topology root to this node.",
+		Limits:       Limits{Min: iptr(0)},
+	},
+	{
 		Path:         WUSPMeshTelemetryPrefix + "Node.{i}.LastSeen",
 		Type:         TypeDateTime,
 		Access:       ReadOnly,
@@ -266,6 +295,20 @@ var WUSPMeshTelemetryLinkParams = []Param{
 		Access:       ReadOnly,
 		SinceVersion: "1.0",
 		Description:  "Path reference to the target Device.WUSP_MeshTelemetry.Node.{i}. row.",
+	},
+	{
+		Path:         WUSPMeshTelemetryPrefix + "Link.{i}.SourceMACAddress",
+		Type:         TypeMACAddress,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "MAC address of the source node for this topology link when known.",
+	},
+	{
+		Path:         WUSPMeshTelemetryPrefix + "Link.{i}.TargetMACAddress",
+		Type:         TypeMACAddress,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "MAC address of the target node for this topology link when known.",
 	},
 	{
 		Path:         WUSPMeshTelemetryPrefix + "Link.{i}.Status",

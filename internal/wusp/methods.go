@@ -879,6 +879,23 @@ func safeStringLengthTarget(limits Limits, fallback int) int {
 
 func safeSamplePathRef(path string) string {
 	switch {
+	case strings.Contains(path, "WUSP_MeshTelemetry.Protocol") && strings.HasSuffix(path, ".StandardMultiAPReference"):
+		return "Device.WiFi.MultiAP.APDevice.1."
+	case strings.Contains(path, "WUSP_MeshTelemetry.Protocol") && strings.HasSuffix(path, ".PrimaryObject"):
+		return "Device.WUSP_MeshTelemetry.BATMANAdv.1."
+	case strings.Contains(path, "WUSP_MeshTelemetry") && strings.HasSuffix(path, ".ProtocolReference"):
+		return "Device.WUSP_MeshTelemetry.Protocol.1."
+	case strings.Contains(path, "WUSP_MeshTelemetry.IEEE80211s") && strings.HasSuffix(path, ".RadioReference"):
+		return "Device.WiFi.Radio.1."
+	case strings.Contains(path, "WUSP_MeshTelemetry.Link") || strings.Contains(path, "WUSP_MeshTelemetry.Route"):
+		if strings.HasSuffix(path, ".Interface") {
+			return "Device.IP.Interface.1."
+		}
+		return "Device.WUSP_MeshTelemetry.Node.1."
+	case strings.Contains(path, "WUSP_MeshTelemetry.Node") && strings.HasSuffix(path, ".ParentNode"):
+		return "Device.WUSP_MeshTelemetry.Node.1."
+	case strings.Contains(path, "WUSP_MeshTelemetry.Node") && strings.HasSuffix(path, ".PeerReference"):
+		return "Device.WireGuard.Peer.1."
 	case strings.Contains(path, "WireGuard"):
 		return "Device.WireGuard.Peer.1."
 	case strings.Contains(path, "ManagementServer"):

@@ -173,11 +173,21 @@ func TestOpenWrtBackendCollectMeshTopologyFromRealTopo(t *testing.T) {
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Hostname", "gateway")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Role", "Controller")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.MACAddress", "02:00:00:00:00:01")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.HopCount", 0)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Hostname", "hallway-ap")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Role", "Relay")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress", "02:00:00:00:00:01")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 1)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.Address", "192.168.10.3")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentNode", "Device.WUSP_MeshTelemetry.Node.2.")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentMACAddress", "02:00:00:00:00:02")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.HopCount", 2)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceNode", "Device.WUSP_MeshTelemetry.Node.1.")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetNode", "Device.WUSP_MeshTelemetry.Node.2.")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress", "02:00:00:00:00:01")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetMACAddress", "02:00:00:00:00:02")
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SignalQuality", 78)
 	assertUintField(t, msg, "Device.WiFi.MultiAP.APDeviceNumberOfEntries", 3)
 	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.1.BackhaulLinkType", "None")
@@ -201,7 +211,7 @@ func TestOpenWrtBackendCollectMeshTopologyFallsBackToCLI(t *testing.T) {
 					"mesh_type":"openmesh",
 					"devices":{
 						"02:00:00:00:10:01":{"hostname":"root-node","role":"gateway"},
-						"02:00:00:00:10:02":{"hostname":"leaf-node","role":"agent","rssi":-68}
+						"02:00:00:00:10:02":{"hostname":"leaf-node","role":"agent","parent_mac":"02:00:00:00:10:01","rssi":-68}
 					}
 				}`), nil
 			}
@@ -219,9 +229,17 @@ func TestOpenWrtBackendCollectMeshTopologyFallsBackToCLI(t *testing.T) {
 		t.Fatalf("cli calls=%v, want one getRealTopo fallback", calls)
 	}
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.1.Name", "OpenMesh")
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Hostname", "root-node")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.Hostname", "leaf-node")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 2)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Hostname", "root-node")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.MACAddress", "02:00:00:00:10:01")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Hostname", "leaf-node")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.MACAddress", "02:00:00:00:10:02")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress", "02:00:00:00:10:01")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 1)
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress", "02:00:00:00:10:01")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetMACAddress", "02:00:00:00:10:02")
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(cli mesh topology): %v", err)
 	}

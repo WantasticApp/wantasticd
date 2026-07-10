@@ -11,13 +11,15 @@ import (
 
 // meshNode is a simplified mesh topology node shared by platform collectors.
 type meshNode struct {
-	id       string
-	name     string
-	mac      string
-	ip       string
-	signal   int
-	role     string
-	children []*meshNode
+	id        string
+	name      string
+	mac       string
+	ip        string
+	signal    int
+	role      string
+	parentID  string
+	parentMAC string
+	children  []*meshNode
 }
 
 type meshSnapshot struct {
@@ -87,14 +89,18 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 		msg.Set("Device.WUSP_MeshTelemetry.Protocol.1.StandardMultiAPReference", wusp.String("Device.WiFi.MultiAP."))
 	}
 
-	nodes := flattenMeshNodes(snapshot.topology)
+	roots := attachMeshParentHints(normalizedMeshRoots(snapshot.topology))
+	nodes := flattenMeshForest(roots)
 	msg.Set("Device.WUSP_MeshTelemetry.NodeNumberOfEntries", wusp.Uint(uint64(len(nodes))))
-	msg.Set("Device.WUSP_MeshTelemetry.LinkNumberOfEntries", wusp.Uint(uint64(countMeshLinks(snapshot.topology))))
+	msg.Set("Device.WUSP_MeshTelemetry.LinkNumberOfEntries", wusp.Uint(uint64(countMeshLinksForRoots(roots))))
 	if len(nodes) == 0 {
 		return
 	}
 
 	nodeIndex := make(map[*meshNode]int, len(nodes))
+	parentByNode := make(map[*meshNode]*meshNode, len(nodes))
+	depthByNode := make(map[*meshNode]int, len(nodes))
+	indexMeshTree(roots, nil, 0, parentByNode, depthByNode, make(map[*meshNode]struct{}, len(nodes)))
 	apDeviceCount := 0
 	for i, node := range nodes {
 		index := i + 1
@@ -105,6 +111,20 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 		msg.Set(prefix+"Role", wusp.String(normalizeMeshRole(firstNonEmpty(node.role, snapshot.role))))
 		msg.Set(prefix+"Status", wusp.String("Online"))
 		msg.Set(prefix+"NeighborCount", wusp.Uint(uint64(len(node.children))))
+		if mac, ok := parseMeshMAC(node.mac); ok {
+			msg.Set(prefix+"MACAddress", wusp.MAC(mac))
+		}
+		if parent := parentByNode[node]; parent != nil {
+			if parentIndex := nodeIndex[parent]; parentIndex > 0 {
+				msg.Set(prefix+"ParentNode", wusp.String(meshNodePath(parentIndex)))
+			}
+			if parentMAC, ok := parseMeshMAC(parent.mac); ok {
+				msg.Set(prefix+"ParentMACAddress", wusp.MAC(parentMAC))
+			}
+		} else if parentMAC, ok := parseMeshMAC(node.parentMAC); ok {
+			msg.Set(prefix+"ParentMACAddress", wusp.MAC(parentMAC))
+		}
+		msg.Set(prefix+"HopCount", wusp.Uint(uint64(depthByNode[node])))
 		if node.name != "" {
 			msg.Set(prefix+"Hostname", wusp.String(node.name))
 		}
@@ -138,35 +158,90 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 	msg.Set("Device.WiFi.MultiAP.APDeviceNumberOfEntries", wusp.Uint(uint64(apDeviceCount)))
 
 	linkIndex := 0
-	appendMeshLinks(msg, snapshot.topology, nodeIndex, &linkIndex)
+	appendMeshLinksForRoots(msg, roots, nodeIndex, &linkIndex)
 }
 
-func flattenMeshNodes(root *meshNode) []*meshNode {
+func normalizedMeshRoots(root *meshNode) []*meshNode {
 	if root == nil {
 		return nil
 	}
-	nodes := []*meshNode{root}
-	for _, child := range root.children {
-		nodes = append(nodes, flattenMeshNodes(child)...)
+	if isSyntheticMeshRoot(root) {
+		return dedupeMeshChildren(root.children)
+	}
+	return []*meshNode{root}
+}
+
+func isSyntheticMeshRoot(node *meshNode) bool {
+	if node == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(node.name), "Mesh Topology") &&
+		strings.TrimSpace(firstNonEmpty(node.id, node.mac, node.ip)) == ""
+}
+
+func flattenMeshForest(roots []*meshNode) []*meshNode {
+	nodes := make([]*meshNode, 0)
+	seen := make(map[*meshNode]struct{})
+	for _, root := range roots {
+		nodes = append(nodes, flattenMeshNodes(root, seen)...)
 	}
 	return nodes
 }
 
-func countMeshLinks(node *meshNode) int {
+func flattenMeshNodes(root *meshNode, seen map[*meshNode]struct{}) []*meshNode {
+	if root == nil {
+		return nil
+	}
+	if _, ok := seen[root]; ok {
+		return nil
+	}
+	seen[root] = struct{}{}
+	nodes := []*meshNode{root}
+	for _, child := range root.children {
+		nodes = append(nodes, flattenMeshNodes(child, seen)...)
+	}
+	return nodes
+}
+
+func countMeshLinksForRoots(roots []*meshNode) int {
+	total := 0
+	seen := make(map[*meshNode]struct{})
+	for _, root := range roots {
+		total += countMeshLinks(root, seen)
+	}
+	return total
+}
+
+func countMeshLinks(node *meshNode, seen map[*meshNode]struct{}) int {
 	if node == nil {
 		return 0
 	}
+	if _, ok := seen[node]; ok {
+		return 0
+	}
+	seen[node] = struct{}{}
 	count := len(node.children)
 	for _, child := range node.children {
-		count += countMeshLinks(child)
+		count += countMeshLinks(child, seen)
 	}
 	return count
 }
 
-func appendMeshLinks(msg *wusp.Message, node *meshNode, nodeIndex map[*meshNode]int, linkIndex *int) {
+func appendMeshLinksForRoots(msg *wusp.Message, roots []*meshNode, nodeIndex map[*meshNode]int, linkIndex *int) {
+	seen := make(map[*meshNode]struct{})
+	for _, root := range roots {
+		appendMeshLinks(msg, root, nodeIndex, linkIndex, seen)
+	}
+}
+
+func appendMeshLinks(msg *wusp.Message, node *meshNode, nodeIndex map[*meshNode]int, linkIndex *int, seen map[*meshNode]struct{}) {
 	if node == nil {
 		return
 	}
+	if _, ok := seen[node]; ok {
+		return
+	}
+	seen[node] = struct{}{}
 	source := nodeIndex[node]
 	for _, child := range node.children {
 		target := nodeIndex[child]
@@ -174,8 +249,14 @@ func appendMeshLinks(msg *wusp.Message, node *meshNode, nodeIndex map[*meshNode]
 			*linkIndex = *linkIndex + 1
 			prefix := fmt.Sprintf("Device.WUSP_MeshTelemetry.Link.%d.", *linkIndex)
 			msg.Set(prefix+"Alias", wusp.String(fmt.Sprintf("link-%d", *linkIndex)))
-			msg.Set(prefix+"SourceNode", wusp.String(fmt.Sprintf("Device.WUSP_MeshTelemetry.Node.%d.", source)))
-			msg.Set(prefix+"TargetNode", wusp.String(fmt.Sprintf("Device.WUSP_MeshTelemetry.Node.%d.", target)))
+			msg.Set(prefix+"SourceNode", wusp.String(meshNodePath(source)))
+			msg.Set(prefix+"TargetNode", wusp.String(meshNodePath(target)))
+			if mac, ok := parseMeshMAC(node.mac); ok {
+				msg.Set(prefix+"SourceMACAddress", wusp.MAC(mac))
+			}
+			if mac, ok := parseMeshMAC(child.mac); ok {
+				msg.Set(prefix+"TargetMACAddress", wusp.MAC(mac))
+			}
 			msg.Set(prefix+"Status", wusp.String("Up"))
 			if child.signal != 0 {
 				quality := signalDBMToQuality(child.signal)
@@ -183,8 +264,153 @@ func appendMeshLinks(msg *wusp.Message, node *meshNode, nodeIndex map[*meshNode]
 				msg.Set(prefix+"Metric", wusp.Uint(uint64(100-quality)))
 			}
 		}
-		appendMeshLinks(msg, child, nodeIndex, linkIndex)
+		appendMeshLinks(msg, child, nodeIndex, linkIndex, seen)
 	}
+}
+
+func indexMeshTree(roots []*meshNode, parent *meshNode, depth int, parents map[*meshNode]*meshNode, depths map[*meshNode]int, seen map[*meshNode]struct{}) {
+	for _, node := range roots {
+		if node == nil {
+			continue
+		}
+		if _, ok := seen[node]; ok {
+			continue
+		}
+		seen[node] = struct{}{}
+		if parent != nil {
+			parents[node] = parent
+		}
+		depths[node] = depth
+		indexMeshTree(node.children, node, depth+1, parents, depths, seen)
+	}
+}
+
+func attachMeshParentHints(roots []*meshNode) []*meshNode {
+	roots = dedupeMeshChildren(roots)
+	nodes := flattenMeshForest(roots)
+	if len(nodes) < 2 {
+		return roots
+	}
+	byKey := make(map[string]*meshNode, len(nodes)*3)
+	for _, node := range nodes {
+		for _, key := range meshIdentityKeys(node) {
+			if _, exists := byKey[key]; !exists {
+				byKey[key] = node
+			}
+		}
+	}
+
+	parentByNode := make(map[*meshNode]*meshNode, len(nodes))
+	indexMeshTree(roots, nil, 0, parentByNode, make(map[*meshNode]int, len(nodes)), make(map[*meshNode]struct{}, len(nodes)))
+	for _, node := range nodes {
+		parent := lookupMeshParent(node, byKey)
+		if parent == nil || parent == node {
+			continue
+		}
+		if parentByNode[node] == parent {
+			continue
+		}
+		if wouldCreateMeshCycle(parent, node, parentByNode) {
+			continue
+		}
+		if oldParent := parentByNode[node]; oldParent != nil {
+			oldParent.children = removeMeshChild(oldParent.children, node)
+		} else {
+			roots = removeMeshChild(roots, node)
+		}
+		if !hasMeshChild(parent, node) {
+			parent.children = append(parent.children, node)
+		}
+		parentByNode[node] = parent
+	}
+	return dedupeMeshChildren(roots)
+}
+
+func lookupMeshParent(node *meshNode, byKey map[string]*meshNode) *meshNode {
+	if node == nil {
+		return nil
+	}
+	for _, value := range []string{node.parentMAC, node.parentID} {
+		for _, key := range meshIdentityKeys(&meshNode{id: value, mac: value, name: value, ip: value}) {
+			if parent := byKey[key]; parent != nil {
+				return parent
+			}
+		}
+	}
+	return nil
+}
+
+func meshIdentityKeys(node *meshNode) []string {
+	if node == nil {
+		return nil
+	}
+	keys := make([]string, 0, 5)
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		keys = append(keys, value)
+		if mac, ok := parseMeshMAC(value); ok {
+			keys = append(keys, mac.String())
+		}
+	}
+	add(node.id)
+	add(node.mac)
+	add(node.name)
+	add(node.ip)
+	if len(keys) < 2 {
+		return keys
+	}
+	deduped := keys[:0]
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, key)
+	}
+	return deduped
+}
+
+func hasMeshChild(parent, child *meshNode) bool {
+	if parent == nil || child == nil {
+		return false
+	}
+	for _, item := range parent.children {
+		if item == child {
+			return true
+		}
+	}
+	return false
+}
+
+func wouldCreateMeshCycle(parent, child *meshNode, parentByNode map[*meshNode]*meshNode) bool {
+	for node := parent; node != nil; node = parentByNode[node] {
+		if node == child {
+			return true
+		}
+	}
+	return false
+}
+
+func removeMeshChild(children []*meshNode, child *meshNode) []*meshNode {
+	if child == nil {
+		return children
+	}
+	result := children[:0]
+	for _, item := range children {
+		if item == child {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func meshNodePath(index int) string {
+	return fmt.Sprintf("Device.WUSP_MeshTelemetry.Node.%d.", index)
 }
 
 func normalizeMeshProtocol(value string) string {

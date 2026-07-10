@@ -323,6 +323,23 @@ func meshNodeFromMap(payload map[string]any, hint string, depth int) *meshNode {
 	node.ip = firstStringCI(payload, "ip", "ipaddr", "ip_address", "ipAddress", "ipv4", "address", "lan_ip", "lanIP")
 	node.role = firstNonEmpty(node.role, firstStringCI(payload, "role", "type", "device_role", "deviceRole", "mode", "node_type", "nodeType"))
 	node.signal = firstIntCI(payload, "rssi", "signal", "signal_strength", "signalStrength", "backhaul_signal", "backhaulSignal", "rx_signal", "rxSignal")
+	node.parentID = firstStringCI(payload,
+		"parent", "parent_id", "parentId", "parent_node", "parentNode",
+		"parent_al_id", "parentAlId", "parentAlID", "parent_ieee1905_id", "parentIEEE1905ID",
+		"uplink", "uplink_id", "uplinkId", "upstream", "upstream_id", "upstreamId",
+		"backhaul_parent", "backhaulParent",
+	)
+	node.parentMAC = firstStringCI(payload,
+		"parent_mac", "parentMac", "parent_mac_address", "parentMacAddress",
+		"parent_al_mac", "parentAlMac", "parentALMAC",
+		"uplink_mac", "uplinkMac", "upstream_mac", "upstreamMac",
+		"backhaul_parent_mac", "backhaulParentMAC",
+	)
+	if node.parentMAC == "" {
+		if mac, ok := parseMeshMAC(node.parentID); ok {
+			node.parentMAC = mac.String()
+		}
+	}
 
 	children := make([]*meshNode, 0)
 	for _, key := range openWrtMeshContainerKeys() {
@@ -567,6 +584,11 @@ func isOpenWrtMeshScalarKey(key string) bool {
 		"hostname", "host", "name", "alias", "device_name", "devicename", "friendly_name", "friendlyname", "label",
 		"ip", "ipaddr", "ip_address", "ipaddress", "ipv4", "address", "lan_ip", "lanip",
 		"role", "type", "device_role", "devicerole", "mode", "node_type", "nodetype",
+		"parent", "parent_id", "parentid", "parent_node", "parentnode", "parent_al_id", "parentalid", "parent_ieee1905_id", "parentieee1905id",
+		"parent_mac", "parentmac", "parent_mac_address", "parentmacaddress", "parent_al_mac", "parentalmac",
+		"uplink", "uplink_id", "uplinkid", "uplink_mac", "uplinkmac",
+		"upstream", "upstream_id", "upstreamid", "upstream_mac", "upstreammac",
+		"backhaul_parent", "backhaulparent", "backhaul_parent_mac", "backhaulparentmac",
 		"rssi", "signal", "signal_strength", "signalstrength", "backhaul_signal", "backhaulsignal", "rx_signal", "rxsignal",
 		"protocol", "mesh_protocol", "meshprotocol", "mesh_type", "meshtype", "standard", "status", "state":
 		return true

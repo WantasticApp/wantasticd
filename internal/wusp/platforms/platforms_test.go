@@ -3,6 +3,7 @@ package platforms
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,6 +226,20 @@ func assertStringField(t *testing.T, msg *wusp.Message, path, want string) {
 	}
 	if got.AsString() != want {
 		t.Fatalf("%s=%q want %q", path, got.AsString(), want)
+	}
+}
+
+func assertMACField(t *testing.T, msg *wusp.Message, path, want string) {
+	t.Helper()
+	got, ok := msg.Get(path)
+	if !ok {
+		t.Fatalf("%s missing from message", path)
+	}
+	if got.Tag != wusp.TagMAC {
+		t.Fatalf("%s tag=%v want TagMAC", path, got.Tag)
+	}
+	if actual := net.HardwareAddr(got.AsBytes()).String(); actual != want {
+		t.Fatalf("%s=%q want %q", path, actual, want)
 	}
 }
 

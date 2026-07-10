@@ -48,46 +48,13 @@ func collectMeshStatic(msg *wusp.Message) {
 	if topology != nil {
 		flattenMeshTopology(msg, topology, 0)
 	}
-}
 
-// meshNode is a simplified mesh topology node.
-type meshNode struct {
-	name     string
-	mac      string
-	ip       string
-	signal   int
-	role     string
-	children []*meshNode
-}
-
-// flattenMeshTopology writes mesh nodes as TR-181 DataElements devices.
-func flattenMeshTopology(msg *wusp.Message, node *meshNode, index int) int {
-	if node == nil {
-		return index
-	}
-	index++
-	prefix := fmt.Sprintf("Device.WiFi.DataElements.Network.Device.%d.", index)
-
-	if node.mac != "" {
-		msg.Set(prefix+"ID", wusp.String(node.mac))
-	}
-	if node.name != "" {
-		msg.Set(prefix+"X_WANTASTIC_Hostname", wusp.String(node.name))
-	}
-	if node.ip != "" {
-		msg.Set(prefix+"X_WANTASTIC_IPAddress", wusp.String(node.ip))
-	}
-	if node.signal != 0 {
-		msg.Set(prefix+"X_WANTASTIC_Signal", wusp.Int(int64(node.signal)))
-	}
-	if node.role != "" {
-		msg.Set(prefix+"X_WANTASTIC_Role", wusp.String(node.role))
-	}
-
-	for _, child := range node.children {
-		index = flattenMeshTopology(msg, child, index)
-	}
-	return index
+	appendMeshSnapshot(msg, meshSnapshot{
+		protocol:       protocol,
+		role:           role,
+		implementation: "Vendor",
+		topology:       topology,
+	})
 }
 
 // detectMeshTopology checks sysfs/procfs for mesh indicators.

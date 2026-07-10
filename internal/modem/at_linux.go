@@ -188,6 +188,12 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 			}
 		}
 	}
+	if lines := at.send("AT+CGCONTRDP"); len(lines) > 0 {
+		c.parseCGCONTRDP(lines, info)
+	}
+	if lines := at.send("AT+QMAP=\"WWAN\""); len(lines) > 0 {
+		c.parseQuectelWANIP(lines, info)
+	}
 	if lines := at.send("AT+QNWINFO"); len(lines) > 0 {
 		c.parseQuectelNetworkInfo(lines[0], info)
 	}
@@ -426,6 +432,87 @@ func (c *atController) parseQuectelServingCellInfo(lines []string, info *Info) {
 				setIntIfParsed(&info.Signal.SINR, values[offset+5])
 				setIntIfParsed(&info.Signal.RSRQ, values[offset+6])
 			}
+		}
+	}
+}
+
+func (c *atController) parseCGCONTRDP(lines []string, info *Info) {
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "+CGCONTRDP:") {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "+CGCONTRDP:")))
+		if len(values) < 4 {
+			continue
+		}
+		apn := strings.TrimSpace(values[2])
+		if apn == "" || strings.EqualFold(apn, "ims") {
+			continue
+		}
+		info.APN = apn
+		localAddr := strings.TrimSpace(values[3])
+		if localAddr != "" {
+			if strings.Contains(localAddr, ":") {
+				info.IPv6Address = localAddr
+			} else {
+				info.IPAddress = localAddr
+				info.Connected = true
+			}
+		}
+		if len(values) > 5 && strings.TrimSpace(values[5]) != "" {
+			info.DNS1 = strings.TrimSpace(values[5])
+		}
+		if len(values) > 6 && strings.TrimSpace(values[6]) != "" {
+			info.DNS2 = strings.TrimSpace(values[6])
+		}
+		if info.IPVersion == 0 {
+			switch {
+			case info.IPAddress != "" && info.IPv6Address != "":
+				info.IPVersion = -1
+			case info.IPv6Address != "":
+				info.IPVersion = 6
+			case info.IPAddress != "":
+				info.IPVersion = 4
+			}
+		}
+		return
+	}
+}
+
+func (c *atController) parseQuectelWANIP(lines []string, info *Info) {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+QMAP:") || !strings.Contains(line, "WWAN") {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QMAP:")))
+		if len(values) < 5 || !strings.EqualFold(values[0], "WWAN") {
+			continue
+		}
+		connected := strings.TrimSpace(values[1]) == "1"
+		ipType := strings.ToUpper(strings.TrimSpace(values[3]))
+		addr := strings.Trim(strings.TrimSpace(values[4]), `"`)
+		if addr == "" || addr == "0.0.0.0" || addr == "0:0:0:0:0:0:0:0" || addr == "::" {
+			continue
+		}
+		switch ipType {
+		case "IPV4":
+			info.IPAddress = addr
+			if connected {
+				info.Connected = true
+			}
+		case "IPV6":
+			info.IPv6Address = addr
+			if connected {
+				info.Connected = true
+			}
+		}
+		if info.IPAddress != "" && info.IPv6Address != "" {
+			info.IPVersion = -1
+		} else if info.IPv6Address != "" {
+			info.IPVersion = 6
+		} else if info.IPAddress != "" {
+			info.IPVersion = 4
 		}
 	}
 }

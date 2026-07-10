@@ -121,6 +121,315 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	}
 }
 
+func TestOpenWrtBackendCollectMeshTopologyFromRealTopo(t *testing.T) {
+	sampleTime := time.Unix(1700000300, 0).UTC()
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, errors.New("cli disabled in test")
+		},
+		Now: func() time.Time {
+			return sampleTime
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "device" && method == "getRealTopo" {
+				return []byte(`{
+					"mesh_protocol":"easymesh",
+					"controller":{
+						"al_mac":"02:00:00:00:00:01",
+						"hostname":"gateway",
+						"ip":"192.168.10.1",
+						"role":"controller",
+						"children":[
+							{
+								"al_mac":"02:00:00:00:00:02",
+								"hostname":"hallway-ap",
+								"ipaddr":"192.168.10.2",
+								"role":"agent",
+								"rssi":-61,
+								"children":[
+									{
+										"al_mac":"02:00:00:00:00:03",
+										"name":"edge-room",
+										"ip_address":"192.168.10.3",
+										"type":"agent",
+										"signal_strength":"-72 dBm"
+									}
+								]
+							}
+						]
+					}
+				}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.1.Name", "EasyMesh")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.1.Implementation", "OpenWrt")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Hostname", "gateway")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Role", "Controller")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Hostname", "hallway-ap")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Role", "Relay")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.Address", "192.168.10.3")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceNode", "Device.WUSP_MeshTelemetry.Node.1.")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetNode", "Device.WUSP_MeshTelemetry.Node.2.")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SignalQuality", 78)
+	assertUintField(t, msg, "Device.WiFi.MultiAP.APDeviceNumberOfEntries", 3)
+	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.1.BackhaulLinkType", "None")
+	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.2.BackhaulLinkType", "Wi-Fi")
+	assertTimeField(t, msg, "Device.WUSP_MeshTelemetry.LastSampleTime", sampleTime)
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(mesh topology): %v", err)
+	}
+}
+
+func TestOpenWrtBackendCollectMeshTopologyFallsBackToCLI(t *testing.T) {
+	var calls []string
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+			return nil, errors.New("ubus rpc unavailable")
+		},
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+			if name == "ubus" && strings.Join(args, " ") == "call device getRealTopo" {
+				return []byte(`{
+					"mesh_type":"openmesh",
+					"devices":{
+						"02:00:00:00:10:01":{"hostname":"root-node","role":"gateway"},
+						"02:00:00:00:10:02":{"hostname":"leaf-node","role":"agent","rssi":-68}
+					}
+				}`), nil
+			}
+			return nil, errors.New("unexpected command")
+		},
+		Now: func() time.Time {
+			return time.Unix(1700000400, 0).UTC()
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+
+	if len(calls) != 1 || calls[0] != "ubus call device getRealTopo" {
+		t.Fatalf("cli calls=%v, want one getRealTopo fallback", calls)
+	}
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.1.Name", "OpenMesh")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Hostname", "root-node")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.Hostname", "leaf-node")
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(cli mesh topology): %v", err)
+	}
+}
+
+func TestOpenWrtBackendCollectMeshConfigFromUCI(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), `config wifi-device 'radio0'
+	option channel '36'
+
+config wifi-iface 'mesh0'
+	option device 'radio0'
+	option mode 'mesh'
+	option ifname 'mesh0'
+	option network 'bat0'
+	option mesh_id 'wantastic-mesh'
+	option encryption 'sae'
+	option mesh_fwding '1'
+	option mesh_nolearn '0'
+	option mesh_rssi_threshold '-78'
+	option mesh_max_peer_links '32'
+	option mesh_max_retries '4'
+	option mesh_hwmp_rootmode '2'
+	option mesh_gate_announcements '1'
+	option mesh_connected_to_gate '0'
+	option mesh_connected_to_as '1'
+	option mesh_ttl '31'
+`)
+	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'bat0'
+	option proto 'batadv'
+	option routing_algo 'BATMAN_V'
+	option aggregated_ogms '1'
+	option fragmentation '1'
+	option gw_mode 'client'
+	option gw_bandwidth '10000/2000'
+	option gw_sel_class '20'
+	option orig_interval '1000'
+	option bridge_loop_avoidance '1'
+	option distributed_arp_table '1'
+	option multicast_mode '1'
+	option multicast_fanout '16'
+	option hop_penalty '30'
+	option ap_isolation '0'
+	option isolation_mark '0x00000001/0xffffffff'
+`)
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+			return nil, errors.New("ubus disabled")
+		},
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, errors.New("command disabled")
+		},
+		Now: func() time.Time {
+			return time.Unix(1700000500, 0).UTC()
+		},
+	})
+	msg := &wusp.Message{}
+	backend.appendOpenWrtMeshConfig(context.Background(), msg)
+
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.ProtocolNumberOfEntries", 2)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.1.Name", "IEEE80211s")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.2.Name", "BATMANAdv")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshID", "wantastic-mesh")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.IEEE80211s.1.Network", "bat0")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.IEEE80211s.1.Channel", 36)
+	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshForwarding", true)
+	assertIntField(t, msg, "Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshRSSIThreshold", -78)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshTTL", 31)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.BATMANAdv.1.RoutingAlgorithm", "BATMAN_V")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.BATMANAdv.1.GatewayMode", "client")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.BATMANAdv.1.OrigInterval", 1000)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.BATMANAdv.1.HopPenalty", 30)
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(mesh config): %v", err)
+	}
+}
+
+func TestOpenWrtBackendSetMeshConfigWritesUCI(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), `config wifi-device 'radio0'
+	option channel '36'
+
+config wifi-iface 'mesh0'
+	option device 'radio0'
+	option mode 'mesh'
+	option mesh_id 'old-mesh'
+`)
+	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'bat0'
+	option proto 'batadv'
+	option orig_interval '1000'
+`)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	if err := backend.Set(context.Background(), "Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshID", wusp.String("new-mesh")); err != nil {
+		t.Fatalf("Set IEEE80211s MeshID: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshForwarding", wusp.Bool(false)); err != nil {
+		t.Fatalf("Set IEEE80211s MeshForwarding: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.WUSP_MeshTelemetry.IEEE80211s.1.Channel", wusp.Uint(44)); err != nil {
+		t.Fatalf("Set IEEE80211s Channel: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.WUSP_MeshTelemetry.BATMANAdv.1.OrigInterval", wusp.Uint(2000)); err != nil {
+		t.Fatalf("Set BATMANAdv OrigInterval: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.WUSP_MeshTelemetry.BATMANAdv.1.GatewayMode", wusp.String("server")); err != nil {
+		t.Fatalf("Set BATMANAdv GatewayMode: %v", err)
+	}
+
+	wirelessData, err := os.ReadFile(filepath.Join(configDir, "wireless"))
+	if err != nil {
+		t.Fatalf("read wireless config: %v", err)
+	}
+	wireless := string(wirelessData)
+	if !strings.Contains(wireless, "option mesh_id 'new-mesh'") {
+		t.Fatalf("wireless config missing new mesh_id:\n%s", wireless)
+	}
+	if !strings.Contains(wireless, "option mesh_fwding '0'") {
+		t.Fatalf("wireless config missing mesh_fwding=0:\n%s", wireless)
+	}
+	if !strings.Contains(wireless, "option channel '44'") {
+		t.Fatalf("wireless config missing channel=44:\n%s", wireless)
+	}
+	networkData, err := os.ReadFile(filepath.Join(configDir, "network"))
+	if err != nil {
+		t.Fatalf("read network config: %v", err)
+	}
+	network := string(networkData)
+	if !strings.Contains(network, "option orig_interval '2000'") {
+		t.Fatalf("network config missing orig_interval=2000:\n%s", network)
+	}
+	if !strings.Contains(network, "option gw_mode 'server'") {
+		t.Fatalf("network config missing gw_mode=server:\n%s", network)
+	}
+}
+
+func TestOpenWrtBackendSetMeshConfigRejectsUnsafeValues(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	wirelessPath := filepath.Join(configDir, "wireless")
+	networkPath := filepath.Join(configDir, "network")
+	originalWireless := `config wifi-device 'radio0'
+	option channel '36'
+
+config wifi-iface 'mesh0'
+	option device 'radio0'
+	option mode 'mesh'
+	option mesh_id 'stable-mesh'
+`
+	originalNetwork := `config interface 'bat0'
+	option proto 'batadv'
+	option hop_penalty '30'
+`
+	mustWriteFile(t, wirelessPath, originalWireless)
+	mustWriteFile(t, networkPath, originalNetwork)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	tests := []struct {
+		path  string
+		value wusp.Value
+	}{
+		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshID", wusp.String("")},
+		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.Channel", wusp.Uint(0)},
+		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.Enable", wusp.String("true")},
+		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshForwarding", wusp.String("false")},
+		{"Device.WUSP_MeshTelemetry.IEEE80211s.1.MeshTTL", wusp.Uint(300)},
+		{"Device.WUSP_MeshTelemetry.BATMANAdv.1.Enable", wusp.String("true")},
+		{"Device.WUSP_MeshTelemetry.BATMANAdv.1.GatewayMode", wusp.String("auto")},
+		{"Device.WUSP_MeshTelemetry.BATMANAdv.1.HopPenalty", wusp.Uint(300)},
+		{"Device.WUSP_MeshTelemetry.BATMANAdv.1.APIsolation", wusp.String("false")},
+		{"Device.WUSP_MeshTelemetry.BATMANAdv.1.IsolationMark", wusp.String("1/2")},
+	}
+	for _, tt := range tests {
+		if err := backend.Set(context.Background(), tt.path, tt.value); err == nil {
+			t.Fatalf("Set(%s) returned nil, want validation error", tt.path)
+		}
+	}
+
+	wirelessData, err := os.ReadFile(wirelessPath)
+	if err != nil {
+		t.Fatalf("read wireless config: %v", err)
+	}
+	if string(wirelessData) != originalWireless {
+		t.Fatalf("wireless config changed after rejected Set:\n%s", wirelessData)
+	}
+	networkData, err := os.ReadFile(networkPath)
+	if err != nil {
+		t.Fatalf("read network config: %v", err)
+	}
+	if string(networkData) != originalNetwork {
+		t.Fatalf("network config changed after rejected Set:\n%s", networkData)
+	}
+}
+
 // TestOpenWrtBackendSetAndDelete verifies that Set/Delete mutate the on-disk
 // /etc/config/* files directly (no uci CLI, no ubus). The historical version
 // of this test asserted the ubus-first behaviour; that path is now a fallback
@@ -636,5 +945,16 @@ func assertTimeField(t *testing.T, msg *wusp.Message, path string, want time.Tim
 	}
 	if !got.AsTime().Equal(want) {
 		t.Fatalf("%s=%s want %s", path, got.AsTime().UTC().Format(time.RFC3339), want.UTC().Format(time.RFC3339))
+	}
+}
+
+func assertIntField(t *testing.T, msg *wusp.Message, path string, want int64) {
+	t.Helper()
+	got, ok := msg.Get(path)
+	if !ok {
+		t.Fatalf("%s missing from message", path)
+	}
+	if got.AsInt() != want {
+		t.Fatalf("%s=%d want %d", path, got.AsInt(), want)
 	}
 }

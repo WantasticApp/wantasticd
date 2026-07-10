@@ -89,7 +89,7 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 		msg.Set("Device.WUSP_MeshTelemetry.Protocol.1.StandardMultiAPReference", wusp.String("Device.WiFi.MultiAP."))
 	}
 
-	roots := attachMeshParentHints(normalizedMeshRoots(snapshot.topology))
+	roots := ensureMeshTreeRoot(attachMeshParentHints(normalizedMeshRoots(snapshot.topology)))
 	nodes := flattenMeshForest(roots)
 	msg.Set("Device.WUSP_MeshTelemetry.NodeNumberOfEntries", wusp.Uint(uint64(len(nodes))))
 	msg.Set("Device.WUSP_MeshTelemetry.LinkNumberOfEntries", wusp.Uint(uint64(countMeshLinksForRoots(roots))))
@@ -324,6 +324,83 @@ func attachMeshParentHints(roots []*meshNode) []*meshNode {
 		parentByNode[node] = parent
 	}
 	return dedupeMeshChildren(roots)
+}
+
+func ensureMeshTreeRoot(roots []*meshNode) []*meshNode {
+	roots = dedupeMeshChildren(roots)
+	if len(roots) < 2 || meshHasAnyChild(roots) {
+		return roots
+	}
+	rootIndex := chooseMeshRootIndex(roots)
+	root := roots[rootIndex]
+	if root == nil {
+		return roots
+	}
+	if strings.TrimSpace(root.role) == "" {
+		root.role = "controller"
+	}
+	children := make([]*meshNode, 0, len(roots)-1)
+	for index, node := range roots {
+		if index == rootIndex || node == nil {
+			continue
+		}
+		if strings.TrimSpace(node.role) == "" {
+			node.role = "agent"
+		}
+		if node.parentID == "" {
+			node.parentID = meshNodeID(root, 1)
+		}
+		if node.parentMAC == "" {
+			node.parentMAC = root.mac
+		}
+		children = append(children, node)
+	}
+	root.children = append(root.children, children...)
+	return []*meshNode{root}
+}
+
+func meshHasAnyChild(roots []*meshNode) bool {
+	for _, root := range roots {
+		if root != nil && len(root.children) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func chooseMeshRootIndex(roots []*meshNode) int {
+	bestIndex := 0
+	bestScore := -1
+	for index, node := range roots {
+		score := meshRootScore(node, index)
+		if score > bestScore {
+			bestScore = score
+			bestIndex = index
+		}
+	}
+	return bestIndex
+}
+
+func meshRootScore(node *meshNode, index int) int {
+	if node == nil {
+		return -1
+	}
+	score := 100 - index
+	normalizedRole := strings.ToLower(strings.TrimSpace(node.role))
+	normalizedName := strings.ToLower(strings.TrimSpace(firstNonEmpty(node.name, node.id)))
+	if strings.Contains(normalizedRole, "controller") || strings.Contains(normalizedRole, "gateway") || normalizedRole == "root" {
+		score += 1000
+	}
+	if strings.Contains(normalizedName, "controller") || strings.Contains(normalizedName, "gateway") || strings.Contains(normalizedName, "root") {
+		score += 500
+	}
+	if strings.HasSuffix(strings.TrimSpace(node.ip), ".1") {
+		score += 400
+	}
+	if strings.HasSuffix(strings.TrimSpace(node.ip), ".254") {
+		score += 200
+	}
+	return score
 }
 
 func lookupMeshParent(node *meshNode, byKey map[string]*meshNode) *meshNode {

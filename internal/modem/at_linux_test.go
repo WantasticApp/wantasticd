@@ -46,6 +46,47 @@ func TestParseQuectelNetworkInfo(t *testing.T) {
 	}
 }
 
+func TestParseCGCONTRDPPrefersNonIMSContext(t *testing.T) {
+	info := &Info{}
+	c := &atController{}
+
+	c.parseCGCONTRDP([]string{
+		`+CGCONTRDP: 2,6,"ims","36.4.216.1",,"fd00::1","fd00::2"`,
+		`+CGCONTRDP: 1,5,"internet","10.110.61.83",,"10.151.151.44","10.151.151.48"`,
+	}, info)
+
+	if info.APN != "internet" {
+		t.Fatalf("APN=%q want internet", info.APN)
+	}
+	if info.IPAddress != "10.110.61.83" || !info.Connected || info.IPVersion != 4 {
+		t.Fatalf("connection ip=%q connected=%v ipversion=%d", info.IPAddress, info.Connected, info.IPVersion)
+	}
+	if info.DNS1 != "10.151.151.44" || info.DNS2 != "10.151.151.48" {
+		t.Fatalf("dns=%q/%q want 10.151.151.44/10.151.151.48", info.DNS1, info.DNS2)
+	}
+}
+
+func TestParseQuectelWANIP(t *testing.T) {
+	info := &Info{}
+	c := &atController{}
+
+	c.parseQuectelWANIP([]string{
+		`+QMAP: "WWAN",1,1,"IPV4","10.110.61.83"`,
+		`+QMAP: "WWAN",1,1,"IPV6","2001:db8::10"`,
+		`+QMAP: "WWAN",0,1,"IPV6","0:0:0:0:0:0:0:0"`,
+	}, info)
+
+	if !info.Connected {
+		t.Fatal("Connected=false want true")
+	}
+	if info.IPAddress != "10.110.61.83" || info.IPv6Address != "2001:db8::10" {
+		t.Fatalf("addresses=%q/%q", info.IPAddress, info.IPv6Address)
+	}
+	if info.IPVersion != -1 {
+		t.Fatalf("IPVersion=%d want -1 for IPv4v6", info.IPVersion)
+	}
+}
+
 func TestParseFibocomXCESQ(t *testing.T) {
 	c := &atController{}
 	sig := SignalQuality{}

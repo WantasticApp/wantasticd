@@ -3,8 +3,8 @@ package wusp
 import "testing"
 
 func TestBroadbandDataModelsCoverAggregates(t *testing.T) {
-	if len(BroadbandDataModels) != 3 {
-		t.Fatalf("expected 3 broadband data models, got %d", len(BroadbandDataModels))
+	if len(BroadbandDataModels) != 4 {
+		t.Fatalf("expected 4 broadband data models, got %d", len(BroadbandDataModels))
 	}
 
 	paramCount := 0

@@ -274,6 +274,9 @@ func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value)
 		if err := b.setWiFiParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
 			return err
 		}
+		if err := b.setOpenWrtMeshParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
+			return err
+		}
 		return wusp.ErrUSPPathUnsupported
 	}
 }
@@ -376,6 +379,9 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
 	collectCellularStatic(msg)
 	collectGPSStatic(msg)
+	collectMeshStatic(msg)
+	b.appendOpenWrtMeshTopology(ctx, msg)
+	b.appendOpenWrtMeshConfig(ctx, msg)
 
 	return msg, nil
 }

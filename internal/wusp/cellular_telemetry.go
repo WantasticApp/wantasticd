@@ -11,7 +11,7 @@ var WUSPCellularTelemetryObjects = []Object{
 
 var AllWUSPCellularTelemetryParams = []Param{
 	{Path: WUSPCellularTelemetryPrefix + "InterfaceNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly, SinceVersion: "1.0", Description: "Number of cellular modem telemetry interface rows.", Limits: Limits{Min: iptr(0)}},
-	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.Alias", Type: TypeAlias, Access: ReadWrite, SinceVersion: "1.0", Description: "USP non-functional unique key for this cellular telemetry interface."},
+	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.Alias", Type: TypeAlias, Access: ReadOnly, SinceVersion: "1.0", Description: "USP non-functional unique key for this cellular telemetry interface."},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.InterfaceReference", Type: TypePathRef, Access: ReadOnly, SinceVersion: "1.0", Description: "Reference to the matching Device.Cellular.Interface row."},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.ModemPath", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Linux modem device path or network interface used by the collector.", Limits: Limits{MaxLength: 128}},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.Protocol", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Collection protocol used for this modem.", Limits: Limits{Enums: []string{"at", "qmi", "mbim", "modemmanager", "sysfs", "unknown"}}},

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 )
 
@@ -399,6 +400,113 @@ func TestOpenWrtBackendCellularConfigAugmentsLiveModemRows(t *testing.T) {
 	if _, ok := msg.Get("Device.Cellular.Interface.2.Name"); ok {
 		t.Fatal("config merge created duplicate cellular interface")
 	}
+}
+
+func TestOpenWrtBackendCellularConfigCollectsConfiguredModemRuntime(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'cellwan'
+	option proto 'qmi'
+	option device '/dev/cdc-wdm0'
+	option ifname 'eth1'
+	option apn 'internet'
+`)
+	writeNetStats(t, netClassDir, "eth1", map[string]string{
+		"tx_bytes":   "1234",
+		"rx_bytes":   "5678",
+		"tx_packets": "12",
+		"rx_packets": "34",
+	})
+	mustWriteFile(t, filepath.Join(netClassDir, "eth1", "operstate"), "up\n")
+
+	oldNewModemController := newModemController
+	newModemController = func() modemPkg.Controller {
+		return fakeModemController{
+			infos: map[string]*modemPkg.Info{
+				"/dev/cdc-wdm0": {
+					Interface:  "eth1",
+					Protocol:   "qmi",
+					IMEI:       "123456789012345",
+					Status:     modemPkg.RegHome,
+					Technology: modemPkg.TechLTE,
+					Signal: modemPkg.SignalQuality{
+						RSRP: -91,
+						RSRQ: -8,
+						SINR: 16,
+					},
+				},
+			},
+		}
+	}
+	defer func() { newModemController = oldNewModemController }()
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtCellularConfig(msg)
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "eth1")
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Status", "Up")
+	assertStringField(t, msg, "Device.Cellular.Interface.1.IMEI", "123456789012345")
+	assertIntField(t, msg, "Device.Cellular.Interface.1.RSRP", -91)
+	assertIntField(t, msg, "Device.Cellular.Interface.1.RSRQ", -8)
+	assertIntField(t, msg, "Device.Cellular.Interface.1.SINR", 16)
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesSent", 1234)
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesReceived", 5678)
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.PacketsSent", 12)
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.PacketsReceived", 34)
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.InterfaceReference", "Device.Cellular.Interface.1.")
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.Protocol", "qmi")
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(cellular runtime): %v", err)
+	}
+}
+
+func TestOpenWrtBackendCellularConfigUsesConfiguredNetdevStatsWithoutModemInfo(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'cellwan'
+	option proto 'quectel'
+	option device 'eth1'
+	option apn 'internet'
+`)
+	writeNetStats(t, netClassDir, "eth1", map[string]string{
+		"tx_bytes": "222",
+		"rx_bytes": "333",
+	})
+	mustWriteFile(t, filepath.Join(netClassDir, "eth1", "carrier"), "1\n")
+
+	oldNewModemController := newModemController
+	newModemController = func() modemPkg.Controller {
+		return fakeModemController{err: errors.New("no modem control")}
+	}
+	defer func() { newModemController = oldNewModemController }()
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtCellularConfig(msg)
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "eth1")
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Status", "Up")
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesSent", 222)
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesReceived", 333)
 }
 
 func TestOpenWrtBackendSetCellularConfigWritesUCI(t *testing.T) {
@@ -1243,5 +1351,54 @@ func assertIntField(t *testing.T, msg *wusp.Message, path string, want int64) {
 	}
 	if got.AsInt() != want {
 		t.Fatalf("%s=%d want %d", path, got.AsInt(), want)
+	}
+}
+
+type fakeModemController struct {
+	devices []string
+	infos   map[string]*modemPkg.Info
+	err     error
+}
+
+func (f fakeModemController) Discover() ([]string, error) {
+	if f.err != nil && len(f.devices) == 0 {
+		return nil, f.err
+	}
+	return f.devices, nil
+}
+
+func (f fakeModemController) GetInfo(devicePath string) (*modemPkg.Info, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	info := f.infos[devicePath]
+	if info == nil {
+		return nil, errors.New("not found")
+	}
+	copyInfo := *info
+	return &copyInfo, nil
+}
+
+func (f fakeModemController) GetSignal(string) (*modemPkg.SignalQuality, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f fakeModemController) Connect(string, string) error {
+	return errors.New("not implemented")
+}
+
+func (f fakeModemController) Disconnect(string) error {
+	return errors.New("not implemented")
+}
+
+func (f fakeModemController) Close() error {
+	return nil
+}
+
+func writeNetStats(t *testing.T, netClassDir, iface string, stats map[string]string) {
+	t.Helper()
+	statsDir := filepath.Join(netClassDir, iface, "statistics")
+	for name, value := range stats {
+		mustWriteFile(t, filepath.Join(statsDir, name), value+"\n")
 	}
 }

@@ -353,7 +353,7 @@ func collectCellularStatic(msg *wusp.Message) {
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
 
-	ctl := modemPkg.New()
+	ctl := newModemController()
 	defer ctl.Close()
 
 	devices, err := ctl.Discover()
@@ -380,71 +380,7 @@ func collectCellularStatic(msg *wusp.Message) {
 		if info.Status == modemPkg.RegRoaming {
 			anyRoaming = true
 		}
-		prefix := fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)
-
-		msg.Set(prefix+"Enable", wusp.Bool(true))
-		msg.Set(prefix+"Status", wusp.String(cellularStatus(info)))
-		msg.Set(prefix+"Alias", wusp.String("cpe-cellular-"+strconv.Itoa(ifaceIdx)))
-		msg.Set(prefix+"Name", wusp.String(cellularInterfaceName(info, dev, ifaceIdx)))
-		msg.Set(prefix+"LastChange", wusp.Uint(0))
-		msg.Set(prefix+"LowerLayers", wusp.List())
-		msg.Set(prefix+"Upstream", wusp.Bool(true))
-
-		if validDigitString(info.IMEI, 15, 15) {
-			msg.Set(prefix+"IMEI", wusp.String(info.IMEI))
-		}
-
-		msg.Set(prefix+"SupportedAccessTechnologies", wusp.List(cellularTechList(info.SupportedTechnologies)...))
-		msg.Set(prefix+"PreferredAccessTechnology", wusp.String(cellularAccessTechnology(info.PreferredTechnology)))
-		msg.Set(prefix+"CurrentAccessTechnology", wusp.String(cellularAccessTechnology(info.Technology)))
-		msg.Set(prefix+"AvailableNetworks", cellularAvailableNetworks(info))
-		msg.Set(prefix+"NetworkRequested", wusp.String(""))
-		if info.Operator != "" || info.OperatorMCC != "" || info.OperatorMNC != "" {
-			msg.Set(prefix+"NetworkInUse", wusp.String(cellularNetworkName(info)))
-		}
-		msg.Set(prefix+"Mode", wusp.String(cellularNRMode(info)))
-		if info.UpstreamMaxBitRate > 0 {
-			msg.Set(prefix+"UpstreamMaxBitRate", wusp.Uint(info.UpstreamMaxBitRate))
-		}
-		if info.DownstreamMaxBitRate > 0 {
-			msg.Set(prefix+"DownstreamMaxBitRate", wusp.Uint(info.DownstreamMaxBitRate))
-		}
-		msg.Set(prefix+"SIMReferenceList", wusp.List())
-		appendCellularTelemetryFields(msg, ifaceIdx, dev, info)
-
-		// Signal quality
-		sig := info.Signal
-		if sig.RSSI != 0 {
-			msg.Set(prefix+"RSSI", wusp.Int(int64(sig.RSSI)))
-		}
-		if sig.RSRP != 0 {
-			msg.Set(prefix+"RSRP", wusp.Int(int64(sig.RSRP)))
-		}
-		if sig.RSRQ != 0 {
-			msg.Set(prefix+"RSRQ", wusp.Int(int64(sig.RSRQ)))
-		}
-		if sig.SINR != 0 {
-			msg.Set(prefix+"SINR", wusp.Int(int64(sig.SINR)))
-		}
-
-		// SIM / USIM
-		if validDigitString(info.IMSI, 14, 15) {
-			msg.Set(prefix+"USIM.IMSI", wusp.String(info.IMSI))
-		}
-		if validDigitString(info.ICCID, 6, 20) {
-			msg.Set(prefix+"USIM.ICCID", wusp.String(info.ICCID))
-		}
-		if validDigitString(info.MSISDN, 14, 15) {
-			msg.Set(prefix+"USIM.MSISDN", wusp.String(info.MSISDN))
-		}
-		msg.Set(prefix+"USIM.Status", wusp.String(cellularUSIMStatus(info.SIMStatus)))
-		msg.Set(prefix+"USIM.PINCheck", wusp.String("Off"))
-
-		// Traffic stats
-		setCellularStats(msg, prefix, info)
-
-		msg.Set(prefix+"SMS.StorageNumberOfEntries", wusp.Uint(cellularSMSStorageEntries(info)))
-		msg.Set(prefix+"SMS.MessageNumberOfEntries", wusp.Uint(0))
+		prefix := setCellularInterfaceFields(msg, ifaceIdx, dev, info)
 		if info.SMSStorageLocation != "" {
 			storagePrefix := prefix + "SMS.Storage.1."
 			msg.Set(storagePrefix+"Alias", wusp.String("cpe-sms-storage-1"))
@@ -488,6 +424,76 @@ func collectCellularStatic(msg *wusp.Message) {
 		}
 		msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(true))
 	}
+}
+
+var newModemController = modemPkg.New
+
+func setCellularInterfaceFields(msg *wusp.Message, ifaceIdx int, devicePath string, info *modemPkg.Info) string {
+	prefix := fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)
+	if msg == nil || info == nil || ifaceIdx <= 0 {
+		return prefix
+	}
+
+	msg.Set(prefix+"Enable", wusp.Bool(true))
+	msg.Set(prefix+"Status", wusp.String(cellularStatus(info)))
+	msg.Set(prefix+"Alias", wusp.String("cpe-cellular-"+strconv.Itoa(ifaceIdx)))
+	msg.Set(prefix+"Name", wusp.String(cellularInterfaceName(info, devicePath, ifaceIdx)))
+	msg.Set(prefix+"LastChange", wusp.Uint(0))
+	msg.Set(prefix+"LowerLayers", wusp.List())
+	msg.Set(prefix+"Upstream", wusp.Bool(true))
+
+	if validDigitString(info.IMEI, 15, 15) {
+		msg.Set(prefix+"IMEI", wusp.String(info.IMEI))
+	}
+
+	msg.Set(prefix+"SupportedAccessTechnologies", wusp.List(cellularTechList(info.SupportedTechnologies)...))
+	msg.Set(prefix+"PreferredAccessTechnology", wusp.String(cellularAccessTechnology(info.PreferredTechnology)))
+	msg.Set(prefix+"CurrentAccessTechnology", wusp.String(cellularAccessTechnology(info.Technology)))
+	msg.Set(prefix+"AvailableNetworks", cellularAvailableNetworks(info))
+	msg.Set(prefix+"NetworkRequested", wusp.String(""))
+	if info.Operator != "" || info.OperatorMCC != "" || info.OperatorMNC != "" {
+		msg.Set(prefix+"NetworkInUse", wusp.String(cellularNetworkName(info)))
+	}
+	msg.Set(prefix+"Mode", wusp.String(cellularNRMode(info)))
+	if info.UpstreamMaxBitRate > 0 {
+		msg.Set(prefix+"UpstreamMaxBitRate", wusp.Uint(info.UpstreamMaxBitRate))
+	}
+	if info.DownstreamMaxBitRate > 0 {
+		msg.Set(prefix+"DownstreamMaxBitRate", wusp.Uint(info.DownstreamMaxBitRate))
+	}
+	msg.Set(prefix+"SIMReferenceList", wusp.List())
+	appendCellularTelemetryFields(msg, ifaceIdx, devicePath, info)
+
+	sig := info.Signal
+	if sig.RSSI != 0 {
+		msg.Set(prefix+"RSSI", wusp.Int(int64(sig.RSSI)))
+	}
+	if sig.RSRP != 0 {
+		msg.Set(prefix+"RSRP", wusp.Int(int64(sig.RSRP)))
+	}
+	if sig.RSRQ != 0 {
+		msg.Set(prefix+"RSRQ", wusp.Int(int64(sig.RSRQ)))
+	}
+	if sig.SINR != 0 {
+		msg.Set(prefix+"SINR", wusp.Int(int64(sig.SINR)))
+	}
+
+	if validDigitString(info.IMSI, 14, 15) {
+		msg.Set(prefix+"USIM.IMSI", wusp.String(info.IMSI))
+	}
+	if validDigitString(info.ICCID, 6, 20) {
+		msg.Set(prefix+"USIM.ICCID", wusp.String(info.ICCID))
+	}
+	if validDigitString(info.MSISDN, 14, 15) {
+		msg.Set(prefix+"USIM.MSISDN", wusp.String(info.MSISDN))
+	}
+	msg.Set(prefix+"USIM.Status", wusp.String(cellularUSIMStatus(info.SIMStatus)))
+	msg.Set(prefix+"USIM.PINCheck", wusp.String("Off"))
+	setCellularStats(msg, prefix, info)
+	msg.Set(prefix+"SMS.StorageNumberOfEntries", wusp.Uint(cellularSMSStorageEntries(info)))
+	msg.Set(prefix+"SMS.MessageNumberOfEntries", wusp.Uint(0))
+
+	return prefix
 }
 
 func cellularStatus(info *modemPkg.Info) string {
@@ -1435,6 +1441,23 @@ func readTextFile(path string) string {
 		return ""
 	}
 	return string(data)
+}
+
+func readUintTextFile(path string) uint64 {
+	value, err := strconv.ParseUint(strings.TrimSpace(readTextFile(path)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func firstNonZeroUint(values ...uint64) uint64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func readMemInfo(path string) (uint64, uint64) {

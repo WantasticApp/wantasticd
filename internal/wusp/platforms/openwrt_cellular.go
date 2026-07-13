@@ -3,6 +3,7 @@ package platforms
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -23,6 +24,9 @@ func (b *OpenWrtBackend) appendOpenWrtCellularConfig(msg *wusp.Message) {
 	ifaceIdx := liveIfaceCount
 	apnIdx := messageUint(msg, "Device.Cellular.AccessPointNumberOfEntries")
 	configIdx := uint64(0)
+	ctl := newModemController()
+	defer ctl.Close()
+
 	for _, section := range parsed.Sections {
 		if !isOpenWrtCellularSection(section) {
 			continue
@@ -59,6 +63,17 @@ func (b *OpenWrtBackend) appendOpenWrtCellularConfig(msg *wusp.Message) {
 			msg.Set(ifacePath+"SMS.MessageNumberOfEntries", wusp.Uint(0))
 			setCellularStats(msg, ifacePath, &modemPkg.Info{})
 		}
+		if info, devicePath := b.collectOpenWrtCellularInfo(ctl, section); info != nil {
+			if !enabled && !info.Connected {
+				info.Status = modemPkg.RegNotRegistered
+				info.SIMStatus = modemPkg.SIMAbsent
+			}
+			setCellularInterfaceFields(msg, int(targetIfaceIdx), devicePath, info)
+			msg.Set(ifacePath+"Enable", wusp.Bool(enabled))
+			if !enabled {
+				msg.Set(ifacePath+"Status", wusp.String("Down"))
+			}
+		}
 
 		apn := strings.TrimSpace(section.Options["apn"])
 		if apn == "" {
@@ -80,6 +95,117 @@ func (b *OpenWrtBackend) appendOpenWrtCellularConfig(msg *wusp.Message) {
 
 	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(ifaceIdx))
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(apnIdx))
+}
+
+func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, section openWrtUCISection) (*modemPkg.Info, string) {
+	if ctl == nil {
+		return nil, ""
+	}
+	candidates := openWrtCellularDeviceCandidates(section)
+	for _, candidate := range candidates {
+		info, err := ctl.GetInfo(candidate)
+		if err != nil || info == nil {
+			continue
+		}
+		b.enrichOpenWrtCellularNetStats(info, section)
+		return info, candidate
+	}
+
+	info := &modemPkg.Info{
+		Interface: firstOpenWrtCellularNetdev(section),
+		Protocol:  strings.TrimSpace(section.Options["proto"]),
+	}
+	b.enrichOpenWrtCellularNetStats(info, section)
+	if info.Interface == "" || !hasOpenWrtCellularRuntimeData(info) {
+		return nil, ""
+	}
+	return info, info.Interface
+}
+
+func openWrtCellularDeviceCandidates(section openWrtUCISection) []string {
+	raw := []string{
+		section.Options["device"],
+		section.Options["ifname"],
+		section.Options["interface"],
+		section.Options["modem"],
+		section.Options["control"],
+		section.Options["at_device"],
+		section.Options["atdevice"],
+	}
+	raw = append(raw, section.Lists["device"]...)
+	raw = append(raw, section.Lists["ifname"]...)
+
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(raw))
+	for _, value := range raw {
+		for part := range strings.FieldsSeq(strings.ReplaceAll(value, ",", " ")) {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func (b *OpenWrtBackend) enrichOpenWrtCellularNetStats(info *modemPkg.Info, section openWrtUCISection) {
+	if info == nil {
+		return
+	}
+	iface := firstNonEmpty(info.Interface, firstOpenWrtCellularNetdev(section))
+	if strings.HasPrefix(iface, "/dev/") || strings.Contains(iface, "/") {
+		iface = firstOpenWrtCellularNetdev(section)
+	}
+	if iface == "" {
+		return
+	}
+	base := filepath.Join(b.netClassDir, filepath.Base(iface))
+	stats := filepath.Join(base, "statistics")
+	info.Interface = filepath.Base(iface)
+	info.TxBytes = firstNonZeroUint(info.TxBytes, readUintTextFile(filepath.Join(stats, "tx_bytes")))
+	info.RxBytes = firstNonZeroUint(info.RxBytes, readUintTextFile(filepath.Join(stats, "rx_bytes")))
+	info.TxPackets = firstNonZeroUint(info.TxPackets, readUintTextFile(filepath.Join(stats, "tx_packets")))
+	info.RxPackets = firstNonZeroUint(info.RxPackets, readUintTextFile(filepath.Join(stats, "rx_packets")))
+	info.TxErrors = firstNonZeroUint(info.TxErrors, readUintTextFile(filepath.Join(stats, "tx_errors")))
+	info.RxErrors = firstNonZeroUint(info.RxErrors, readUintTextFile(filepath.Join(stats, "rx_errors")))
+	info.TxDropped = firstNonZeroUint(info.TxDropped, readUintTextFile(filepath.Join(stats, "tx_dropped")))
+	info.RxDropped = firstNonZeroUint(info.RxDropped, readUintTextFile(filepath.Join(stats, "rx_dropped")))
+	info.RxMulticastPackets = firstNonZeroUint(info.RxMulticastPackets, readUintTextFile(filepath.Join(stats, "multicast")))
+	if speed := readUintTextFile(filepath.Join(base, "speed")); speed > 0 {
+		info.UpstreamMaxBitRate = firstNonZeroUint(info.UpstreamMaxBitRate, speed*1000*1000)
+		info.DownstreamMaxBitRate = firstNonZeroUint(info.DownstreamMaxBitRate, speed*1000*1000)
+	}
+	if state := strings.TrimSpace(b.readTextFile(filepath.Join(base, "operstate"))); state == "up" {
+		info.Connected = true
+	}
+	if carrier := strings.TrimSpace(b.readTextFile(filepath.Join(base, "carrier"))); carrier == "1" {
+		info.Connected = true
+	}
+}
+
+func firstOpenWrtCellularNetdev(section openWrtUCISection) string {
+	for _, candidate := range openWrtCellularDeviceCandidates(section) {
+		base := filepath.Base(candidate)
+		if base == "." || strings.HasPrefix(candidate, "/dev/") {
+			continue
+		}
+		return base
+	}
+	return ""
+}
+
+func hasOpenWrtCellularRuntimeData(info *modemPkg.Info) bool {
+	return info.Connected ||
+		info.TxBytes != 0 || info.RxBytes != 0 ||
+		info.TxPackets != 0 || info.RxPackets != 0 ||
+		info.Signal.RSSI != 0 || info.Signal.RSRP != 0 ||
+		info.Signal.RSRQ != 0 || info.Signal.SINR != 0 ||
+		info.IMEI != "" || info.IMSI != "" || info.ICCID != ""
 }
 
 func (b *OpenWrtBackend) setOpenWrtCellularParam(ctx context.Context, path string, value wusp.Value) error {

@@ -87,6 +87,39 @@ func TestParseQuectelWANIP(t *testing.T) {
 	}
 }
 
+func TestParseQuectelCarrierAggregation(t *testing.T) {
+	rows := parseQuectelCarrierAggregation([]string{
+		`+QCAINFO: "PCC",1850,120,-91,-8,16,100,"LTE BAND 3",20`,
+		`+QCAINFO: "NR5G",627264,322,-88,-10,21,0,"NR5G BAND 78",100`,
+	})
+
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+	if rows[0].Role != "PCC" || rows[0].RAT != "LTE" || rows[0].Band != "B3" || rows[0].EARFCN != 1850 || rows[0].PCI != 120 {
+		t.Fatalf("lte row=%+v", rows[0])
+	}
+	if rows[1].RAT != "NR" || rows[1].Band != "N78" || rows[1].EARFCN != 627264 || rows[1].SINR != 21 {
+		t.Fatalf("nr row=%+v", rows[1])
+	}
+}
+
+func TestParseQuectelNeighborCells(t *testing.T) {
+	lte := parseQuectelNeighborCells([]string{
+		`+QENG: "neighbourcell intra","LTE",1850,121,-101,-12,-70,10,0,0`,
+	})
+	nr := parseQuectelNR5GMeasInfo([]string{
+		`+QNWCFG: "nr5g_meas_info",627264,322,0,-88,-10`,
+	})
+
+	if len(lte) != 1 || lte[0].RAT != "LTE" || lte[0].Relation != "intra" || lte[0].PCI != 121 {
+		t.Fatalf("lte=%+v", lte)
+	}
+	if len(nr) != 1 || nr[0].RAT != "NR" || nr[0].Relation != "nr5g" || nr[0].Frequency != 627264 {
+		t.Fatalf("nr=%+v", nr)
+	}
+}
+
 func TestParseFibocomXCESQ(t *testing.T) {
 	c := &atController{}
 	sig := SignalQuality{}

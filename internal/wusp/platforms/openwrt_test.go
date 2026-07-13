@@ -327,6 +327,145 @@ func TestOpenWrtBackendCollectMeshTopologyUsesLinkHints(t *testing.T) {
 	}
 }
 
+func TestOpenWrtBackendCollectCellularConfigFromUCI(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'cellwan'
+	option proto 'qmi'
+	option device '/dev/cdc-wdm0'
+	option apn 'internet'
+	option username 'user1'
+	option password 'pass1'
+	option pdptype 'ipv4v6'
+	option type 'default,hipri'
+
+config interface 'backupcell'
+	option proto 'mbim'
+	option disabled '1'
+	option apn 'backup'
+`)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtCellularConfig(msg)
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 2)
+	assertUintField(t, msg, "Device.Cellular.AccessPointNumberOfEntries", 2)
+	assertBoolField(t, msg, "Device.Cellular.Interface.1.Enable", true)
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "cellwan")
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Status", "Dormant")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.APN", "internet")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Username", "user1")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Password", "pass1")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Interface", "Device.Cellular.Interface.1.")
+	assertBoolField(t, msg, "Device.Cellular.Interface.2.Enable", false)
+	assertStringField(t, msg, "Device.Cellular.Interface.2.Status", "Down")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.2.APN", "backup")
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(cellular config): %v", err)
+	}
+}
+
+func TestOpenWrtBackendSetCellularConfigWritesUCI(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	networkPath := filepath.Join(configDir, "network")
+	mustWriteFile(t, networkPath, `config interface 'cellwan'
+	option proto 'qmi'
+	option device '/dev/cdc-wdm0'
+	option apn 'internet'
+	option username 'olduser'
+	option password 'oldpass'
+`)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.APN", wusp.String("new.apn")); err != nil {
+		t.Fatalf("Set cellular APN: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.Username", wusp.String("newuser")); err != nil {
+		t.Fatalf("Set cellular Username: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.Password", wusp.String("newpass")); err != nil {
+		t.Fatalf("Set cellular Password: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.Interface.1.Enable", wusp.Bool(false)); err != nil {
+		t.Fatalf("Set cellular Interface Enable: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.IPVersion", wusp.Int(-1)); err != nil {
+		t.Fatalf("Set cellular IPVersion: %v", err)
+	}
+
+	networkData, err := os.ReadFile(networkPath)
+	if err != nil {
+		t.Fatalf("read network config: %v", err)
+	}
+	network := string(networkData)
+	for _, want := range []string{
+		"option apn 'new.apn'",
+		"option username 'newuser'",
+		"option password 'newpass'",
+		"option disabled '1'",
+		"option pdptype 'ipv4v6'",
+	} {
+		if !strings.Contains(network, want) {
+			t.Fatalf("network config missing %q:\n%s", want, network)
+		}
+	}
+}
+
+func TestOpenWrtBackendSetCellularConfigRejectsUnsafeValues(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	networkPath := filepath.Join(configDir, "network")
+	originalNetwork := `config interface 'cellwan'
+	option proto 'qmi'
+	option apn 'stable'
+`
+	mustWriteFile(t, networkPath, originalNetwork)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	longAPN := strings.Repeat("a", 101)
+	tests := []struct {
+		path  string
+		value wusp.Value
+	}{
+		{"Device.Cellular.Interface.1.Enable", wusp.String("false")},
+		{"Device.Cellular.AccessPoint.1.Enable", wusp.String("true")},
+		{"Device.Cellular.AccessPoint.1.APN", wusp.String("")},
+		{"Device.Cellular.AccessPoint.1.APN", wusp.String(longAPN)},
+		{"Device.Cellular.AccessPoint.1.Username", wusp.Uint(1)},
+		{"Device.Cellular.AccessPoint.1.IPVersion", wusp.Int(4)},
+	}
+	for _, tt := range tests {
+		if err := backend.Set(context.Background(), tt.path, tt.value); err == nil {
+			t.Fatalf("Set(%s) returned nil, want validation error", tt.path)
+		}
+	}
+
+	networkData, err := os.ReadFile(networkPath)
+	if err != nil {
+		t.Fatalf("read network config: %v", err)
+	}
+	if string(networkData) != originalNetwork {
+		t.Fatalf("network config changed after rejected Set:\n%s", networkData)
+	}
+}
+
 func TestOpenWrtBackendCollectMeshConfigFromUCI(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")

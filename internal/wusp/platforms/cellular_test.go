@@ -100,3 +100,39 @@ func TestCellularRepresentativeMessageValidates(t *testing.T) {
 		t.Fatalf("ValidateMessageFast() error: %v", err)
 	}
 }
+
+func TestCellularTelemetryRepresentativeMessageValidates(t *testing.T) {
+	msg := wusp.NewMessage()
+	prefix := "Device.WUSP_CellularTelemetry.Interface.1."
+	msg.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(1))
+	msg.Set(prefix+"Alias", wusp.String("cpe-cellular-telemetry-1"))
+	msg.Set(prefix+"InterfaceReference", wusp.String("Device.Cellular.Interface.1."))
+	msg.Set(prefix+"ModemPath", wusp.String("/dev/cdc-wdm0"))
+	msg.Set(prefix+"Protocol", wusp.String("at"))
+	msg.Set(prefix+"NRMode", wusp.String("NonStandalone"))
+	msg.Set(prefix+"Band", wusp.String("B3"))
+	msg.Set(prefix+"CellID", wusp.Uint(12345))
+	msg.Set(prefix+"TAC", wusp.Uint(22))
+	msg.Set(prefix+"DNS1", wusp.String("1.1.1.1"))
+	msg.Set(prefix+"CarrierNumberOfEntries", wusp.Uint(1))
+	msg.Set(prefix+"NeighborCellNumberOfEntries", wusp.Uint(1))
+	msg.Set(prefix+"Carrier.1.Role", wusp.String("PCC"))
+	msg.Set(prefix+"Carrier.1.RAT", wusp.String("LTE"))
+	msg.Set(prefix+"Carrier.1.Band", wusp.String("B3"))
+	msg.Set(prefix+"Carrier.1.EARFCN", wusp.Uint(1850))
+	msg.Set(prefix+"Carrier.1.PCI", wusp.Uint(120))
+	msg.Set(prefix+"Carrier.1.Bandwidth", wusp.String("20MHz"))
+	msg.Set(prefix+"Carrier.1.RSRP", wusp.Int(-91))
+	msg.Set(prefix+"Carrier.1.RSRQ", wusp.Int(-8))
+	msg.Set(prefix+"Carrier.1.SINR", wusp.Int(16))
+	msg.Set(prefix+"NeighborCell.1.RAT", wusp.String("LTE"))
+	msg.Set(prefix+"NeighborCell.1.Relation", wusp.String("intra"))
+	msg.Set(prefix+"NeighborCell.1.Frequency", wusp.Uint(1850))
+	msg.Set(prefix+"NeighborCell.1.PCI", wusp.Uint(121))
+	msg.Set(prefix+"NeighborCell.1.RSRP", wusp.Int(-101))
+	msg.Set(prefix+"NeighborCell.1.RSRQ", wusp.Int(-12))
+
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(cellular telemetry) error: %v", err)
+	}
+}

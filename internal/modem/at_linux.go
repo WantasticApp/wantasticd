@@ -203,6 +203,15 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	if lines := at.send("AT+QENG=\"servingcell\""); len(lines) > 0 {
 		c.parseQuectelServingCellInfo(lines, info)
 	}
+	if lines := at.send("AT+QCAINFO"); len(lines) > 0 {
+		info.CarrierAggregation = parseQuectelCarrierAggregation(lines)
+	}
+	if lines := at.send("AT+QENG=\"neighbourcell\""); len(lines) > 0 {
+		info.NeighborCells = append(info.NeighborCells, parseQuectelNeighborCells(lines)...)
+	}
+	if lines := at.send("AT+QNWCFG=\"nr5g_meas_info\""); len(lines) > 0 {
+		info.NeighborCells = append(info.NeighborCells, parseQuectelNR5GMeasInfo(lines)...)
+	}
 	if isFibocom(info) {
 		if lines := at.send("AT+GTPKGVER?"); len(lines) > 0 && info.Revision == "" {
 			info.Revision = parseColonValue(lines[0])
@@ -241,11 +250,40 @@ func (c *atController) GetSignal(devicePath string) (*SignalQuality, error) {
 }
 
 func (c *atController) Connect(devicePath, apn string) error {
-	return fmt.Errorf("AT command connect not implemented — use NetworkManager or uqmi")
+	apn = strings.TrimSpace(apn)
+	if apn == "" {
+		return fmt.Errorf("AT command connect requires APN")
+	}
+	at, closeFn, err := c.openATSession(devicePath)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+	at.send(fmt.Sprintf("AT+CGDCONT=1,\"IPV4V6\",\"%s\"", escapeATString(apn)))
+	at.send("AT+CGACT=1,1")
+	return nil
 }
 
 func (c *atController) Disconnect(devicePath string) error {
-	return fmt.Errorf("AT command disconnect not implemented — use NetworkManager or uqmi")
+	at, closeFn, err := c.openATSession(devicePath)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+	at.send("AT+CGACT=0,1")
+	return nil
+}
+
+func (c *atController) openATSession(devicePath string) (*atSession, func(), error) {
+	port := c.findATPort(devicePath)
+	if port == "" {
+		return nil, func() {}, fmt.Errorf("no AT port found for %s", devicePath)
+	}
+	f, err := os.OpenFile(port, os.O_RDWR, 0666)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return &atSession{f: f, scanner: bufio.NewScanner(f)}, func() { _ = f.Close() }, nil
 }
 
 // ── Signal parsing ──────────────────────────────────────────────────────────
@@ -564,6 +602,110 @@ func (c *atController) parseSMSStorage(line string, info *Info) {
 		info.SMSStorageUsed = parseUint(values[1])
 		info.SMSStorageCapacity = parseUint(values[2])
 	}
+}
+
+func parseQuectelCarrierAggregation(lines []string) []CarrierInfo {
+	out := make([]CarrierInfo, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+QCAINFO:") {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QCAINFO:")))
+		if len(values) < 2 {
+			continue
+		}
+		carrier := CarrierInfo{
+			Role: strings.TrimSpace(values[0]),
+			Raw:  line,
+		}
+		roleUpper := strings.ToUpper(carrier.Role)
+		if strings.Contains(roleUpper, "NR5G") {
+			carrier.RAT = "NR"
+		} else {
+			carrier.RAT = "LTE"
+		}
+		if len(values) > 1 {
+			carrier.EARFCN = parseUint(values[1])
+		}
+		if len(values) > 2 {
+			carrier.PCI = parseUint(values[2])
+		}
+		if len(values) > 3 {
+			carrier.RSRP = parseOptionalInt(values[3])
+		}
+		if len(values) > 4 {
+			carrier.RSRQ = parseOptionalInt(values[4])
+		}
+		if len(values) > 5 {
+			carrier.SINR = parseOptionalInt(values[5])
+		}
+		if len(values) > 6 {
+			carrier.Bandwidth = strings.TrimSpace(values[6])
+		}
+		for _, value := range values {
+			upper := strings.ToUpper(strings.TrimSpace(value))
+			switch {
+			case strings.Contains(upper, "LTE BAND"):
+				carrier.Band = "B" + digitsOnly(upper)
+			case strings.Contains(upper, "NR5G BAND"):
+				carrier.Band = "N" + digitsOnly(upper)
+			}
+		}
+		out = append(out, carrier)
+	}
+	return out
+}
+
+func parseQuectelNeighborCells(lines []string) []NeighborCell {
+	out := make([]NeighborCell, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+QENG:") || !strings.Contains(line, "neighbourcell") {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QENG:")))
+		if len(values) < 6 {
+			continue
+		}
+		relation := strings.TrimSpace(values[0])
+		relation = strings.TrimPrefix(relation, "neighbourcell ")
+		cell := NeighborCell{
+			RAT:      strings.ToUpper(strings.TrimSpace(values[1])),
+			Relation: relation,
+			Raw:      line,
+		}
+		cell.Frequency = parseUint(values[2])
+		cell.PCI = parseUint(values[3])
+		cell.RSRP = parseOptionalInt(values[4])
+		cell.RSRQ = parseOptionalInt(values[5])
+		out = append(out, cell)
+	}
+	return out
+}
+
+func parseQuectelNR5GMeasInfo(lines []string) []NeighborCell {
+	out := make([]NeighborCell, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+QNWCFG:") || !strings.Contains(line, "nr5g_meas_info") {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QNWCFG:")))
+		if len(values) < 6 || !strings.EqualFold(values[0], "nr5g_meas_info") {
+			continue
+		}
+		out = append(out, NeighborCell{
+			RAT:       "NR",
+			Relation:  "nr5g",
+			Frequency: parseUint(values[1]),
+			PCI:       parseUint(values[2]),
+			RSRP:      parseOptionalInt(values[4]),
+			RSRQ:      parseOptionalInt(values[5]),
+			Raw:       line,
+		})
+	}
+	return out
 }
 
 // ── Registration parsing ────────────────────────────────────────────────────
@@ -892,6 +1034,25 @@ func parseUint(value string) uint64 {
 	}
 	v, _ := strconv.ParseUint(value, 10, 64)
 	return v
+}
+
+func parseOptionalInt(value string) int {
+	v, _ := strconv.Atoi(strings.TrimSpace(strings.Trim(value, "\"")))
+	return v
+}
+
+func digitsOnly(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func escapeATString(value string) string {
+	return strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(value)
 }
 
 func readUintFile(path string) uint64 {

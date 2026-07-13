@@ -628,33 +628,180 @@ func parseQuectelCarrierAggregation(lines []string) []CarrierInfo {
 		if len(values) > 1 {
 			carrier.EARFCN = parseUint(values[1])
 		}
-		if len(values) > 2 {
-			carrier.PCI = parseUint(values[2])
-		}
-		if len(values) > 3 {
-			carrier.RSRP = parseOptionalInt(values[3])
-		}
-		if len(values) > 4 {
-			carrier.RSRQ = parseOptionalInt(values[4])
-		}
-		if len(values) > 5 {
-			carrier.SINR = parseOptionalInt(values[5])
-		}
-		if len(values) > 6 {
-			carrier.Bandwidth = strings.TrimSpace(values[6])
-		}
-		for _, value := range values {
+
+		bandIdx := -1
+		for i, value := range values {
 			upper := strings.ToUpper(strings.TrimSpace(value))
 			switch {
 			case strings.Contains(upper, "LTE BAND"):
+				carrier.RAT = "LTE"
 				carrier.Band = "B" + digitsOnly(upper)
+				bandIdx = i
 			case strings.Contains(upper, "NR5G BAND"):
+				carrier.RAT = "NR"
 				carrier.Band = "N" + digitsOnly(upper)
+				bandIdx = i
 			}
+		}
+
+		if len(values) > 2 {
+			carrier.Bandwidth = quectelBandwidth(values[2], carrier.RAT)
+		}
+		if bandIdx > 0 && bandIdx <= 3 {
+			if idx := quectelQCAIndex(len(values), "pci"); idx >= 0 && len(values) > idx {
+				carrier.PCI = parseUint(values[idx])
+			}
+			if idx := quectelQCAIndex(len(values), "rsrp"); idx >= 0 && len(values) > idx {
+				carrier.RSRP = parseOptionalInt(values[idx])
+			}
+			if idx := quectelQCAIndex(len(values), "rsrq"); idx >= 0 && len(values) > idx {
+				carrier.RSRQ = parseOptionalInt(values[idx])
+			}
+			if idx := quectelQCAIndex(len(values), "sinr"); idx >= 0 && len(values) > idx {
+				carrier.SINR = parseQuectelSINR(values[idx], carrier.RAT)
+			}
+		} else {
+			if len(values) > 2 {
+				carrier.PCI = parseUint(values[2])
+			}
+			if len(values) > 3 {
+				carrier.RSRP = parseOptionalInt(values[3])
+			}
+			if len(values) > 4 {
+				carrier.RSRQ = parseOptionalInt(values[4])
+			}
+			if len(values) > 5 {
+				carrier.SINR = parseQuectelSINR(values[5], carrier.RAT)
+			}
+			if len(values) > 6 && carrier.Bandwidth == "" {
+				carrier.Bandwidth = strings.TrimSpace(values[6])
+			}
+		}
+		if carrier.Bandwidth == "" && len(values) > 0 {
+			carrier.Bandwidth = strings.TrimSpace(values[len(values)-1])
 		}
 		out = append(out, carrier)
 	}
 	return out
+}
+
+func quectelQCAIndex(partsLen int, metric string) int {
+	switch metric {
+	case "pci":
+		if partsLen == 8 {
+			return 4
+		}
+		return 5
+	case "rsrp":
+		if partsLen == 8 {
+			return 5
+		}
+		if partsLen == 12 {
+			return 9
+		}
+		return 6
+	case "rsrq":
+		if partsLen == 8 {
+			return 6
+		}
+		if partsLen == 12 {
+			return 10
+		}
+		return 7
+	case "sinr":
+		switch partsLen {
+		case 8:
+			return 7
+		case 9:
+			return 8
+		case 12:
+			return 11
+		default:
+			return 9
+		}
+	default:
+		return -1
+	}
+}
+
+func quectelBandwidth(value, rat string) string {
+	code := strings.TrimSpace(strings.Trim(value, "\""))
+	if code == "" || code == "-" {
+		return ""
+	}
+	if strings.EqualFold(rat, "NR") {
+		switch code {
+		case "0":
+			return "5 MHz"
+		case "1":
+			return "10 MHz"
+		case "2":
+			return "15 MHz"
+		case "3":
+			return "20 MHz"
+		case "4":
+			return "25 MHz"
+		case "5":
+			return "30 MHz"
+		case "6":
+			return "40 MHz"
+		case "7":
+			return "50 MHz"
+		case "8":
+			return "60 MHz"
+		case "9":
+			return "70 MHz"
+		case "10":
+			return "80 MHz"
+		case "11":
+			return "90 MHz"
+		case "12":
+			return "100 MHz"
+		case "13":
+			return "200 MHz"
+		case "14":
+			return "400 MHz"
+		case "15":
+			return "35 MHz"
+		case "16":
+			return "45 MHz"
+		}
+	} else {
+		switch code {
+		case "6":
+			return "1.4 MHz"
+		case "15":
+			return "3 MHz"
+		case "25":
+			return "5 MHz"
+		case "50":
+			return "10 MHz"
+		case "75":
+			return "15 MHz"
+		case "100":
+			return "20 MHz"
+		}
+	}
+	return code
+}
+
+func parseQuectelSINR(value, rat string) int {
+	v := parseOptionalInt(value)
+	if v == -32768 {
+		return 0
+	}
+	if strings.EqualFold(rat, "NR") && (v >= 100 || v <= -100) {
+		if v >= 4000 {
+			v = 4000
+		} else if v < -3000 {
+			return 0
+		}
+		if v >= 0 {
+			return (v + 50) / 100
+		}
+		return (v - 50) / 100
+	}
+	return v
 }
 
 func parseQuectelNeighborCells(lines []string) []NeighborCell {

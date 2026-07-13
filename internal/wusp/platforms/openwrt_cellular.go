@@ -19,36 +19,46 @@ func (b *OpenWrtBackend) appendOpenWrtCellularConfig(msg *wusp.Message) {
 		return
 	}
 
-	ifaceIdx := messageUint(msg, "Device.Cellular.InterfaceNumberOfEntries")
+	liveIfaceCount := messageUint(msg, "Device.Cellular.InterfaceNumberOfEntries")
+	ifaceIdx := liveIfaceCount
 	apnIdx := messageUint(msg, "Device.Cellular.AccessPointNumberOfEntries")
+	configIdx := uint64(0)
 	for _, section := range parsed.Sections {
 		if !isOpenWrtCellularSection(section) {
 			continue
 		}
-		ifaceIdx++
-		ifacePath := fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)
+		configIdx++
+		targetIfaceIdx := configIdx
+		createInterface := targetIfaceIdx > liveIfaceCount
+		if createInterface {
+			ifaceIdx++
+			targetIfaceIdx = ifaceIdx
+		}
+		ifacePath := fmt.Sprintf("Device.Cellular.Interface.%d.", targetIfaceIdx)
 		name := firstNonEmpty(section.Name, fmt.Sprintf("cellular%d", ifaceIdx))
 		enabled := !parseOpenWrtBool(section.Options["disabled"], false)
 
 		msg.Set(ifacePath+"Enable", wusp.Bool(enabled))
-		msg.Set(ifacePath+"Status", wusp.String(openWrtCellularStatus(enabled)))
-		msg.Set(ifacePath+"Alias", wusp.String("cpe-cellular-"+strconv.FormatUint(ifaceIdx, 10)))
-		msg.Set(ifacePath+"Name", wusp.String(name))
-		msg.Set(ifacePath+"LastChange", wusp.Uint(0))
-		msg.Set(ifacePath+"LowerLayers", wusp.List())
-		msg.Set(ifacePath+"Upstream", wusp.Bool(true))
-		msg.Set(ifacePath+"SupportedAccessTechnologies", wusp.List(cellularTechList(nil)...))
-		msg.Set(ifacePath+"PreferredAccessTechnology", wusp.String("Unknown"))
-		msg.Set(ifacePath+"CurrentAccessTechnology", wusp.String("Unknown"))
-		msg.Set(ifacePath+"AvailableNetworks", wusp.List())
-		msg.Set(ifacePath+"NetworkRequested", wusp.String(""))
-		msg.Set(ifacePath+"Mode", wusp.String("Unknown"))
-		msg.Set(ifacePath+"SIMReferenceList", wusp.List())
-		msg.Set(ifacePath+"USIM.Status", wusp.String("None"))
-		msg.Set(ifacePath+"USIM.PINCheck", wusp.String("Off"))
-		msg.Set(ifacePath+"SMS.StorageNumberOfEntries", wusp.Uint(0))
-		msg.Set(ifacePath+"SMS.MessageNumberOfEntries", wusp.Uint(0))
-		setCellularStats(msg, ifacePath, &modemPkg.Info{})
+		if createInterface {
+			msg.Set(ifacePath+"Status", wusp.String(openWrtCellularStatus(enabled)))
+			msg.Set(ifacePath+"Alias", wusp.String("cpe-cellular-"+strconv.FormatUint(targetIfaceIdx, 10)))
+			msg.Set(ifacePath+"Name", wusp.String(name))
+			msg.Set(ifacePath+"LastChange", wusp.Uint(0))
+			msg.Set(ifacePath+"LowerLayers", wusp.List())
+			msg.Set(ifacePath+"Upstream", wusp.Bool(true))
+			msg.Set(ifacePath+"SupportedAccessTechnologies", wusp.List(cellularTechList(nil)...))
+			msg.Set(ifacePath+"PreferredAccessTechnology", wusp.String("Unknown"))
+			msg.Set(ifacePath+"CurrentAccessTechnology", wusp.String("Unknown"))
+			msg.Set(ifacePath+"AvailableNetworks", wusp.List())
+			msg.Set(ifacePath+"NetworkRequested", wusp.String(""))
+			msg.Set(ifacePath+"Mode", wusp.String("Unknown"))
+			msg.Set(ifacePath+"SIMReferenceList", wusp.List())
+			msg.Set(ifacePath+"USIM.Status", wusp.String("None"))
+			msg.Set(ifacePath+"USIM.PINCheck", wusp.String("Off"))
+			msg.Set(ifacePath+"SMS.StorageNumberOfEntries", wusp.Uint(0))
+			msg.Set(ifacePath+"SMS.MessageNumberOfEntries", wusp.Uint(0))
+			setCellularStats(msg, ifacePath, &modemPkg.Info{})
+		}
 
 		apn := strings.TrimSpace(section.Options["apn"])
 		if apn == "" {
@@ -120,6 +130,9 @@ func (b *OpenWrtBackend) setOpenWrtCellularAccessPointParam(ctx context.Context,
 	if err != nil {
 		return err
 	}
+	if option == "" {
+		return nil
+	}
 	return b.setUCIOption(ctx, "network", section, option, converted, true, networkReloadScript)
 }
 
@@ -155,11 +168,29 @@ func openWrtCellularAPNOptionValue(leaf string, value wusp.Value) (string, strin
 	case "Password":
 		password, err := boundedCellularString("Password", value, 0, 256)
 		return "password", password, err
+	case "Proxy":
+		proxy, err := boundedCellularString("Proxy", value, 0, 256)
+		return "proxy", proxy, err
+	case "ProxyPort":
+		port, err := cellularUintString("ProxyPort", value, 1, 65535)
+		return "proxyport", port, err
+	case "Interface":
+		ref, err := boundedCellularString("Interface", value, 0, 128)
+		if err != nil {
+			return "", "", err
+		}
+		if ref != "" && !strings.HasPrefix(ref, "Device.Cellular.Interface.") {
+			return "", "", fmt.Errorf("wusp openwrt cellular Interface must reference Device.Cellular.Interface")
+		}
+		return "", "", nil
 	case "IPVersion":
 		if value.Tag != wusp.TagInt || value.AsInt() != -1 {
 			return "", "", fmt.Errorf("wusp openwrt cellular IPVersion only supports -1 (IPv4v6/default)")
 		}
 		return "pdptype", "ipv4v6", nil
+	case "Type":
+		apnType, err := cellularListString("Type", value, 0, 128)
+		return "type", apnType, err
 	default:
 		return "", "", wusp.ErrUSPPathUnsupported
 	}
@@ -278,6 +309,54 @@ func boundedCellularString(name string, value wusp.Value, minLen, maxLen int) (s
 		return "", fmt.Errorf("wusp openwrt cellular %s must be a string", name)
 	}
 	text := strings.TrimSpace(value.AsString())
+	if len(text) < minLen || len(text) > maxLen {
+		return "", fmt.Errorf("wusp openwrt cellular %s length must be %d..%d", name, minLen, maxLen)
+	}
+	return text, nil
+}
+
+func cellularUintString(name string, value wusp.Value, minValue, maxValue uint64) (string, error) {
+	var n uint64
+	switch value.Tag {
+	case wusp.TagUint:
+		n = value.AsUint()
+	case wusp.TagInt:
+		if value.AsInt() < 0 {
+			return "", fmt.Errorf("wusp openwrt cellular %s must be %d..%d", name, minValue, maxValue)
+		}
+		n = uint64(value.AsInt())
+	case wusp.TagString:
+		parsed, err := strconv.ParseUint(strings.TrimSpace(value.AsString()), 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("wusp openwrt cellular %s must be numeric", name)
+		}
+		n = parsed
+	default:
+		return "", fmt.Errorf("wusp openwrt cellular %s must be numeric", name)
+	}
+	if n < minValue || n > maxValue {
+		return "", fmt.Errorf("wusp openwrt cellular %s must be %d..%d", name, minValue, maxValue)
+	}
+	return strconv.FormatUint(n, 10), nil
+}
+
+func cellularListString(name string, value wusp.Value, minLen, maxLen int) (string, error) {
+	var text string
+	switch value.Tag {
+	case wusp.TagList:
+		items := make([]string, 0, len(value.AsList()))
+		for _, item := range value.AsList() {
+			itemText := strings.TrimSpace(wusp.ValueToString(item))
+			if itemText != "" {
+				items = append(items, itemText)
+			}
+		}
+		text = strings.Join(items, ",")
+	case wusp.TagString:
+		text = strings.TrimSpace(value.AsString())
+	default:
+		return "", fmt.Errorf("wusp openwrt cellular %s must be a string or list", name)
+	}
 	if len(text) < minLen || len(text) > maxLen {
 		return "", fmt.Errorf("wusp openwrt cellular %s length must be %d..%d", name, minLen, maxLen)
 	}

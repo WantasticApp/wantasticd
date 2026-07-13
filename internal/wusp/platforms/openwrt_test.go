@@ -371,6 +371,36 @@ config interface 'backupcell'
 	}
 }
 
+func TestOpenWrtBackendCellularConfigAugmentsLiveModemRows(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'cellwan'
+	option proto 'qmi'
+	option apn 'internet'
+`)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, nil
+		},
+	})
+
+	msg := &wusp.Message{}
+	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(1))
+	msg.Set("Device.Cellular.Interface.1.Name", wusp.String("wwan0"))
+
+	backend.appendOpenWrtCellularConfig(msg)
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 1)
+	assertUintField(t, msg, "Device.Cellular.AccessPointNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "wwan0")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Interface", "Device.Cellular.Interface.1.")
+	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.APN", "internet")
+	if _, ok := msg.Get("Device.Cellular.Interface.2.Name"); ok {
+		t.Fatal("config merge created duplicate cellular interface")
+	}
+}
+
 func TestOpenWrtBackendSetCellularConfigWritesUCI(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")
@@ -398,6 +428,18 @@ func TestOpenWrtBackendSetCellularConfigWritesUCI(t *testing.T) {
 	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.Password", wusp.String("newpass")); err != nil {
 		t.Fatalf("Set cellular Password: %v", err)
 	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.Type", wusp.List(wusp.String("default"), wusp.String("hipri"))); err != nil {
+		t.Fatalf("Set cellular Type: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.Proxy", wusp.String("10.0.0.1")); err != nil {
+		t.Fatalf("Set cellular Proxy: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.ProxyPort", wusp.Uint(8080)); err != nil {
+		t.Fatalf("Set cellular ProxyPort: %v", err)
+	}
+	if err := backend.Set(context.Background(), "Device.Cellular.AccessPoint.1.Interface", wusp.String("Device.Cellular.Interface.1.")); err != nil {
+		t.Fatalf("Set cellular Interface: %v", err)
+	}
 	if err := backend.Set(context.Background(), "Device.Cellular.Interface.1.Enable", wusp.Bool(false)); err != nil {
 		t.Fatalf("Set cellular Interface Enable: %v", err)
 	}
@@ -414,6 +456,9 @@ func TestOpenWrtBackendSetCellularConfigWritesUCI(t *testing.T) {
 		"option apn 'new.apn'",
 		"option username 'newuser'",
 		"option password 'newpass'",
+		"option type 'default,hipri'",
+		"option proxy '10.0.0.1'",
+		"option proxyport '8080'",
 		"option disabled '1'",
 		"option pdptype 'ipv4v6'",
 	} {
@@ -449,6 +494,9 @@ func TestOpenWrtBackendSetCellularConfigRejectsUnsafeValues(t *testing.T) {
 		{"Device.Cellular.AccessPoint.1.APN", wusp.String("")},
 		{"Device.Cellular.AccessPoint.1.APN", wusp.String(longAPN)},
 		{"Device.Cellular.AccessPoint.1.Username", wusp.Uint(1)},
+		{"Device.Cellular.AccessPoint.1.ProxyPort", wusp.Uint(0)},
+		{"Device.Cellular.AccessPoint.1.Type", wusp.Uint(1)},
+		{"Device.Cellular.AccessPoint.1.Interface", wusp.String("Device.IP.Interface.1.")},
 		{"Device.Cellular.AccessPoint.1.IPVersion", wusp.Int(4)},
 	}
 	for _, tt := range tests {

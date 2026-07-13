@@ -38,6 +38,18 @@ func TestCellularStatusMapping(t *testing.T) {
 	}
 }
 
+func TestCellularModemIdentityUsesStableHardwareKeys(t *testing.T) {
+	if got := cellularModemIdentity("/dev/ttyUSB2", &modemPkg.Info{IMEI: "123456789012345"}); got != "imei:123456789012345" {
+		t.Fatalf("identity=%q", got)
+	}
+	if got := cellularModemIdentity("/dev/ttyUSB2", &modemPkg.Info{ICCID: "89014103211118510720"}); got != "iccid:89014103211118510720" {
+		t.Fatalf("identity=%q", got)
+	}
+	if got := cellularModemIdentity("wwan0", &modemPkg.Info{}); got != "net:wwan0" {
+		t.Fatalf("identity=%q", got)
+	}
+}
+
 func TestCellularRepresentativeMessageValidates(t *testing.T) {
 	msg := wusp.NewMessage()
 	prefix := "Device.Cellular.Interface.1."

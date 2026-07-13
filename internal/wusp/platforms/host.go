@@ -364,10 +364,17 @@ func collectCellularStatic(msg *wusp.Message) {
 	ifaceIdx := 0
 	apnIdx := 0
 	anyRoaming := false
+	seenModems := make(map[string]struct{})
 	for _, dev := range devices {
 		info, err := ctl.GetInfo(dev)
 		if err != nil || info == nil {
 			continue
+		}
+		if identity := cellularModemIdentity(dev, info); identity != "" {
+			if _, ok := seenModems[identity]; ok {
+				continue
+			}
+			seenModems[identity] = struct{}{}
 		}
 		ifaceIdx++
 		if info.Status == modemPkg.RegRoaming {
@@ -510,6 +517,22 @@ func cellularInterfaceName(info *modemPkg.Info, devicePath string, idx int) stri
 		}
 	}
 	return fmt.Sprintf("cellular%d", idx)
+}
+
+func cellularModemIdentity(devicePath string, info *modemPkg.Info) string {
+	if info == nil {
+		return ""
+	}
+	if validDigitString(info.IMEI, 15, 15) {
+		return "imei:" + info.IMEI
+	}
+	if validDigitString(info.ICCID, 6, 20) {
+		return "iccid:" + info.ICCID
+	}
+	if path := firstNonEmpty(info.Interface, devicePath); path != "" && strings.HasPrefix(filepath.Base(path), "wwan") {
+		return "net:" + filepath.Base(path)
+	}
+	return ""
 }
 
 func cellularAccessTechnology(tech modemPkg.Technology) string {

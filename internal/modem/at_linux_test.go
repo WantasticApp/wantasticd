@@ -104,6 +104,29 @@ func TestParseQuectelCarrierAggregation(t *testing.T) {
 	}
 }
 
+func TestParseQuectelCarrierAggregationQuecManagerLayout(t *testing.T) {
+	rows := parseQuectelCarrierAggregation([]string{
+		`+QCAINFO: "PCC",501390,12,"NR5G BAND 41",147,-11,-11,2463`,
+		`+QCAINFO: "SCC",393850,3,"NR5G BAND 25",1,354,1,3,378000`,
+	})
+
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+	if rows[0].RAT != "NR" || rows[0].Band != "N41" || rows[0].Bandwidth != "100 MHz" || rows[0].PCI != 147 {
+		t.Fatalf("pcc row=%+v", rows[0])
+	}
+	if rows[0].RSRP != -11 || rows[0].RSRQ != -11 || rows[0].SINR != 25 {
+		t.Fatalf("pcc signal=%+v", rows[0])
+	}
+	if rows[1].Band != "N25" || rows[1].Bandwidth != "20 MHz" || rows[1].PCI != 354 {
+		t.Fatalf("scc row=%+v", rows[1])
+	}
+	if rows[1].SINR != 40 {
+		t.Fatalf("scc sinr=%d want 40", rows[1].SINR)
+	}
+}
+
 func TestParseQuectelNeighborCells(t *testing.T) {
 	lte := parseQuectelNeighborCells([]string{
 		`+QENG: "neighbourcell intra","LTE",1850,121,-101,-12,-70,10,0,0`,

@@ -349,6 +349,10 @@ func collectCPUInfoStatic(ctx context.Context, runner func(context.Context, stri
 // collectCellularStatic discovers and queries cellular modems, populating
 // Device.Cellular.Interface.{n}. TR-181 params (IMEI, signal, registration, etc.)
 func collectCellularStatic(msg *wusp.Message) {
+	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
+	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
+	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
+
 	ctl := modemPkg.New()
 	defer ctl.Close()
 
@@ -399,6 +403,7 @@ func collectCellularStatic(msg *wusp.Message) {
 			msg.Set(prefix+"DownstreamMaxBitRate", wusp.Uint(info.DownstreamMaxBitRate))
 		}
 		msg.Set(prefix+"SIMReferenceList", wusp.List())
+		appendCellularTelemetryFields(msg, ifaceIdx, dev, info)
 
 		// Signal quality
 		sig := info.Signal
@@ -623,6 +628,96 @@ func setCellularStats(msg *wusp.Message, prefix string, info *modemPkg.Info) {
 	for name, value := range stats {
 		msg.Set(prefix+"Stats."+name, wusp.Uint(value))
 	}
+}
+
+func appendCellularTelemetryFields(msg *wusp.Message, ifaceIdx int, modemPath string, info *modemPkg.Info) {
+	if msg == nil || info == nil || ifaceIdx <= 0 {
+		return
+	}
+	root := fmt.Sprintf("Device.WUSP_CellularTelemetry.Interface.%d.", ifaceIdx)
+	msg.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(uint64(ifaceIdx)))
+	msg.Set(root+"Alias", wusp.String("cpe-cellular-telemetry-"+strconv.Itoa(ifaceIdx)))
+	msg.Set(root+"InterfaceReference", wusp.String(fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)))
+	msg.Set(root+"ModemPath", wusp.String(firstNonEmpty(modemPath, info.Interface)))
+	msg.Set(root+"Protocol", wusp.String(firstNonEmpty(info.Protocol, "unknown")))
+	msg.Set(root+"NRMode", wusp.String(cellularNRMode(info)))
+	if info.Band != "" {
+		msg.Set(root+"Band", wusp.String(info.Band))
+	}
+	if info.CellID > 0 {
+		msg.Set(root+"CellID", wusp.Uint(uint64(info.CellID)))
+	}
+	if info.TAC > 0 {
+		msg.Set(root+"TAC", wusp.Uint(uint64(info.TAC)))
+	}
+	if info.LAC > 0 {
+		msg.Set(root+"LAC", wusp.Uint(uint64(info.LAC)))
+	}
+	if info.DNS1 != "" {
+		msg.Set(root+"DNS1", wusp.String(info.DNS1))
+	}
+	if info.DNS2 != "" {
+		msg.Set(root+"DNS2", wusp.String(info.DNS2))
+	}
+	if ip := net.ParseIP(info.IPAddress); ip != nil && ip.To4() != nil {
+		msg.Set(root+"IPv4Address", wusp.IP4(ip))
+	}
+	if ip := net.ParseIP(info.IPv6Address); ip != nil && ip.To16() != nil && ip.To4() == nil {
+		msg.Set(root+"IPv6Address", wusp.IP6(ip))
+	}
+
+	for i, carrier := range info.CarrierAggregation {
+		prefix := fmt.Sprintf("%sCarrier.%d.", root, i+1)
+		msg.Set(prefix+"Role", wusp.String(firstNonEmpty(carrier.Role, "Unknown")))
+		msg.Set(prefix+"RAT", wusp.String(firstNonEmpty(carrier.RAT, "Unknown")))
+		if carrier.Band != "" {
+			msg.Set(prefix+"Band", wusp.String(carrier.Band))
+		}
+		if carrier.EARFCN > 0 {
+			msg.Set(prefix+"EARFCN", wusp.Uint(carrier.EARFCN))
+		}
+		if carrier.PCI > 0 {
+			msg.Set(prefix+"PCI", wusp.Uint(carrier.PCI))
+		}
+		if carrier.Bandwidth != "" {
+			msg.Set(prefix+"Bandwidth", wusp.String(carrier.Bandwidth))
+		}
+		if carrier.RSRP != 0 {
+			msg.Set(prefix+"RSRP", wusp.Int(int64(carrier.RSRP)))
+		}
+		if carrier.RSRQ != 0 {
+			msg.Set(prefix+"RSRQ", wusp.Int(int64(carrier.RSRQ)))
+		}
+		if carrier.SINR != 0 {
+			msg.Set(prefix+"SINR", wusp.Int(int64(carrier.SINR)))
+		}
+		if carrier.Raw != "" {
+			msg.Set(prefix+"Raw", wusp.String(carrier.Raw))
+		}
+	}
+	msg.Set(root+"CarrierNumberOfEntries", wusp.Uint(uint64(len(info.CarrierAggregation))))
+
+	for i, cell := range info.NeighborCells {
+		prefix := fmt.Sprintf("%sNeighborCell.%d.", root, i+1)
+		msg.Set(prefix+"RAT", wusp.String(firstNonEmpty(cell.RAT, "Unknown")))
+		msg.Set(prefix+"Relation", wusp.String(cell.Relation))
+		if cell.Frequency > 0 {
+			msg.Set(prefix+"Frequency", wusp.Uint(cell.Frequency))
+		}
+		if cell.PCI > 0 {
+			msg.Set(prefix+"PCI", wusp.Uint(cell.PCI))
+		}
+		if cell.RSRP != 0 {
+			msg.Set(prefix+"RSRP", wusp.Int(int64(cell.RSRP)))
+		}
+		if cell.RSRQ != 0 {
+			msg.Set(prefix+"RSRQ", wusp.Int(int64(cell.RSRQ)))
+		}
+		if cell.Raw != "" {
+			msg.Set(prefix+"Raw", wusp.String(cell.Raw))
+		}
+	}
+	msg.Set(root+"NeighborCellNumberOfEntries", wusp.Uint(uint64(len(info.NeighborCells))))
 }
 
 func cellularSMSStorageEntries(info *modemPkg.Info) uint64 {

@@ -65,6 +65,10 @@ type Info struct {
 	UpstreamMaxBitRate    uint64 `json:"upstream_max_bit_rate"`
 	DownstreamMaxBitRate  uint64 `json:"downstream_max_bit_rate"`
 
+	// Quectel extended radio telemetry.
+	CarrierAggregation []CarrierInfo  `json:"carrier_aggregation,omitempty"`
+	NeighborCells      []NeighborCell `json:"neighbor_cells,omitempty"`
+
 	// SMS
 	SMSStorageLocation string `json:"sms_storage_location"`
 	SMSStorageCapacity uint64 `json:"sms_storage_capacity"`
@@ -78,6 +82,34 @@ type Info struct {
 	Interface   string    `json:"interface"` // e.g. "wwan0", "/dev/cdc-wdm0"
 	Protocol    string    `json:"protocol"`  // "qmi", "mbim", "at"
 	CollectedAt time.Time `json:"collected_at"`
+}
+
+// CarrierInfo describes one serving/aggregated LTE or NR carrier, typically
+// sourced from Quectel AT+QCAINFO.
+type CarrierInfo struct {
+	Role      string `json:"role"`
+	RAT       string `json:"rat"`
+	Band      string `json:"band"`
+	EARFCN    uint64 `json:"earfcn"`
+	PCI       uint64 `json:"pci"`
+	Bandwidth string `json:"bandwidth"`
+	RSRP      int    `json:"rsrp"`
+	RSRQ      int    `json:"rsrq"`
+	SINR      int    `json:"sinr"`
+	CellID    string `json:"cell_id"`
+	TAC       string `json:"tac"`
+	Raw       string `json:"raw,omitempty"`
+}
+
+// NeighborCell describes one LTE/NR neighbor measurement.
+type NeighborCell struct {
+	RAT       string `json:"rat"`
+	Relation  string `json:"relation"`
+	Frequency uint64 `json:"frequency"`
+	PCI       uint64 `json:"pci"`
+	RSRP      int    `json:"rsrp"`
+	RSRQ      int    `json:"rsrq"`
+	Raw       string `json:"raw,omitempty"`
 }
 
 // SignalQuality holds multi-technology signal measurements.

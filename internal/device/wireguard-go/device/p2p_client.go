@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -65,6 +66,28 @@ const (
 	NATPortRestricted
 	NATSymmetric
 )
+
+func normalizeUDPAddr(addr net.UDPAddr) net.UDPAddr {
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		addr.IP = append(net.IP(nil), ip4...)
+		return addr
+	}
+	if ip16 := addr.IP.To16(); ip16 != nil {
+		addr.IP = append(net.IP(nil), ip16...)
+	}
+	return addr
+}
+
+func isUsablePunchAddr(addr net.UDPAddr) bool {
+	if addr.Port <= 0 || addr.IP == nil {
+		return false
+	}
+	ip := addr.IP
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
+	return !ip.IsUnspecified()
+}
 
 type P2PSession struct {
 	TargetID     uint32
@@ -254,6 +277,10 @@ func (c *P2PClient) tryP2PUnlocked(peer *DiscoveredPeer) {
 func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 	// Server is telling us to punch to this peer
 	targetID := msg.TargetID
+	now := time.Now()
+
+	var relayedPubKey NoisePublicKey
+	copy(relayedPubKey[:], msg.PublicKey[:])
 
 	c.mu.Lock()
 	peer, ok := c.peers[targetID]
@@ -264,10 +291,41 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		}
 		c.peers[targetID] = peer
 	}
+	if peer.State == P2PStateEstablished {
+		c.mu.Unlock()
+		return
+	}
+
+	if !relayedPubKey.IsZero() {
+		if peer.PublicKey.IsZero() {
+			peer.PublicKey = relayedPubKey
+		} else if !peer.PublicKey.Equals(relayedPubKey) {
+			peer.State = P2PStateFailed
+			peer.LastUsed = now
+			c.mu.Unlock()
+			c.device.log.Errorf("[P2P] Punch relay key mismatch for target %d", targetID)
+			return
+		}
+	}
+	if peer.PublicKey.IsZero() {
+		peer.State = P2PStateFailed
+		peer.LastUsed = now
+		c.mu.Unlock()
+		c.device.log.Verbosef("[P2P] Punch relay missing public key for target %d", targetID)
+		return
+	}
+	if len(msg.Payload) >= net.IPv4len {
+		assignedIP := append(net.IP(nil), msg.Payload[:net.IPv4len]...)
+		if !assignedIP.Equal(net.IPv4zero) && (len(peer.AssignedIP) != net.IPv4len || peer.AssignedIP.Equal(net.IPv4zero)) {
+			peer.AssignedIP = assignedIP
+		}
+	}
 
 	// Update with latest addresses from server
-	peer.LocalAddr = msg.LocalAddr()
-	peer.ObservedAddr = msg.ObservedAddr()
+	peer.LocalAddr = normalizeUDPAddr(msg.LocalAddr())
+	peer.ObservedAddr = normalizeUDPAddr(msg.ObservedAddr())
+	peer.LastUsed = now
+	peer.State = P2PStateTrying
 
 	// Create session
 	session := &P2PSession{
@@ -303,6 +361,9 @@ func (c *P2PClient) sendPunchPackets(session *P2PSession, targets []net.UDPAddr,
 				return
 			}
 			rawPacket := c.makePunchPacket(session)
+			if len(rawPacket) == 0 {
+				continue
+			}
 			// Wrap in WireGuard MessageP2PType (6)
 			packet := make([]byte, 4+len(rawPacket))
 			binary.LittleEndian.PutUint32(packet[:4], MessageP2PType)
@@ -319,8 +380,29 @@ func (c *P2PClient) sendPunchPackets(session *P2PSession, targets []net.UDPAddr,
 }
 
 func (c *P2PClient) holePunch(session *P2PSession, peer *DiscoveredPeer) {
-	// Try both addresses
-	targets := []net.UDPAddr{session.ObservedAddr, session.LocalAddr}
+	// Try both addresses, but skip placeholders and duplicates.
+	targets := make([]net.UDPAddr, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	for _, candidate := range []net.UDPAddr{session.ObservedAddr, session.LocalAddr} {
+		candidate = normalizeUDPAddr(candidate)
+		if !isUsablePunchAddr(candidate) {
+			continue
+		}
+		key := candidate.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, candidate)
+	}
+	if len(targets) == 0 {
+		c.mu.Lock()
+		peer.State = P2PStateFailed
+		peer.LastUsed = time.Now()
+		c.mu.Unlock()
+		c.device.log.Verbosef("[P2P] Punch relay for peer %d had no usable endpoint", peer.ID)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -342,6 +424,10 @@ func (c *P2PClient) holePunch(session *P2PSession, peer *DiscoveredPeer) {
 }
 
 func (c *P2PClient) makePunchPacket(session *P2PSession) []byte {
+	if session.TargetPubKey.IsZero() {
+		return nil
+	}
+
 	// Punch packet: [P2PSubtypePunchPacket:1][nonce:8][mac:32]
 	packet := make([]byte, 1+8+32)
 	packet[0] = P2PSubtypePunchPacket
@@ -351,12 +437,14 @@ func (c *P2PClient) makePunchPacket(session *P2PSession) []byte {
 	ss, err := c.device.staticIdentity.privateKey.sharedSecret(session.TargetPubKey)
 	c.device.staticIdentity.RUnlock()
 
-	if err == nil {
-		mac, _ := blake2s.New256(ss[:])
-		mac.Write(session.Nonce[:])
-		sum := mac.Sum(nil)
-		copy(packet[9:], sum)
+	if err != nil {
+		return nil
 	}
+
+	mac, _ := blake2s.New256(ss[:])
+	mac.Write(session.Nonce[:])
+	sum := mac.Sum(nil)
+	copy(packet[9:], sum)
 
 	return packet
 }
@@ -384,7 +472,7 @@ func (c *P2PClient) verifyPunchPacket(packet []byte, session *P2PSession) bool {
 	mac.Write(nonce[:])
 	sum := mac.Sum(nil)
 
-	return string(sum) == string(packet[9:])
+	return subtle.ConstantTimeCompare(sum, packet[9:]) == 1
 }
 
 func (c *P2PClient) GetEndpoint(peerID uint32) conn.Endpoint {
@@ -515,8 +603,7 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 // is not blocked. If the peer already exists in WireGuard (e.g. from a previous
 // session) the endpoint and allowed-IPs are updated in place.
 func (c *P2PClient) configureWireGuardPeer(pubKey NoisePublicKey, assignedIP net.IP, endpointAddr string) {
-	var zeroKey [32]byte
-	if pubKey == zeroKey || len(assignedIP) != 4 || assignedIP.Equal(net.IPv4zero) {
+	if pubKey.IsZero() || len(assignedIP) != net.IPv4len || assignedIP.Equal(net.IPv4zero) {
 		c.device.log.Verbosef("[P2P] configureWireGuardPeer: skipping peer with missing key or IP")
 		return
 	}

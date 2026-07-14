@@ -17,6 +17,9 @@ import (
 func collectGPSStatic(msg *wusp.Message) {
 	info := gpsFromGPSD()
 	if info == nil {
+		info = gpsFromModemManager()
+	}
+	if info == nil {
 		info = gpsFromFile()
 	}
 	if info == nil {

@@ -91,6 +91,34 @@ func (c *modemManagerController) Disconnect(devicePath string) error {
 	return nil
 }
 
+func (c *modemManagerController) SetFunctionality(devicePath, mode string) error {
+	return c.at.SetFunctionality(devicePath, mode)
+}
+
+func (c *modemManagerController) SetSIMSlot(devicePath string, slot int) error {
+	return c.at.SetSIMSlot(devicePath, slot)
+}
+
+func (c *modemManagerController) SetIMEI(devicePath, imei string) error {
+	return c.at.SetIMEI(devicePath, imei)
+}
+
+func (c *modemManagerController) SetAPNProfile(devicePath string, profile int, pdpType, apn string) error {
+	return c.at.SetAPNProfile(devicePath, profile, pdpType, apn)
+}
+
+func (c *modemManagerController) SendSMS(devicePath, phoneNumber, message string) error {
+	return c.at.SendSMS(devicePath, phoneNumber, message)
+}
+
+func (c *modemManagerController) ListSMS(devicePath string) (string, error) {
+	return c.at.ListSMS(devicePath)
+}
+
+func (c *modemManagerController) DeleteSMS(devicePath, index string) error {
+	return c.at.DeleteSMS(devicePath, index)
+}
+
 func (c *modemManagerController) modemManagerModems() ([]mm.Modem, error) {
 	manager, err := mm.NewModemManager()
 	if err != nil {

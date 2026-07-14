@@ -87,6 +87,7 @@ var AllDeviceObjects = concatObjects(
 	WireGuardObjects,
 	WUSPObjects,
 	WUSPCellularTelemetryObjects,
+	WUSPCellularControlObjects,
 	WUSPMeshTelemetryObjects,
 )
 
@@ -98,6 +99,7 @@ var AllDeviceParams = concat(
 	AllWireGuardParams,
 	AllWUSPParams,
 	AllWUSPCellularTelemetryParams,
+	AllWUSPCellularControlParams,
 	AllWUSPMeshTelemetryParams,
 )
 
@@ -138,6 +140,15 @@ var BroadbandDataModels = []BroadbandDataModel{
 		WUSPSourceURL,
 		WUSPCellularTelemetryObjects,
 		AllWUSPCellularTelemetryParams,
+	),
+	newBroadbandDataModel(
+		"wusp-cellular-control",
+		"Wantastic WUSP Cellular Control",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPCellularControlObjects,
+		AllWUSPCellularControlParams,
 	),
 	newBroadbandDataModel(
 		"wusp-mesh-telemetry",

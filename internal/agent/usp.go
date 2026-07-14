@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
+	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 	"wantastic-agent/internal/wusp/platforms"
 )
@@ -487,7 +489,7 @@ func (r *uspRuntime) isControllerPeer(peerPublicKeyHex string) bool {
 // canonical "Device.Foo()" command paths; we route them to platform-specific
 // effects. Unsupported commands return ErrUSPPathUnsupported, which the
 // controller surfaces back to the dashboard as a clean "not supported" error.
-func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, _ *wusp.Message, _ map[string]string) (*wusp.Message, error) {
+func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *wusp.Message, _ map[string]string) (*wusp.Message, error) {
 	cmd := strings.TrimSpace(cmdPath)
 	log.Printf("[USP] Operate request: %s", cmd)
 	switch cmd {
@@ -520,8 +522,143 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, _ *wusp.
 		}()
 		return nil, nil
 	default:
+		if strings.HasPrefix(cmd, "Device.WUSP_CellularControl.Interface.") {
+			return r.handleCellularOperate(ctx, cmd, input)
+		}
 		return nil, wusp.ErrUSPPathUnsupported
 	}
+}
+
+func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, input *wusp.Message) (*wusp.Message, error) {
+	const prefix = "Device.WUSP_CellularControl.Interface."
+	rest := strings.TrimPrefix(cmd, prefix)
+	parts := strings.SplitN(rest, ".", 2)
+	if len(parts) != 2 {
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+	index, err := strconv.Atoi(parts[0])
+	if err != nil || index <= 0 {
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+	operation := strings.TrimSuffix(parts[1], "()")
+	if operation == parts[1] || operation == "" {
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+
+	ctl := modemPkg.New()
+	defer ctl.Close()
+	control, ok := ctl.(modemPkg.ControlController)
+	if !ok {
+		return cellularOperateStatus(index, "Error", "cellular control backend is not available", ""), nil
+	}
+	devicePath := cellularOperateDevicePath(ctl, input, index)
+	var output string
+
+	switch operation {
+	case "SetFunctionality":
+		mode := cellularInputString(input, "ModemFunctionality", "Mode")
+		if mode == "" {
+			mode = "Full"
+		}
+		err = control.SetFunctionality(devicePath, mode)
+		output = "modem functionality set to " + mode
+	case "SwitchSIM":
+		slot := cellularInputInt(input, 1, "SIMSlot", "Slot")
+		err = control.SetSIMSlot(devicePath, slot)
+		output = fmt.Sprintf("SIM slot switched to %d", slot)
+	case "SetIMEI":
+		imei := cellularInputString(input, "IMEIOverride", "IMEI")
+		err = control.SetIMEI(devicePath, imei)
+		output = "IMEI command accepted"
+	case "ApplyAPN":
+		profile := cellularInputInt(input, 1, "APNProfileNumber", "Profile")
+		pdpType := cellularInputString(input, "APNPDPType", "PDPType")
+		apn := cellularInputString(input, "APN")
+		err = control.SetAPNProfile(devicePath, profile, pdpType, apn)
+		output = "APN profile applied"
+	case "SendSMS":
+		phone := cellularInputString(input, "PhoneNumber", "To")
+		message := cellularInputString(input, "Message", "Body")
+		err = control.SendSMS(devicePath, phone, message)
+		output = "SMS sent"
+	case "ListSMS":
+		output, err = control.ListSMS(devicePath)
+		if output == "" {
+			output = "[]"
+		}
+	case "DeleteSMS":
+		index := cellularInputString(input, "DeleteIndex", "SMSIndex", "Index")
+		err = control.DeleteSMS(devicePath, index)
+		output = "SMS deleted"
+	default:
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if err != nil {
+		return cellularOperateStatus(index, "Error", err.Error(), ""), nil
+	}
+	if operation == "ListSMS" {
+		return cellularOperateStatus(index, "Success", "SMS inbox refreshed", output), nil
+	}
+	return cellularOperateStatus(index, "Success", output, ""), nil
+}
+
+func cellularOperateDevicePath(ctl modemPkg.Controller, input *wusp.Message, index int) string {
+	if path := cellularInputString(input, "ModemPath"); path != "" {
+		return path
+	}
+	devices, err := ctl.Discover()
+	if err == nil && index > 0 && len(devices) >= index {
+		return devices[index-1]
+	}
+	if err == nil && len(devices) > 0 {
+		return devices[0]
+	}
+	return ""
+}
+
+func cellularInputString(input *wusp.Message, names ...string) string {
+	if input == nil {
+		return ""
+	}
+	for _, name := range names {
+		if value, ok := input.Get(name); ok {
+			return strings.TrimSpace(wusp.ValueToString(value))
+		}
+		for _, field := range input.Fields {
+			if strings.HasSuffix(field.Path, "."+name) || field.Path == name {
+				return strings.TrimSpace(wusp.ValueToString(field.Val))
+			}
+		}
+	}
+	return ""
+}
+
+func cellularInputInt(input *wusp.Message, fallback int, names ...string) int {
+	value := cellularInputString(input, names...)
+	if value == "" {
+		return fallback
+	}
+	if parsed, err := strconv.Atoi(value); err == nil {
+		return parsed
+	}
+	return fallback
+}
+
+func cellularOperateStatus(index int, status, output, smsInbox string) *wusp.Message {
+	msg := wusp.NewMessage()
+	prefix := fmt.Sprintf("Device.WUSP_CellularControl.Interface.%d.", index)
+	msg.Set(prefix+"LastCommandStatus", wusp.String(status))
+	msg.Set(prefix+"LastCommandOutput", wusp.String(output))
+	if smsInbox != "" {
+		msg.Set(prefix+"SMSInboxJSON", wusp.String(smsInbox))
+	}
+	return msg
 }
 
 // tryReboot attempts to issue a system reboot. Returns an error if no

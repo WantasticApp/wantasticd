@@ -352,6 +352,7 @@ func collectCellularStatic(msg *wusp.Message) {
 	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
+	msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(0))
 
 	ctl := newModemController()
 	defer ctl.Close()
@@ -381,6 +382,7 @@ func collectCellularStatic(msg *wusp.Message) {
 			anyRoaming = true
 		}
 		prefix := setCellularInterfaceFields(msg, ifaceIdx, dev, info)
+		setCellularControlFields(msg, ifaceIdx, dev, info)
 		if info.SMSStorageLocation != "" {
 			storagePrefix := prefix + "SMS.Storage.1."
 			msg.Set(storagePrefix+"Alias", wusp.String("cpe-sms-storage-1"))
@@ -409,7 +411,7 @@ func collectCellularStatic(msg *wusp.Message) {
 			msg.Set(apnPrefix+"Proxy", wusp.String(""))
 			msg.Set(apnPrefix+"ProxyPort", wusp.Uint(1))
 			msg.Set(apnPrefix+"Interface", wusp.String(fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)))
-			msg.Set(apnPrefix+"IPVersion", wusp.Int(-1))
+			msg.Set(apnPrefix+"IPVersion", wusp.Int(int64(info.IPVersion)))
 			msg.Set(apnPrefix+"Type", wusp.List(wusp.String("default")))
 		}
 	}
@@ -423,6 +425,7 @@ func collectCellularStatic(msg *wusp.Message) {
 			msg.Set("Device.Cellular.RoamingStatus", wusp.String("Home"))
 		}
 		msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(true))
+		msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(uint64(ifaceIdx)))
 	}
 }
 
@@ -491,8 +494,34 @@ func setCellularInterfaceFields(msg *wusp.Message, ifaceIdx int, devicePath stri
 	msg.Set(prefix+"USIM.PINCheck", wusp.String("Off"))
 	setCellularStats(msg, prefix, info)
 	msg.Set(prefix+"SMS.StorageNumberOfEntries", wusp.Uint(cellularSMSStorageEntries(info)))
-	msg.Set(prefix+"SMS.MessageNumberOfEntries", wusp.Uint(0))
+	msg.Set(prefix+"SMS.MessageNumberOfEntries", wusp.Uint(info.SMSStorageUsed))
 
+	return prefix
+}
+
+func setCellularControlFields(msg *wusp.Message, ifaceIdx int, devicePath string, info *modemPkg.Info) string {
+	prefix := fmt.Sprintf("Device.WUSP_CellularControl.Interface.%d.", ifaceIdx)
+	if msg == nil || info == nil || ifaceIdx <= 0 {
+		return prefix
+	}
+
+	msg.Set(prefix+"Alias", wusp.String("cpe-cellular-control-"+strconv.Itoa(ifaceIdx)))
+	msg.Set(prefix+"InterfaceReference", wusp.String(fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)))
+	msg.Set(prefix+"ModemPath", wusp.String(firstNonEmpty(devicePath, info.Interface)))
+	msg.Set(prefix+"SupportedOperations", wusp.String("SetFunctionality,SwitchSIM,SetIMEI,ApplyAPN,SendSMS,ListSMS,DeleteSMS"))
+	msg.Set(prefix+"ModemFunctionality", wusp.String(firstNonEmpty(info.ModemFunctionality, "Unknown")))
+	if info.SIMSlot > 0 {
+		msg.Set(prefix+"SIMSlot", wusp.Uint(uint64(info.SIMSlot)))
+	} else {
+		msg.Set(prefix+"SIMSlot", wusp.Uint(1))
+	}
+	msg.Set(prefix+"IMEIOverride", wusp.String(""))
+	msg.Set(prefix+"APNProfileNumber", wusp.Uint(1))
+	msg.Set(prefix+"APNPDPType", wusp.String("IPV4V6"))
+	msg.Set(prefix+"APN", wusp.String(info.APN))
+	msg.Set(prefix+"SMSInboxJSON", wusp.String(""))
+	msg.Set(prefix+"LastCommandStatus", wusp.String("Idle"))
+	msg.Set(prefix+"LastCommandOutput", wusp.String(""))
 	return prefix
 }
 
@@ -535,8 +564,19 @@ func cellularModemIdentity(devicePath string, info *modemPkg.Info) string {
 	if validDigitString(info.ICCID, 6, 20) {
 		return "iccid:" + info.ICCID
 	}
-	if path := firstNonEmpty(info.Interface, devicePath); path != "" && strings.HasPrefix(filepath.Base(path), "wwan") {
-		return "net:" + filepath.Base(path)
+	if path := firstNonEmpty(info.Interface, devicePath); path != "" {
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, "wwan") ||
+			strings.HasPrefix(base, "rmnet") ||
+			strings.HasPrefix(base, "qmimux") ||
+			strings.HasPrefix(base, "mhi") ||
+			strings.HasPrefix(base, "usb") ||
+			strings.HasPrefix(base, "eth") ||
+			base == "bridge0" ||
+			base == "wan" ||
+			base == "wan0" {
+			return "net:" + base
+		}
 	}
 	return ""
 }

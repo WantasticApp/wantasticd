@@ -75,8 +75,9 @@ type Info struct {
 	SMSStorageUsed     uint64 `json:"sms_storage_used"`
 
 	// SIM
-	SIMStatus SIMStatus `json:"sim_status"`
-	SIMSlot   int       `json:"sim_slot"`
+	SIMStatus          SIMStatus `json:"sim_status"`
+	SIMSlot            int       `json:"sim_slot"`
+	ModemFunctionality string    `json:"modem_functionality"`
 
 	// Metadata
 	Interface   string    `json:"interface"` // e.g. "wwan0", "/dev/cdc-wdm0"
@@ -253,6 +254,19 @@ type Controller interface {
 
 	// Close releases resources.
 	Close() error
+}
+
+// ControlController is implemented by modem backends that can mutate Quectel /
+// 3GPP modem state. The WUSP agent calls these through explicit Operate
+// commands because several of them can detach the modem or reboot the radio.
+type ControlController interface {
+	SetFunctionality(devicePath, mode string) error
+	SetSIMSlot(devicePath string, slot int) error
+	SetIMEI(devicePath, imei string) error
+	SetAPNProfile(devicePath string, profile int, pdpType, apn string) error
+	SendSMS(devicePath, phoneNumber, message string) error
+	ListSMS(devicePath string) (string, error)
+	DeleteSMS(devicePath, index string) error
 }
 
 // New returns the best available modem Controller for this platform.

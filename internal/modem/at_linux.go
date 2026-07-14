@@ -22,6 +22,8 @@ import (
 // Falls back to sysfs/procfs for device info when AT ports aren't accessible.
 type atController struct{}
 
+const smsToolDevicePath = "sms_tool"
+
 func (c *atController) Close() error { return nil }
 
 func (c *atController) Discover() ([]string, error) {
@@ -39,7 +41,7 @@ func (c *atController) Discover() ([]string, error) {
 	if entries, err := os.ReadDir("/sys/class/net"); err == nil {
 		for _, e := range entries {
 			name := e.Name()
-			if strings.HasPrefix(name, "wwan") || strings.HasPrefix(name, "rmnet") {
+			if isPrimaryCellularNetInterface(name) {
 				add(name)
 			}
 			// Check if interface is a USB modem via driver
@@ -71,6 +73,13 @@ func (c *atController) Discover() ([]string, error) {
 		}
 	}
 
+	if smsToolAvailable() {
+		if iface := firstCellularNetInterface(); iface != "" {
+			add(iface)
+		}
+		add(smsToolDevicePath)
+	}
+
 	return devices, nil
 }
 
@@ -83,8 +92,14 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 
 	port := c.findATPort(devicePath)
 	if port == "" {
+		if c.enrichFromSMSTool(info) {
+			c.enrichFromNetStats(devicePath, info)
+			if hasCellularInfo(info) {
+				return info, nil
+			}
+		}
 		// No AT port — return sysfs-only data if we got anything
-		if info.Model != "" || info.Manufacturer != "" {
+		if hasCellularInfo(info) {
 			return info, nil
 		}
 		return nil, fmt.Errorf("no AT port found for %s", devicePath)
@@ -128,6 +143,8 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 			val = strings.TrimSpace(strings.TrimPrefix(val, "+CCID:"))
 		}
 		info.ICCID = val
+	} else if lines := at.send("AT+ICCID"); len(lines) > 0 {
+		info.ICCID = parseColonValue(lines[0])
 	}
 	if lines := at.send("AT+CNUM"); len(lines) > 0 {
 		// +CNUM: "","+1234567890",129
@@ -220,6 +237,12 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	if lines := at.send("AT+CPMS?"); len(lines) > 0 {
 		c.parseSMSStorage(lines[0], info)
 	}
+	if lines := at.send("AT+QUIMSLOT?"); len(lines) > 0 {
+		info.SIMSlot = parseQuectelSIMSlot(lines)
+	}
+	if lines := at.send("AT+CFUN?"); len(lines) > 0 {
+		info.ModemFunctionality = parseFunctionality(lines[0])
+	}
 
 	info.SupportedTechnologies = inferSupportedTechnologies(info)
 	if info.Technology == TechNR5GNSA {
@@ -237,6 +260,12 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 func (c *atController) GetSignal(devicePath string) (*SignalQuality, error) {
 	port := c.findATPort(devicePath)
 	if port == "" {
+		if smsToolAvailable() {
+			info := c.infoFromSysfs(devicePath)
+			if c.enrichFromSMSTool(info) {
+				return &info.Signal, nil
+			}
+		}
 		return nil, fmt.Errorf("no AT port found for %s", devicePath)
 	}
 	f, err := os.OpenFile(port, os.O_RDWR, 0666)
@@ -254,24 +283,121 @@ func (c *atController) Connect(devicePath, apn string) error {
 	if apn == "" {
 		return fmt.Errorf("AT command connect requires APN")
 	}
-	at, closeFn, err := c.openATSession(devicePath)
-	if err != nil {
+	if _, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+CGDCONT=1,\"IPV4V6\",\"%s\"", escapeATString(apn)), 8); err != nil {
 		return err
 	}
-	defer closeFn()
-	at.send(fmt.Sprintf("AT+CGDCONT=1,\"IPV4V6\",\"%s\"", escapeATString(apn)))
-	at.send("AT+CGACT=1,1")
-	return nil
+	_, err := c.sendATCommand(devicePath, "AT+CGACT=1,1", 15)
+	return err
 }
 
 func (c *atController) Disconnect(devicePath string) error {
-	at, closeFn, err := c.openATSession(devicePath)
+	_, err := c.sendATCommand(devicePath, "AT+CGACT=0,1", 15)
+	return err
+}
+
+func (c *atController) SetFunctionality(devicePath, mode string) error {
+	value, err := functionalityATValue(mode)
 	if err != nil {
 		return err
 	}
-	defer closeFn()
-	at.send("AT+CGACT=0,1")
+	_, err = c.sendATCommand(devicePath, "AT+CFUN="+value, 30)
+	return err
+}
+
+func (c *atController) SetSIMSlot(devicePath string, slot int) error {
+	if slot < 1 || slot > 4 {
+		return fmt.Errorf("SIM slot must be between 1 and 4")
+	}
+	if _, err := c.sendATCommand(devicePath, "AT+CFUN=0", 30); err != nil {
+		return err
+	}
+	if _, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+QUIMSLOT=%d", slot), 15); err != nil {
+		return err
+	}
+	_, err := c.sendATCommand(devicePath, "AT+CFUN=1", 45)
+	return err
+}
+
+func (c *atController) SetIMEI(devicePath, imei string) error {
+	imei = digitsOnly(imei)
+	if len(imei) != 15 {
+		return fmt.Errorf("IMEI must contain exactly 15 digits")
+	}
+	_, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+EGMR=1,7,\"%s\"", imei), 15)
+	return err
+}
+
+func (c *atController) SetAPNProfile(devicePath string, profile int, pdpType, apn string) error {
+	apn = strings.TrimSpace(apn)
+	if apn == "" {
+		return fmt.Errorf("APN is required")
+	}
+	if profile <= 0 {
+		profile = 1
+	}
+	pdpType = strings.ToUpper(strings.TrimSpace(pdpType))
+	switch pdpType {
+	case "", "IPV4V6":
+		pdpType = "IPV4V6"
+	case "IP", "IPV6":
+	default:
+		return fmt.Errorf("unsupported PDP type %q", pdpType)
+	}
+	_, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+CGDCONT=%d,\"%s\",\"%s\"", profile, pdpType, escapeATString(apn)), 8)
+	return err
+}
+
+func (c *atController) SendSMS(_ string, phoneNumber, message string) error {
+	if !smsToolAvailable() {
+		return fmt.Errorf("sms_tool not found")
+	}
+	phoneNumber = strings.TrimSpace(phoneNumber)
+	message = strings.TrimSpace(message)
+	if phoneNumber == "" || message == "" {
+		return fmt.Errorf("phone number and message are required")
+	}
+	cmd := exec.Command("sms_tool", "send", phoneNumber, message)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("sms_tool send failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	return nil
+}
+
+func (c *atController) ListSMS(_ string) (string, error) {
+	if !smsToolAvailable() {
+		return "", fmt.Errorf("sms_tool not found")
+	}
+	out, err := exec.Command("sms_tool", "-j", "recv").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("sms_tool recv failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (c *atController) DeleteSMS(_ string, index string) error {
+	if !smsToolAvailable() {
+		return fmt.Errorf("sms_tool not found")
+	}
+	index = strings.TrimSpace(index)
+	if index == "" {
+		return fmt.Errorf("SMS index is required")
+	}
+	cmd := exec.Command("sms_tool", "delete", index)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("sms_tool delete failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (c *atController) sendATCommand(devicePath, cmd string, timeoutSeconds int) ([]string, error) {
+	if at, closeFn, err := c.openATSession(devicePath); err == nil {
+		defer closeFn()
+		return at.send(cmd), nil
+	}
+	if smsToolAvailable() {
+		return runSMSToolAT(cmd, timeoutSeconds)
+	}
+	return nil, fmt.Errorf("no AT port found for %s", devicePath)
 }
 
 func (c *atController) openATSession(devicePath string) (*atSession, func(), error) {
@@ -286,6 +412,170 @@ func (c *atController) openATSession(devicePath string) (*atSession, func(), err
 	return &atSession{f: f, scanner: bufio.NewScanner(f)}, func() { _ = f.Close() }, nil
 }
 
+func (c *atController) enrichFromSMSTool(info *Info) bool {
+	if info == nil || !smsToolAvailable() {
+		return false
+	}
+	ran := false
+	run := func(cmd string, timeout int) []string {
+		lines, err := runSMSToolAT(cmd, timeout)
+		if err == nil && len(lines) > 0 {
+			ran = true
+			return lines
+		}
+		return nil
+	}
+
+	info.Protocol = "sms_tool"
+	info.CollectedAt = time.Now()
+	if iface := firstCellularNetInterface(); iface != "" {
+		info.Interface = iface
+	}
+
+	if lines := run("ATI", 5); len(lines) > 0 && info.Model == "" {
+		info.Model = strings.Join(lines, " ")
+	}
+	if lines := run("AT+CGMI", 5); len(lines) > 0 && info.Manufacturer == "" {
+		info.Manufacturer = strings.TrimSpace(lines[0])
+	}
+	if lines := run("AT+CGMM", 5); len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
+		info.Model = strings.TrimSpace(lines[0])
+	}
+	if lines := run("AT+CGMR", 5); len(lines) > 0 && info.Revision == "" {
+		info.Revision = strings.TrimSpace(lines[0])
+	}
+	if lines := run("AT+CGSN", 5); len(lines) > 0 && info.IMEI == "" {
+		info.IMEI = digitsOnly(lines[0])
+	}
+	if lines := run("AT+CIMI", 5); len(lines) > 0 && info.IMSI == "" {
+		info.IMSI = digitsOnly(lines[0])
+	}
+	if lines := run("AT+ICCID", 5); len(lines) > 0 && info.ICCID == "" {
+		info.ICCID = digitsOnly(parseColonValue(lines[0]))
+	} else if lines := run("AT+CCID", 5); len(lines) > 0 && info.ICCID == "" {
+		info.ICCID = digitsOnly(parseColonValue(lines[0]))
+	}
+	if lines := run("AT+CNUM", 5); len(lines) > 0 && info.MSISDN == "" {
+		info.MSISDN = parseCNUM(lines[0])
+	}
+	if lines := run("AT+CPIN?", 5); len(lines) > 0 {
+		info.SIMStatus = parseCPIN(lines[0])
+	}
+	if lines := run("AT+CSQ", 5); len(lines) > 0 {
+		parseCSQ(lines[0], &info.Signal)
+	}
+	if lines := run("AT+QCSQ", 5); len(lines) > 0 {
+		c.parseQuectelSignal(lines[0], &info.Signal)
+	} else if lines := run("AT+CESQ", 5); len(lines) > 0 {
+		c.parseCESQ(lines[0], &info.Signal)
+	}
+	if lines := run("AT+COPS?", 5); len(lines) > 0 {
+		parseCOPS(lines[0], info)
+	}
+	for _, cmd := range []string{"AT+C5GREG?", "AT+CEREG?", "AT+CGREG?", "AT+CREG?"} {
+		if lines := run(cmd, 5); len(lines) > 0 && parseRegistrationLine(lines[0], info) {
+			break
+		}
+	}
+	if lines := run("AT+CGDCONT?", 5); len(lines) > 0 {
+		parseCGDCONT(lines, info)
+	}
+	if lines := run("AT+CGCONTRDP", 8); len(lines) > 0 {
+		c.parseCGCONTRDP(lines, info)
+	}
+	if lines := run("AT+QMAP=\"WWAN\"", 5); len(lines) > 0 {
+		c.parseQuectelWANIP(lines, info)
+	}
+	if lines := run("AT+QNWINFO", 5); len(lines) > 0 {
+		c.parseQuectelNetworkInfo(lines[0], info)
+	}
+	if lines := run("AT+QSPN", 5); len(lines) > 0 {
+		c.parseQuectelOperator(lines[0], info)
+	}
+	if lines := run("AT+QENG=\"servingcell\"", 8); len(lines) > 0 {
+		c.parseQuectelServingCell(lines, &info.Signal)
+		c.parseQuectelServingCellInfo(lines, info)
+	}
+	if lines := run("AT+QCAINFO", 8); len(lines) > 0 {
+		info.CarrierAggregation = parseQuectelCarrierAggregation(lines)
+	}
+	if lines := run("AT+QENG=\"neighbourcell\"", 8); len(lines) > 0 {
+		info.NeighborCells = append(info.NeighborCells, parseQuectelNeighborCells(lines)...)
+	}
+	if lines := run("AT+QNWCFG=\"nr5g_meas_info\"", 8); len(lines) > 0 {
+		info.NeighborCells = append(info.NeighborCells, parseQuectelNR5GMeasInfo(lines)...)
+	}
+	if lines := run("AT+CPMS?", 5); len(lines) > 0 {
+		c.parseSMSStorage(lines[0], info)
+	}
+	if lines := run("AT+QUIMSLOT?", 5); len(lines) > 0 {
+		info.SIMSlot = parseQuectelSIMSlot(lines)
+	}
+	if lines := run("AT+CFUN?", 5); len(lines) > 0 {
+		info.ModemFunctionality = parseFunctionality(lines[0])
+	}
+
+	info.SupportedTechnologies = inferSupportedTechnologies(info)
+	if info.Technology == TechNR5GNSA {
+		info.NRMode = "NonStandalone"
+	} else if info.Technology == TechNR5G {
+		info.NRMode = "Standalone"
+	} else if info.NRMode == "" {
+		info.NRMode = "Unknown"
+	}
+	return ran
+}
+
+func smsToolAvailable() bool {
+	_, err := exec.LookPath("sms_tool")
+	return err == nil
+}
+
+func runSMSToolAT(cmd string, timeoutSeconds int) ([]string, error) {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 5
+	}
+	out, err := exec.Command("sms_tool", "at", cmd, "-t", strconv.Itoa(timeoutSeconds)).CombinedOutput()
+	lines := cleanATCommandOutput(string(out), cmd)
+	if err != nil {
+		return lines, fmt.Errorf("sms_tool at %q failed: %w: %s", cmd, err, strings.TrimSpace(string(out)))
+	}
+	return lines, nil
+}
+
+func cleanATCommandOutput(raw, cmd string) []string {
+	cmd = strings.TrimSpace(cmd)
+	var lines []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if line == "" || line == cmd || line == "OK" || line == "ERROR" {
+			continue
+		}
+		if strings.HasPrefix(line, "AT command") || strings.HasPrefix(line, ">") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func hasCellularInfo(info *Info) bool {
+	if info == nil {
+		return false
+	}
+	return info.Model != "" ||
+		info.Manufacturer != "" ||
+		info.IMEI != "" ||
+		info.IMSI != "" ||
+		info.ICCID != "" ||
+		info.Operator != "" ||
+		(info.Interface != "" && filepath.Base(info.Interface) != smsToolDevicePath && isCellularNetInterfaceCandidate(filepath.Base(info.Interface))) ||
+		info.Signal.RSSI != 0 ||
+		info.Signal.RSRP != 0 ||
+		info.TxBytes != 0 ||
+		info.RxBytes != 0
+}
+
 // ── Signal parsing ──────────────────────────────────────────────────────────
 
 func (c *atController) parseSignal(at *atSession) SignalQuality {
@@ -293,16 +583,7 @@ func (c *atController) parseSignal(at *atSession) SignalQuality {
 
 	// Basic CSQ
 	if lines := at.send("AT+CSQ"); len(lines) > 0 {
-		if strings.HasPrefix(lines[0], "+CSQ:") {
-			parts := strings.Split(strings.TrimPrefix(lines[0], "+CSQ:"), ",")
-			if len(parts) > 0 {
-				if csq, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && csq >= 0 && csq <= 31 {
-					sig.CSQ = csq
-					sig.RSSI = -113 + csq*2
-					sig.Bars = csqToBars(csq)
-				}
-			}
-		}
+		parseCSQ(lines[0], &sig)
 	}
 
 	// Extended signal: AT+QCSQ (Quectel), AT+CESQ (3GPP), or AT+QENG
@@ -321,6 +602,21 @@ func (c *atController) parseSignal(at *atSession) SignalQuality {
 	}
 
 	return sig
+}
+
+func parseCSQ(line string, sig *SignalQuality) {
+	if sig == nil || !strings.HasPrefix(line, "+CSQ:") {
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(line, "+CSQ:"), ",")
+	if len(parts) == 0 {
+		return
+	}
+	if csq, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && csq >= 0 && csq <= 31 {
+		sig.CSQ = csq
+		sig.RSSI = -113 + csq*2
+		sig.Bars = csqToBars(csq)
+	}
 }
 
 // parseQuectelSignal parses +QCSQ: "LTE",-71,-8,157,-12
@@ -601,6 +897,160 @@ func (c *atController) parseSMSStorage(line string, info *Info) {
 		info.SMSStorageLocation = values[0]
 		info.SMSStorageUsed = parseUint(values[1])
 		info.SMSStorageCapacity = parseUint(values[2])
+	}
+}
+
+func parseCNUM(line string) string {
+	if !strings.Contains(line, ",") {
+		return ""
+	}
+	parts := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+CNUM:")))
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(strings.Trim(parts[1], "\""))
+}
+
+func parseCPIN(line string) SIMStatus {
+	upper := strings.ToUpper(line)
+	switch {
+	case strings.Contains(upper, "READY"):
+		return SIMReady
+	case strings.Contains(upper, "SIM PIN"), strings.Contains(upper, "SIM PUK"):
+		return SIMLocked
+	case strings.Contains(upper, "ERROR"):
+		return SIMError
+	default:
+		return SIMAbsent
+	}
+}
+
+func parseCOPS(line string, info *Info) {
+	if info == nil || !strings.HasPrefix(line, "+COPS:") {
+		return
+	}
+	parts := splitATCSV(strings.TrimPrefix(line, "+COPS:"))
+	if len(parts) >= 3 {
+		info.Operator = strings.Trim(parts[2], "\"")
+	}
+	if len(parts) >= 4 {
+		info.Technology = copsTechToTech(strings.TrimSpace(parts[3]))
+	}
+}
+
+func parseRegistrationLine(line string, info *Info) bool {
+	if info == nil {
+		return false
+	}
+	prefix := ""
+	for _, candidate := range []string{"+C5GREG:", "+CEREG:", "+CGREG:", "+CREG:"} {
+		if strings.HasPrefix(line, candidate) {
+			prefix = candidate
+			break
+		}
+	}
+	if prefix == "" {
+		return false
+	}
+	parts := splitATCSV(strings.TrimPrefix(line, prefix))
+	statIdx := 1
+	if len(parts) == 1 {
+		statIdx = 0
+	}
+	if len(parts) <= statIdx {
+		return false
+	}
+	switch strings.TrimSpace(parts[statIdx]) {
+	case "1":
+		info.Status = RegHome
+	case "5":
+		info.Status = RegRoaming
+	case "2":
+		info.Status = RegSearching
+	case "3":
+		info.Status = RegDenied
+	default:
+		info.Status = RegNotRegistered
+	}
+	if len(parts) >= statIdx+3 {
+		if area, err := strconv.ParseUint(strings.TrimSpace(parts[statIdx+1]), 16, 32); err == nil {
+			if prefix == "+CREG:" || prefix == "+CGREG:" {
+				info.LAC = uint16(area)
+			} else {
+				info.TAC = uint32(area)
+			}
+		}
+		if ci, err := strconv.ParseUint(strings.TrimSpace(parts[statIdx+2]), 16, 32); err == nil {
+			info.CellID = uint32(ci)
+		}
+	}
+	if len(parts) > statIdx+3 && info.Technology == TechUnknown {
+		info.Technology = copsTechToTech(strings.TrimSpace(parts[statIdx+3]))
+	}
+	return info.Status != RegNotRegistered
+}
+
+func parseCGDCONT(lines []string, info *Info) {
+	if info == nil {
+		return
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "+CGDCONT:") {
+			continue
+		}
+		parts := splitATCSV(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "+CGDCONT:")))
+		if len(parts) >= 3 {
+			pdpType := strings.ToUpper(strings.TrimSpace(parts[1]))
+			info.APN = strings.TrimSpace(parts[2])
+			info.IPVersion = pdpTypeToIPVersion(pdpType)
+			return
+		}
+	}
+}
+
+func parseQuectelSIMSlot(lines []string) int {
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "+QUIMSLOT:") {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "+QUIMSLOT:")))
+		if len(values) > 0 {
+			if slot, err := strconv.Atoi(strings.TrimSpace(values[0])); err == nil {
+				return slot
+			}
+		}
+	}
+	return 0
+}
+
+func parseFunctionality(line string) string {
+	if strings.HasPrefix(strings.TrimSpace(line), "+CFUN:") {
+		line = parseColonValue(line)
+	}
+	switch strings.TrimSpace(line) {
+	case "0":
+		return "Disabled"
+	case "1":
+		return "Full"
+	case "4":
+		return "LowPower"
+	default:
+		return strings.TrimSpace(line)
+	}
+}
+
+func functionalityATValue(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "1", "full", "on", "enabled", "enable":
+		return "1", nil
+	case "0", "disabled", "off", "disable":
+		return "0", nil
+	case "4", "lowpower", "low_power", "airplane", "flight":
+		return "4", nil
+	case "reset", "restart", "reboot":
+		return "1,1", nil
+	default:
+		return "", fmt.Errorf("unsupported modem functionality %q", mode)
 	}
 }
 
@@ -1329,7 +1779,7 @@ func registrationStringToStatus(value string) RegistrationStatus {
 
 func cellularNetInterface(devicePath string) string {
 	base := filepath.Base(devicePath)
-	if strings.HasPrefix(base, "wwan") || strings.HasPrefix(base, "rmnet") || strings.HasPrefix(base, "usb") {
+	if isCellularNetInterfaceCandidate(base) {
 		if _, err := os.Stat(filepath.Join("/sys/class/net", base)); err == nil {
 			return base
 		}
@@ -1378,11 +1828,51 @@ func firstCellularNetInterface() string {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if strings.HasPrefix(name, "wwan") || strings.HasPrefix(name, "rmnet") || strings.HasPrefix(name, "usb") {
+		if isPrimaryCellularNetInterface(name) {
+			return name
+		}
+	}
+	if !smsToolAvailable() {
+		return ""
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if isCellularNetInterfaceCandidate(name) {
 			return name
 		}
 	}
 	return ""
+}
+
+func isPrimaryCellularNetInterface(name string) bool {
+	for _, prefix := range []string{"wwan", "rmnet", "qmimux", "mhi", "usb"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCellularNetInterfaceCandidate(name string) bool {
+	if name == "" {
+		return false
+	}
+	if isPrimaryCellularNetInterface(name) {
+		return true
+	}
+	lower := strings.ToLower(name)
+	for _, prefix := range []string{"lo", "tun", "utun", "wg", "wlan", "wifi", "phy", "ifb", "veth", "docker", "tailscale", "zt"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	switch lower {
+	case "br-lan", "lan", "lan0":
+		return false
+	case "bridge0", "wan", "wan0", "eth0", "eth1":
+		return true
+	}
+	return strings.HasPrefix(lower, "br-wan") || strings.HasPrefix(lower, "eth")
 }
 
 func findCDCWDMForDevice(devicePath string) string {

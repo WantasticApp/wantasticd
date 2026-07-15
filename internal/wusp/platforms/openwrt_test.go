@@ -328,7 +328,7 @@ func TestOpenWrtBackendCollectMeshTopologyUsesLinkHints(t *testing.T) {
 	}
 }
 
-func TestOpenWrtBackendCollectCellularConfigFromUCI(t *testing.T) {
+func TestOpenWrtBackendSkipsCellularConfigWithoutRuntimeData(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")
 	mustWriteFile(t, filepath.Join(configDir, "network"), `config interface 'cellwan'
@@ -355,18 +355,11 @@ config interface 'backupcell'
 	msg := &wusp.Message{}
 	backend.appendOpenWrtCellularConfig(msg)
 
-	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 2)
-	assertUintField(t, msg, "Device.Cellular.AccessPointNumberOfEntries", 2)
-	assertBoolField(t, msg, "Device.Cellular.Interface.1.Enable", true)
-	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "cellwan")
-	assertStringField(t, msg, "Device.Cellular.Interface.1.Status", "Dormant")
-	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.APN", "internet")
-	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Username", "user1")
-	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Password", "pass1")
-	assertStringField(t, msg, "Device.Cellular.AccessPoint.1.Interface", "Device.Cellular.Interface.1.")
-	assertBoolField(t, msg, "Device.Cellular.Interface.2.Enable", false)
-	assertStringField(t, msg, "Device.Cellular.Interface.2.Status", "Down")
-	assertStringField(t, msg, "Device.Cellular.AccessPoint.2.APN", "backup")
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.Cellular.AccessPointNumberOfEntries", 0)
+	if _, ok := msg.Get("Device.Cellular.Interface.1.Name"); ok {
+		t.Fatal("config-only cellular section fabricated an interface row")
+	}
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(cellular config): %v", err)
 	}

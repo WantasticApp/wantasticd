@@ -63,6 +63,7 @@ type OpenWrtBackend struct {
 	ubusTimeout           time.Duration
 	ubusCaller            func(string, string, time.Duration) ([]byte, error)
 	commandRunner         func(context.Context, string, ...string) ([]byte, error)
+	cellular              *cellularMonitor
 	now                   func() time.Time
 }
 
@@ -181,6 +182,7 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		ubusTimeout:           opts.UbusTimeout,
 		ubusCaller:            opts.UbusCaller,
 		commandRunner:         opts.CommandRunner,
+		cellular:              newCellularMonitor(),
 		now:                   opts.Now,
 	}
 	if backend.ubusTimeout <= 0 {
@@ -380,7 +382,11 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	// Network interface details via getifaddrs (pure Go)
 	collectNetworkInterfacesStatic(msg)
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
-	collectCellularStatic(msg)
+	if b.cellular != nil {
+		collectCellularSnapshot(msg, b.cellular.snapshot())
+	} else {
+		collectCellularStatic(msg)
+	}
 	b.appendOpenWrtCellularConfig(msg)
 	collectGPSStatic(msg)
 	collectMeshStatic(msg)

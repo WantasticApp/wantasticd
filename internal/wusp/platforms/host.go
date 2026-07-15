@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	modemPkg "wantastic-agent/internal/modem"
@@ -41,6 +42,7 @@ type hostBackend struct {
 	onuReleasePath        string
 	netClassDir           string
 	commandRunner         CommandRunner
+	cellular              *cellularMonitor
 	now                   func() time.Time
 }
 
@@ -77,6 +79,7 @@ func newHostBackend(kind Kind, opts Options) *hostBackend {
 		onuReleasePath:        coalesceString(opts.ONUReleasePath, "/etc/onu-release"),
 		netClassDir:           coalesceString(opts.NetClassDir, defaultNetClassDir(kind)),
 		commandRunner:         opts.CommandRunner,
+		cellular:              newCellularMonitor(),
 		now:                   opts.Now,
 	}
 	if backend.commandRunner == nil {
@@ -233,7 +236,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 
 	collectNetworkInterfacesStatic(msg)
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
-	collectCellularStatic(msg)
+	b.collectCellularStatic(msg)
 	collectGPSStatic(msg)
 	collectMeshStatic(msg)
 
@@ -349,16 +352,147 @@ func collectCPUInfoStatic(ctx context.Context, runner func(context.Context, stri
 // collectCellularStatic discovers and queries cellular modems, populating
 // Device.Cellular.Interface.{n}. TR-181 params (IMEI, signal, registration, etc.)
 func collectCellularStatic(msg *wusp.Message) {
-	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
-	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
-	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
-	msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(0))
+	collectCellularSnapshot(msg, collectCellularEntries())
+}
 
+func (b *hostBackend) collectCellularStatic(msg *wusp.Message) {
+	if b != nil && b.cellular != nil {
+		collectCellularSnapshot(msg, b.cellular.snapshot())
+		return
+	}
+	collectCellularStatic(msg)
+}
+
+type cellularEntry struct {
+	devicePath string
+	info       *modemPkg.Info
+}
+
+type cellularMonitor struct {
+	mu         sync.RWMutex
+	entries    []cellularEntry
+	last       time.Time
+	started    bool
+	refreshing bool
+	interval   time.Duration
+	maxAge     time.Duration
+}
+
+func newCellularMonitor() *cellularMonitor {
+	return &cellularMonitor{
+		interval: 10 * time.Second,
+		maxAge:   45 * time.Second,
+	}
+}
+
+func (m *cellularMonitor) snapshot() []cellularEntry {
+	if m == nil {
+		return collectCellularEntries()
+	}
+	m.start()
+	m.mu.RLock()
+	entries := cloneCellularEntries(m.entries)
+	last := m.last
+	maxAge := m.maxAge
+	m.mu.RUnlock()
+	if !last.IsZero() && time.Since(last) < maxAge {
+		return entries
+	}
+	return m.refresh()
+}
+
+func (m *cellularMonitor) start() {
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return
+	}
+	m.started = true
+	interval := m.interval
+	m.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			m.refresh()
+		}
+	}()
+}
+
+func (m *cellularMonitor) refresh() []cellularEntry {
+	m.mu.Lock()
+	if m.refreshing {
+		entries := cloneCellularEntries(m.entries)
+		m.mu.Unlock()
+		return entries
+	}
+	m.refreshing = true
+	m.mu.Unlock()
+
+	entries := collectCellularEntries()
+
+	m.mu.Lock()
+	if len(entries) > 0 || m.last.IsZero() || time.Since(m.last) > m.maxAge {
+		m.entries = cloneCellularEntries(entries)
+		m.last = time.Now()
+	}
+	m.refreshing = false
+	out := cloneCellularEntries(m.entries)
+	m.mu.Unlock()
+	return out
+}
+
+func cloneCellularEntries(entries []cellularEntry) []cellularEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]cellularEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.info == nil {
+			continue
+		}
+		info := *entry.info
+		out = append(out, cellularEntry{devicePath: entry.devicePath, info: &info})
+	}
+	return out
+}
+
+func collectCellularEntries() []cellularEntry {
 	ctl := newModemController()
 	defer ctl.Close()
 
 	devices, err := ctl.Discover()
 	if err != nil || len(devices) == 0 {
+		return nil
+	}
+
+	entries := make([]cellularEntry, 0, len(devices))
+	seenModems := make(map[string]struct{})
+	for _, dev := range devices {
+		info, err := ctl.GetInfo(dev)
+		if err != nil || info == nil || !shouldPublishCellularInfo(dev, info) {
+			continue
+		}
+		if identity := cellularModemIdentity(dev, info); identity != "" {
+			if _, ok := seenModems[identity]; ok {
+				continue
+			}
+			seenModems[identity] = struct{}{}
+		}
+		infoCopy := *info
+		entries = append(entries, cellularEntry{devicePath: dev, info: &infoCopy})
+	}
+	return entries
+}
+
+func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
+	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
+	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
+	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
+	msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(0))
+
+	if len(entries) == 0 {
 		return
 	}
 
@@ -366,9 +500,10 @@ func collectCellularStatic(msg *wusp.Message) {
 	apnIdx := 0
 	anyRoaming := false
 	seenModems := make(map[string]struct{})
-	for _, dev := range devices {
-		info, err := ctl.GetInfo(dev)
-		if err != nil || info == nil {
+	for _, entry := range entries {
+		dev := entry.devicePath
+		info := entry.info
+		if info == nil || !shouldPublishCellularInfo(dev, info) {
 			continue
 		}
 		if identity := cellularModemIdentity(dev, info); identity != "" {
@@ -411,7 +546,7 @@ func collectCellularStatic(msg *wusp.Message) {
 			msg.Set(apnPrefix+"Proxy", wusp.String(""))
 			msg.Set(apnPrefix+"ProxyPort", wusp.Uint(1))
 			msg.Set(apnPrefix+"Interface", wusp.String(fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)))
-			msg.Set(apnPrefix+"IPVersion", wusp.Int(int64(info.IPVersion)))
+			msg.Set(apnPrefix+"IPVersion", wusp.Int(int64(cellularIPVersion(info.IPVersion))))
 			msg.Set(apnPrefix+"Type", wusp.List(wusp.String("default")))
 		}
 	}
@@ -508,14 +643,13 @@ func setCellularControlFields(msg *wusp.Message, ifaceIdx int, devicePath string
 	msg.Set(prefix+"Alias", wusp.String("cpe-cellular-control-"+strconv.Itoa(ifaceIdx)))
 	msg.Set(prefix+"InterfaceReference", wusp.String(fmt.Sprintf("Device.Cellular.Interface.%d.", ifaceIdx)))
 	msg.Set(prefix+"ModemPath", wusp.String(firstNonEmpty(devicePath, info.Interface)))
-	msg.Set(prefix+"SupportedOperations", wusp.String("SetFunctionality,SwitchSIM,SetIMEI,ApplyAPN,SendSMS,ListSMS,DeleteSMS"))
+	msg.Set(prefix+"SupportedOperations", wusp.String(cellularSupportedOperations(devicePath, info)))
 	msg.Set(prefix+"ModemFunctionality", wusp.String(firstNonEmpty(info.ModemFunctionality, "Unknown")))
 	if info.SIMSlot > 0 {
 		msg.Set(prefix+"SIMSlot", wusp.Uint(uint64(info.SIMSlot)))
 	} else {
 		msg.Set(prefix+"SIMSlot", wusp.Uint(1))
 	}
-	msg.Set(prefix+"IMEIOverride", wusp.String(""))
 	msg.Set(prefix+"APNProfileNumber", wusp.Uint(1))
 	msg.Set(prefix+"APNPDPType", wusp.String("IPV4V6"))
 	msg.Set(prefix+"APN", wusp.String(info.APN))
@@ -564,21 +698,113 @@ func cellularModemIdentity(devicePath string, info *modemPkg.Info) string {
 	if validDigitString(info.ICCID, 6, 20) {
 		return "iccid:" + info.ICCID
 	}
-	if path := firstNonEmpty(info.Interface, devicePath); path != "" {
+	if validDigitString(info.IMSI, 14, 15) {
+		return "imsi:" + info.IMSI
+	}
+	if strings.HasPrefix(devicePath, "/org/freedesktop/ModemManager") {
+		return "mm:" + devicePath
+	}
+	if cellularControlCapable(devicePath, info) {
+		return "dev:" + filepath.Base(firstNonEmpty(devicePath, info.Interface))
+	}
+	if path := firstNonEmpty(info.Interface, devicePath); path != "" && hasCellularRuntimeData(info) {
 		base := filepath.Base(path)
-		if strings.HasPrefix(base, "wwan") ||
-			strings.HasPrefix(base, "rmnet") ||
-			strings.HasPrefix(base, "qmimux") ||
-			strings.HasPrefix(base, "mhi") ||
-			strings.HasPrefix(base, "usb") ||
-			strings.HasPrefix(base, "eth") ||
-			base == "bridge0" ||
-			base == "wan" ||
-			base == "wan0" {
+		if isCellularNetdev(base) {
 			return "net:" + base
 		}
 	}
 	return ""
+}
+
+func shouldPublishCellularInfo(devicePath string, info *modemPkg.Info) bool {
+	if info == nil {
+		return false
+	}
+	if validDigitString(info.IMEI, 15, 15) ||
+		validDigitString(info.ICCID, 6, 20) ||
+		validDigitString(info.IMSI, 14, 15) {
+		return true
+	}
+	if strings.TrimSpace(info.Model) != "" ||
+		strings.TrimSpace(info.Manufacturer) != "" ||
+		strings.TrimSpace(info.Revision) != "" {
+		return true
+	}
+	if strings.HasPrefix(devicePath, "/org/freedesktop/ModemManager") {
+		return true
+	}
+	return hasCellularRuntimeData(info)
+}
+
+func hasCellularRuntimeData(info *modemPkg.Info) bool {
+	if info == nil {
+		return false
+	}
+	return info.Connected ||
+		info.Status == modemPkg.RegHome ||
+		info.Status == modemPkg.RegRoaming ||
+		info.Status == modemPkg.RegSearching ||
+		info.Technology != modemPkg.TechUnknown ||
+		info.TxBytes != 0 || info.RxBytes != 0 ||
+		info.TxPackets != 0 || info.RxPackets != 0 ||
+		info.Signal.RSSI != 0 || info.Signal.RSRP != 0 ||
+		info.Signal.RSRQ != 0 || info.Signal.SINR != 0 ||
+		info.APN != "" || info.IPAddress != "" || info.IPv6Address != "" ||
+		info.DNS1 != "" || info.DNS2 != "" ||
+		info.Band != "" || info.CellID != 0 || info.TAC != 0 || info.LAC != 0 ||
+		len(info.CarrierAggregation) > 0 || len(info.NeighborCells) > 0 ||
+		info.SMSStorageLocation != "" || info.SMSStorageCapacity != 0 || info.SMSStorageUsed != 0 ||
+		info.SIMStatus == modemPkg.SIMReady ||
+		info.SIMStatus == modemPkg.SIMLocked ||
+		info.SIMStatus == modemPkg.SIMError
+}
+
+func isCellularNetdev(base string) bool {
+	return strings.HasPrefix(base, "wwan") ||
+		strings.HasPrefix(base, "rmnet") ||
+		strings.HasPrefix(base, "qmimux") ||
+		strings.HasPrefix(base, "mhi") ||
+		strings.HasPrefix(base, "usb") ||
+		strings.HasPrefix(base, "eth") ||
+		base == "bridge0" ||
+		base == "wan" ||
+		base == "wan0"
+}
+
+func cellularControlCapable(devicePath string, info *modemPkg.Info) bool {
+	path := firstNonEmpty(devicePath, info.Interface)
+	if strings.HasPrefix(path, "/org/freedesktop/ModemManager") ||
+		strings.HasPrefix(path, "/dev/") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(info.Protocol)) {
+	case "modemmanager", "at", "qmi", "mbim":
+		return validDigitString(info.IMEI, 15, 15) ||
+			validDigitString(info.ICCID, 6, 20) ||
+			validDigitString(info.IMSI, 14, 15)
+	default:
+		return false
+	}
+}
+
+func cellularSMSCapable(devicePath string, info *modemPkg.Info) bool {
+	if info == nil || !cellularControlCapable(devicePath, info) {
+		return false
+	}
+	return info.SMSStorageLocation != "" ||
+		info.SMSStorageCapacity != 0 ||
+		info.SMSStorageUsed != 0 ||
+		info.SIMStatus == modemPkg.SIMReady ||
+		validDigitString(info.IMSI, 14, 15) ||
+		validDigitString(info.ICCID, 6, 20)
+}
+
+func cellularSupportedOperations(devicePath string, info *modemPkg.Info) string {
+	ops := []string{"SetFunctionality", "SwitchSIM", "SetIMEI", "ApplyAPN"}
+	if cellularSMSCapable(devicePath, info) {
+		ops = append(ops, "SendSMS", "ListSMS", "DeleteSMS")
+	}
+	return strings.Join(ops, ",")
 }
 
 func cellularAccessTechnology(tech modemPkg.Technology) string {
@@ -650,6 +876,13 @@ func cellularNRMode(info *modemPkg.Info) string {
 	}
 }
 
+func cellularIPVersion(version int) int {
+	if version == 0 {
+		return -1
+	}
+	return version
+}
+
 func validDigitString(value string, minLen, maxLen int) bool {
 	value = strings.TrimSpace(value)
 	if len(value) < minLen || len(value) > maxLen {
@@ -710,6 +943,30 @@ func appendCellularTelemetryFields(msg *wusp.Message, ifaceIdx int, modemPath st
 	msg.Set(root+"ModemPath", wusp.String(firstNonEmpty(modemPath, info.Interface)))
 	msg.Set(root+"Protocol", wusp.String(firstNonEmpty(info.Protocol, "unknown")))
 	msg.Set(root+"NRMode", wusp.String(cellularNRMode(info)))
+	if info.Manufacturer != "" {
+		msg.Set(root+"Manufacturer", wusp.String(info.Manufacturer))
+	}
+	if info.Model != "" {
+		msg.Set(root+"Model", wusp.String(info.Model))
+	}
+	if info.Revision != "" {
+		msg.Set(root+"Revision", wusp.String(info.Revision))
+	}
+	if validDigitString(info.IMEI, 15, 15) {
+		msg.Set(root+"EquipmentIdentifier", wusp.String(info.IMEI))
+	}
+	if validDigitString(info.IMSI, 14, 15) {
+		msg.Set(root+"SubscriberIdentity", wusp.String(info.IMSI))
+	}
+	if validDigitString(info.ICCID, 6, 20) {
+		msg.Set(root+"SIMIdentifier", wusp.String(info.ICCID))
+	}
+	if strings.TrimSpace(info.MSISDN) != "" {
+		msg.Set(root+"PhoneNumber", wusp.String(info.MSISDN))
+	}
+	if !info.CollectedAt.IsZero() {
+		msg.Set(root+"CollectedAt", wusp.Time(info.CollectedAt.UTC()))
+	}
 	if info.Band != "" {
 		msg.Set(root+"Band", wusp.String(info.Band))
 	}

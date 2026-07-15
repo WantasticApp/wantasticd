@@ -34,45 +34,34 @@ func (b *OpenWrtBackend) appendOpenWrtCellularConfig(msg *wusp.Message) {
 		configIdx++
 		targetIfaceIdx := configIdx
 		createInterface := targetIfaceIdx > liveIfaceCount
+		name := firstNonEmpty(section.Name, fmt.Sprintf("cellular%d", ifaceIdx))
+		enabled := !parseOpenWrtBool(section.Options["disabled"], false)
+		info, devicePath := b.collectOpenWrtCellularInfo(ctl, section)
+		if info != nil && !enabled && !info.Connected {
+			info.Status = modemPkg.RegNotRegistered
+			info.SIMStatus = modemPkg.SIMAbsent
+		}
 		if createInterface {
+			if info == nil || !shouldPublishCellularInfo(devicePath, info) {
+				continue
+			}
 			ifaceIdx++
 			targetIfaceIdx = ifaceIdx
 		}
 		ifacePath := fmt.Sprintf("Device.Cellular.Interface.%d.", targetIfaceIdx)
-		name := firstNonEmpty(section.Name, fmt.Sprintf("cellular%d", ifaceIdx))
-		enabled := !parseOpenWrtBool(section.Options["disabled"], false)
 
 		msg.Set(ifacePath+"Enable", wusp.Bool(enabled))
 		if createInterface {
-			msg.Set(ifacePath+"Status", wusp.String(openWrtCellularStatus(enabled)))
-			msg.Set(ifacePath+"Alias", wusp.String("cpe-cellular-"+strconv.FormatUint(targetIfaceIdx, 10)))
-			msg.Set(ifacePath+"Name", wusp.String(name))
-			msg.Set(ifacePath+"LastChange", wusp.Uint(0))
-			msg.Set(ifacePath+"LowerLayers", wusp.List())
-			msg.Set(ifacePath+"Upstream", wusp.Bool(true))
-			msg.Set(ifacePath+"SupportedAccessTechnologies", wusp.List(cellularTechList(nil)...))
-			msg.Set(ifacePath+"PreferredAccessTechnology", wusp.String("Unknown"))
-			msg.Set(ifacePath+"CurrentAccessTechnology", wusp.String("Unknown"))
-			msg.Set(ifacePath+"AvailableNetworks", wusp.List())
-			msg.Set(ifacePath+"NetworkRequested", wusp.String(""))
-			msg.Set(ifacePath+"Mode", wusp.String("Unknown"))
-			msg.Set(ifacePath+"SIMReferenceList", wusp.List())
-			msg.Set(ifacePath+"USIM.Status", wusp.String("None"))
-			msg.Set(ifacePath+"USIM.PINCheck", wusp.String("Off"))
-			msg.Set(ifacePath+"SMS.StorageNumberOfEntries", wusp.Uint(0))
-			msg.Set(ifacePath+"SMS.MessageNumberOfEntries", wusp.Uint(0))
-			setCellularStats(msg, ifacePath, &modemPkg.Info{})
+			info.Interface = firstNonEmpty(info.Interface, name)
 		}
-		if info, devicePath := b.collectOpenWrtCellularInfo(ctl, section); info != nil {
-			if !enabled && !info.Connected {
-				info.Status = modemPkg.RegNotRegistered
-				info.SIMStatus = modemPkg.SIMAbsent
-			}
+		if info != nil {
 			setCellularInterfaceFields(msg, int(targetIfaceIdx), devicePath, info)
-			msg.Set(ifacePath+"Enable", wusp.Bool(enabled))
-			if !enabled {
-				msg.Set(ifacePath+"Status", wusp.String("Down"))
-			}
+			setCellularControlFields(msg, int(targetIfaceIdx), devicePath, info)
+			msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(targetIfaceIdx))
+		}
+		msg.Set(ifacePath+"Enable", wusp.Bool(enabled))
+		if !enabled {
+			msg.Set(ifacePath+"Status", wusp.String("Down"))
 		}
 
 		apn := strings.TrimSpace(section.Options["apn"])
@@ -200,11 +189,7 @@ func firstOpenWrtCellularNetdev(section openWrtUCISection) string {
 }
 
 func hasOpenWrtCellularRuntimeData(info *modemPkg.Info) bool {
-	return info.Connected ||
-		info.TxBytes != 0 || info.RxBytes != 0 ||
-		info.TxPackets != 0 || info.RxPackets != 0 ||
-		info.Signal.RSSI != 0 || info.Signal.RSRP != 0 ||
-		info.Signal.RSRQ != 0 || info.Signal.SINR != 0 ||
+	return hasCellularRuntimeData(info) ||
 		info.IMEI != "" || info.IMSI != "" || info.ICCID != ""
 }
 

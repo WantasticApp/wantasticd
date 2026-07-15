@@ -2,6 +2,7 @@ package platforms
 
 import (
 	"testing"
+	"time"
 
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
@@ -45,8 +46,70 @@ func TestCellularModemIdentityUsesStableHardwareKeys(t *testing.T) {
 	if got := cellularModemIdentity("/dev/ttyUSB2", &modemPkg.Info{ICCID: "89014103211118510720"}); got != "iccid:89014103211118510720" {
 		t.Fatalf("identity=%q", got)
 	}
-	if got := cellularModemIdentity("wwan0", &modemPkg.Info{}); got != "net:wwan0" {
-		t.Fatalf("identity=%q", got)
+	if got := cellularModemIdentity("wwan0", &modemPkg.Info{}); got != "" {
+		t.Fatalf("empty netdev identity=%q want empty", got)
+	}
+	if got := cellularModemIdentity("wwan0", &modemPkg.Info{RxBytes: 1}); got != "net:wwan0" {
+		t.Fatalf("runtime netdev identity=%q", got)
+	}
+}
+
+func TestCellularPublishSkipsEmptyNetdevRows(t *testing.T) {
+	msg := wusp.NewMessage()
+	collectCellularSnapshot(msg, []cellularEntry{
+		{devicePath: "rmnet_data3", info: &modemPkg.Info{Interface: "rmnet_data3"}},
+		{devicePath: "rmnet_data4", info: &modemPkg.Info{Interface: "rmnet_data4"}},
+	})
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 0)
+	if _, ok := msg.Get("Device.Cellular.Interface.1.Name"); ok {
+		t.Fatal("empty rmnet row was published")
+	}
+}
+
+func TestCellularPublishIncludesIdentityAndStats(t *testing.T) {
+	msg := wusp.NewMessage()
+	collectedAt := time.Date(2026, 7, 15, 10, 30, 0, 0, time.UTC)
+	collectCellularSnapshot(msg, []cellularEntry{
+		{
+			devicePath: "/org/freedesktop/ModemManager1/Modem/0",
+			info: &modemPkg.Info{
+				Manufacturer: "Quectel",
+				Model:        "RG520N",
+				Revision:     "RG520NNAAR01A08M4G",
+				IMEI:         "123456789012345",
+				IMSI:         "310410123456789",
+				ICCID:        "89014103211118510720",
+				Interface:    "rmnet_data0",
+				Protocol:     "modemmanager",
+				Status:       modemPkg.RegHome,
+				Technology:   modemPkg.TechLTE,
+				Signal: modemPkg.SignalQuality{
+					RSRP: -91,
+					RSRQ: -8,
+					SINR: 16,
+				},
+				APN:         "internet",
+				IPAddress:   "100.64.1.2",
+				DNS1:        "1.1.1.1",
+				RxBytes:     5678,
+				TxBytes:     1234,
+				SIMStatus:   modemPkg.SIMReady,
+				CollectedAt: collectedAt,
+			},
+		},
+	})
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "rmnet_data0")
+	assertStringField(t, msg, "Device.Cellular.Interface.1.IMEI", "123456789012345")
+	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesReceived", 5678)
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.Manufacturer", "Quectel")
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.Model", "RG520N")
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.EquipmentIdentifier", "123456789012345")
+	assertStringField(t, msg, "Device.WUSP_CellularControl.Interface.1.SupportedOperations", "SetFunctionality,SwitchSIM,SetIMEI,ApplyAPN,SendSMS,ListSMS,DeleteSMS")
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(cellular publish): %v", err)
 	}
 }
 
@@ -122,6 +185,14 @@ func TestCellularTelemetryRepresentativeMessageValidates(t *testing.T) {
 	msg.Set(prefix+"ModemPath", wusp.String("/dev/cdc-wdm0"))
 	msg.Set(prefix+"Protocol", wusp.String("at"))
 	msg.Set(prefix+"NRMode", wusp.String("NonStandalone"))
+	msg.Set(prefix+"Manufacturer", wusp.String("Quectel"))
+	msg.Set(prefix+"Model", wusp.String("RG520N"))
+	msg.Set(prefix+"Revision", wusp.String("RG520NNAAR01A08M4G"))
+	msg.Set(prefix+"EquipmentIdentifier", wusp.String("123456789012345"))
+	msg.Set(prefix+"SubscriberIdentity", wusp.String("310410123456789"))
+	msg.Set(prefix+"SIMIdentifier", wusp.String("89014103211118510720"))
+	msg.Set(prefix+"PhoneNumber", wusp.String("+15555550123"))
+	msg.Set(prefix+"CollectedAt", wusp.Time(time.Date(2026, 7, 15, 10, 30, 0, 0, time.UTC)))
 	msg.Set(prefix+"Band", wusp.String("B3"))
 	msg.Set(prefix+"CellID", wusp.Uint(12345))
 	msg.Set(prefix+"TAC", wusp.Uint(22))

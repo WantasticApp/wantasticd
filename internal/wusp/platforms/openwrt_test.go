@@ -416,6 +416,7 @@ func TestOpenWrtBackendCellularConfigCollectsConfiguredModemRuntime(t *testing.T
 	oldNewModemController := newModemController
 	newModemController = func() modemPkg.Controller {
 		return fakeModemController{
+			devices: []string{"/dev/cdc-wdm0"},
 			infos: map[string]*modemPkg.Info{
 				"/dev/cdc-wdm0": {
 					Interface:  "eth1",
@@ -463,7 +464,7 @@ func TestOpenWrtBackendCellularConfigCollectsConfiguredModemRuntime(t *testing.T
 	}
 }
 
-func TestOpenWrtBackendCellularConfigUsesConfiguredNetdevStatsWithoutModemInfo(t *testing.T) {
+func TestOpenWrtBackendCellularConfigSkipsConfiguredNetdevStatsWithoutModemInfo(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")
 	netClassDir := filepath.Join(root, "sys", "class", "net")
@@ -495,11 +496,10 @@ func TestOpenWrtBackendCellularConfigUsesConfiguredNetdevStatsWithoutModemInfo(t
 	msg := &wusp.Message{}
 	backend.appendOpenWrtCellularConfig(msg)
 
-	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 1)
-	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "eth1")
-	assertStringField(t, msg, "Device.Cellular.Interface.1.Status", "Up")
-	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesSent", 222)
-	assertUintField(t, msg, "Device.Cellular.Interface.1.Stats.BytesReceived", 333)
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 0)
+	if _, ok := msg.Get("Device.Cellular.Interface.1.Name"); ok {
+		t.Fatal("stats-only OpenWrt cellular netdev was published as a modem")
+	}
 }
 
 func TestOpenWrtBackendSetCellularConfigWritesUCI(t *testing.T) {

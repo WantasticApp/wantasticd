@@ -11,13 +11,24 @@ import (
 func TestGPSLocationMessageValidates(t *testing.T) {
 	msg := wusp.NewMessage()
 	info := &gpsInfo{
-		lat:       33.573100,
-		lon:       -7.589800,
-		alt:       45.2,
-		fix:       "3D",
-		timestamp: time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
+		lat:              33.573100,
+		lon:              -7.589800,
+		alt:              45.2,
+		speed:            12.4,
+		course:           180.5,
+		hdop:             0.8,
+		satellites:       8,
+		satellitesInView: 12,
+		fix:              "3D",
+		status:           "Fix3D",
+		fixQuality:       "3",
+		protocol:         "quectel-at",
+		modemPath:        "/dev/ttyUSB2",
+		nmea:             map[string]string{"GGA": "$GPGGA,120000.0,3334.386,N,00735.388,W,1,08,0.8,45.2,M,0,M,,*00"},
+		timestamp:        time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
 	}
 
+	appendGNSSFields(msg, info)
 	msg.Set("Device.DeviceInfo.LocationNumberOfEntries", wusp.Uint(1))
 	msg.Set("Device.DeviceInfo.Location.1.Source", wusp.String("GPS"))
 	msg.Set("Device.DeviceInfo.Location.1.AcquiredTime", wusp.Time(info.timestamp))

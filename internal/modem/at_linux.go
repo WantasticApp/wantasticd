@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -105,16 +106,16 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 		return nil, fmt.Errorf("no AT port found for %s", devicePath)
 	}
 
-	f, err := os.OpenFile(port, os.O_RDWR, 0666)
+	at, closeFn, err := c.openATSessionOnPortWithRetry(port, 3)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", port, err)
+		return nil, err
 	}
-	defer f.Close()
+	defer closeFn()
 
-	at := &atSession{f: f, scanner: bufio.NewScanner(f)}
 	info.Interface = devicePath
 	info.Protocol = "at"
 	info.CollectedAt = time.Now()
+	_, _ = at.sendWithTimeout("AT", time.Second)
 
 	// Identity
 	if lines := at.send("ATI"); len(lines) > 0 {
@@ -220,6 +221,15 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	if lines := at.send("AT+QENG=\"servingcell\""); len(lines) > 0 {
 		c.parseQuectelServingCellInfo(lines, info)
 	}
+	if lines := at.send("AT+QRSRP"); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QRSRP", &info.Signal.RSRP)
+	}
+	if lines := at.send("AT+QRSRQ"); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QRSRQ", &info.Signal.RSRQ)
+	}
+	if lines := at.send("AT+QSINR"); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QSINR", &info.Signal.SINR)
+	}
 	if lines := at.send("AT+QCAINFO"); len(lines) > 0 {
 		info.CarrierAggregation = parseQuectelCarrierAggregation(lines)
 	}
@@ -242,6 +252,18 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	}
 	if lines := at.send("AT+CFUN?"); len(lines) > 0 {
 		info.ModemFunctionality = parseFunctionality(lines[0])
+	}
+	if lines := at.send("AT+QTEMP"); len(lines) > 0 {
+		info.TemperatureC = parseQuectelTemperature(lines)
+	}
+	if lines := at.send("AT+QNWCFG=\"lte_time_advance\",1;+QNWCFG=\"lte_time_advance\""); len(lines) > 0 {
+		info.LTETimingAdvance = parseQuectelTimeAdvance(lines, "lte_time_advance")
+	}
+	if lines := at.send("AT+QNWCFG=\"nr5g_time_advance\",1;+QNWCFG=\"nr5g_time_advance\""); len(lines) > 0 {
+		info.NR5GTimingAdvance = parseQuectelTimeAdvance(lines, "nr5g_time_advance")
+	}
+	if lines := at.send("AT+QGDCNT?;+QGDNRCNT?"); len(lines) > 0 {
+		parseQuectelDataCounters(lines, info)
 	}
 
 	info.SupportedTechnologies = inferSupportedTechnologies(info)
@@ -268,12 +290,12 @@ func (c *atController) GetSignal(devicePath string) (*SignalQuality, error) {
 		}
 		return nil, fmt.Errorf("no AT port found for %s", devicePath)
 	}
-	f, err := os.OpenFile(port, os.O_RDWR, 0666)
+	at, closeFn, err := c.openATSessionOnPortWithRetry(port, 3)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	at := &atSession{f: f, scanner: bufio.NewScanner(f)}
+	defer closeFn()
+	_, _ = at.sendWithTimeout("AT", time.Second)
 	sig := c.parseSignal(at)
 	return &sig, nil
 }
@@ -347,6 +369,97 @@ func (c *atController) SetAPNProfile(devicePath string, profile int, pdpType, ap
 	return err
 }
 
+func (c *atController) SetGNSS(devicePath string, enabled bool) error {
+	if enabled {
+		if lines, err := c.sendATCommand(devicePath, "AT+QGPS?", 5); err == nil && quecGPSIsEnabled(lines) {
+			return nil
+		}
+		if _, err := c.sendATCommand(devicePath, "AT+QGPSCFG=\"nmeasrc\",1", 5); err != nil {
+			// Older Quectel firmware can reject nmeasrc. The GNSS session itself
+			// is still useful without on-demand NMEA sentences.
+			_ = err
+		}
+		_, err := c.sendATCommand(devicePath, "AT+QGPS=1", 20)
+		return err
+	}
+	_, err := c.sendATCommand(devicePath, "AT+QGPSEND", 10)
+	return err
+}
+
+func (c *atController) GetGNSS(devicePath string) (*GNSSInfo, error) {
+	info := &GNSSInfo{
+		Status:    "Unknown",
+		ModemPath: devicePath,
+		Protocol:  "quectel-at",
+		NMEA:      map[string]string{},
+	}
+
+	lines, err := c.sendATCommand(devicePath, "AT+QGPS?", 5)
+	if err != nil {
+		return nil, err
+	}
+	info.Enabled = quecGPSIsEnabled(lines)
+	if !info.Enabled {
+		info.Status = "Disabled"
+		return info, nil
+	}
+
+	locationLines, err := c.sendATCommand(devicePath, "AT+QGPSLOC=2", 10)
+	if err == nil {
+		for _, line := range locationLines {
+			if parsed, ok := parseQuectelGPSLocation(line); ok {
+				*info = mergeGNSSInfo(*info, parsed)
+				info.RawLocation = line
+				break
+			}
+		}
+	}
+
+	for _, sentenceType := range []string{"GGA", "RMC", "GSA", "GSV"} {
+		if nmea, ok := c.readQuectelNMEA(devicePath, sentenceType); ok {
+			info.NMEA[sentenceType] = nmea
+			if parsed := gnssInfoFromNMEA(nmea); parsed != nil {
+				*info = mergeGNSSInfo(*info, *parsed)
+			}
+		}
+	}
+
+	if info.Status == "Unknown" {
+		if info.Latitude != 0 || info.Longitude != 0 {
+			info.Status = "Fix2D"
+		} else {
+			info.Status = "Searching"
+		}
+	}
+	if info.LastFixTime.IsZero() && !info.UTC.IsZero() {
+		info.LastFixTime = info.UTC
+	}
+	if info.LastFixTime.IsZero() && (info.Latitude != 0 || info.Longitude != 0) {
+		info.LastFixTime = time.Now()
+	}
+	return info, nil
+}
+
+func (c *atController) readQuectelNMEA(devicePath, sentenceType string) (string, bool) {
+	lines, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+QGPSGNMEA=\"%s\"", sentenceType), 8)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "+QGPSGNMEA:") {
+			values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QGPSGNMEA:")))
+			if len(values) > 0 {
+				return values[0], true
+			}
+		}
+		if strings.HasPrefix(line, "$") {
+			return line, true
+		}
+	}
+	return "", false
+}
+
 func (c *atController) SendSMS(_ string, phoneNumber, message string) error {
 	if !smsToolAvailable() {
 		return fmt.Errorf("sms_tool not found")
@@ -390,12 +503,49 @@ func (c *atController) DeleteSMS(_ string, index string) error {
 }
 
 func (c *atController) sendATCommand(devicePath, cmd string, timeoutSeconds int) ([]string, error) {
-	if at, closeFn, err := c.openATSession(devicePath); err == nil {
-		defer closeFn()
-		return at.send(cmd), nil
+	return c.sendATCommandWithRetry(devicePath, cmd, timeoutSeconds, 3)
+}
+
+func (c *atController) sendATCommandWithRetry(devicePath, cmd string, timeoutSeconds, attempts int) ([]string, error) {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 5
+	}
+	port := c.findATPort(devicePath)
+	var lastErr error
+	if port != "" {
+		for attempt := 1; attempt <= attempts; attempt++ {
+			at, closeFn, err := c.openATSessionOnPort(port)
+			if err != nil {
+				lastErr = err
+				c.unlockStaleSocat(port)
+				time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
+				continue
+			}
+			_, _ = at.sendWithTimeout("AT", time.Second)
+			lines, err := at.sendWithTimeout(cmd, time.Duration(timeoutSeconds)*time.Second)
+			closeFn()
+			if err == nil {
+				return lines, nil
+			}
+			lastErr = err
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
 	}
 	if smsToolAvailable() {
-		return runSMSToolAT(cmd, timeoutSeconds)
+		for attempt := 1; attempt <= attempts; attempt++ {
+			lines, err := runSMSToolAT(cmd, timeoutSeconds)
+			if err == nil {
+				return lines, nil
+			}
+			lastErr = err
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, fmt.Errorf("no AT port found for %s", devicePath)
 }
@@ -405,11 +555,52 @@ func (c *atController) openATSession(devicePath string) (*atSession, func(), err
 	if port == "" {
 		return nil, func() {}, fmt.Errorf("no AT port found for %s", devicePath)
 	}
+	return c.openATSessionOnPort(port)
+}
+
+func (c *atController) openATSessionOnPort(port string) (*atSession, func(), error) {
 	f, err := os.OpenFile(port, os.O_RDWR, 0666)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, func() {}, fmt.Errorf("open %s: %w", port, err)
 	}
 	return &atSession{f: f, scanner: bufio.NewScanner(f)}, func() { _ = f.Close() }, nil
+}
+
+func (c *atController) openATSessionOnPortWithRetry(port string, attempts int) (*atSession, func(), error) {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		at, closeFn, err := c.openATSessionOnPort(port)
+		if err == nil {
+			return at, closeFn, nil
+		}
+		lastErr = err
+		c.unlockStaleSocat(port)
+		time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
+	}
+	return nil, func() {}, lastErr
+}
+
+func (c *atController) unlockStaleSocat(port string) {
+	base := filepath.Base(strings.TrimSpace(port))
+	if base == "" || base == "." {
+		return
+	}
+	out, err := exec.Command("pgrep", "-f", "socat.*"+base).Output()
+	if err != nil {
+		return
+	}
+	for _, raw := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(raw)
+		if err != nil || pid <= 0 || pid == os.Getpid() {
+			continue
+		}
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
 }
 
 func (c *atController) enrichFromSMSTool(info *Info) bool {
@@ -496,6 +687,15 @@ func (c *atController) enrichFromSMSTool(info *Info) bool {
 		c.parseQuectelServingCell(lines, &info.Signal)
 		c.parseQuectelServingCellInfo(lines, info)
 	}
+	if lines := run("AT+QRSRP", 5); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QRSRP", &info.Signal.RSRP)
+	}
+	if lines := run("AT+QRSRQ", 5); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QRSRQ", &info.Signal.RSRQ)
+	}
+	if lines := run("AT+QSINR", 5); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QSINR", &info.Signal.SINR)
+	}
 	if lines := run("AT+QCAINFO", 8); len(lines) > 0 {
 		info.CarrierAggregation = parseQuectelCarrierAggregation(lines)
 	}
@@ -513,6 +713,18 @@ func (c *atController) enrichFromSMSTool(info *Info) bool {
 	}
 	if lines := run("AT+CFUN?", 5); len(lines) > 0 {
 		info.ModemFunctionality = parseFunctionality(lines[0])
+	}
+	if lines := run("AT+QTEMP", 5); len(lines) > 0 {
+		info.TemperatureC = parseQuectelTemperature(lines)
+	}
+	if lines := run("AT+QNWCFG=\"lte_time_advance\",1;+QNWCFG=\"lte_time_advance\"", 5); len(lines) > 0 {
+		info.LTETimingAdvance = parseQuectelTimeAdvance(lines, "lte_time_advance")
+	}
+	if lines := run("AT+QNWCFG=\"nr5g_time_advance\",1;+QNWCFG=\"nr5g_time_advance\"", 5); len(lines) > 0 {
+		info.NR5GTimingAdvance = parseQuectelTimeAdvance(lines, "nr5g_time_advance")
+	}
+	if lines := run("AT+QGDCNT?;+QGDNRCNT?", 5); len(lines) > 0 {
+		parseQuectelDataCounters(lines, info)
 	}
 
 	info.SupportedTechnologies = inferSupportedTechnologies(info)
@@ -537,6 +749,9 @@ func runSMSToolAT(cmd string, timeoutSeconds int) ([]string, error) {
 	}
 	out, err := exec.Command("sms_tool", "at", cmd, "-t", strconv.Itoa(timeoutSeconds)).CombinedOutput()
 	lines := cleanATCommandOutput(string(out), cmd)
+	if atOutputError(string(out)) {
+		return lines, fmt.Errorf("modem returned error for %q: %s", cmd, atErrorLine(string(out)))
+	}
 	if err != nil {
 		return lines, fmt.Errorf("sms_tool at %q failed: %w: %s", cmd, err, strings.TrimSpace(string(out)))
 	}
@@ -557,6 +772,26 @@ func cleanATCommandOutput(raw, cmd string) []string {
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+func atOutputError(raw string) bool {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if line == "ERROR" || strings.HasPrefix(line, "+CME ERROR") || strings.HasPrefix(line, "+CMS ERROR") {
+			return true
+		}
+	}
+	return false
+}
+
+func atErrorLine(raw string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if line == "ERROR" || strings.HasPrefix(line, "+CME ERROR") || strings.HasPrefix(line, "+CMS ERROR") {
+			return line
+		}
+	}
+	return "ERROR"
 }
 
 func hasCellularInfo(info *Info) bool {
@@ -599,6 +834,15 @@ func (c *atController) parseSignal(at *atSession) SignalQuality {
 	// Try serving cell info for band/cell details
 	if lines := at.send("AT+QENG=\"servingcell\""); len(lines) > 0 {
 		c.parseQuectelServingCell(lines, &sig)
+	}
+	if lines := at.send("AT+QRSRP"); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QRSRP", &sig.RSRP)
+	}
+	if lines := at.send("AT+QRSRQ"); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QRSRQ", &sig.RSRQ)
+	}
+	if lines := at.send("AT+QSINR"); len(lines) > 0 {
+		parseQuectelMetricAverages(lines, "QSINR", &sig.SINR)
 	}
 
 	return sig
@@ -1039,6 +1283,297 @@ func parseFunctionality(line string) string {
 	}
 }
 
+func quecGPSIsEnabled(lines []string) bool {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "+QGPS:") {
+			values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QGPS:")))
+			return len(values) > 0 && strings.TrimSpace(values[0]) == "1"
+		}
+	}
+	return false
+}
+
+func parseQuectelGPSLocation(line string) (GNSSInfo, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "+QGPSLOC:") {
+		return GNSSInfo{}, false
+	}
+	values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QGPSLOC:")))
+	if len(values) < 3 {
+		return GNSSInfo{}, false
+	}
+	lat, errLat := strconv.ParseFloat(strings.Trim(values[1], "\""), 64)
+	lon, errLon := strconv.ParseFloat(strings.Trim(values[2], "\""), 64)
+	if errLat != nil || errLon != nil || (lat == 0 && lon == 0) {
+		return GNSSInfo{}, false
+	}
+	info := GNSSInfo{
+		Enabled:        true,
+		Status:         "Fix2D",
+		Latitude:       lat,
+		Longitude:      lon,
+		RawLocation:    line,
+		FixQuality:     valueAt(values, 5),
+		LastFixTime:    time.Now(),
+		Protocol:       "quectel-at",
+		SatellitesUsed: int(parseUint(valueAt(values, 10))),
+	}
+	if info.SatellitesUsed > 0 {
+		info.SatellitesInView = info.SatellitesUsed
+	}
+	info.HDOP = parseFloatDefault(valueAt(values, 3), 0)
+	info.Altitude = parseFloatDefault(valueAt(values, 4), 0)
+	info.Course = parseFloatDefault(valueAt(values, 6), 0)
+	info.SpeedKPH = parseFloatDefault(valueAt(values, 7), 0)
+	switch strings.TrimSpace(info.FixQuality) {
+	case "3":
+		info.Status = "Fix3D"
+	case "0", "":
+		info.Status = "NoFix"
+	default:
+		info.Status = "Fix2D"
+	}
+	if ts := parseQuectelGPSTime(valueAt(values, 0), valueAt(values, 9)); !ts.IsZero() {
+		info.UTC = ts
+		info.LastFixTime = ts
+	}
+	return info, true
+}
+
+func parseQuectelGPSTime(rawTime, rawDate string) time.Time {
+	rawTime = strings.TrimSpace(strings.Trim(rawTime, "\""))
+	rawDate = strings.TrimSpace(strings.Trim(rawDate, "\""))
+	if len(rawTime) < 6 {
+		return time.Time{}
+	}
+	hour, errH := strconv.Atoi(rawTime[0:2])
+	minute, errM := strconv.Atoi(rawTime[2:4])
+	secondFloat, errS := strconv.ParseFloat(rawTime[4:], 64)
+	if errH != nil || errM != nil || errS != nil {
+		return time.Time{}
+	}
+	second := int(secondFloat)
+	nsec := int((secondFloat - float64(second)) * 1e9)
+	now := time.Now().UTC()
+	year, month, day := now.Date()
+	if len(rawDate) == 6 {
+		if parsedDay, err := strconv.Atoi(rawDate[0:2]); err == nil {
+			day = parsedDay
+		}
+		if parsedMonth, err := strconv.Atoi(rawDate[2:4]); err == nil && parsedMonth >= 1 && parsedMonth <= 12 {
+			month = time.Month(parsedMonth)
+		}
+		if parsedYear, err := strconv.Atoi(rawDate[4:6]); err == nil {
+			if parsedYear >= 70 {
+				year = 1900 + parsedYear
+			} else {
+				year = 2000 + parsedYear
+			}
+		}
+	}
+	return time.Date(year, month, day, hour, minute, second, nsec, time.UTC)
+}
+
+func gnssInfoFromNMEA(sentence string) *GNSSInfo {
+	fields := strings.Split(strings.TrimSpace(sentence), ",")
+	if len(fields) == 0 {
+		return nil
+	}
+	talker := strings.TrimPrefix(fields[0], "$")
+	switch {
+	case strings.HasSuffix(talker, "GGA"):
+		return gnssInfoFromGGA(fields, sentence)
+	case strings.HasSuffix(talker, "RMC"):
+		return gnssInfoFromRMC(fields, sentence)
+	case strings.HasSuffix(talker, "GSA"):
+		return gnssInfoFromGSA(fields, sentence)
+	case strings.HasSuffix(talker, "GSV"):
+		return gnssInfoFromGSV(fields, sentence)
+	default:
+		return nil
+	}
+}
+
+func gnssInfoFromGGA(fields []string, raw string) *GNSSInfo {
+	if len(fields) < 10 {
+		return nil
+	}
+	lat, lon, ok := parseNMEALatLon(fields[2], fields[3], fields[4], fields[5])
+	if !ok {
+		return nil
+	}
+	fixQuality := strings.TrimSpace(fields[6])
+	if fixQuality == "0" {
+		return &GNSSInfo{Enabled: true, Status: "NoFix", FixQuality: fixQuality, NMEA: map[string]string{"GGA": raw}}
+	}
+	sats := int(parseUint(fields[7]))
+	info := &GNSSInfo{
+		Enabled:          true,
+		Status:           "Fix3D",
+		Latitude:         lat,
+		Longitude:        lon,
+		Altitude:         parseFloatDefault(fields[9], 0),
+		HDOP:             parseFloatDefault(fields[8], 0),
+		FixQuality:       fixQuality,
+		SatellitesUsed:   sats,
+		SatellitesInView: sats,
+		UTC:              parseNMEATimestamp(fields[1], ""),
+		NMEA:             map[string]string{"GGA": raw},
+	}
+	info.LastFixTime = info.UTC
+	return info
+}
+
+func gnssInfoFromRMC(fields []string, raw string) *GNSSInfo {
+	if len(fields) < 10 || strings.TrimSpace(fields[2]) != "A" {
+		return nil
+	}
+	lat, lon, ok := parseNMEALatLon(fields[3], fields[4], fields[5], fields[6])
+	if !ok {
+		return nil
+	}
+	info := &GNSSInfo{
+		Enabled:     true,
+		Status:      "Fix2D",
+		Latitude:    lat,
+		Longitude:   lon,
+		SpeedKPH:    parseFloatDefault(fields[7], 0) * 1.852,
+		Course:      parseFloatDefault(fields[8], 0),
+		UTC:         parseNMEATimestamp(fields[1], fields[9]),
+		LastFixTime: parseNMEATimestamp(fields[1], fields[9]),
+		NMEA:        map[string]string{"RMC": raw},
+	}
+	return info
+}
+
+func gnssInfoFromGSA(fields []string, raw string) *GNSSInfo {
+	if len(fields) < 3 {
+		return nil
+	}
+	status := "NoFix"
+	switch strings.TrimSpace(fields[2]) {
+	case "2":
+		status = "Fix2D"
+	case "3":
+		status = "Fix3D"
+	}
+	hdop := 0.0
+	if len(fields) > 16 {
+		hdop = parseFloatDefault(fields[16], 0)
+	}
+	return &GNSSInfo{Enabled: true, Status: status, HDOP: hdop, FixQuality: strings.TrimSpace(fields[2]), NMEA: map[string]string{"GSA": raw}}
+}
+
+func gnssInfoFromGSV(fields []string, raw string) *GNSSInfo {
+	if len(fields) < 4 {
+		return nil
+	}
+	return &GNSSInfo{Enabled: true, SatellitesInView: int(parseUint(fields[3])), NMEA: map[string]string{"GSV": raw}}
+}
+
+func parseNMEALatLon(rawLat, ns, rawLon, ew string) (float64, float64, bool) {
+	lat, ok := parseNMEACoordinate(rawLat, ns)
+	if !ok {
+		return 0, 0, false
+	}
+	lon, ok := parseNMEACoordinate(rawLon, ew)
+	if !ok {
+		return 0, 0, false
+	}
+	return lat, lon, true
+}
+
+func parseNMEACoordinate(raw, hemisphere string) (float64, bool) {
+	raw = strings.TrimSpace(raw)
+	hemisphere = strings.ToUpper(strings.TrimSpace(hemisphere))
+	if raw == "" || hemisphere == "" {
+		return 0, false
+	}
+	degreeDigits := 2
+	if hemisphere == "E" || hemisphere == "W" {
+		degreeDigits = 3
+	}
+	if len(raw) <= degreeDigits {
+		return 0, false
+	}
+	degrees, err := strconv.ParseFloat(raw[:degreeDigits], 64)
+	if err != nil {
+		return 0, false
+	}
+	minutes, err := strconv.ParseFloat(raw[degreeDigits:], 64)
+	if err != nil {
+		return 0, false
+	}
+	value := degrees + minutes/60
+	if hemisphere == "S" || hemisphere == "W" {
+		value = -value
+	}
+	return value, true
+}
+
+func parseNMEATimestamp(rawTime, rawDate string) time.Time {
+	return parseQuectelGPSTime(rawTime, rawDate)
+}
+
+func mergeGNSSInfo(base, update GNSSInfo) GNSSInfo {
+	if update.Enabled {
+		base.Enabled = true
+	}
+	if update.Status != "" && update.Status != "Unknown" {
+		base.Status = update.Status
+	}
+	if update.Latitude != 0 || update.Longitude != 0 {
+		base.Latitude = update.Latitude
+		base.Longitude = update.Longitude
+	}
+	if update.Altitude != 0 {
+		base.Altitude = update.Altitude
+	}
+	if update.SpeedKPH != 0 {
+		base.SpeedKPH = update.SpeedKPH
+	}
+	if update.Course != 0 {
+		base.Course = update.Course
+	}
+	if update.HDOP != 0 {
+		base.HDOP = update.HDOP
+	}
+	if update.FixQuality != "" {
+		base.FixQuality = update.FixQuality
+	}
+	if update.SatellitesUsed != 0 {
+		base.SatellitesUsed = update.SatellitesUsed
+	}
+	if update.SatellitesInView != 0 {
+		base.SatellitesInView = update.SatellitesInView
+	}
+	if !update.UTC.IsZero() {
+		base.UTC = update.UTC
+	}
+	if !update.LastFixTime.IsZero() {
+		base.LastFixTime = update.LastFixTime
+	}
+	if update.RawLocation != "" {
+		base.RawLocation = update.RawLocation
+	}
+	if base.NMEA == nil {
+		base.NMEA = map[string]string{}
+	}
+	for key, value := range update.NMEA {
+		if value != "" {
+			base.NMEA[key] = value
+		}
+	}
+	if update.ModemPath != "" {
+		base.ModemPath = update.ModemPath
+	}
+	if update.Protocol != "" {
+		base.Protocol = update.Protocol
+	}
+	return base
+}
+
 func functionalityATValue(mode string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "1", "full", "on", "enabled", "enable":
@@ -1252,6 +1787,133 @@ func parseQuectelSINR(value, rat string) int {
 		return (v - 50) / 100
 	}
 	return v
+}
+
+func parseQuectelMetricAverages(lines []string, metric string, dst *int) {
+	if dst == nil || metric == "" {
+		return
+	}
+	prefix := "+" + strings.ToUpper(metric) + ":"
+	values := make([]int, 0, 8)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(line), prefix) {
+			continue
+		}
+		payload := strings.TrimSpace(line[len(prefix):])
+		for _, part := range splitATCSV(payload) {
+			if v, ok := parseQuectelMetricValue(part, metric); ok {
+				values = append(values, v)
+			}
+		}
+	}
+	if len(values) == 0 {
+		return
+	}
+	sum := 0
+	for _, value := range values {
+		sum += value
+	}
+	*dst = sum / len(values)
+}
+
+func parseQuectelMetricValue(value, metric string) (int, bool) {
+	raw := strings.TrimSpace(strings.Trim(value, "\""))
+	if raw == "" || strings.EqualFold(raw, "LTE") || strings.EqualFold(raw, "NR5G") || raw == "-" {
+		return 0, false
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, false
+	}
+	switch strings.ToUpper(metric) {
+	case "QRSRP":
+		if v == -32768 || v == -37625 || v == -140 || v > 0 || v < -180 {
+			return 0, false
+		}
+	case "QRSRQ":
+		if v == -32768 || v == 0 || v > 0 || v < -60 {
+			return 0, false
+		}
+	case "QSINR":
+		if v == -32768 || v == -37625 {
+			return 0, false
+		}
+		if v >= 100 || v <= -100 {
+			v = parseQuectelSINR(raw, "NR")
+		}
+		if v < -50 || v > 80 {
+			return 0, false
+		}
+	}
+	return v, true
+}
+
+func parseQuectelTemperature(lines []string) int {
+	values := make([]int, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+QTEMP:") {
+			continue
+		}
+		parts := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QTEMP:")))
+		if len(parts) < 2 {
+			continue
+		}
+		temp, err := strconv.Atoi(strings.TrimSpace(strings.Trim(parts[1], "\"")))
+		if err != nil || temp < -40 || temp > 125 {
+			continue
+		}
+		values = append(values, temp)
+	}
+	if len(values) == 0 {
+		return 0
+	}
+	sum := 0
+	for _, value := range values {
+		sum += value
+	}
+	return (sum + len(values)/2) / len(values)
+}
+
+func parseQuectelTimeAdvance(lines []string, name string) int {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+QNWCFG:") || !strings.Contains(strings.ToLower(line), name) {
+			continue
+		}
+		values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QNWCFG:")))
+		for i := len(values) - 1; i >= 1; i-- {
+			if v, err := strconv.Atoi(strings.TrimSpace(strings.Trim(values[i], "\""))); err == nil && v >= 0 {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
+func parseQuectelDataCounters(lines []string, info *Info) {
+	if info == nil {
+		return
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "+QGDNRCNT:"):
+			values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QGDNRCNT:")))
+			if len(values) >= 2 {
+				info.RxBytes = firstNonZero(info.RxBytes, parseUint(values[0]))
+				info.TxBytes = firstNonZero(info.TxBytes, parseUint(values[1]))
+			}
+		case strings.HasPrefix(line, "+QGDCNT:"):
+			values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+QGDCNT:")))
+			if len(values) >= 2 {
+				info.TxBytes = firstNonZero(info.TxBytes, parseUint(values[0]))
+				info.RxBytes = firstNonZero(info.RxBytes, parseUint(values[1]))
+			}
+		}
+	}
 }
 
 func parseQuectelNeighborCells(lines []string) []NeighborCell {
@@ -1631,6 +2293,25 @@ func parseUint(value string) uint64 {
 	}
 	v, _ := strconv.ParseUint(value, 10, 64)
 	return v
+}
+
+func parseFloatDefault(value string, fallback float64) float64 {
+	value = strings.TrimSpace(strings.Trim(value, "\""))
+	if value == "" || value == "-" {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func valueAt(values []string, index int) string {
+	if index < 0 || index >= len(values) {
+		return ""
+	}
+	return strings.TrimSpace(values[index])
 }
 
 func parseOptionalInt(value string) int {
@@ -2043,26 +2724,39 @@ type atSession struct {
 }
 
 func (a *atSession) send(cmd string) []string {
-	a.f.Write([]byte(cmd + "\r\n"))
+	lines, _ := a.sendWithTimeout(cmd, 1500*time.Millisecond)
+	return lines
+}
+
+func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string, error) {
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
+	}
+	if err := a.f.SetDeadline(time.Now().Add(timeout)); err != nil {
+		_ = err
+	}
+	if _, err := a.f.Write([]byte(cmd + "\r\n")); err != nil {
+		return nil, err
+	}
 
 	var lines []string
-	deadline := time.After(1500 * time.Millisecond)
 	for {
-		select {
-		case <-deadline:
-			return lines
-		default:
-			if a.scanner.Scan() {
-				line := strings.TrimSpace(a.scanner.Text())
-				if line == "OK" || line == "ERROR" || strings.HasPrefix(line, "+CME ERROR") {
-					return lines
-				}
-				if line != "" && line != cmd {
-					lines = append(lines, line)
-				}
-			} else {
-				return lines
+		if !a.scanner.Scan() {
+			if err := a.scanner.Err(); err != nil {
+				return lines, err
 			}
+			return lines, fmt.Errorf("AT command %q ended before OK", cmd)
 		}
+		line := strings.TrimSpace(a.scanner.Text())
+		if line == "" || line == cmd {
+			continue
+		}
+		if line == "OK" {
+			return lines, nil
+		}
+		if line == "ERROR" || strings.HasPrefix(line, "+CME ERROR") || strings.HasPrefix(line, "+CMS ERROR") {
+			return lines, fmt.Errorf("AT command %q failed: %s", cmd, line)
+		}
+		lines = append(lines, line)
 	}
 }

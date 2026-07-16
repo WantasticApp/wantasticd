@@ -576,6 +576,16 @@ func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, inpu
 		apn := cellularInputString(input, "APN")
 		err = control.SetAPNProfile(devicePath, profile, pdpType, apn)
 		output = "APN profile applied"
+	case "StartGNSS":
+		err = control.SetGNSS(devicePath, true)
+		output = "GNSS session started"
+	case "StopGNSS":
+		err = control.SetGNSS(devicePath, false)
+		output = "GNSS session stopped"
+	case "RefreshGNSS":
+		var gnss *modemPkg.GNSSInfo
+		gnss, err = control.GetGNSS(devicePath)
+		output = cellularGNSSOutput(gnss)
 	case "SendSMS":
 		phone := cellularInputString(input, "PhoneNumber", "To")
 		message := cellularInputString(input, "Message", "Body")
@@ -659,6 +669,23 @@ func cellularOperateStatus(index int, status, output, smsInbox string) *wusp.Mes
 		msg.Set(prefix+"SMSInboxJSON", wusp.String(smsInbox))
 	}
 	return msg
+}
+
+func cellularGNSSOutput(info *modemPkg.GNSSInfo) string {
+	if info == nil {
+		return "GNSS status unavailable"
+	}
+	if info.Latitude != 0 || info.Longitude != 0 {
+		return fmt.Sprintf(
+			"GNSS %s %.6f,%.6f sats=%d hdop=%.1f",
+			firstNonEmpty(info.Status, "Unknown"),
+			info.Latitude,
+			info.Longitude,
+			info.SatellitesUsed,
+			info.HDOP,
+		)
+	}
+	return "GNSS " + firstNonEmpty(info.Status, "Unknown")
 }
 
 // tryReboot attempts to issue a system reboot. Returns an error if no

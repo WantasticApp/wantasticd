@@ -68,6 +68,9 @@ type Info struct {
 	// Quectel extended radio telemetry.
 	CarrierAggregation []CarrierInfo  `json:"carrier_aggregation,omitempty"`
 	NeighborCells      []NeighborCell `json:"neighbor_cells,omitempty"`
+	TemperatureC       int            `json:"temperature_c,omitempty"`
+	LTETimingAdvance   int            `json:"lte_timing_advance,omitempty"`
+	NR5GTimingAdvance  int            `json:"nr5g_timing_advance,omitempty"`
 
 	// SMS
 	SMSStorageLocation string `json:"sms_storage_location"`
@@ -123,6 +126,27 @@ type SignalQuality struct {
 	ECIO int `json:"ecio"` // dB  (UMTS Ec/Io)
 	CSQ  int `json:"csq"`  // 0-31 (legacy GSM signal quality)
 	Bars int `json:"bars"` // 0-5 (normalized signal strength)
+}
+
+// GNSSInfo holds modem-backed GPS/GNSS state and raw diagnostic payloads.
+type GNSSInfo struct {
+	Enabled          bool              `json:"enabled"`
+	Status           string            `json:"status"`
+	Latitude         float64           `json:"latitude"`
+	Longitude        float64           `json:"longitude"`
+	Altitude         float64           `json:"altitude"`
+	SpeedKPH         float64           `json:"speed_kph"`
+	Course           float64           `json:"course"`
+	HDOP             float64           `json:"hdop"`
+	FixQuality       string            `json:"fix_quality"`
+	SatellitesUsed   int               `json:"satellites_used"`
+	SatellitesInView int               `json:"satellites_in_view"`
+	UTC              time.Time         `json:"utc"`
+	LastFixTime      time.Time         `json:"last_fix_time"`
+	RawLocation      string            `json:"raw_location"`
+	NMEA             map[string]string `json:"nmea,omitempty"`
+	ModemPath        string            `json:"modem_path"`
+	Protocol         string            `json:"protocol"`
 }
 
 // Technology represents the radio access technology.
@@ -264,6 +288,8 @@ type ControlController interface {
 	SetSIMSlot(devicePath string, slot int) error
 	SetIMEI(devicePath, imei string) error
 	SetAPNProfile(devicePath string, profile int, pdpType, apn string) error
+	SetGNSS(devicePath string, enabled bool) error
+	GetGNSS(devicePath string) (*GNSSInfo, error)
 	SendSMS(devicePath, phoneNumber, message string) error
 	ListSMS(devicePath string) (string, error)
 	DeleteSMS(devicePath, index string) error

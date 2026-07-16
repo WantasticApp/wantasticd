@@ -91,13 +91,47 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 		return nil, ""
 	}
 	candidates := openWrtCellularDeviceCandidates(section)
+	var statsOnly *modemPkg.Info
+	var statsOnlyPath string
 	for _, candidate := range candidates {
 		info, err := ctl.GetInfo(candidate)
 		if err != nil || info == nil {
 			continue
 		}
 		b.enrichOpenWrtCellularNetStats(info, section)
-		return info, candidate
+		if shouldPublishCellularInfo(candidate, info) {
+			return info, candidate
+		}
+		if statsOnly == nil && hasCellularStats(info) {
+			statsCopy := *info
+			statsOnly = &statsCopy
+			statsOnlyPath = candidate
+		}
+	}
+
+	if devices, err := ctl.Discover(); err == nil {
+		seen := make(map[string]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			seen[candidate] = struct{}{}
+		}
+		for _, candidate := range devices {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			info, err := ctl.GetInfo(candidate)
+			if err != nil || info == nil {
+				continue
+			}
+			b.enrichOpenWrtCellularNetStats(info, section)
+			if shouldPublishCellularInfo(candidate, info) {
+				return info, candidate
+			}
+			if statsOnly == nil && hasCellularStats(info) {
+				statsCopy := *info
+				statsOnly = &statsCopy
+				statsOnlyPath = candidate
+			}
+		}
 	}
 
 	info := &modemPkg.Info{
@@ -105,6 +139,10 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 		Protocol:  strings.TrimSpace(section.Options["proto"]),
 	}
 	b.enrichOpenWrtCellularNetStats(info, section)
+	if statsOnly != nil {
+		mergeCellularStats(statsOnly, info)
+		return statsOnly, statsOnlyPath
+	}
 	if info.Interface == "" || !hasOpenWrtCellularRuntimeData(info) {
 		return nil, ""
 	}

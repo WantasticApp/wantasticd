@@ -13,16 +13,25 @@ import (
 )
 
 // collectGPSStatic populates the standard TR-181 Device.DeviceInfo.Location
-// object from gpsd or common OpenWrt GPS status files.
+// object and the Wantastic GNSS extension from gpsd, ModemManager, Quectel AT,
+// or common OpenWrt GPS status files.
 func collectGPSStatic(msg *wusp.Message) {
 	info := gpsFromGPSD()
 	if info == nil {
 		info = gpsFromModemManager()
 	}
 	if info == nil {
+		info = gpsFromQuectelAT()
+	}
+	if info == nil {
 		info = gpsFromFile()
 	}
 	if info == nil {
+		return
+	}
+
+	appendGNSSFields(msg, info)
+	if info.lat == 0 && info.lon == 0 {
 		return
 	}
 
@@ -37,10 +46,13 @@ func collectGPSStatic(msg *wusp.Message) {
 }
 
 type gpsInfo struct {
-	lat, lon, alt, speed float64
-	satellites           int
-	fix                  string
-	timestamp            time.Time
+	lat, lon, alt, speed, course, hdop float64
+	satellites, satellitesInView       int
+	fix, status, fixQuality            string
+	source, modemPath, protocol        string
+	rawLocation                        string
+	nmea                               map[string]string
+	timestamp, utc                     time.Time
 }
 
 func gpsFromGPSD() *gpsInfo {
@@ -50,7 +62,7 @@ func gpsFromGPSD() *gpsInfo {
 	}
 	defer gps.Close()
 
-	info := &gpsInfo{fix: "none"}
+	info := &gpsInfo{fix: "none", status: "Searching", source: "gpsd", protocol: "gpsd"}
 
 	gps.AddFilter("TPV", func(r interface{}) {
 		tpv, ok := r.(*gpsd.TPVReport)
@@ -90,12 +102,16 @@ func gpsFromGPSD() *gpsInfo {
 	if info.lat == 0 && info.lon == 0 {
 		return nil
 	}
+	info.status = gnssStatusFromFix(info.fix)
 	return info
 }
 
 func gpsFromFile() *gpsInfo {
 	for _, path := range []string{"/tmp/gps_info.txt", "/tmp/gpsdata", "/var/run/gps_info.txt"} {
 		if info := gpsFromStatusFile(path); info != nil {
+			info.source = "file"
+			info.protocol = "file"
+			info.modemPath = path
 			return info
 		}
 	}
@@ -120,7 +136,7 @@ func parseGPSStatus(data string, fallbackTime time.Time) *gpsInfo {
 		if strings.HasPrefix(line, "latitude=") {
 			var lat, lon, alt float64
 			if _, err := fmt.Sscanf(line, "latitude=%f, longitude=%f, altitude=%f", &lat, &lon, &alt); err == nil {
-				return &gpsInfo{lat: lat, lon: lon, alt: alt, fix: "2D", timestamp: fallbackTime}
+				return &gpsInfo{lat: lat, lon: lon, alt: alt, fix: "2D", status: "Fix2D", timestamp: fallbackTime}
 			}
 		}
 		if key, val, ok := strings.Cut(line, "="); ok {
@@ -153,6 +169,7 @@ func parseGPSStatus(data string, fallbackTime time.Time) *gpsInfo {
 		speed:      speed,
 		satellites: satellites,
 		fix:        fix,
+		status:     gnssStatusFromFix(fix),
 		timestamp:  timestamp,
 	}
 }
@@ -182,6 +199,82 @@ func firstValue(values map[string]string, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func appendGNSSFields(msg *wusp.Message, info *gpsInfo) {
+	if msg == nil || info == nil {
+		return
+	}
+	msg.Set("Device.WUSP_GNSS.ReceiverNumberOfEntries", wusp.Uint(1))
+	prefix := "Device.WUSP_GNSS.Receiver.1."
+	msg.Set(prefix+"Alias", wusp.String("cpe-gnss-1"))
+	msg.Set(prefix+"LocationReference", wusp.String("Device.DeviceInfo.Location.1."))
+	msg.Set(prefix+"Enable", wusp.Bool(info.status != "Disabled"))
+	msg.Set(prefix+"Status", wusp.String(firstNonEmpty(info.status, gnssStatusFromFix(info.fix), "Unknown")))
+	msg.Set(prefix+"Protocol", wusp.String(firstNonEmpty(info.protocol, info.source, "unknown")))
+	if info.modemPath != "" {
+		msg.Set(prefix+"ModemPath", wusp.String(info.modemPath))
+	}
+	if info.lat != 0 || info.lon != 0 {
+		msg.Set(prefix+"Latitude", wusp.Float(info.lat))
+		msg.Set(prefix+"Longitude", wusp.Float(info.lon))
+	}
+	if info.alt != 0 {
+		msg.Set(prefix+"Altitude", wusp.Float(info.alt))
+	}
+	if info.speed != 0 {
+		msg.Set(prefix+"SpeedKPH", wusp.Float(info.speed))
+	}
+	if info.course != 0 {
+		msg.Set(prefix+"Course", wusp.Float(info.course))
+	}
+	if info.hdop != 0 {
+		msg.Set(prefix+"HDOP", wusp.Float(info.hdop))
+	}
+	if info.fixQuality != "" {
+		msg.Set(prefix+"FixQuality", wusp.String(info.fixQuality))
+	}
+	if info.satellites > 0 {
+		msg.Set(prefix+"SatellitesUsed", wusp.Uint(uint64(info.satellites)))
+	}
+	if info.satellitesInView > 0 {
+		msg.Set(prefix+"SatellitesInView", wusp.Uint(uint64(info.satellitesInView)))
+	}
+	if !info.utc.IsZero() {
+		msg.Set(prefix+"UTC", wusp.Time(info.utc.UTC()))
+	}
+	if !info.timestamp.IsZero() {
+		msg.Set(prefix+"LastFixTime", wusp.Time(info.timestamp.UTC()))
+	}
+	if info.rawLocation != "" {
+		msg.Set(prefix+"RawLocation", wusp.String(info.rawLocation))
+	}
+	for _, item := range []struct {
+		key  string
+		path string
+	}{
+		{"GGA", "RawGGA"},
+		{"RMC", "RawRMC"},
+		{"GSA", "RawGSA"},
+		{"GSV", "RawGSV"},
+	} {
+		if raw := strings.TrimSpace(info.nmea[item.key]); raw != "" {
+			msg.Set(prefix+item.path, wusp.String(raw))
+		}
+	}
+}
+
+func gnssStatusFromFix(fix string) string {
+	switch strings.ToUpper(strings.TrimSpace(fix)) {
+	case "3D", "FIX3D":
+		return "Fix3D"
+	case "2D", "FIX2D":
+		return "Fix2D"
+	case "NOFIX", "NONE", "NO FIX", "0":
+		return "NoFix"
+	default:
+		return "Unknown"
+	}
 }
 
 func formatLocationDataObject(info *gpsInfo) string {

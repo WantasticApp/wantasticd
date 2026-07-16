@@ -107,6 +107,14 @@ func (c *modemManagerController) SetAPNProfile(devicePath string, profile int, p
 	return c.at.SetAPNProfile(devicePath, profile, pdpType, apn)
 }
 
+func (c *modemManagerController) SetGNSS(devicePath string, enabled bool) error {
+	return c.at.SetGNSS(c.atDevicePathForModemManager(devicePath), enabled)
+}
+
+func (c *modemManagerController) GetGNSS(devicePath string) (*GNSSInfo, error) {
+	return c.at.GetGNSS(c.atDevicePathForModemManager(devicePath))
+}
+
 func (c *modemManagerController) SendSMS(devicePath, phoneNumber, message string) error {
 	return c.at.SendSMS(devicePath, phoneNumber, message)
 }
@@ -117,6 +125,22 @@ func (c *modemManagerController) ListSMS(devicePath string) (string, error) {
 
 func (c *modemManagerController) DeleteSMS(devicePath, index string) error {
 	return c.at.DeleteSMS(devicePath, index)
+}
+
+func (c *modemManagerController) atDevicePathForModemManager(devicePath string) string {
+	modem, ok := c.modemForPath(devicePath)
+	if !ok {
+		return devicePath
+	}
+	for _, candidate := range modemManagerPathCandidates(modem) {
+		if strings.HasPrefix(candidate, "/dev/tty") {
+			return candidate
+		}
+	}
+	if primary, err := modem.GetPrimaryPort(); err == nil && primary != "" {
+		return "/dev/" + filepath.Base(primary)
+	}
+	return devicePath
 }
 
 func (c *modemManagerController) modemManagerModems() ([]mm.Modem, error) {

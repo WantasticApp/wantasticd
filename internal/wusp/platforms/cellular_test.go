@@ -67,6 +67,32 @@ func TestCellularPublishSkipsEmptyNetdevRows(t *testing.T) {
 	}
 }
 
+func TestCellularPublishSkipsStatsOnlyNetdevRows(t *testing.T) {
+	msg := wusp.NewMessage()
+	collectCellularSnapshot(msg, []cellularEntry{
+		{devicePath: "rmnet_data3", info: &modemPkg.Info{Interface: "rmnet_data3", RxBytes: 1234, TxBytes: 5678}},
+	})
+
+	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 0)
+	if _, ok := msg.Get("Device.Cellular.Interface.1.Stats.BytesReceived"); ok {
+		t.Fatal("stats-only rmnet row was published as a modem")
+	}
+}
+
+func TestCoalesceCellularEntriesMergesStatsIntoModem(t *testing.T) {
+	entries := coalesceCellularEntries([]cellularEntry{
+		{devicePath: "rmnet_data0", info: &modemPkg.Info{Interface: "rmnet_data0", RxBytes: 1234, TxBytes: 5678}},
+		{devicePath: "/dev/ttyUSB2", info: &modemPkg.Info{Interface: "rmnet_data0", IMEI: "123456789012345", Signal: modemPkg.SignalQuality{RSRP: -91}}},
+	})
+
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d want 1", len(entries))
+	}
+	if entries[0].info.RxBytes != 1234 || entries[0].info.TxBytes != 5678 {
+		t.Fatalf("stats not merged: %+v", entries[0].info)
+	}
+}
+
 func TestCellularPublishIncludesIdentityAndStats(t *testing.T) {
 	msg := wusp.NewMessage()
 	collectedAt := time.Date(2026, 7, 15, 10, 30, 0, 0, time.UTC)
@@ -89,13 +115,16 @@ func TestCellularPublishIncludesIdentityAndStats(t *testing.T) {
 					RSRQ: -8,
 					SINR: 16,
 				},
-				APN:         "internet",
-				IPAddress:   "100.64.1.2",
-				DNS1:        "1.1.1.1",
-				RxBytes:     5678,
-				TxBytes:     1234,
-				SIMStatus:   modemPkg.SIMReady,
-				CollectedAt: collectedAt,
+				APN:               "internet",
+				IPAddress:         "100.64.1.2",
+				DNS1:              "1.1.1.1",
+				RxBytes:           5678,
+				TxBytes:           1234,
+				TemperatureC:      48,
+				LTETimingAdvance:  12,
+				NR5GTimingAdvance: 23,
+				SIMStatus:         modemPkg.SIMReady,
+				CollectedAt:       collectedAt,
 			},
 		},
 	})
@@ -107,7 +136,10 @@ func TestCellularPublishIncludesIdentityAndStats(t *testing.T) {
 	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.Manufacturer", "Quectel")
 	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.Model", "RG520N")
 	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.EquipmentIdentifier", "123456789012345")
-	assertStringField(t, msg, "Device.WUSP_CellularControl.Interface.1.SupportedOperations", "SetFunctionality,SwitchSIM,SetIMEI,ApplyAPN,SendSMS,ListSMS,DeleteSMS")
+	assertIntField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.TemperatureC", 48)
+	assertIntField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.LTETimingAdvance", 12)
+	assertIntField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.NR5GTimingAdvance", 23)
+	assertStringField(t, msg, "Device.WUSP_CellularControl.Interface.1.SupportedOperations", "SetFunctionality,SwitchSIM,SetIMEI,ApplyAPN,StartGNSS,StopGNSS,RefreshGNSS,SendSMS,ListSMS,DeleteSMS")
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(cellular publish): %v", err)
 	}
@@ -197,6 +229,9 @@ func TestCellularTelemetryRepresentativeMessageValidates(t *testing.T) {
 	msg.Set(prefix+"CellID", wusp.Uint(12345))
 	msg.Set(prefix+"TAC", wusp.Uint(22))
 	msg.Set(prefix+"DNS1", wusp.String("1.1.1.1"))
+	msg.Set(prefix+"TemperatureC", wusp.Int(48))
+	msg.Set(prefix+"LTETimingAdvance", wusp.Int(12))
+	msg.Set(prefix+"NR5GTimingAdvance", wusp.Int(23))
 	msg.Set(prefix+"CarrierNumberOfEntries", wusp.Uint(1))
 	msg.Set(prefix+"NeighborCellNumberOfEntries", wusp.Uint(1))
 	msg.Set(prefix+"Carrier.1.Role", wusp.String("PCC"))

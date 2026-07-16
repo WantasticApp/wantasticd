@@ -468,22 +468,63 @@ func collectCellularEntries() []cellularEntry {
 	}
 
 	entries := make([]cellularEntry, 0, len(devices))
-	seenModems := make(map[string]struct{})
 	for _, dev := range devices {
 		info, err := ctl.GetInfo(dev)
-		if err != nil || info == nil || !shouldPublishCellularInfo(dev, info) {
+		if err != nil || info == nil {
 			continue
 		}
-		if identity := cellularModemIdentity(dev, info); identity != "" {
+		infoCopy := *info
+		entries = append(entries, cellularEntry{devicePath: dev, info: &infoCopy})
+	}
+	return coalesceCellularEntries(entries)
+}
+
+func coalesceCellularEntries(entries []cellularEntry) []cellularEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	statsByInterface := make(map[string]*modemPkg.Info)
+	var fallbackStats *modemPkg.Info
+	richCount := 0
+	for _, entry := range entries {
+		if entry.info != nil && hasCellularModemTelemetryData(entry.devicePath, entry.info) {
+			richCount++
+		}
+		if entry.info == nil || !hasCellularStats(entry.info) || hasCellularModemTelemetryData(entry.devicePath, entry.info) {
+			continue
+		}
+		iface := filepath.Base(firstNonEmpty(entry.info.Interface, entry.devicePath))
+		if iface != "." && iface != "" {
+			statsByInterface[iface] = entry.info
+		}
+		if fallbackStats == nil {
+			fallbackStats = entry.info
+		}
+	}
+
+	out := make([]cellularEntry, 0, len(entries))
+	seenModems := make(map[string]struct{})
+	for _, entry := range entries {
+		info := entry.info
+		if info == nil || !hasCellularModemTelemetryData(entry.devicePath, info) {
+			continue
+		}
+		iface := filepath.Base(firstNonEmpty(info.Interface, entry.devicePath))
+		if stats := statsByInterface[iface]; stats != nil {
+			mergeCellularStats(info, stats)
+		} else if fallbackStats != nil && richCount == 1 && !hasCellularStats(info) {
+			mergeCellularStats(info, fallbackStats)
+		}
+		if identity := cellularModemIdentity(entry.devicePath, info); identity != "" {
 			if _, ok := seenModems[identity]; ok {
 				continue
 			}
 			seenModems[identity] = struct{}{}
 		}
 		infoCopy := *info
-		entries = append(entries, cellularEntry{devicePath: dev, info: &infoCopy})
+		out = append(out, cellularEntry{devicePath: entry.devicePath, info: &infoCopy})
 	}
-	return entries
+	return out
 }
 
 func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
@@ -720,6 +761,13 @@ func shouldPublishCellularInfo(devicePath string, info *modemPkg.Info) bool {
 	if info == nil {
 		return false
 	}
+	return hasCellularModemTelemetryData(devicePath, info)
+}
+
+func hasCellularModemTelemetryData(devicePath string, info *modemPkg.Info) bool {
+	if info == nil {
+		return false
+	}
 	if validDigitString(info.IMEI, 15, 15) ||
 		validDigitString(info.ICCID, 6, 20) ||
 		validDigitString(info.IMSI, 14, 15) {
@@ -733,7 +781,22 @@ func shouldPublishCellularInfo(devicePath string, info *modemPkg.Info) bool {
 	if strings.HasPrefix(devicePath, "/org/freedesktop/ModemManager") {
 		return true
 	}
-	return hasCellularRuntimeData(info)
+	if info.Technology != modemPkg.TechUnknown ||
+		info.Signal.RSSI != 0 || info.Signal.RSRP != 0 ||
+		info.Signal.RSRQ != 0 || info.Signal.SINR != 0 ||
+		info.APN != "" || info.IPAddress != "" || info.IPv6Address != "" ||
+		info.DNS1 != "" || info.DNS2 != "" ||
+		info.Operator != "" || info.OperatorMCC != "" || info.OperatorMNC != "" ||
+		info.Band != "" || info.CellID != 0 || info.TAC != 0 || info.LAC != 0 ||
+		len(info.CarrierAggregation) > 0 || len(info.NeighborCells) > 0 ||
+		info.SMSStorageLocation != "" || info.SMSStorageCapacity != 0 || info.SMSStorageUsed != 0 ||
+		info.SIMStatus == modemPkg.SIMReady ||
+		info.SIMStatus == modemPkg.SIMLocked ||
+		info.SIMStatus == modemPkg.SIMError ||
+		info.TemperatureC != 0 || info.LTETimingAdvance != 0 || info.NR5GTimingAdvance != 0 {
+		return true
+	}
+	return false
 }
 
 func hasCellularRuntimeData(info *modemPkg.Info) bool {
@@ -757,6 +820,38 @@ func hasCellularRuntimeData(info *modemPkg.Info) bool {
 		info.SIMStatus == modemPkg.SIMReady ||
 		info.SIMStatus == modemPkg.SIMLocked ||
 		info.SIMStatus == modemPkg.SIMError
+}
+
+func hasCellularStats(info *modemPkg.Info) bool {
+	return info != nil && (info.TxBytes != 0 || info.RxBytes != 0 ||
+		info.TxPackets != 0 || info.RxPackets != 0 ||
+		info.TxErrors != 0 || info.RxErrors != 0 ||
+		info.TxDropped != 0 || info.RxDropped != 0 ||
+		info.UpstreamMaxBitRate != 0 || info.DownstreamMaxBitRate != 0)
+}
+
+func mergeCellularStats(dst, src *modemPkg.Info) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.TxBytes = firstNonZeroUint(dst.TxBytes, src.TxBytes)
+	dst.RxBytes = firstNonZeroUint(dst.RxBytes, src.RxBytes)
+	dst.TxPackets = firstNonZeroUint(dst.TxPackets, src.TxPackets)
+	dst.RxPackets = firstNonZeroUint(dst.RxPackets, src.RxPackets)
+	dst.TxErrors = firstNonZeroUint(dst.TxErrors, src.TxErrors)
+	dst.RxErrors = firstNonZeroUint(dst.RxErrors, src.RxErrors)
+	dst.TxDropped = firstNonZeroUint(dst.TxDropped, src.TxDropped)
+	dst.RxDropped = firstNonZeroUint(dst.RxDropped, src.RxDropped)
+	dst.TxMulticastPackets = firstNonZeroUint(dst.TxMulticastPackets, src.TxMulticastPackets)
+	dst.RxMulticastPackets = firstNonZeroUint(dst.RxMulticastPackets, src.RxMulticastPackets)
+	dst.TxBroadcastPackets = firstNonZeroUint(dst.TxBroadcastPackets, src.TxBroadcastPackets)
+	dst.RxBroadcastPackets = firstNonZeroUint(dst.RxBroadcastPackets, src.RxBroadcastPackets)
+	dst.RxUnknownProtoPackets = firstNonZeroUint(dst.RxUnknownProtoPackets, src.RxUnknownProtoPackets)
+	dst.UpstreamMaxBitRate = firstNonZeroUint(dst.UpstreamMaxBitRate, src.UpstreamMaxBitRate)
+	dst.DownstreamMaxBitRate = firstNonZeroUint(dst.DownstreamMaxBitRate, src.DownstreamMaxBitRate)
+	if dst.Interface == "" || strings.HasPrefix(dst.Interface, "/dev/") {
+		dst.Interface = src.Interface
+	}
 }
 
 func isCellularNetdev(base string) bool {
@@ -800,7 +895,7 @@ func cellularSMSCapable(devicePath string, info *modemPkg.Info) bool {
 }
 
 func cellularSupportedOperations(devicePath string, info *modemPkg.Info) string {
-	ops := []string{"SetFunctionality", "SwitchSIM", "SetIMEI", "ApplyAPN"}
+	ops := []string{"SetFunctionality", "SwitchSIM", "SetIMEI", "ApplyAPN", "StartGNSS", "StopGNSS", "RefreshGNSS"}
 	if cellularSMSCapable(devicePath, info) {
 		ops = append(ops, "SendSMS", "ListSMS", "DeleteSMS")
 	}
@@ -990,6 +1085,15 @@ func appendCellularTelemetryFields(msg *wusp.Message, ifaceIdx int, modemPath st
 	}
 	if ip := net.ParseIP(info.IPv6Address); ip != nil && ip.To16() != nil && ip.To4() == nil {
 		msg.Set(root+"IPv6Address", wusp.IP6(ip))
+	}
+	if info.TemperatureC != 0 {
+		msg.Set(root+"TemperatureC", wusp.Int(int64(info.TemperatureC)))
+	}
+	if info.LTETimingAdvance > 0 {
+		msg.Set(root+"LTETimingAdvance", wusp.Int(int64(info.LTETimingAdvance)))
+	}
+	if info.NR5GTimingAdvance > 0 {
+		msg.Set(root+"NR5GTimingAdvance", wusp.Int(int64(info.NR5GTimingAdvance)))
 	}
 
 	for i, carrier := range info.CarrierAggregation {

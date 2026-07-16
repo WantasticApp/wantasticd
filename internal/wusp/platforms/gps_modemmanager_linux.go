@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	modemPkg "wantastic-agent/internal/modem"
+
 	mm "github.com/maltegrosse/go-modemmanager"
 )
 
@@ -86,7 +88,11 @@ func gpsInfoFromModemManagerLocation(location mm.CurrentLocation) *gpsInfo {
 			lon:       raw.Longitude,
 			alt:       raw.Altitude,
 			fix:       "3D",
+			status:    "Fix3D",
+			source:    "modemmanager",
+			protocol:  "modemmanager",
 			timestamp: timestamp,
+			utc:       timestamp,
 		}
 	}
 
@@ -96,6 +102,9 @@ func gpsInfoFromModemManagerLocation(location mm.CurrentLocation) *gpsInfo {
 			lat:       cdma.Latitude,
 			lon:       cdma.Longitude,
 			fix:       "2D",
+			status:    "Fix2D",
+			source:    "modemmanager",
+			protocol:  "modemmanager",
 			timestamp: time.Now(),
 		}
 	}
@@ -125,6 +134,75 @@ func gpsInfoFromNMEASentences(sentences []string) *gpsInfo {
 	return best
 }
 
+func gpsFromQuectelAT() *gpsInfo {
+	ctl := modemPkg.New()
+	defer ctl.Close()
+	control, ok := ctl.(modemPkg.ControlController)
+	if !ok {
+		return nil
+	}
+	devices, err := ctl.Discover()
+	if err != nil || len(devices) == 0 {
+		return nil
+	}
+	for _, dev := range devices {
+		info, err := control.GetGNSS(dev)
+		if err != nil {
+			continue
+		}
+		if info != nil && info.Status == "Disabled" {
+			_ = control.SetGNSS(dev, true)
+			time.Sleep(350 * time.Millisecond)
+			if refreshed, refreshErr := control.GetGNSS(dev); refreshErr == nil && refreshed != nil {
+				info = refreshed
+			}
+		}
+		if converted := gpsInfoFromModemGNSS(dev, info); converted != nil {
+			return converted
+		}
+	}
+	return nil
+}
+
+func gpsInfoFromModemGNSS(devicePath string, info *modemPkg.GNSSInfo) *gpsInfo {
+	if info == nil {
+		return nil
+	}
+	out := &gpsInfo{
+		lat:              info.Latitude,
+		lon:              info.Longitude,
+		alt:              info.Altitude,
+		speed:            info.SpeedKPH,
+		course:           info.Course,
+		hdop:             info.HDOP,
+		satellites:       info.SatellitesUsed,
+		satellitesInView: info.SatellitesInView,
+		fix:              info.Status,
+		status:           info.Status,
+		fixQuality:       info.FixQuality,
+		source:           "quectel-at",
+		protocol:         firstNonEmpty(info.Protocol, "quectel-at"),
+		modemPath:        firstNonEmpty(info.ModemPath, devicePath),
+		rawLocation:      info.RawLocation,
+		nmea:             info.NMEA,
+		timestamp:        info.LastFixTime,
+		utc:              info.UTC,
+	}
+	if out.timestamp.IsZero() && !out.utc.IsZero() {
+		out.timestamp = out.utc
+	}
+	if out.timestamp.IsZero() && (out.lat != 0 || out.lon != 0) {
+		out.timestamp = time.Now()
+	}
+	if out.status == "" {
+		out.status = "Unknown"
+	}
+	if out.status == "Disabled" || out.status == "Searching" || out.lat != 0 || out.lon != 0 {
+		return out
+	}
+	return nil
+}
+
 func gpsInfoFromGGA(fields []string) *gpsInfo {
 	if len(fields) < 10 || strings.TrimSpace(fields[6]) == "0" {
 		return nil
@@ -141,6 +219,9 @@ func gpsInfoFromGGA(fields []string) *gpsInfo {
 		alt:        alt,
 		satellites: sats,
 		fix:        "3D",
+		status:     "Fix3D",
+		source:     "modemmanager",
+		protocol:   "modemmanager",
 		timestamp:  parseNMEATimestamp(fields[1], ""),
 	}
 }
@@ -159,6 +240,9 @@ func gpsInfoFromRMC(fields []string) *gpsInfo {
 		lon:       lon,
 		speed:     speedKnots * 1.852,
 		fix:       "2D",
+		status:    "Fix2D",
+		source:    "modemmanager",
+		protocol:  "modemmanager",
 		timestamp: parseNMEATimestamp(fields[1], fields[9]),
 	}
 }

@@ -46,6 +46,28 @@ func TestParseQuectelNetworkInfo(t *testing.T) {
 	}
 }
 
+func TestParseQuectelGPSLocation(t *testing.T) {
+	info, ok := parseQuectelGPSLocation(`+QGPSLOC: 120000.0,33.573100,-7.589800,0.8,45.2,3,180.5,12.4,6.7,150726,08`)
+	if !ok {
+		t.Fatal("parseQuectelGPSLocation returned ok=false")
+	}
+	if info.Status != "Fix3D" {
+		t.Fatalf("Status=%q want Fix3D", info.Status)
+	}
+	if info.Latitude != 33.573100 || info.Longitude != -7.589800 {
+		t.Fatalf("coordinates=(%f,%f)", info.Latitude, info.Longitude)
+	}
+	if info.HDOP != 0.8 || info.Altitude != 45.2 || info.Course != 180.5 || info.SpeedKPH != 12.4 {
+		t.Fatalf("metrics hdop=%f alt=%f course=%f speed=%f", info.HDOP, info.Altitude, info.Course, info.SpeedKPH)
+	}
+	if info.SatellitesUsed != 8 {
+		t.Fatalf("SatellitesUsed=%d want 8", info.SatellitesUsed)
+	}
+	if got := info.UTC.Format("2006-01-02T15:04:05Z"); got != "2026-07-15T12:00:00Z" {
+		t.Fatalf("UTC=%s", got)
+	}
+}
+
 func TestParseCGCONTRDPPrefersNonIMSContext(t *testing.T) {
 	info := &Info{}
 	c := &atController{}
@@ -101,6 +123,67 @@ func TestParseQuectelCarrierAggregation(t *testing.T) {
 	}
 	if rows[1].RAT != "NR" || rows[1].Band != "N78" || rows[1].EARFCN != 627264 || rows[1].SINR != 21 {
 		t.Fatalf("nr row=%+v", rows[1])
+	}
+}
+
+func TestParseQuectelMetricAverages(t *testing.T) {
+	sig := SignalQuality{}
+
+	parseQuectelMetricAverages([]string{
+		`+QRSRP: -91,-92,-32768,-140,"LTE"`,
+		`+QRSRP: -88,-89,-32768,-37625,"NR5G"`,
+	}, "QRSRP", &sig.RSRP)
+	parseQuectelMetricAverages([]string{
+		`+QRSRQ: -8,-9,-32768,-32768,"LTE"`,
+	}, "QRSRQ", &sig.RSRQ)
+	parseQuectelMetricAverages([]string{
+		`+QSINR: 1500,1200,-32768,-32768,"NR5G"`,
+	}, "QSINR", &sig.SINR)
+
+	if sig.RSRP != -90 {
+		t.Fatalf("RSRP=%d want -90", sig.RSRP)
+	}
+	if sig.RSRQ != -8 {
+		t.Fatalf("RSRQ=%d want -8", sig.RSRQ)
+	}
+	if sig.SINR != 14 {
+		t.Fatalf("SINR=%d want 14", sig.SINR)
+	}
+}
+
+func TestParseQuectelTemperatureAndTimingAdvance(t *testing.T) {
+	temp := parseQuectelTemperature([]string{
+		`+QTEMP: "cpuss-0",46`,
+		`+QTEMP: "cpuss-1",48`,
+		`+QTEMP: "pmic-0",255`,
+	})
+	if temp != 47 {
+		t.Fatalf("temp=%d want 47", temp)
+	}
+
+	ta := parseQuectelTimeAdvance([]string{
+		`+QNWCFG: "lte_time_advance",1,32`,
+	}, "lte_time_advance")
+	if ta != 32 {
+		t.Fatalf("timing advance=%d want 32", ta)
+	}
+}
+
+func TestParseQuectelDataCounters(t *testing.T) {
+	info := &Info{}
+	parseQuectelDataCounters([]string{
+		`+QGDCNT: 100,200`,
+	}, info)
+	if info.TxBytes != 100 || info.RxBytes != 200 {
+		t.Fatalf("lte counters tx=%d rx=%d", info.TxBytes, info.RxBytes)
+	}
+
+	info = &Info{}
+	parseQuectelDataCounters([]string{
+		`+QGDNRCNT: 300,400`,
+	}, info)
+	if info.RxBytes != 300 || info.TxBytes != 400 {
+		t.Fatalf("nr counters tx=%d rx=%d", info.TxBytes, info.RxBytes)
 	}
 }
 

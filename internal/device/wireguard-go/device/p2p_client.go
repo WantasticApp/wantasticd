@@ -261,9 +261,12 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		peer.LastUsed = time.Now()
 
 		if existing, ok := c.peers[peer.ID]; ok {
-			if existing.State == P2PStateEstablished || existing.State == P2PStateTrying {
+			switch existing.State {
+			case P2PStateEstablished, P2PStateTrying:
 				offset += 78
 				continue
+			case P2PStateFailed:
+				peer.State = P2PStateFailed
 			}
 			peer.LastUsed = existing.LastUsed
 			peer.PunchAttempts = existing.PunchAttempts
@@ -436,11 +439,11 @@ func (c *P2PClient) sendPunchPackets(session *P2PSession, targets []net.UDPAddr,
 func (c *P2PClient) holePunch(session *P2PSession, peer *DiscoveredPeer, targets []net.UDPAddr) {
 	if len(targets) == 0 {
 		c.mu.Lock()
-		peer.State = P2PStateFailed
-		peer.LastUsed = time.Now()
-		peer.PunchAttempts++
+		failed := c.failPunchSessionIfCurrentLocked(peer, session, time.Now())
 		c.mu.Unlock()
-		c.device.log.Verbosef("[P2P] Punch relay for peer %d had no usable endpoint", peer.ID)
+		if failed {
+			c.device.log.Verbosef("[P2P] Punch relay for peer %d had no usable endpoint", peer.ID)
+		}
 		return
 	}
 
@@ -451,14 +454,29 @@ func (c *P2PClient) holePunch(session *P2PSession, peer *DiscoveredPeer, targets
 
 	<-ctx.Done()
 	c.mu.Lock()
-	if !session.Established {
-		peer.State = P2PStateFailed
-		peer.LastUsed = time.Now()
-		peer.PunchAttempts++
+	if c.failPunchSessionIfCurrentLocked(peer, session, time.Now()) {
 		c.device.log.Verbosef("[P2P] Punch timeout for peer %d after %d targets — retry in ~%s",
 			peer.ID, len(targets), p2pRetryDelay(peer.PunchAttempts))
 	}
 	c.mu.Unlock()
+}
+
+// failPunchSessionIfCurrentLocked marks a punch attempt failed only when the
+// timed-out session is still the active session for that peer. Punch attempts
+// can overlap when both peers retry or the coordinator relays fresh endpoints;
+// an older goroutine must not clobber a newer successful attempt.
+func (c *P2PClient) failPunchSessionIfCurrentLocked(peer *DiscoveredPeer, session *P2PSession, now time.Time) bool {
+	if peer == nil || session == nil || session.Established || peer.State == P2PStateEstablished {
+		return false
+	}
+	current := c.sessions[peer.ID]
+	if current != session {
+		return false
+	}
+	peer.State = P2PStateFailed
+	peer.LastUsed = now
+	peer.PunchAttempts++
+	return true
 }
 
 func buildPunchTargets(session *P2PSession) []net.UDPAddr {

@@ -120,7 +120,7 @@ func TestCellularMonitorPreservesLastRichSnapshotOnEmptyRefresh(t *testing.T) {
 	monitor.interval = time.Hour
 	monitor.maxAge = 0
 
-	first := monitor.snapshot()
+	first := monitor.refresh()
 	if len(first) != 1 {
 		t.Fatalf("first snapshot entries=%d want 1", len(first))
 	}
@@ -132,6 +132,20 @@ func TestCellularMonitorPreservesLastRichSnapshotOnEmptyRefresh(t *testing.T) {
 	}
 	if second[0].info.IMEI != "123456789012345" {
 		t.Fatalf("second snapshot IMEI=%q want preserved modem identity", second[0].info.IMEI)
+	}
+}
+
+func TestCellularMonitorSnapshotDoesNotBlockOnSlowModem(t *testing.T) {
+	originalNewModemController := newModemController
+	defer func() { newModemController = originalNewModemController }()
+	newModemController = func() modemPkg.Controller {
+		return fakeModemController{delay: 500 * time.Millisecond}
+	}
+	monitor := newCellularMonitor()
+	started := time.Now()
+	_ = monitor.snapshot()
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("snapshot blocked on live modem refresh for %s", elapsed)
 	}
 }
 

@@ -453,7 +453,11 @@ func (m *cellularMonitor) snapshot() []cellularEntry {
 	if !last.IsZero() && time.Since(last) < maxAge {
 		return entries
 	}
-	return m.refresh()
+	// Live modem queries can take tens of seconds and are serialized by the AT
+	// transport. Never block a USP Get request on them; refresh single-flight in
+	// the background and return the latest complete snapshot immediately.
+	go m.refresh()
+	return entries
 }
 
 func (m *cellularMonitor) start() {
@@ -465,6 +469,7 @@ func (m *cellularMonitor) start() {
 	m.started = true
 	interval := m.interval
 	m.mu.Unlock()
+	go m.refresh()
 
 	go func() {
 		ticker := time.NewTicker(interval)

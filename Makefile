@@ -20,6 +20,11 @@ ADB_GOOS?=linux
 ADB_GOARCH?=arm64
 ADB_GOARM?=7
 ADB_TEST_BINARY=bin/wusp-device-test
+ADB_AGENT_GOARCH?=arm
+ADB_AGENT_GOARM?=7
+ADB_AGENT_BINARY=bin/wantasticd-linux-$(ADB_AGENT_GOARCH)
+ADB_AGENT_REMOTE_PATH?=/usr/bin/wantasticd
+ADB_AGENT_SERVICE?=wantasticd
 
 # Build targets
 TARGETS := \
@@ -117,4 +122,13 @@ adb-test-run: adb-test-build
 adb-live:
 	@ADB_BINARY=$(ADB_TEST_BINARY) ADB_TEST_ARGS='$(ADB_TEST_ARGS)' tools/adb-live.sh
 
-.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live
+adb-wantasticd-build:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(ADB_AGENT_GOARCH) GOARM=$(ADB_AGENT_GOARM) $(GOBUILD) -trimpath -o $(ADB_AGENT_BINARY) $(CMD_PATH)
+
+# Build and atomically replace the real agent on the connected device. The
+# updater keeps a backup and restores it automatically if the service fails.
+adb-wantasticd-update: adb-wantasticd-build
+	@ADB_BINARY=$(ADB_AGENT_BINARY) ADB_REMOTE_PATH=$(ADB_AGENT_REMOTE_PATH) ADB_SERVICE=$(ADB_AGENT_SERVICE) tools/adb-update-wantasticd.sh
+
+.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update

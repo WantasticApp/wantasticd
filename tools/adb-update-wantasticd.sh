@@ -37,7 +37,7 @@ adb_cmd shell "chmod 0755 '$stage' && '$stage' version >/dev/null"
 if adb_cmd shell "command -v systemctl >/dev/null 2>&1 && { [ -d /run/systemd/system ] || [ -S /run/systemd/private ]; }"; then
 	service_manager=systemd
 	echo "Ensuring systemd unit $unit_path"
-	adb_cmd shell "mkdir -p /etc/systemd/system || exit 1; if [ ! -f '$unit_path' ] || ! grep -Fqx 'ExecStart=$remote_path connect --config $config_path' '$unit_path'; then printf '%s\n' '[Unit]' 'Description=Wantastic Overlay Networking Daemon' 'After=network-online.target' 'Wants=network-online.target' '' '[Service]' 'Type=simple' 'ExecStart=$remote_path connect --config $config_path' 'Restart=on-failure' 'RestartSec=5' 'KillMode=process' '' '[Install]' 'WantedBy=multi-user.target' > '$unit_path' || exit 1; fi; chmod 0644 '$unit_path' || exit 1; systemctl daemon-reload || exit 1; systemctl enable '$service' >/dev/null || exit 1"
+	adb_cmd shell "mkdir -p /etc/systemd/system || exit 1; if [ ! -f '$unit_path' ] || ! grep -Fqx 'ExecStart=$remote_path connect --config $config_path' '$unit_path' || ! grep -Fqx 'KillMode=control-group' '$unit_path' || ! grep -Fqx 'TimeoutStopSec=10' '$unit_path'; then printf '%s\n' '[Unit]' 'Description=Wantastic Overlay Networking Daemon' 'After=network-online.target' 'Wants=network-online.target' '' '[Service]' 'Type=simple' 'ExecStart=$remote_path connect --config $config_path' 'Restart=on-failure' 'RestartSec=5' 'KillMode=control-group' 'TimeoutStopSec=10' '' '[Install]' 'WantedBy=multi-user.target' > '$unit_path' || exit 1; fi; chmod 0644 '$unit_path' || exit 1; systemctl daemon-reload || exit 1; systemctl enable '$service' >/dev/null || exit 1"
 else
 	service_manager=initd
 	echo "Ensuring init service $init_path"

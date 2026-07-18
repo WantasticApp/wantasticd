@@ -226,7 +226,7 @@ func (a *Agent) performSelfUpdate(ctx context.Context, version string) {
 	}
 	updated, err := a.updater.CheckAndUpdate(ctx, version)
 	if err != nil {
-		log.Printf("Self-update failed: %v", err)
+		log.Printf("Self-update failed; agent remains active and will retry on the next scheduled check: %v", err)
 		return
 	}
 	if updated {

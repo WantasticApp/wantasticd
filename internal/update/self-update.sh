@@ -5,6 +5,8 @@
 set -e
 
 BASE_URL="https://get.wantastic.app"
+CONNECT_TIMEOUT="${WANTASTIC_UPDATE_CONNECT_TIMEOUT:-15}"
+DOWNLOAD_TIMEOUT="${WANTASTIC_UPDATE_DOWNLOAD_TIMEOUT:-300}"
 
 # ── platform ─────────────────────────────────────────────────────────────────
 UNAME_S="$(uname -s)"
@@ -86,7 +88,8 @@ main() {
   # Fetch latest version tag if not supplied
   if [ -z "$VERSION" ]; then
     echo "Fetching latest version…"
-    VERSION=$(curl -sSL "${BASE_URL}/latest" | tr -d '[:space:]')
+    VERSION=$(curl -sSL --connect-timeout "$CONNECT_TIMEOUT" --max-time 30 \
+      "${BASE_URL}/latest" | tr -d '[:space:]')
   fi
   [ -z "$VERSION" ] && { echo "Error: could not determine latest version"; exit 1; }
 
@@ -100,7 +103,15 @@ main() {
   TMP_DIR=$(mktemp -d)
   trap 'rm -rf "$TMP_DIR"' EXIT
 
-  CODE=$(curl -sSL -w "%{http_code}" -o "$TMP_DIR/pkg.tar.gz" "$DOWNLOAD_URL")
+  CODE=$(curl -sSL \
+    --connect-timeout "$CONNECT_TIMEOUT" \
+    --max-time "$DOWNLOAD_TIMEOUT" \
+    --retry 2 \
+    --retry-delay 2 \
+    --retry-connrefused \
+    -w "%{http_code}" \
+    -o "$TMP_DIR/pkg.tar.gz" \
+    "$DOWNLOAD_URL")
   [ "$CODE" = "200" ] || { echo "Error: download failed (HTTP $CODE)"; exit 1; }
 
   tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"

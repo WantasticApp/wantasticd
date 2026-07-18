@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -262,11 +263,11 @@ type ifAddrMsg struct {
 	Index                           uint32
 }
 type ifInfoMsg struct {
-	Family         uint8
-	_              uint8
-	Type           uint16
-	Index          int32
-	Flags, Change  uint32
+	Family        uint8
+	_             uint8
+	Type          uint16
+	Index         int32
+	Flags, Change uint32
 }
 
 func nlAlign(l int) int { return (l + 3) &^ 3 }
@@ -451,9 +452,10 @@ func findIptablesBinary() string {
 }
 
 func iptablesEnsure(binary string, rule FirewallRule) error {
-	// Check if rule exists (-C), add (-A) if not
+	// Check quietly: iptables prints "Bad rule" for an ordinary missing-rule
+	// result, which is expected before the first add.
 	args := append([]string{"-t", rule.Table, "-C", rule.Chain}, rule.Args...)
-	if forkExecWait(binary, args...) == nil {
+	if exec.Command(binary, args...).Run() == nil {
 		return nil
 	}
 	args[2] = "-A"
@@ -461,6 +463,10 @@ func iptablesEnsure(binary string, rule FirewallRule) error {
 }
 
 func iptablesDelete(binary string, rule FirewallRule) error {
+	check := append([]string{"-t", rule.Table, "-C", rule.Chain}, rule.Args...)
+	if exec.Command(binary, check...).Run() != nil {
+		return nil
+	}
 	args := append([]string{"-t", rule.Table, "-D", rule.Chain}, rule.Args...)
 	return forkExecWait(binary, args...)
 }

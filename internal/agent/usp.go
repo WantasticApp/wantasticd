@@ -374,6 +374,15 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		log.Printf("[USP] agent.HandleRequest failed: method=%d id=%d err=%v", req.Method, req.ID, err)
 		return err
 	}
+	if resp.Message != nil {
+		objects, values := dataModelMessageCounts(resp.Message)
+		log.Printf("[USP] DataModel message collected: method=%s objects=%d values=%d requested_paths=%d",
+			req.Method, objects, values, len(req.Paths))
+	}
+	if resp.SupportedDataModel != nil {
+		log.Printf("[USP] DataModel schema: models=%d objects=%d parameters=%d",
+			len(resp.SupportedDataModel.Models), len(resp.SupportedDataModel.Objects), len(resp.SupportedDataModel.Params))
+	}
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
 		// Encoding can fail if the platform backend returned a value whose
@@ -393,6 +402,24 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 	log.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
 	return r.replyControlPayload(reply, req, frame)
+}
+
+func dataModelMessageCounts(msg *wusp.Message) (objects, values int) {
+	if msg == nil {
+		return 0, 0
+	}
+	objectPaths := make(map[string]struct{})
+	for _, field := range msg.Fields {
+		path := strings.TrimSpace(field.Path)
+		if path == "" {
+			continue
+		}
+		values++
+		if dot := strings.LastIndexByte(path, '.'); dot > 0 {
+			objectPaths[path[:dot+1]] = struct{}{}
+		}
+	}
+	return len(objectPaths), values
 }
 
 func (r *uspRuntime) replyControlResponse(reply func([]byte) error, req wusp.USPAgentRequest, resp wusp.USPAgentResponse) error {

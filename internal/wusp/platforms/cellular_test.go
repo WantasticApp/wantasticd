@@ -62,6 +62,10 @@ func TestCellularPublishSkipsEmptyNetdevRows(t *testing.T) {
 	})
 
 	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.Cellular.AccessPointNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.WUSP_CellularControl.InterfaceNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.WUSP_GNSS.ReceiverNumberOfEntries", 0)
 	if _, ok := msg.Get("Device.Cellular.Interface.1.Name"); ok {
 		t.Fatal("empty rmnet row was published")
 	}
@@ -74,6 +78,8 @@ func TestCellularPublishSkipsStatsOnlyNetdevRows(t *testing.T) {
 	})
 
 	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", 0)
+	assertUintField(t, msg, "Device.WUSP_CellularControl.InterfaceNumberOfEntries", 0)
 	if _, ok := msg.Get("Device.Cellular.Interface.1.Stats.BytesReceived"); ok {
 		t.Fatal("stats-only rmnet row was published as a modem")
 	}
@@ -90,6 +96,42 @@ func TestCoalesceCellularEntriesMergesStatsIntoModem(t *testing.T) {
 	}
 	if entries[0].info.RxBytes != 1234 || entries[0].info.TxBytes != 5678 {
 		t.Fatalf("stats not merged: %+v", entries[0].info)
+	}
+}
+
+func TestCellularMonitorPreservesLastRichSnapshotOnEmptyRefresh(t *testing.T) {
+	originalNewModemController := newModemController
+	defer func() { newModemController = originalNewModemController }()
+
+	fake := &fakeModemController{
+		devices: []string{"/dev/ttyUSB2"},
+		infos: map[string]*modemPkg.Info{
+			"/dev/ttyUSB2": {
+				Interface: "rmnet_data0",
+				IMEI:      "123456789012345",
+				Model:     "RG520N",
+				Signal:    modemPkg.SignalQuality{RSRP: -91},
+			},
+		},
+	}
+	newModemController = func() modemPkg.Controller { return fake }
+
+	monitor := newCellularMonitor()
+	monitor.interval = time.Hour
+	monitor.maxAge = 0
+
+	first := monitor.snapshot()
+	if len(first) != 1 {
+		t.Fatalf("first snapshot entries=%d want 1", len(first))
+	}
+
+	fake.infos = map[string]*modemPkg.Info{}
+	second := monitor.snapshot()
+	if len(second) != 1 {
+		t.Fatalf("second snapshot entries=%d want preserved entry", len(second))
+	}
+	if second[0].info.IMEI != "123456789012345" {
+		t.Fatalf("second snapshot IMEI=%q want preserved modem identity", second[0].info.IMEI)
 	}
 }
 

@@ -127,6 +127,10 @@ type USPAgentOptions struct {
 // modelled as discrete requests over parameter paths, which maps cleanly onto
 // both USP Records and WireGuard's packet-oriented transport.
 type USPAgent struct {
+	// Use the typed atomic so Go guarantees 64-bit alignment on 32-bit ARM.
+	// A plain uint64 placed after pointer-sized fields can otherwise panic.
+	nextEventID atomic.Uint64
+
 	mu              sync.RWMutex
 	fillProfile     FillProfile
 	uploadHandler   USPTransferHandler
@@ -141,7 +145,6 @@ type USPAgent struct {
 	// Event subsystem
 	subscriptions map[string]USPSubscription // keyed by subscription ID
 	eventSender   USPEventSender
-	nextEventID   uint64 // accessed via sync/atomic
 }
 
 func NewUSPAgent(opts USPAgentOptions) *USPAgent {
@@ -1370,7 +1373,7 @@ func (a *USPAgent) Emit(ctx context.Context, event USPEvent) error {
 }
 
 func (a *USPAgent) sendEventWire(ctx context.Context, sender USPEventSender, event USPEvent) error {
-	id := atomic.AddUint64(&a.nextEventID, 1)
+	id := a.nextEventID.Add(1)
 	req := EncodeEventToRequest(event, id)
 	encoded, err := EncodeUSPAgentRequest(req)
 	if err != nil {

@@ -41,9 +41,6 @@ func (c *atController) Discover() ([]string, error) {
 	// Quectel SDX/RM520 embedded firmware exposes a vendor-managed AT PTY.
 	// Prefer the bridge because atfwd owns the underlying at_mdm/at_usb nodes,
 	// and all rmnet_data interfaces represent PDP muxes of this one modem.
-	if _, err := os.Stat("/dev/ttyOUT2"); err == nil {
-		return []string{"/dev/ttyOUT2"}, nil
-	}
 	var devices []string
 	seen := make(map[string]bool)
 
@@ -52,6 +49,10 @@ func (c *atController) Discover() ([]string, error) {
 			seen[path] = true
 			devices = append(devices, path)
 		}
+	}
+
+	if _, err := os.Stat("/dev/ttyOUT2"); err == nil {
+		add("/dev/ttyOUT2")
 	}
 
 	// 1. sysfs: WWAN network interfaces (most reliable)

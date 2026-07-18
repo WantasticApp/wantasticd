@@ -490,8 +490,11 @@ func (m *cellularMonitor) refresh() []cellularEntry {
 	entries := collectCellularEntriesWithController(controller)
 
 	m.mu.Lock()
-	if len(entries) > 0 || m.last.IsZero() || time.Since(m.last) > m.maxAge {
+	if len(entries) > 0 {
 		m.entries = cloneCellularEntries(entries)
+		m.last = time.Now()
+	} else if m.last.IsZero() {
+		m.entries = nil
 		m.last = time.Now()
 	}
 	m.refreshing = false
@@ -594,7 +597,9 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
+	msg.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(0))
+	msg.Set("Device.WUSP_GNSS.ReceiverNumberOfEntries", wusp.Uint(0))
 
 	if len(entries) == 0 {
 		return

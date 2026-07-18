@@ -20,6 +20,10 @@ const (
 
 const (
 	MetadataKeyResponseMaxControlPayload = "wusp.response_max_control_payload"
+	MetadataKeyRequestSequence           = "wusp.request_sequence"
+	MetadataKeyResponseSequence          = "wusp.response_sequence"
+	MetadataKeyQueuePolicy               = "wusp.queue_policy"
+	QueuePolicyAction                    = "action"
 	TransferMetadataSource               = "source"
 	TransferMetadataDestination          = "destination"
 	TransferMetadataSessionID            = "session_id"
@@ -69,6 +73,99 @@ func RequestedResponseMaxControlPayload(metadata map[string]string, fallback int
 		return WUSPMaxDatagramPayload
 	}
 	return parsed
+}
+
+func WithRequestSequence(metadata map[string]string, sequence uint64) map[string]string {
+	out := CloneMetadata(metadata)
+	if sequence == 0 {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]string, 1)
+	}
+	out[MetadataKeyRequestSequence] = strconv.FormatUint(sequence, 10)
+	return out
+}
+
+func RequestSequence(metadata map[string]string) (uint64, bool) {
+	return parseMetadataUint(metadata, MetadataKeyRequestSequence)
+}
+
+func WithResponseSequence(metadata map[string]string, sequence uint64) map[string]string {
+	out := CloneMetadata(metadata)
+	if sequence == 0 {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]string, 1)
+	}
+	out[MetadataKeyResponseSequence] = strconv.FormatUint(sequence, 10)
+	return out
+}
+
+func ResponseSequence(metadata map[string]string) (uint64, bool) {
+	return parseMetadataUint(metadata, MetadataKeyResponseSequence)
+}
+
+func ResponseMetadataForRequest(req USPAgentRequest) map[string]string {
+	if sequence, ok := RequestSequence(req.Metadata); ok {
+		return WithResponseSequence(nil, sequence)
+	}
+	return nil
+}
+
+func WithQueuePolicy(metadata map[string]string, policy string) map[string]string {
+	policy = strings.TrimSpace(policy)
+	out := CloneMetadata(metadata)
+	if policy == "" {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]string, 1)
+	}
+	out[MetadataKeyQueuePolicy] = policy
+	return out
+}
+
+func QueuePolicy(metadata map[string]string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(metadata[MetadataKeyQueuePolicy])
+}
+
+func IsWUSPActionMethod(method USPAgentMethod) bool {
+	switch method {
+	case USPAgentMethodSet,
+		USPAgentMethodAdd,
+		USPAgentMethodDelete,
+		USPAgentMethodOperate,
+		USPAgentMethodNotify,
+		USPAgentMethodUpload,
+		USPAgentMethodDownload:
+		return true
+	default:
+		return false
+	}
+}
+
+func ShouldQueueUSPRequest(req USPAgentRequest) bool {
+	return IsWUSPActionMethod(req.Method) || QueuePolicy(req.Metadata) == QueuePolicyAction
+}
+
+func parseMetadataUint(metadata map[string]string, key string) (uint64, bool) {
+	if len(metadata) == 0 {
+		return 0, false
+	}
+	value := strings.TrimSpace(metadata[key])
+	if value == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || parsed == 0 {
+		return 0, false
+	}
+	return parsed, true
 }
 
 // USPAgentMethod identifies one USP operation carried over the WUSP control transport.
@@ -169,8 +266,18 @@ var (
 func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPAgentResponse, error) {
 	req = resolveFastRequestPaths(req)
 	resp := USPAgentResponse{
-		ID:     req.ID,
-		Method: req.Method,
+		ID:       req.ID,
+		Method:   req.Method,
+		Metadata: ResponseMetadataForRequest(req),
+	}
+
+	if ShouldQueueUSPRequest(req) {
+		release, err := a.acquireActionQueue(ctx)
+		if err != nil {
+			resp.Error = fmt.Sprintf("action queue wait: %v", err)
+			return resp, nil
+		}
+		defer release()
 	}
 
 	switch req.Method {

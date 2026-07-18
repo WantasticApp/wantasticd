@@ -136,6 +136,7 @@ type USPAgent struct {
 	collector       DataCollector
 	setter          DataSetter
 	values          map[string]Field
+	actionQueue     chan struct{}
 
 	// Event subsystem
 	subscriptions map[string]USPSubscription // keyed by subscription ID
@@ -153,8 +154,24 @@ func NewUSPAgent(opts USPAgentOptions) *USPAgent {
 		collector:       opts.Collector,
 		setter:          opts.Setter,
 		values:          make(map[string]Field),
+		actionQueue:     make(chan struct{}, 1),
 		subscriptions:   make(map[string]USPSubscription),
 		eventSender:     opts.EventSender,
+	}
+}
+
+func (a *USPAgent) acquireActionQueue(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.actionQueue == nil {
+		return func() {}, nil
+	}
+	select {
+	case a.actionQueue <- struct{}{}:
+		return func() { <-a.actionQueue }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

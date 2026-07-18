@@ -202,7 +202,8 @@ func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, valu
 }
 
 func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
-	state, _ := b.readState()
+	state, stateErr := b.readState()
+	logCollectorError("host.state", stateErr)
 	now := b.now()
 
 	manufacturer := b.readManufacturer(ctx)
@@ -293,12 +294,12 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		msg.Set("Device.IP.InterfaceNumberOfEntries", wusp.Uint(uint64(interfaceCount)))
 	}
 
-	collectNetworkInterfacesStatic(msg)
-	collectHostFirewallStatic(ctx, b.commandRunner, msg)
-	collectCPUInfoStatic(ctx, b.commandRunner, msg)
-	b.collectCellularStatic(msg)
-	collectGPSStatic(msg)
-	collectMeshStatic(msg)
+	_ = runCollector("network.interfaces", func() error { collectNetworkInterfacesStatic(msg); return nil })
+	_ = runCollector("firewall", func() error { collectHostFirewallStatic(ctx, b.commandRunner, msg); return nil })
+	_ = runCollector("cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
+	_ = runCollector("cellular", func() error { b.collectCellularStatic(msg); return nil })
+	_ = runCollector("gnss", func() error { collectGPSStatic(msg); return nil })
+	_ = runCollector("mesh", func() error { collectMeshStatic(msg); return nil })
 
 	return msg
 }
@@ -308,6 +309,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 func collectNetworkInterfacesStatic(msg *wusp.Message) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
+		logCollectorError("network.interfaces", err)
 		return
 	}
 	idx := 1
@@ -329,7 +331,9 @@ func collectNetworkInterfacesStatic(msg *wusp.Message) {
 		msg.Set(prefix+"MaxMTUSize", wusp.Uint(uint64(iface.MTU)))
 
 		addrs, err := iface.Addrs()
-		if err == nil {
+		if err != nil {
+			logCollectorError("network.interface."+iface.Name+".addresses", err)
+		} else {
 			v4Idx, v6Idx := 1, 1
 			for _, addr := range addrs {
 				ipNet, ok := addr.(*net.IPNet)
@@ -529,14 +533,22 @@ func collectCellularEntriesWithController(ctl modemPkg.Controller) []cellularEnt
 		return nil
 	}
 	devices, err := ctl.Discover()
-	if err != nil || len(devices) == 0 {
+	if err != nil {
+		logCollectorError("cellular.discover", err)
+		return nil
+	}
+	if len(devices) == 0 {
 		return nil
 	}
 
 	entries := make([]cellularEntry, 0, len(devices))
 	for _, dev := range devices {
 		info, err := ctl.GetInfo(dev)
-		if err != nil || info == nil {
+		if err != nil {
+			logCollectorError("cellular.info."+dev, err)
+			continue
+		}
+		if info == nil {
 			continue
 		}
 		infoCopy := *info
@@ -597,6 +609,7 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
+	msg.Set("Device.TrustedElements.SIMNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.WUSP_GNSS.ReceiverNumberOfEntries", wusp.Uint(0))
@@ -606,6 +619,7 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 	}
 
 	ifaceIdx := 0
+	simIdx := 0
 	apnIdx := 0
 	anyRoaming := false
 	seenModems := make(map[string]struct{})
@@ -626,6 +640,12 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 			anyRoaming = true
 		}
 		prefix := setCellularInterfaceFields(msg, ifaceIdx, dev, info)
+		if cellularHasSIM(info) {
+			simIdx++
+			simRef := fmt.Sprintf("Device.TrustedElements.SIM.%d.", simIdx)
+			msg.Set(prefix+"SIMReferenceList", wusp.List(wusp.String(simRef)))
+			setTrustedSIMFields(msg, simIdx, info)
+		}
 		setCellularControlFields(msg, ifaceIdx, dev, info)
 		if info.SMSStorageLocation != "" {
 			storagePrefix := prefix + "SMS.Storage.1."
@@ -662,6 +682,7 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 
 	if ifaceIdx > 0 {
 		msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(uint64(ifaceIdx)))
+		msg.Set("Device.TrustedElements.SIMNumberOfEntries", wusp.Uint(uint64(simIdx)))
 		msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(uint64(apnIdx)))
 		if anyRoaming {
 			msg.Set("Device.Cellular.RoamingStatus", wusp.String("Roaming"))
@@ -670,6 +691,35 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 		}
 		msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(true))
 		msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(uint64(ifaceIdx)))
+	}
+}
+
+func cellularHasSIM(info *modemPkg.Info) bool {
+	return info != nil && (info.SIMStatus != modemPkg.SIMAbsent ||
+		validDigitString(info.IMSI, 14, 15) || validDigitString(info.ICCID, 6, 20))
+}
+
+func setTrustedSIMFields(msg *wusp.Message, simIdx int, info *modemPkg.Info) {
+	if msg == nil || info == nil || simIdx <= 0 {
+		return
+	}
+	prefix := fmt.Sprintf("Device.TrustedElements.SIM.%d.", simIdx)
+	msg.Set(prefix+"Alias", wusp.String("cpe-sim-"+strconv.Itoa(simIdx)))
+	msg.Set(prefix+"Status", wusp.String(cellularUSIMStatus(info.SIMStatus)))
+	msg.Set(prefix+"Type", wusp.String("USIM"))
+	msg.Set(prefix+"Usage", wusp.String("UICC"))
+	msg.Set(prefix+"ProfileNumberOfEntries", wusp.Uint(0))
+	if validDigitString(info.IMSI, 14, 15) {
+		msg.Set(prefix+"IMSI", wusp.String(info.IMSI))
+	}
+	if validDigitString(info.ICCID, 6, 20) {
+		msg.Set(prefix+"ICCID", wusp.String(info.ICCID))
+	}
+	if validDigitString(info.MSISDN, 14, 15) {
+		msg.Set(prefix+"MSISDN", wusp.String(info.MSISDN))
+	}
+	if info.SIMStatus == modemPkg.SIMLocked {
+		msg.Set(prefix+"PINCheck", wusp.String("OnNetworkAccess"))
 	}
 }
 

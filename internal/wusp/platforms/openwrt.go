@@ -321,7 +321,11 @@ const (
 )
 
 func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) {
-	snapshot := b.collectSnapshot(ctx)
+	var snapshot openWrtSnapshot
+	_ = runCollector("openwrt.snapshot", func() error {
+		snapshot = b.collectSnapshot(ctx)
+		return nil
+	})
 
 	modelName := firstNonEmpty(strings.TrimSpace(snapshot.board.Model), snapshot.release["DISTRIB_DEVICE_MODEL"], strings.TrimSpace(snapshot.board.BoardName))
 	modelNumber := firstNonEmpty(strings.TrimSpace(snapshot.board.BoardName), modelName)
@@ -376,22 +380,25 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 		appendField(msg, "Device.Firewall.LastChange", wusp.Time(snapshot.firewallLastChange))
 	}
 	appendField(msg, "Device.Firewall.Type", wusp.String("Stateful"))
-	b.appendFirewallFields(msg)
-	b.appendWiFiFields(msg)
+	_ = runCollector("openwrt.firewall", func() error { b.appendFirewallFields(msg); return nil })
+	_ = runCollector("openwrt.wifi", func() error { b.appendWiFiFields(msg); return nil })
 
 	// Network interface details via getifaddrs (pure Go)
-	collectNetworkInterfacesStatic(msg)
-	collectCPUInfoStatic(ctx, b.commandRunner, msg)
-	if b.cellular != nil {
-		collectCellularSnapshot(msg, b.cellular.snapshot())
-	} else {
-		collectCellularStatic(msg)
-	}
-	b.appendOpenWrtCellularConfig(msg)
-	collectGPSStatic(msg)
-	collectMeshStatic(msg)
-	b.appendOpenWrtMeshTopology(ctx, msg)
-	b.appendOpenWrtMeshConfig(ctx, msg)
+	_ = runCollector("openwrt.network.interfaces", func() error { collectNetworkInterfacesStatic(msg); return nil })
+	_ = runCollector("openwrt.cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
+	_ = runCollector("openwrt.cellular.runtime", func() error {
+		if b.cellular != nil {
+			collectCellularSnapshot(msg, b.cellular.snapshot())
+		} else {
+			collectCellularStatic(msg)
+		}
+		return nil
+	})
+	_ = runCollector("openwrt.cellular.config", func() error { b.appendOpenWrtCellularConfig(msg); return nil })
+	_ = runCollector("openwrt.gnss", func() error { collectGPSStatic(msg); return nil })
+	_ = runCollector("openwrt.mesh.runtime", func() error { collectMeshStatic(msg); return nil })
+	_ = runCollector("openwrt.mesh.topology", func() error { b.appendOpenWrtMeshTopology(ctx, msg); return nil })
+	_ = runCollector("openwrt.mesh.config", func() error { b.appendOpenWrtMeshConfig(ctx, msg); return nil })
 
 	return msg, nil
 }
@@ -404,10 +411,13 @@ func appendField(msg *wusp.Message, path string, value wusp.Value) {
 }
 
 func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
-	state, _ := b.readState()
-	board, _ := b.readBoardInfo()
+	state, stateErr := b.readState()
+	logCollectorError("openwrt.state", stateErr)
+	board, boardErr := b.readBoardInfo()
+	logCollectorError("openwrt.board", boardErr)
 	release := b.readReleaseInfo()
-	systemInfo, _ := b.readSystemInfo()
+	systemInfo, systemErr := b.readSystemInfo()
+	logCollectorError("openwrt.system", systemErr)
 
 	hostname := firstNonEmpty(b.readHostname(), strings.TrimSpace(board.Hostname))
 	if hostname == "" {

@@ -25,7 +25,11 @@ func collectHostFirewallStatic(ctx context.Context, runner CommandRunner, msg *w
 		return
 	}
 	raw, err := runner(ctx, "iptables-save")
-	if err != nil || len(raw) == 0 {
+	if err != nil {
+		logCollectorError("firewall.iptables-save", err)
+		return
+	}
+	if len(raw) == 0 {
 		return
 	}
 	chains := parseIPTablesSave(string(raw))

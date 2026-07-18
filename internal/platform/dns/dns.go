@@ -9,18 +9,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 var (
-	resolvConfPath = "/etc/resolv.conf"
-	lookupHost     = net.DefaultResolver.LookupHost
-	lstatPath      = os.Lstat
-	readFile       = os.ReadFile
-	writeFile      = os.WriteFile
-	removePath     = os.Remove
-	lookPath       = exec.LookPath
+	resolvConfPath  = "/etc/resolv.conf"
+	lookupHost      = net.DefaultResolver.LookupHost
+	lookupViaServer = lookupHostWithServer
+	lstatPath       = os.Lstat
+	readFile        = os.ReadFile
+	writeFile       = os.WriteFile
+	removePath      = os.Remove
+	lookPath        = exec.LookPath
 )
+
+func lookupHostWithServer(ctx context.Context, server, host string) ([]string, error) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(server, "53"))
+		},
+	}
+	return resolver.LookupHost(ctx, host)
+}
 
 // Request describes a DNS apply operation. The package deliberately treats
 // direct resolver-file writes as the last adapter because most modern systems
@@ -60,6 +72,62 @@ func EnsureBootstrap(ctx context.Context) Result {
 		log.Printf("DNS: bootstrap DNS apply skipped (%s)", result.Reason)
 	}
 	return result
+}
+
+// EnsureBootstrapHost repairs a resolver list poisoned by an unavailable
+// tunnel DNS. Existing servers are probed concurrently and only servers that
+// can resolve the actual bootstrap host are retained, preserving their order.
+func EnsureBootstrapHost(ctx context.Context, host string) Result {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return EnsureBootstrap(ctx)
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	if _, err := lookupHost(checkCtx, host); err == nil {
+		return Result{Method: "system-resolver", Reason: "resolver already works"}
+	}
+	existing := readResolvNameservers(resolvConfPath)
+	reachable := probeResolverServers(checkCtx, existing, host)
+	if len(reachable) == 0 {
+		return EnsureBootstrap(ctx)
+	}
+	result, err := Apply(ctx, Request{Servers: reachable, Reason: "bootstrap endpoint resolution"})
+	if err != nil {
+		log.Printf("DNS: reachable bootstrap DNS apply failed: %v", err)
+		return Result{Skipped: true, Reason: err.Error()}
+	}
+	if result.Changed {
+		log.Printf("DNS: selected reachable bootstrap resolvers for %s: %v", host, reachable)
+	}
+	return result
+}
+
+func probeResolverServers(ctx context.Context, servers []string, host string) []string {
+	ok := make([]bool, len(servers))
+	var wg sync.WaitGroup
+	for i, server := range servers {
+		i, server := i, strings.TrimSpace(server)
+		if net.ParseIP(server) == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			defer cancel()
+			_, err := lookupViaServer(probeCtx, server, host)
+			ok[i] = err == nil
+		}()
+	}
+	wg.Wait()
+	out := make([]string, 0, len(servers))
+	for i, server := range servers {
+		if ok[i] {
+			out = append(out, strings.TrimSpace(server))
+		}
+	}
+	return out
 }
 
 func ApplyTunnel(ctx context.Context, servers []string) Result {

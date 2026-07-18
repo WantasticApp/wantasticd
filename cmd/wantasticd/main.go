@@ -447,6 +447,10 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		serverURL = keyFile.ServerURL
 	}
 	serverURL = resolveClaimServerURL(serverURL, "", "")
+	claimHost := ""
+	if parsed, parseErr := url.Parse(serverURL); parseErr == nil {
+		claimHost = parsed.Hostname()
+	}
 	log.Printf("Waiting for Wantastic device claim: public_key=%s server=%s", keyFile.PublicKey, serverURL)
 	log.Printf("Claim URL: %s", buildClaimURL(serverURL, keyFile.PublicKey))
 
@@ -458,6 +462,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
+		platformdns.EnsureBootstrapHost(parentCtx, claimHost)
 		claim, waitErr := auth.WaitClaimConfig(parentCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
 		if waitErr == nil && claim != nil && claim.Claimed {
 			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray) {

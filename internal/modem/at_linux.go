@@ -8,26 +8,42 @@ package modem
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // atController communicates with modems via AT commands over serial ports.
 // Falls back to sysfs/procfs for device info when AT ports aren't accessible.
 type atController struct{}
 
+// The RM520 vendor AT bridge is a single-command transport shared by the
+// cellular and GNSS collectors. Concurrent CGI/microcom calls corrupt replies
+// and leave helper processes behind.
+var atBridgeMu sync.Mutex
+
 const smsToolDevicePath = "sms_tool"
 
 func (c *atController) Close() error { return nil }
 
 func (c *atController) Discover() ([]string, error) {
+	// Quectel SDX/RM520 embedded firmware exposes a vendor-managed AT PTY.
+	// Prefer the bridge because atfwd owns the underlying at_mdm/at_usb nodes,
+	// and all rmnet_data interfaces represent PDP muxes of this one modem.
+	if _, err := os.Stat("/dev/ttyOUT2"); err == nil {
+		return []string{"/dev/ttyOUT2"}, nil
+	}
 	var devices []string
 	seen := make(map[string]bool)
 
@@ -66,7 +82,13 @@ func (c *atController) Discover() ([]string, error) {
 	}
 
 	// 3. /dev serial ports (AT command interfaces)
-	for _, pattern := range []string{"/dev/ttyUSB*", "/dev/ttyACM*"} {
+	for _, pattern := range []string{
+		"/dev/ttyUSB*", "/dev/ttyACM*",
+		// Qualcomm SDX platforms (including the RM520N-GL smart module)
+		// expose the modem AT service through these character devices rather
+		// than a USB tty.
+		"/dev/at_mdm*", "/dev/at_usb*",
+	} {
 		if matches, err := filepath.Glob(pattern); err == nil {
 			for _, m := range matches {
 				add(m)
@@ -143,9 +165,9 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 		if strings.HasPrefix(val, "+CCID:") {
 			val = strings.TrimSpace(strings.TrimPrefix(val, "+CCID:"))
 		}
-		info.ICCID = val
+		info.ICCID = digitsOnly(val)
 	} else if lines := at.send("AT+ICCID"); len(lines) > 0 {
-		info.ICCID = parseColonValue(lines[0])
+		info.ICCID = digitsOnly(parseColonValue(lines[0]))
 	}
 	if lines := at.send("AT+CNUM"); len(lines) > 0 {
 		// +CNUM: "","+1234567890",129
@@ -165,12 +187,18 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 
 	// SIM status
 	if lines := at.send("AT+CPIN?"); len(lines) > 0 {
-		if strings.Contains(lines[0], "READY") {
-			info.SIMStatus = SIMReady
-		} else if strings.Contains(lines[0], "SIM PIN") {
-			info.SIMStatus = SIMLocked
-		} else {
-			info.SIMStatus = SIMError
+		for _, line := range lines {
+			if !strings.HasPrefix(strings.TrimSpace(line), "+CPIN:") {
+				continue
+			}
+			if strings.Contains(line, "READY") {
+				info.SIMStatus = SIMReady
+			} else if strings.Contains(line, "SIM PIN") {
+				info.SIMStatus = SIMLocked
+			} else {
+				info.SIMStatus = SIMError
+			}
+			break
 		}
 	}
 
@@ -267,7 +295,7 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	}
 
 	info.SupportedTechnologies = inferSupportedTechnologies(info)
-	if info.Technology == TechNR5GNSA {
+	if info.Technology == TechNR5GNSA || hasLTEAndNRCarriers(info.CarrierAggregation) {
 		info.NRMode = "NonStandalone"
 	} else if info.Technology == TechNR5G {
 		info.NRMode = "Standalone"
@@ -275,8 +303,24 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 		info.NRMode = "Unknown"
 	}
 	c.enrichFromNetStats(devicePath, info)
+	if info.IPAddress != "" || info.IPv6Address != "" {
+		info.Connected = true
+	}
 
 	return info, nil
+}
+
+func hasLTEAndNRCarriers(carriers []CarrierInfo) bool {
+	var lte, nr bool
+	for _, carrier := range carriers {
+		switch strings.ToUpper(strings.TrimSpace(carrier.RAT)) {
+		case "LTE":
+			lte = true
+		case "NR", "NR5G":
+			nr = true
+		}
+	}
+	return lte && nr
 }
 
 func (c *atController) GetSignal(devicePath string) (*SignalQuality, error) {
@@ -460,46 +504,133 @@ func (c *atController) readQuectelNMEA(devicePath, sentenceType string) (string,
 	return "", false
 }
 
-func (c *atController) SendSMS(_ string, phoneNumber, message string) error {
-	if !smsToolAvailable() {
-		return fmt.Errorf("sms_tool not found")
-	}
+func (c *atController) SendSMS(devicePath string, phoneNumber, message string) error {
 	phoneNumber = strings.TrimSpace(phoneNumber)
 	message = strings.TrimSpace(message)
 	if phoneNumber == "" || message == "" {
 		return fmt.Errorf("phone number and message are required")
 	}
-	cmd := exec.Command("sms_tool", "send", phoneNumber, message)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("sms_tool send failed: %w: %s", err, strings.TrimSpace(string(out)))
+	if !validSMSPhoneNumber(phoneNumber) {
+		return fmt.Errorf("invalid SMS phone number")
 	}
-	return nil
+	if len(message) > 1600 {
+		return fmt.Errorf("SMS message exceeds 1600 bytes")
+	}
+	if smsToolAvailable() {
+		cmd := exec.Command("sms_tool", "send", phoneNumber, message)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("sms_tool send failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	const sendBridge = "/usrdata/simpleadmin/www/cgi-bin/send_sms"
+	if filepath.Base(c.findATPort(devicePath)) == "ttyOUT2" {
+		if info, err := os.Stat(sendBridge); err == nil && !info.IsDir() {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "timeout", "40", sendBridge)
+			cmd.Env = append(os.Environ(), "QUERY_STRING=number="+url.QueryEscape(phoneNumber)+"&msg="+url.QueryEscape(message))
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				return fmt.Errorf("SMS send timed out")
+			}
+			if err != nil || atOutputError(string(out)) {
+				return fmt.Errorf("SMS send failed: %v: %s", err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("no native WMS or SMS AT bridge is available")
 }
 
-func (c *atController) ListSMS(_ string) (string, error) {
-	if !smsToolAvailable() {
-		return "", fmt.Errorf("sms_tool not found")
+func (c *atController) ListSMS(devicePath string) (string, error) {
+	if smsToolAvailable() {
+		out, err := exec.Command("sms_tool", "-j", "recv").CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("sms_tool recv failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return strings.TrimSpace(string(out)), nil
 	}
-	out, err := exec.Command("sms_tool", "-j", "recv").CombinedOutput()
+	lines, err := c.sendATCommand(devicePath, `AT+CMGF=1;+CPMS="ME","ME","ME";+CMGL="ALL"`, 30)
 	if err != nil {
-		return "", fmt.Errorf("sms_tool recv failed: %w: %s", err, strings.TrimSpace(string(out)))
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	payload, err := json.Marshal(parseATTextMessages(lines))
+	return string(payload), err
 }
 
-func (c *atController) DeleteSMS(_ string, index string) error {
-	if !smsToolAvailable() {
-		return fmt.Errorf("sms_tool not found")
-	}
+func (c *atController) DeleteSMS(devicePath string, index string) error {
 	index = strings.TrimSpace(index)
-	if index == "" {
-		return fmt.Errorf("SMS index is required")
+	idx, err := strconv.Atoi(index)
+	if err != nil || idx <= 0 {
+		return fmt.Errorf("SMS index must be a positive integer")
 	}
-	cmd := exec.Command("sms_tool", "delete", index)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("sms_tool delete failed: %w: %s", err, strings.TrimSpace(string(out)))
+	if smsToolAvailable() {
+		cmd := exec.Command("sms_tool", "delete", index)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("sms_tool delete failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
-	return nil
+	_, err = c.sendATCommand(devicePath, "AT+CMGD="+strconv.Itoa(idx), 15)
+	return err
+}
+
+type atTextMessage struct {
+	Index  int    `json:"index"`
+	Status string `json:"status,omitempty"`
+	Number string `json:"number,omitempty"`
+	Time   string `json:"time,omitempty"`
+	Body   string `json:"body,omitempty"`
+}
+
+func parseATTextMessages(lines []string) []atTextMessage {
+	var out []atTextMessage
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "+CMGL:") {
+			values := splitATCSV(strings.TrimSpace(strings.TrimPrefix(line, "+CMGL:")))
+			if len(values) < 1 {
+				continue
+			}
+			idx, err := strconv.Atoi(strings.TrimSpace(values[0]))
+			if err != nil || idx <= 0 {
+				continue
+			}
+			msg := atTextMessage{Index: idx}
+			if len(values) > 1 {
+				msg.Status = values[1]
+			}
+			if len(values) > 2 {
+				msg.Number = values[2]
+			}
+			if len(values) > 4 {
+				msg.Time = values[4]
+			}
+			out = append(out, msg)
+			continue
+		}
+		if len(out) > 0 && line != "" && !strings.HasPrefix(line, "+") {
+			if out[len(out)-1].Body != "" {
+				out[len(out)-1].Body += "\n"
+			}
+			out[len(out)-1].Body += line
+		}
+	}
+	return out
+}
+
+func validSMSPhoneNumber(value string) bool {
+	for i, r := range value {
+		if r == '+' && i == 0 {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	digits := digitsOnly(value)
+	return len(digits) >= 3 && len(digits) <= 15
 }
 
 func (c *atController) sendATCommand(devicePath, cmd string, timeoutSeconds int) ([]string, error) {
@@ -559,11 +690,25 @@ func (c *atController) openATSession(devicePath string) (*atSession, func(), err
 }
 
 func (c *atController) openATSessionOnPort(port string) (*atSession, func(), error) {
-	f, err := os.OpenFile(port, os.O_RDWR, 0666)
+	if filepath.Base(port) == "ttyOUT2" {
+		const cgiAT = "/usrdata/simpleadmin/www/cgi-bin/get_atcommand"
+		if info, err := os.Stat(cgiAT); err == nil && !info.IsDir() {
+			return &atSession{port: port, cgiAT: cgiAT}, func() {}, nil
+		}
+		if microcom, err := exec.LookPath("microcom"); err == nil {
+			return &atSession{port: port, microcom: microcom}, func() {}, nil
+		}
+	}
+	fd, err := unix.Open(port, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("open %s: %w", port, err)
 	}
-	return &atSession{f: f, scanner: bufio.NewScanner(f)}, func() { _ = f.Close() }, nil
+	f := os.NewFile(uintptr(fd), port)
+	if f == nil {
+		_ = unix.Close(fd)
+		return nil, func() {}, fmt.Errorf("open %s: invalid file descriptor", port)
+	}
+	return &atSession{f: f, reader: bufio.NewReader(f)}, func() { _ = f.Close() }, nil
 }
 
 func (c *atController) openATSessionOnPortWithRetry(port string, attempts int) (*atSession, func(), error) {
@@ -766,7 +911,8 @@ func cleanATCommandOutput(raw, cmd string) []string {
 		if line == "" || line == cmd || line == "OK" || line == "ERROR" {
 			continue
 		}
-		if strings.HasPrefix(line, "AT command") || strings.HasPrefix(line, ">") {
+		if strings.HasPrefix(line, "AT command") || strings.HasPrefix(line, ">") ||
+			strings.HasPrefix(strings.ToLower(line), "content-type:") {
 			continue
 		}
 		lines = append(lines, line)
@@ -1620,11 +1766,11 @@ func parseQuectelCarrierAggregation(lines []string) []CarrierInfo {
 			switch {
 			case strings.Contains(upper, "LTE BAND"):
 				carrier.RAT = "LTE"
-				carrier.Band = "B" + digitsOnly(upper)
+				carrier.Band = "B" + digitsOnly(upper[strings.Index(upper, "BAND")+len("BAND"):])
 				bandIdx = i
 			case strings.Contains(upper, "NR5G BAND"):
 				carrier.RAT = "NR"
-				carrier.Band = "N" + digitsOnly(upper)
+				carrier.Band = "N" + digitsOnly(upper[strings.Index(upper, "BAND")+len("BAND"):])
 				bandIdx = i
 			}
 		}
@@ -1934,10 +2080,19 @@ func parseQuectelNeighborCells(lines []string) []NeighborCell {
 			Relation: relation,
 			Raw:      line,
 		}
+		if cell.RAT != "LTE" && !strings.Contains(cell.RAT, "NR") {
+			continue
+		}
 		cell.Frequency = parseUint(values[2])
+		if strings.TrimSpace(values[3]) == "-" {
+			continue
+		}
 		cell.PCI = parseUint(values[3])
-		cell.RSRP = parseOptionalInt(values[4])
-		cell.RSRQ = parseOptionalInt(values[5])
+		if cell.RAT == "LTE" || strings.Contains(cell.RAT, "NR") {
+			// RM520 LTE/NR QENG neighbor rows report RSRQ before RSRP.
+			cell.RSRQ = parseOptionalInt(values[4])
+			cell.RSRP = parseOptionalInt(values[5])
+		}
 		out = append(out, cell)
 	}
 	return out
@@ -2503,6 +2658,9 @@ func firstNetChild(root string) string {
 }
 
 func firstCellularNetInterface() string {
+	if iface := defaultRouteCellularInterface("/proc/net/route"); iface != "" {
+		return iface
+	}
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
 		return ""
@@ -2520,6 +2678,31 @@ func firstCellularNetInterface() string {
 		name := entry.Name()
 		if isCellularNetInterfaceCandidate(name) {
 			return name
+		}
+	}
+	return ""
+}
+
+func defaultRouteCellularInterface(routePath string) string {
+	raw, err := os.ReadFile(routePath)
+	if err != nil {
+		return ""
+	}
+	return parseDefaultRouteCellularInterface(string(raw))
+}
+
+func parseDefaultRouteCellularInterface(raw string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[1] != "00000000" {
+			continue
+		}
+		flags, err := strconv.ParseUint(fields[3], 16, 32)
+		if err != nil || flags&0x1 == 0 {
+			continue
+		}
+		if isPrimaryCellularNetInterface(fields[0]) {
+			return fields[0]
 		}
 	}
 	return ""
@@ -2676,7 +2859,9 @@ func setIntFromFlat(dst *int, flat map[string]string, keys ...string) {
 
 func (c *atController) findATPort(devicePath string) string {
 	// If devicePath is already a serial port, use it directly
-	if strings.HasPrefix(devicePath, "/dev/tty") {
+	if strings.HasPrefix(devicePath, "/dev/tty") ||
+		strings.HasPrefix(devicePath, "/dev/at_mdm") ||
+		strings.HasPrefix(devicePath, "/dev/at_usb") {
 		return devicePath
 	}
 
@@ -2693,7 +2878,7 @@ func (c *atController) findATPort(devicePath string) string {
 	realPath, err := filepath.EvalSymlinks(sysPath + "/device")
 	if err != nil {
 		// Fallback: try common serial ports
-		for _, port := range []string{"/dev/ttyUSB2", "/dev/ttyUSB1", "/dev/ttyUSB0", "/dev/ttyACM0"} {
+		for _, port := range []string{"/dev/at_mdm0", "/dev/at_usb0", "/dev/ttyUSB2", "/dev/ttyUSB1", "/dev/ttyUSB0", "/dev/ttyACM0"} {
 			if _, err := os.Stat(port); err == nil {
 				return port
 			}
@@ -2719,8 +2904,11 @@ func (c *atController) findATPort(devicePath string) string {
 
 // atSession wraps serial I/O for AT commands.
 type atSession struct {
-	f       *os.File
-	scanner *bufio.Scanner
+	f        *os.File
+	reader   *bufio.Reader
+	port     string
+	microcom string
+	cgiAT    string
 }
 
 func (a *atSession) send(cmd string) []string {
@@ -2732,6 +2920,51 @@ func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string
 	if timeout <= 0 {
 		timeout = 1500 * time.Millisecond
 	}
+	if a.cgiAT != "" {
+		atBridgeMu.Lock()
+		defer atBridgeMu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		seconds := strconv.Itoa(max(1, int(timeout/time.Second)+1))
+		command := exec.CommandContext(ctx, "timeout", seconds, a.cgiAT)
+		command.Env = append(os.Environ(), "QUERY_STRING=atcmd="+url.QueryEscape(cmd))
+		output, err := command.CombinedOutput()
+		lines := cleanATCommandOutput(string(output), cmd)
+		if ctx.Err() != nil {
+			return lines, fmt.Errorf("AT command %q timed out", cmd)
+		}
+		if atOutputError(string(output)) {
+			return lines, fmt.Errorf("AT command %q failed: %s", cmd, atErrorLine(string(output)))
+		}
+		if err != nil {
+			return lines, fmt.Errorf("AT bridge %q failed: %w", cmd, err)
+		}
+		return lines, nil
+	}
+	if a.microcom != "" {
+		atBridgeMu.Lock()
+		defer atBridgeMu.Unlock()
+		lockPath := filepath.Join("/var/lock", "LCK.."+filepath.Base(a.port))
+		clearStaleMicrocomLock(lockPath)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		millis := int(timeout / time.Millisecond)
+		command := exec.CommandContext(ctx, a.microcom, "-t", strconv.Itoa(millis), a.port)
+		command.Stdin = strings.NewReader(cmd + "\r\n")
+		output, err := command.CombinedOutput()
+		_ = os.Remove(lockPath)
+		lines := cleanATCommandOutput(string(output), cmd)
+		if ctx.Err() != nil {
+			return lines, fmt.Errorf("AT command %q timed out", cmd)
+		}
+		if atOutputError(string(output)) {
+			return lines, fmt.Errorf("AT command %q failed: %s", cmd, atErrorLine(string(output)))
+		}
+		if err != nil {
+			return lines, fmt.Errorf("microcom %q failed: %w", cmd, err)
+		}
+		return lines, nil
+	}
 	if err := a.f.SetDeadline(time.Now().Add(timeout)); err != nil {
 		_ = err
 	}
@@ -2739,15 +2972,30 @@ func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string
 		return nil, err
 	}
 
+	deadline := time.Now().Add(timeout)
 	var lines []string
 	for {
-		if !a.scanner.Scan() {
-			if err := a.scanner.Err(); err != nil {
-				return lines, err
-			}
-			return lines, fmt.Errorf("AT command %q ended before OK", cmd)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return lines, fmt.Errorf("AT command %q timed out", cmd)
 		}
-		line := strings.TrimSpace(a.scanner.Text())
+		pollTimeout := int(remaining / time.Millisecond)
+		if pollTimeout < 1 {
+			pollTimeout = 1
+		}
+		fds := []unix.PollFd{{Fd: int32(a.f.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, pollTimeout)
+		if err != nil {
+			return lines, err
+		}
+		if n == 0 {
+			return lines, fmt.Errorf("AT command %q timed out", cmd)
+		}
+		raw, err := a.reader.ReadString('\n')
+		if err != nil {
+			return lines, err
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || line == cmd {
 			continue
 		}
@@ -2758,5 +3006,20 @@ func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string
 			return lines, fmt.Errorf("AT command %q failed: %s", cmd, line)
 		}
 		lines = append(lines, line)
+	}
+}
+
+func clearStaleMicrocomLock(path string) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		_ = os.Remove(path)
+		return
+	}
+	if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+		_ = os.Remove(path)
 	}
 }

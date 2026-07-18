@@ -30,6 +30,13 @@ type DataSetter interface {
 	Delete(context.Context, ...string) error
 }
 
+// DataAdder materializes a USP Add in the underlying device before the agent
+// stores any local representation. Backends may return ErrUSPPathUnsupported
+// to retain the normal in-memory behavior.
+type DataAdder interface {
+	Add(context.Context, string, *Message) ([]string, error)
+}
+
 // DataBackend combines collection and mutation for a concrete platform.
 type DataBackend interface {
 	DataCollector
@@ -331,6 +338,16 @@ func (a *USPAgent) Add(objectPath string, initial *Message) ([]string, error) {
 	}
 	if strings.Count(objectPath, "{i}") > 1 {
 		return nil, &ValidationError{Path: objectPath, Reason: "add requires parent instances to be concrete"}
+	}
+	if adder, ok := a.setter.(DataAdder); ok {
+		paths, err := adder.Add(context.Background(), objectPath, initial)
+		switch {
+		case err == nil:
+			return paths, nil
+		case errors.Is(err, ErrUSPPathUnsupported):
+		default:
+			return nil, err
+		}
 	}
 
 	values := a.snapshotValues()

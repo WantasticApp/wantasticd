@@ -212,14 +212,17 @@ func TestParseQuectelCarrierAggregationQuecManagerLayout(t *testing.T) {
 
 func TestParseQuectelNeighborCells(t *testing.T) {
 	lte := parseQuectelNeighborCells([]string{
-		`+QENG: "neighbourcell intra","LTE",1850,121,-101,-12,-70,10,0,0`,
+		`+QENG: "neighbourcell intra","LTE",1650,461,-12,-97,-62,-,-,-,-,-,-`,
 	})
 	nr := parseQuectelNR5GMeasInfo([]string{
 		`+QNWCFG: "nr5g_meas_info",627264,322,0,-88,-10`,
 	})
 
-	if len(lte) != 1 || lte[0].RAT != "LTE" || lte[0].Relation != "intra" || lte[0].PCI != 121 {
+	if len(lte) != 1 || lte[0].RAT != "LTE" || lte[0].Relation != "intra" || lte[0].PCI != 461 {
 		t.Fatalf("lte=%+v", lte)
+	}
+	if lte[0].RSRP != -97 || lte[0].RSRQ != -12 {
+		t.Fatalf("lte signal=%+v", lte[0])
 	}
 	if len(nr) != 1 || nr[0].RAT != "NR" || nr[0].Relation != "nr5g" || nr[0].Frequency != 627264 {
 		t.Fatalf("nr=%+v", nr)
@@ -247,5 +250,64 @@ func TestParseJSONSignalUQMI(t *testing.T) {
 	}
 	if info.Signal.RSSI != -61 || info.Signal.RSRQ != -8 || info.Signal.RSRP != -91 || info.Signal.SINR != 16 {
 		t.Fatalf("signal=%+v", info.Signal)
+	}
+}
+
+func TestParseDefaultRouteCellularInterface(t *testing.T) {
+	routes := "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n" +
+		"bridge0\t00E1A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\n" +
+		"rmnet_data1\t00000000\tAA65A70A\t0003\t0\t0\t0\t00000000\n"
+	if got := parseDefaultRouteCellularInterface(routes); got != "rmnet_data1" {
+		t.Fatalf("interface=%q want rmnet_data1", got)
+	}
+}
+
+func TestParseATTextMessages(t *testing.T) {
+	messages := parseATTextMessages([]string{
+		`+CMGL: 14,"REC UNREAD","665",,"26/07/17,09:04:11+04"`,
+		`hello from network`,
+	})
+	if len(messages) != 1 || messages[0].Index != 14 || messages[0].Number != "665" || messages[0].Body != "hello from network" {
+		t.Fatalf("messages=%+v", messages)
+	}
+	if !validSMSPhoneNumber("+212600000000") || validSMSPhoneNumber("+212;reboot") {
+		t.Fatal("SMS phone validation failed")
+	}
+}
+
+func TestParseATTextMessagesMultilineAndInvalidHeader(t *testing.T) {
+	messages := parseATTextMessages([]string{
+		`+CMGL: nope,"REC READ","123"`,
+		`ignored`,
+		`+CMGL: 2,"REC READ","+212700000000",,"26/07/18,10:00:00+04"`,
+		`first line`,
+		`second line`,
+	})
+	if len(messages) != 1 || messages[0].Body != "first line\nsecond line" {
+		t.Fatalf("messages=%+v", messages)
+	}
+}
+
+func TestRM520CarrierBandAndNSAMode(t *testing.T) {
+	carriers := parseQuectelCarrierAggregation([]string{
+		`+QCAINFO: "PCC",1650,100,"LTE BAND 3",1,461,-97,-12,-62,9`,
+		`+QCAINFO: "SCC",649920,10,"NR5G BAND 78",356`,
+	})
+	if len(carriers) != 2 || carriers[1].Band != "N78" || carriers[1].RAT != "NR" {
+		t.Fatalf("carriers=%+v", carriers)
+	}
+	if !hasLTEAndNRCarriers(carriers) {
+		t.Fatal("LTE+NR carriers were not recognized as NSA")
+	}
+}
+
+func TestRM520NeighborFiltering(t *testing.T) {
+	rows := parseQuectelNeighborCells([]string{
+		`+QENG: "neighbourcell intra","LTE",1650,461,-12,-97,-62,-,-,-,-,-,-`,
+		`+QENG: "neighbourcell inter","LTE",2850,-,-,-,-,-,30,6,22,14`,
+		`+QENG: "neighbourcell","WCDMA",2956,2,12,8,-,-,-,-`,
+	})
+	if len(rows) != 1 || rows[0].RSRP != -97 || rows[0].RSRQ != -12 {
+		t.Fatalf("rows=%+v", rows)
 	}
 }

@@ -3,7 +3,9 @@ package wusp
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type mockCollector struct {
@@ -304,5 +306,116 @@ func TestUSPAgentAddGetInstancesOperateNotifyAndSupport(t *testing.T) {
 	protocol := agent.GetSupportedProtocol()
 	if protocol.Name == "" || protocol.RecommendedChunkSize == 0 {
 		t.Fatalf("protocol=%+v want populated protocol info", protocol)
+	}
+}
+
+func TestUSPAgentHandleRequestEchoesRequestSequence(t *testing.T) {
+	agent := NewUSPAgent(USPAgentOptions{})
+	msg := NewMessage()
+	msg.Set("Device.DeviceInfo.FriendlyName", String("queued-node"))
+
+	resp, err := agent.HandleRequest(context.Background(), USPAgentRequest{
+		ID:       42,
+		Method:   USPAgentMethodSet,
+		Message:  msg,
+		Metadata: WithRequestSequence(nil, 1001),
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest returned error: %v", err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("HandleRequest response error=%q", resp.Error)
+	}
+	sequence, ok := ResponseSequence(resp.Metadata)
+	if !ok || sequence != 1001 {
+		t.Fatalf("response sequence=%d ok=%v want 1001/true", sequence, ok)
+	}
+}
+
+func TestUSPAgentQueuesActionRequests(t *testing.T) {
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{}, 1)
+	var calls atomic.Int32
+
+	agent := NewUSPAgent(USPAgentOptions{
+		OperateHandler: func(ctx context.Context, _ string, _ *Message, _ map[string]string) (*Message, error) {
+			switch calls.Add(1) {
+			case 1:
+				close(firstEntered)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			case 2:
+				secondEntered <- struct{}{}
+			}
+			return NewMessage(), nil
+		},
+	})
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+	})
+
+	req := func(id uint64) USPAgentRequest {
+		return USPAgentRequest{
+			ID:         id,
+			Method:     USPAgentMethodOperate,
+			ObjectPath: "Device.WUSP.Request.{i}.",
+			Metadata:   WithRequestSequence(nil, id),
+		}
+	}
+
+	done1 := make(chan USPAgentResponse, 1)
+	done2 := make(chan USPAgentResponse, 1)
+	go func() {
+		resp, _ := agent.HandleRequest(context.Background(), req(1))
+		done1 <- resp
+	}()
+
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first action to enter")
+	}
+
+	go func() {
+		resp, _ := agent.HandleRequest(context.Background(), req(2))
+		done2 <- resp
+	}()
+
+	select {
+	case <-secondEntered:
+		t.Fatal("second action entered before first action completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+
+	select {
+	case resp := <-done1:
+		if resp.Error != "" {
+			t.Fatalf("first response error=%q", resp.Error)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first action response")
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for second action to enter")
+	}
+	select {
+	case resp := <-done2:
+		if resp.Error != "" {
+			t.Fatalf("second response error=%q", resp.Error)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for second action response")
 	}
 }

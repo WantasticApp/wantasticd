@@ -131,4 +131,6 @@ adb-wantasticd-build:
 adb-wantasticd-update: adb-wantasticd-build
 	@ADB_BINARY=$(ADB_AGENT_BINARY) ADB_REMOTE_PATH=$(ADB_AGENT_REMOTE_PATH) ADB_SERVICE=$(ADB_AGENT_SERVICE) tools/adb-update-wantasticd.sh
 
-.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update
+adb-wantasticd: adb-wantasticd-update
+
+.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update adb-wantasticd

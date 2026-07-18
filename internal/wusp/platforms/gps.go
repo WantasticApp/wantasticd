@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"wantastic-agent/internal/wusp"
@@ -12,10 +13,41 @@ import (
 	"github.com/stratoberry/go-gpsd"
 )
 
+var gnssCollectionCache struct {
+	sync.RWMutex
+	info       *gpsInfo
+	last       time.Time
+	refreshing bool
+}
+
 // collectGPSStatic populates the standard TR-181 Device.DeviceInfo.Location
 // object and the Wantastic GNSS extension from gpsd, ModemManager, Quectel AT,
 // or common OpenWrt GPS status files.
 func collectGPSStatic(msg *wusp.Message) {
+	gnssCollectionCache.Lock()
+	info := gnssCollectionCache.info
+	stale := gnssCollectionCache.last.IsZero() || time.Since(gnssCollectionCache.last) >= 10*time.Second
+	if stale && !gnssCollectionCache.refreshing {
+		gnssCollectionCache.refreshing = true
+		go refreshGPSCollectionCache()
+	}
+	gnssCollectionCache.Unlock()
+	if info == nil {
+		return
+	}
+	appendGPSInfo(msg, info)
+}
+
+func refreshGPSCollectionCache() {
+	info := collectGPSInfo()
+	gnssCollectionCache.Lock()
+	gnssCollectionCache.info = info
+	gnssCollectionCache.last = time.Now()
+	gnssCollectionCache.refreshing = false
+	gnssCollectionCache.Unlock()
+}
+
+func collectGPSInfo() *gpsInfo {
 	info := gpsFromGPSD()
 	if info == nil {
 		info = gpsFromModemManager()
@@ -27,9 +59,15 @@ func collectGPSStatic(msg *wusp.Message) {
 		info = gpsFromFile()
 	}
 	if info == nil {
+		return nil
+	}
+	return info
+}
+
+func appendGPSInfo(msg *wusp.Message, info *gpsInfo) {
+	if msg == nil || info == nil {
 		return
 	}
-
 	appendGNSSFields(msg, info)
 	if info.lat == 0 && info.lon == 0 {
 		return

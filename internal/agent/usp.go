@@ -352,7 +352,10 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		return fmt.Errorf("missing reply transport for request %d", req.ID)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// The controller retries control requests after roughly six seconds. Keep
+	// the agent deadline below that so every request receives a response instead
+	// of accumulating behind a slow platform collector.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if req.Method == wusp.USPAgentMethodUpload || req.Method == wusp.USPAgentMethodDownload {
@@ -369,10 +372,26 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 
 	log.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)
-	resp, err := r.agent.HandleRequest(ctx, req)
+	type requestResult struct {
+		resp wusp.USPAgentResponse
+		err  error
+	}
+	resultCh := make(chan requestResult, 1)
+	go func() {
+		resp, err := r.agent.HandleRequest(ctx, req)
+		resultCh <- requestResult{resp: resp, err: err}
+	}()
+	var resp wusp.USPAgentResponse
+	err = nil
+	select {
+	case result := <-resultCh:
+		resp, err = result.resp, result.err
+	case <-ctx.Done():
+		err = fmt.Errorf("USP %s request exceeded %s: %w", req.Method, 5*time.Second, ctx.Err())
+	}
 	if err != nil {
 		log.Printf("[USP] agent.HandleRequest failed: method=%d id=%d err=%v", req.Method, req.ID, err)
-		return err
+		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{ID: req.ID, Method: req.Method, Error: err.Error()})
 	}
 	if resp.Message != nil {
 		objects, values := dataModelMessageCounts(resp.Message)

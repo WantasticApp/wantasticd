@@ -1351,9 +1351,13 @@ type fakeModemController struct {
 	devices []string
 	infos   map[string]*modemPkg.Info
 	err     error
+	delay   time.Duration
 }
 
 func (f fakeModemController) Discover() ([]string, error) {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 	if f.err != nil && len(f.devices) == 0 {
 		return nil, f.err
 	}

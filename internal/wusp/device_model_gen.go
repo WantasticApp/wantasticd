@@ -6743,7 +6743,7 @@ var uspModelParams = []Param{
 		Description:  "Specifies the IP protocol version, following the definitions in {{bibref|IANA-ipversionnumbers}}. Valid values are: {{range}}.",
 		Limits: Limits{
 			Min: iptr(-1),
-			Max: iptr(-1),
+			Max: iptr(255),
 		},
 	},
 	{
@@ -12555,7 +12555,7 @@ var uspModelParams = []Param{
 		Description:  "Specifies the IP protocol version, following the definitions in {{bibref|IANA-ipversionnumbers}}. Valid values are: {{range}}.",
 		Limits: Limits{
 			Min: iptr(-1),
-			Max: iptr(-1),
+			Max: iptr(255),
 		},
 	},
 	{
@@ -46373,7 +46373,7 @@ var uspModelParams = []Param{
 		Description:  "Specifies the IP protocol version, following the definitions in {{bibref|IANA-ipversionnumbers}}. Valid values are: {{range}}. This parameter can only be modified if the {{object}} is ''Static'' (as explained in the object description).",
 		Limits: Limits{
 			Min: iptr(-1),
-			Max: iptr(-1),
+			Max: iptr(255),
 		},
 	},
 	{

@@ -150,13 +150,6 @@ func gpsFromQuectelAT() *gpsInfo {
 		if err != nil {
 			continue
 		}
-		if info != nil && info.Status == "Disabled" {
-			_ = control.SetGNSS(dev, true)
-			time.Sleep(350 * time.Millisecond)
-			if refreshed, refreshErr := control.GetGNSS(dev); refreshErr == nil && refreshed != nil {
-				info = refreshed
-			}
-		}
 		if converted := gpsInfoFromModemGNSS(dev, info); converted != nil {
 			return converted
 		}

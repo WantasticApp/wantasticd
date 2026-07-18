@@ -100,6 +100,12 @@ func (b *hostBackend) Collect(ctx context.Context, paths ...string) (*wusp.Messa
 }
 
 func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) error {
+	if strings.HasPrefix(strings.TrimSpace(path), "Device.IP.Interface.") {
+		return b.setIPInterfaceParam(ctx, path, value)
+	}
+	if strings.HasPrefix(strings.TrimSpace(path), "Device.Firewall.") {
+		return b.setHostFirewallParam(ctx, path, value)
+	}
 	switch strings.TrimSpace(path) {
 	case "Device.DeviceInfo.HostName":
 		return b.setHostname(ctx, value.AsString())
@@ -122,6 +128,12 @@ func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) er
 
 func (b *hostBackend) Delete(ctx context.Context, paths ...string) error {
 	for _, path := range paths {
+		if strings.HasPrefix(strings.TrimSpace(path), "Device.Firewall.Chain.") {
+			if err := b.deleteHostFirewallRule(ctx, path); err != nil {
+				return err
+			}
+			continue
+		}
 		switch strings.TrimSpace(path) {
 		case "Device.DeviceInfo.FriendlyName":
 			if err := b.updateState(func(state *hostState) {
@@ -140,6 +152,53 @@ func (b *hostBackend) Delete(ctx context.Context, paths ...string) error {
 		}
 	}
 	return nil
+}
+
+func (b *hostBackend) Add(ctx context.Context, objectPath string, initial *wusp.Message) ([]string, error) {
+	return b.addHostFirewallRule(ctx, objectPath, initial)
+}
+
+func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, value wusp.Value) error {
+	index, leaf, ok := parseIndexedPath(path, "Device.IP.Interface.")
+	if !ok {
+		return wusp.ErrUSPPathUnsupported
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return err
+	}
+	filtered := make([]net.Interface, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if len(iface.HardwareAddr) == 0 && !isCellularNetdev(iface.Name) {
+			continue
+		}
+		filtered = append(filtered, iface)
+	}
+	if index == 0 || index > uint64(len(filtered)) {
+		return wusp.ErrUSPPathNotFound
+	}
+	name := filtered[int(index)-1].Name
+	switch leaf {
+	case "Enable":
+		state := "down"
+		if value.AsBool() {
+			state = "up"
+		}
+		_, err = b.commandRunner(ctx, "ip", "link", "set", "dev", name, state)
+		return err
+	case "MaxMTUSize":
+		mtu := value.AsUint()
+		if mtu < 68 || mtu > 65535 {
+			return fmt.Errorf("invalid MTU %d", mtu)
+		}
+		_, err = b.commandRunner(ctx, "ip", "link", "set", "dev", name, "mtu", strconv.FormatUint(mtu, 10))
+		return err
+	default:
+		return wusp.ErrUSPPathUnsupported
+	}
 }
 
 func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
@@ -235,6 +294,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	}
 
 	collectNetworkInterfacesStatic(msg)
+	collectHostFirewallStatic(ctx, b.commandRunner, msg)
 	collectCPUInfoStatic(ctx, b.commandRunner, msg)
 	b.collectCellularStatic(msg)
 	collectGPSStatic(msg)
@@ -252,11 +312,12 @@ func collectNetworkInterfacesStatic(msg *wusp.Message) {
 	}
 	idx := 1
 	for _, iface := range ifaces {
-		// Skip loopback and interfaces with no hardware address
+		// Skip loopback. rmnet/wwan interfaces intentionally have no Ethernet
+		// hardware address but are still first-class TR-181 IP interfaces.
 		if iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		if len(iface.HardwareAddr) == 0 {
+		if len(iface.HardwareAddr) == 0 && !isCellularNetdev(iface.Name) {
 			continue
 		}
 
@@ -266,9 +327,6 @@ func collectNetworkInterfacesStatic(msg *wusp.Message) {
 		msg.Set(prefix+"Status", wusp.String(ifaceStatus(iface.Flags)))
 		msg.Set(prefix+"Type", wusp.String(ifaceType(iface.Name)))
 		msg.Set(prefix+"MaxMTUSize", wusp.Uint(uint64(iface.MTU)))
-		if len(iface.HardwareAddr) == 6 {
-			msg.Set(prefix+"MACAddress", wusp.MAC(iface.HardwareAddr))
-		}
 
 		addrs, err := iface.Addrs()
 		if err == nil {
@@ -310,16 +368,8 @@ func ifaceStatus(flags net.Flags) string {
 
 func ifaceType(name string) string {
 	switch {
-	case strings.HasPrefix(name, "en"):
-		return "Ethernet"
-	case strings.HasPrefix(name, "wl"):
-		return "WiFi"
-	case strings.HasPrefix(name, "awdl"), strings.HasPrefix(name, "llw"):
-		return "WiFi"
 	case strings.HasPrefix(name, "utun"), strings.HasPrefix(name, "tun"):
 		return "Tunnel"
-	case strings.HasPrefix(name, "bridge"):
-		return "Bridge"
 	case strings.HasPrefix(name, "lo"):
 		return "Loopback"
 	default:
@@ -370,6 +420,7 @@ type cellularEntry struct {
 
 type cellularMonitor struct {
 	mu         sync.RWMutex
+	controller modemPkg.Controller
 	entries    []cellularEntry
 	last       time.Time
 	started    bool
@@ -430,7 +481,13 @@ func (m *cellularMonitor) refresh() []cellularEntry {
 	m.refreshing = true
 	m.mu.Unlock()
 
-	entries := collectCellularEntries()
+	m.mu.Lock()
+	if m.controller == nil {
+		m.controller = newModemController()
+	}
+	controller := m.controller
+	m.mu.Unlock()
+	entries := collectCellularEntriesWithController(controller)
 
 	m.mu.Lock()
 	if len(entries) > 0 || m.last.IsZero() || time.Since(m.last) > m.maxAge {
@@ -461,7 +518,13 @@ func cloneCellularEntries(entries []cellularEntry) []cellularEntry {
 func collectCellularEntries() []cellularEntry {
 	ctl := newModemController()
 	defer ctl.Close()
+	return collectCellularEntriesWithController(ctl)
+}
 
+func collectCellularEntriesWithController(ctl modemPkg.Controller) []cellularEntry {
+	if ctl == nil {
+		return nil
+	}
 	devices, err := ctl.Discover()
 	if err != nil || len(devices) == 0 {
 		return nil

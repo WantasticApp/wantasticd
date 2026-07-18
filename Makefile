@@ -14,6 +14,13 @@ BINARY_NAME=wantasticd
 COMPRESS=upx -9 -v
 CMD_PATH=./cmd/wantasticd
 
+# Live RM520N-GL/WUSP diagnostics over ADB. Override ADB_GOARCH, ADB_SERIAL,
+# ADB_REMOTE_DIR and ADB_TEST_ARGS for the target device.
+ADB_GOOS?=linux
+ADB_GOARCH?=arm64
+ADB_GOARM?=7
+ADB_TEST_BINARY=bin/wusp-device-test
+
 # Build targets
 TARGETS := \
 	darwin/arm64 \
@@ -100,4 +107,14 @@ release:
 test:
 	$(GOTEST) -v ./...
 
-.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto
+adb-test-build:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=$(ADB_GOOS) GOARCH=$(ADB_GOARCH) GOARM=$(ADB_GOARM) $(GOCMD) build -trimpath -o $(ADB_TEST_BINARY) ./cmd/test
+
+adb-test-run: adb-test-build
+	@ADB_LIVE_ONCE=1 ADB_BINARY=$(ADB_TEST_BINARY) ADB_TEST_ARGS='$(ADB_TEST_ARGS)' tools/adb-live.sh
+
+adb-live:
+	@ADB_BINARY=$(ADB_TEST_BINARY) ADB_TEST_ARGS='$(ADB_TEST_ARGS)' tools/adb-live.sh
+
+.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live

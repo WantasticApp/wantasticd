@@ -95,7 +95,11 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 	var statsOnlyPath string
 	for _, candidate := range candidates {
 		info, err := ctl.GetInfo(candidate)
-		if err != nil || info == nil {
+		if err != nil {
+			logCollectorError("openwrt.cellular.info."+candidate, err)
+			continue
+		}
+		if info == nil {
 			continue
 		}
 		b.enrichOpenWrtCellularNetStats(info, section)
@@ -119,7 +123,11 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 				continue
 			}
 			info, err := ctl.GetInfo(candidate)
-			if err != nil || info == nil {
+			if err != nil {
+				logCollectorError("openwrt.cellular.info."+candidate, err)
+				continue
+			}
+			if info == nil {
 				continue
 			}
 			b.enrichOpenWrtCellularNetStats(info, section)
@@ -132,6 +140,8 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 				statsOnlyPath = candidate
 			}
 		}
+	} else {
+		logCollectorError("openwrt.cellular.discover", err)
 	}
 
 	info := &modemPkg.Info{

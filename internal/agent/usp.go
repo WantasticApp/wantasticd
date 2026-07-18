@@ -57,8 +57,9 @@ type uspRuntime struct {
 	streams sync.Map // map[uint64]*uspTransferSession
 
 	// Initialization state machine.
-	initState atomic.Int32
-	initReady chan struct{} // closed once initState == uspInitReady
+	initState  atomic.Int32
+	initReady  chan struct{} // closed once initState == uspInitReady
+	warmupDone chan struct{} // closed after initial live cellular collection
 }
 
 type USPRuntimeStats struct {
@@ -220,6 +221,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	}
 
 	backend := platforms.NewBackend(platforms.Options{})
+	cachedBackend := newPersistentDataModelCache(backend, auth.PersistentFilePath("wusp-datamodel.cache"), 15*time.Second)
 	runtime := &uspRuntime{
 		transport:              transport,
 		controllerPublicKeyHex: controllerPublicKeyHex,
@@ -230,10 +232,11 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		},
 		transferDir: filepath.Join(os.TempDir(), "wantastic-usp"),
 		initReady:   make(chan struct{}),
+		warmupDone:  make(chan struct{}),
 	}
 	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
-		Collector:       backend,
-		Setter:          backend,
+		Collector:       cachedBackend,
+		Setter:          cachedBackend,
 		UploadHandler:   runtime.handleUpload,
 		DownloadHandler: runtime.handleDownload,
 		OperateHandler:  runtime.handleOperate,
@@ -247,6 +250,22 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	}); err != nil {
 		return nil, err
 	}
+	go func() {
+		defer close(runtime.warmupDone)
+		defer cachedBackend.Start(context.Background())
+		started := time.Now()
+		// The RM520N-GL native AT bridge serializes a broad telemetry sweep and
+		// can legitimately need more than 45 seconds. Do not announce WUSP with
+		// an empty cellular cache merely because the modem is still collecting.
+		warmCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		log.Printf("[USP] DataModel warmup: starting live cellular collection")
+		if err := cachedBackend.Warmup(warmCtx); err != nil {
+			log.Printf("[USP] DataModel warmup: incomplete after %s: %v; continuing with available values", time.Since(started).Round(time.Millisecond), err)
+			return
+		}
+		log.Printf("[USP] DataModel warmup: complete in %s", time.Since(started).Round(time.Millisecond))
+	}()
 	// Override WUSP-specific fields with actual values (Bootstrap fills
 	// them with synthetic path-derived placeholders).
 	wuspOverrides := map[string]wusp.Value{
@@ -1142,6 +1161,13 @@ func (r *uspRuntime) initializeOnce(ctx context.Context) error {
 	log.Printf("[USP] initializeOnce: server_connected=%v deviceID=%q", connected, r.deviceID)
 	if !connected {
 		return fmt.Errorf("wusp: server tunnel not up (no active WireGuard handshake)")
+	}
+	if r.warmupDone != nil {
+		select {
+		case <-r.warmupDone:
+		case <-ctx.Done():
+			return fmt.Errorf("wusp: data model warmup: %w", ctx.Err())
+		}
 	}
 	log.Printf("[USP] Sending OnBoardRequest to controller")
 	err := r.agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{

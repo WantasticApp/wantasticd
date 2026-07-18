@@ -23,6 +23,8 @@ type Manager struct {
 	httpClient     *http.Client
 }
 
+const updateAttemptTimeout = 7 * time.Minute
+
 func NewManager(currentVersion string) *Manager {
 	return &Manager{
 		currentVersion: currentVersion,
@@ -63,6 +65,12 @@ func (m *Manager) FetchLatestVersion(ctx context.Context) (string, error) {
 
 // RunUpdateScript executes the embedded self-update.sh script
 func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath string) error {
+	// The agent context normally lives for the lifetime of the process. Give the
+	// external downloader its own deadline so a stalled update can never pin the
+	// update worker indefinitely.
+	updateCtx, cancel := context.WithTimeout(ctx, updateAttemptTimeout)
+	defer cancel()
+
 	scriptContent, err := updateScript.ReadFile("self-update.sh")
 	if err != nil {
 		return fmt.Errorf("read embedded script: %w", err)
@@ -86,11 +94,15 @@ func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath
 
 	log.Printf("Running update script for version %s (target: %s)...", targetVersion, binaryPath)
 	// Pass binaryPath as second argument
-	cmd := exec.CommandContext(ctx, "/bin/sh", tmpFile.Name(), targetVersion, binaryPath)
+	cmd := exec.CommandContext(updateCtx, "/bin/sh", tmpFile.Name(), targetVersion, binaryPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.WaitDelay = 5 * time.Second
 
 	if err := cmd.Run(); err != nil {
+		if updateCtx.Err() != nil {
+			return fmt.Errorf("update attempt timed out after %s: %w", updateAttemptTimeout, updateCtx.Err())
+		}
 		return fmt.Errorf("execute update script: %w", err)
 	}
 

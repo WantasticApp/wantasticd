@@ -53,6 +53,27 @@ type timeState struct {
 
 var _ wusp.DataBackend = (*hostBackend)(nil)
 
+// Warmup performs the first expensive modem query before WUSP advertises the
+// agent to its controller. Subsequent snapshots remain cache-backed and never
+// block a USP Get on AT I/O.
+func (b *hostBackend) Warmup(ctx context.Context) error {
+	if b == nil || b.cellular == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		b.cellular.refresh()
+		b.cellular.start()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
+
 func NewLinuxBackend(opts Options) wusp.DataBackend   { return newHostBackend(KindLinux, opts) }
 func NewMacOSBackend(opts Options) wusp.DataBackend   { return newHostBackend(KindMacOS, opts) }
 func NewWindowsBackend(opts Options) wusp.DataBackend { return newHostBackend(KindWindows, opts) }

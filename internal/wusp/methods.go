@@ -238,6 +238,14 @@ func DecodeMessage(data []byte) (*Message, error) {
 	return msg, nil
 }
 
+// DecodeMessageLenient decodes a locally produced snapshot without rejecting
+// platform-specific values that are transport-safe but narrower than a BBF
+// enum. Persistent caches use this so one optional field cannot invalidate the
+// entire last-known-good device snapshot after reboot.
+func DecodeMessageLenient(data []byte) (*Message, error) {
+	return safeDecoder.Decode(data)
+}
+
 func encodeMessageValidated(msg *Message, compress bool) ([]byte, error) {
 	if compress {
 		return safeLZ4Encoder.Encode(msg)

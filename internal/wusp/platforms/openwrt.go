@@ -67,6 +67,24 @@ type OpenWrtBackend struct {
 	now                   func() time.Time
 }
 
+func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
+	if b == nil || b.cellular == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		b.cellular.refresh()
+		b.cellular.start()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
+
 type openWrtState struct {
 	FriendlyName     string `json:"friendly_name,omitempty"`
 	ProvisioningCode string `json:"provisioning_code,omitempty"`

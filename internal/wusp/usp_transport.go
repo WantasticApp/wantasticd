@@ -282,7 +282,7 @@ func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPA
 
 	switch req.Method {
 	case USPAgentMethodGet:
-		msg, err := a.Get(req.Paths...)
+		msg, err := a.GetContext(ctx, req.Paths...)
 		if err != nil {
 			resp.Error = err.Error()
 			return resp, nil
@@ -319,7 +319,7 @@ func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPA
 		}
 		return resp, nil
 	case USPAgentMethodGetInstances:
-		instances, err := a.GetInstances(req.Paths...)
+		instances, err := a.GetInstancesContext(ctx, req.Paths...)
 		if err != nil {
 			resp.Error = err.Error()
 			return resp, nil

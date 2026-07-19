@@ -18,10 +18,12 @@ type persistentDataModelCache struct {
 	path     string
 	interval time.Duration
 
-	mu         sync.RWMutex
-	msg        *wusp.Message
-	refreshing bool
-	startOnce  sync.Once
+	mu             sync.RWMutex
+	msg            *wusp.Message
+	refreshing     bool
+	refreshDone    chan struct{}
+	lastRefreshErr error
+	startOnce      sync.Once
 }
 
 func newPersistentDataModelCache(backend wusp.DataBackend, path string, interval time.Duration) *persistentDataModelCache {
@@ -33,14 +35,28 @@ func newPersistentDataModelCache(backend wusp.DataBackend, path string, interval
 	return c
 }
 
-func (c *persistentDataModelCache) Collect(_ context.Context, paths ...string) (*wusp.Message, error) {
+func (c *persistentDataModelCache) Collect(ctx context.Context, paths ...string) (*wusp.Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.RLock()
 	msg := cloneCachedMessage(c.msg)
 	c.mu.RUnlock()
+	if len(msg.Fields) > 0 {
+		return subsetCachedMessage(msg, paths...), nil
+	}
+
+	// A cold cache must not fan out several simultaneous modem sweeps when the
+	// controller asks for its sectioned WUSP snapshot. Join the active warm-up,
+	// or become the single caller that populates the cache.
+	if err := c.ensureSnapshot(ctx); err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	msg = cloneCachedMessage(c.msg)
+	c.mu.RUnlock()
 	if len(msg.Fields) == 0 {
-		// Preserve normal backend semantics for callers that intentionally use
-		// the agent before startup warm-up (notably embedded/in-process users).
-		return c.backend.Collect(context.Background(), paths...)
+		return nil, fmt.Errorf("collect data model cache: empty snapshot")
 	}
 	return subsetCachedMessage(msg, paths...), nil
 }
@@ -100,16 +116,59 @@ func (c *persistentDataModelCache) Start(ctx context.Context) {
 }
 
 func (c *persistentDataModelCache) Refresh(ctx context.Context) error {
-	c.mu.Lock()
-	if c.refreshing {
-		c.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done, started := c.beginRefresh()
+	if !started {
 		return nil
 	}
+	return c.refreshOwned(ctx, done)
+}
+
+func (c *persistentDataModelCache) ensureSnapshot(ctx context.Context) error {
+	done, started := c.beginRefresh()
+	if started {
+		return c.refreshOwned(ctx, done)
+	}
+
+	select {
+	case <-done:
+		c.mu.RLock()
+		err := c.lastRefreshErr
+		hasSnapshot := c.msg != nil && len(c.msg.Fields) > 0
+		c.mu.RUnlock()
+		if err != nil {
+			return err
+		}
+		if !hasSnapshot {
+			return fmt.Errorf("collect data model cache: empty snapshot")
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *persistentDataModelCache) beginRefresh() (chan struct{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refreshing {
+		return c.refreshDone, false
+	}
+	done := make(chan struct{})
 	c.refreshing = true
-	c.mu.Unlock()
+	c.refreshDone = done
+	c.lastRefreshErr = nil
+	return done, true
+}
+
+func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan struct{}) (err error) {
 	defer func() {
 		c.mu.Lock()
 		c.refreshing = false
+		c.lastRefreshErr = err
+		close(done)
 		c.mu.Unlock()
 	}()
 

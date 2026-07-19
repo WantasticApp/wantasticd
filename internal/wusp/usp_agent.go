@@ -221,12 +221,19 @@ func (a *USPAgent) Snapshot() *Message {
 // Param paths return a single field, while object paths ending with "." return
 // all stored descendant params beneath that object instance/pattern.
 func (a *USPAgent) Get(paths ...string) (*Message, error) {
+	return a.GetContext(context.Background(), paths...)
+}
+
+func (a *USPAgent) GetContext(ctx context.Context, paths ...string) (*Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if a.collector == nil {
 		return a.getStored(paths...)
 	}
 
 	// Collect live data from the platform backend.
-	msg, err := a.collector.Collect(context.Background(), paths...)
+	msg, err := a.collector.Collect(ctx, paths...)
 	if err != nil {
 		return nil, err
 	}
@@ -415,9 +422,16 @@ func (a *USPAgent) AddByCode(code uint64, initial *Message) ([]string, error) {
 }
 
 func (a *USPAgent) GetInstances(paths ...string) ([]string, error) {
+	return a.GetInstancesContext(context.Background(), paths...)
+}
+
+func (a *USPAgent) GetInstancesContext(ctx context.Context, paths ...string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	values := a.snapshotValues()
 	if a.collector != nil {
-		msg, err := a.collector.Collect(context.Background(), paths...)
+		msg, err := a.collector.Collect(ctx, paths...)
 		if err != nil {
 			return nil, err
 		}

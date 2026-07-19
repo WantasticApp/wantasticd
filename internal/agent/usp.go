@@ -40,6 +40,11 @@ type uspTransport interface {
 const (
 	uspInitPending int32 = 0
 	uspInitReady   int32 = 1
+
+	uspWarmupAnnounceGrace       = 3 * time.Second
+	uspWarmupReannounceTimeout   = 5 * time.Second
+	wuspControlFragmentPaceEvery = 16
+	wuspControlFragmentPaceDelay = time.Millisecond
 )
 
 type uspRuntime struct {
@@ -265,6 +270,17 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 			return
 		}
 		log.Printf("[USP] DataModel warmup: complete in %s", time.Since(started).Round(time.Millisecond))
+		if !runtime.transport.IsServerConnected() {
+			log.Printf("[USP] DataModel warmup: cache ready; controller re-announce deferred until tunnel is connected")
+			return
+		}
+		announceCtx, announceCancel := context.WithTimeout(context.Background(), uspWarmupReannounceTimeout)
+		defer announceCancel()
+		if err := runtime.emitOnBoardRequest(announceCtx); err != nil {
+			log.Printf("[USP] DataModel warmup: populated-cache re-announce failed: %v", err)
+			return
+		}
+		log.Printf("[USP] DataModel warmup: re-announced OnBoardRequest with populated cache")
 	}()
 	// Override WUSP-specific fields with actual values (Bootstrap fills
 	// them with synthetic path-derived placeholders).
@@ -484,9 +500,12 @@ func (r *uspRuntime) replyControlPayload(reply func([]byte) error, req wusp.USPA
 		log.Printf("[USP] fragmented control response: request=%d method=%s budget=%d fragments=%d payload_bytes=%d",
 			req.ID, req.Method.String(), budget, len(frames), len(payload))
 	}
-	for _, frame := range frames {
+	for i, frame := range frames {
 		if err := reply(frame); err != nil {
 			return err
+		}
+		if len(frames) > wuspControlFragmentPaceEvery && (i+1)%wuspControlFragmentPaceEvery == 0 {
+			time.Sleep(wuspControlFragmentPaceDelay)
 		}
 	}
 	return nil
@@ -1165,20 +1184,26 @@ func (r *uspRuntime) initializeOnce(ctx context.Context) error {
 	if r.warmupDone != nil {
 		select {
 		case <-r.warmupDone:
+		case <-time.After(uspWarmupAnnounceGrace):
+			log.Printf("[USP] DataModel warmup still running after %s; announcing WUSP and serving cached/partial values", uspWarmupAnnounceGrace)
 		case <-ctx.Done():
 			return fmt.Errorf("wusp: data model warmup: %w", ctx.Err())
 		}
 	}
 	log.Printf("[USP] Sending OnBoardRequest to controller")
-	err := r.agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
+	err := r.emitOnBoardRequest(ctx)
+	if err != nil {
+		log.Printf("[USP] OnBoardRequest emit failed: %v", err)
+	}
+	return err
+}
+
+func (r *uspRuntime) emitOnBoardRequest(ctx context.Context) error {
+	return r.agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
 		SerialNumber:                   r.deviceID,
 		Manufacturer:                   "Wantastic",
 		ProductClass:                   "wantasticd",
 		SoftwareVersion:                r.softwareVersion,
 		AgentSupportedProtocolVersions: wusp.WUSPModelVersion,
 	})
-	if err != nil {
-		log.Printf("[USP] OnBoardRequest emit failed: %v", err)
-	}
-	return err
 }

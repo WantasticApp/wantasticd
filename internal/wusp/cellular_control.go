@@ -19,6 +19,12 @@ var AllWUSPCellularControlParams = []Param{
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.APNProfileNumber", Type: TypeUnsignedInt, Access: ReadWrite, SinceVersion: "1.0", Description: "PDP context profile number used when applying APN settings.", Limits: Limits{Min: iptr(1), Max: iptr(16)}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.APNPDPType", Type: TypeString, Access: ReadWrite, SinceVersion: "1.0", Description: "PDP type used for APN settings.", Limits: Limits{Enums: []string{"IP", "IPV6", "IPV4V6"}}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.APN", Type: TypeString, Access: ReadWrite, SinceVersion: "1.0", Description: "APN value applied with AT+CGDCONT.", Limits: Limits{MaxLength: 100}},
+	// SMS values are command inputs, not persisted modem state. They remain
+	// write-only so the dashboard can validate and encode them for Operate
+	// without exposing a recipient or message in subsequent snapshots.
+	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMS.PhoneNumber", Type: TypeString, Access: WriteOnly, SinceVersion: "1.0", Description: "Destination number supplied to SendSMS.", Limits: Limits{MaxLength: 32}},
+	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMS.Message", Type: TypeString, Access: WriteOnly, SinceVersion: "1.0", Description: "Message body supplied to SendSMS.", Limits: Limits{MaxLength: 1600}},
+	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMS.DeleteIndex", Type: TypeString, Access: WriteOnly, SinceVersion: "1.0", Description: "Message index or all supplied to DeleteSMS.", Limits: Limits{MaxLength: 16}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMSInboxJSON", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "JSON SMS inbox payload returned by sms_tool -j recv.", Limits: Limits{MaxLength: 16384}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.LastCommandStatus", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Status of the most recent cellular control operation.", Limits: Limits{Enums: []string{"Idle", "Success", "Error"}}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.LastCommandOutput", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Short output or error from the most recent cellular control operation.", Limits: Limits{MaxLength: 4096}},

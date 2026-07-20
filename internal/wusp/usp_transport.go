@@ -23,12 +23,16 @@ const (
 	MetadataKeyRequestSequence           = "wusp.request_sequence"
 	MetadataKeyResponseSequence          = "wusp.response_sequence"
 	MetadataKeyQueuePolicy               = "wusp.queue_policy"
-	QueuePolicyAction                    = "action"
-	TransferMetadataSource               = "source"
-	TransferMetadataDestination          = "destination"
-	TransferMetadataSessionID            = "session_id"
-	TransferMetadataChunkSize            = "chunk_size"
-	TransferMetadataTransport            = "transport"
+	// MetadataKeyOperationCommandPath carries the TR-181 command reference for
+	// an Operate request. ObjectPath remains an object path on the wire, which
+	// keeps it valid for selector encoding and object-path validation.
+	MetadataKeyOperationCommandPath = "wusp.operation_command_path"
+	QueuePolicyAction               = "action"
+	TransferMetadataSource          = "source"
+	TransferMetadataDestination     = "destination"
+	TransferMetadataSessionID       = "session_id"
+	TransferMetadataChunkSize       = "chunk_size"
+	TransferMetadataTransport       = "transport"
 )
 
 func CloneMetadata(in map[string]string) map[string]string {
@@ -132,6 +136,66 @@ func QueuePolicy(metadata map[string]string) string {
 		return ""
 	}
 	return strings.TrimSpace(metadata[MetadataKeyQueuePolicy])
+}
+
+// OperationTarget splits a TR-181 Operate target into the object path carried
+// by the transport and its command path. A trailing object path is retained for
+// compatibility with older callers that did not identify a command separately.
+func OperationTarget(path string) (objectPath, commandPath string, err error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", "", &ValidationError{Reason: "operate requires a command path"}
+	}
+	if strings.HasSuffix(path, ".") {
+		return path, "", nil
+	}
+	if !strings.HasSuffix(path, "()") {
+		return "", "", &ValidationError{Path: path, Reason: "operate command path must end with '()'"}
+	}
+
+	commandName := strings.TrimSuffix(path, "()")
+	separator := strings.LastIndex(commandName, ".")
+	if separator <= 0 || separator == len(commandName)-1 {
+		return "", "", &ValidationError{Path: path, Reason: "operate command path must include an object path"}
+	}
+	return commandName[:separator+1], path, nil
+}
+
+// WithOperationCommandPath adds a validated command path to request metadata.
+// The metadata map is always cloned so callers may reuse their original map.
+func WithOperationCommandPath(metadata map[string]string, commandPath string) map[string]string {
+	commandPath = strings.TrimSpace(commandPath)
+	if commandPath == "" {
+		return CloneMetadata(metadata)
+	}
+	out := CloneMetadata(metadata)
+	if out == nil {
+		out = make(map[string]string, 1)
+	}
+	out[MetadataKeyOperationCommandPath] = commandPath
+	return out
+}
+
+// OperationCommandPath resolves the command to invoke from a transport object
+// path and optional command metadata. It rejects mismatched pairs so a command
+// cannot be executed against a different object instance.
+func OperationCommandPath(objectPath string, metadata map[string]string) (string, error) {
+	objectPath = strings.TrimSpace(objectPath)
+	commandPath := strings.TrimSpace(metadata[MetadataKeyOperationCommandPath])
+	if commandPath == "" {
+		return objectPath, nil
+	}
+	expectedObjectPath, normalizedCommandPath, err := OperationTarget(commandPath)
+	if err != nil {
+		return "", err
+	}
+	if expectedObjectPath != objectPath {
+		return "", &ValidationError{
+			Path:   commandPath,
+			Reason: "operate command path does not belong to request object path",
+		}
+	}
+	return normalizedCommandPath, nil
 }
 
 func IsWUSPActionMethod(method USPAgentMethod) bool {
@@ -327,7 +391,12 @@ func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPA
 		resp.Paths = instances
 		return resp, nil
 	case USPAgentMethodOperate:
-		msg, err := a.Operate(ctx, req.ObjectPath, req.Message, req.Metadata)
+		commandPath, err := OperationCommandPath(req.ObjectPath, req.Metadata)
+		if err != nil {
+			resp.Error = err.Error()
+			return resp, nil
+		}
+		msg, err := a.Operate(ctx, commandPath, req.Message, req.Metadata)
 		if err != nil {
 			resp.Error = err.Error()
 			return resp, nil
@@ -726,6 +795,11 @@ func validateUSPAgentRequest(req USPAgentRequest) error {
 	case USPAgentMethodOperate, USPAgentMethodNotify:
 		if strings.TrimSpace(req.ObjectPath) == "" && req.ObjectCode == 0 {
 			return &ValidationError{Reason: "request missing object path"}
+		}
+		if req.Method == USPAgentMethodOperate && strings.TrimSpace(req.ObjectPath) != "" {
+			if _, err := OperationCommandPath(req.ObjectPath, req.Metadata); err != nil {
+				return err
+			}
 		}
 	case USPAgentMethodUpload, USPAgentMethodDownload:
 		if req.Transfer == nil {
@@ -1582,7 +1656,10 @@ func compactRequestSelectors(req USPAgentRequest) USPAgentRequest {
 			req.Paths = nil
 		}
 	}
-	if req.ObjectCode == 0 && strings.TrimSpace(req.ObjectPath) != "" {
+	// An Operate request keeps its object path as a string. The command is
+	// associated with that exact path in metadata, and string paths avoid any
+	// controller/agent schema-code drift for command-bearing requests.
+	if req.Method != USPAgentMethodOperate && req.ObjectCode == 0 && strings.TrimSpace(req.ObjectPath) != "" {
 		if code, instances, ok := strictResolvedObjectCode(model, req.ObjectPath); ok {
 			req.ObjectCode = code
 			req.ObjectInstances = instances

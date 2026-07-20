@@ -521,6 +521,83 @@ func TestUSPAgentHandleRequest(t *testing.T) {
 	}
 }
 
+func TestOperateRequestKeepsObjectAndCommandPathsDistinct(t *testing.T) {
+	const commandPath = "Device.WUSP_CellularControl.Interface.1.SendSMS()"
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+
+	object, command, err := OperationTarget(commandPath)
+	if err != nil {
+		t.Fatalf("OperationTarget returned error: %v", err)
+	}
+	if object != objectPath || command != commandPath {
+		t.Fatalf("OperationTarget=%q/%q want %q/%q", object, command, objectPath, commandPath)
+	}
+
+	frame, err := EncodeUSPAgentRequest(USPAgentRequest{
+		ID:         91,
+		Method:     USPAgentMethodOperate,
+		ObjectPath: object,
+		Metadata:   WithOperationCommandPath(nil, command),
+	})
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest returned error: %v", err)
+	}
+	decoded, err := DecodeUSPAgentRequest(frame)
+	if err != nil {
+		t.Fatalf("DecodeUSPAgentRequest returned error: %v", err)
+	}
+	if decoded.ObjectPath != objectPath {
+		t.Fatalf("decoded object path=%q want %q", decoded.ObjectPath, objectPath)
+	}
+	gotCommand, err := OperationCommandPath(decoded.ObjectPath, decoded.Metadata)
+	if err != nil {
+		t.Fatalf("OperationCommandPath returned error: %v", err)
+	}
+	if gotCommand != commandPath {
+		t.Fatalf("decoded command=%q want %q", gotCommand, commandPath)
+	}
+
+	_, err = EncodeUSPAgentRequest(USPAgentRequest{
+		ID:         92,
+		Method:     USPAgentMethodOperate,
+		ObjectPath: objectPath,
+		Metadata: WithOperationCommandPath(nil,
+			"Device.WUSP_CellularControl.Interface.2.SendSMS()"),
+	})
+	if err == nil {
+		t.Fatal("expected mismatched command/object request to be rejected")
+	}
+}
+
+func TestUSPAgentHandleOperateUsesMetadataCommandPath(t *testing.T) {
+	const commandPath = "Device.WUSP_CellularControl.Interface.1.RefreshGNSS()"
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+
+	var invoked string
+	agent := NewUSPAgent(USPAgentOptions{
+		OperateHandler: func(_ context.Context, path string, _ *Message, _ map[string]string) (*Message, error) {
+			invoked = path
+			return NewMessage(), nil
+		},
+	})
+
+	resp, err := agent.HandleRequest(context.Background(), USPAgentRequest{
+		ID:         93,
+		Method:     USPAgentMethodOperate,
+		ObjectPath: objectPath,
+		Metadata:   WithOperationCommandPath(nil, commandPath),
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest returned error: %v", err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("HandleRequest response error=%q", resp.Error)
+	}
+	if invoked != commandPath {
+		t.Fatalf("handler command=%q want %q", invoked, commandPath)
+	}
+}
+
 func BenchmarkUSPAgentTransportEncodeMaxSize(b *testing.B) {
 	fixture := mustUSPTransportMaxSizeFixture(b)
 

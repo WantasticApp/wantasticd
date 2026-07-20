@@ -315,7 +315,7 @@ func (c *persistentDataModelCache) refreshAsync() {
 // the controller performs its immediate post-mutation sync. A refresh failure
 // does not roll back an already successful device operation.
 func (c *persistentDataModelCache) refreshAfterMutation(ctx context.Context) {
-	if err := c.Refresh(ctx); err != nil {
+	if err := c.ensureSnapshot(ctx); err != nil {
 		log.Printf("[USP] DataModel cache mutation refresh warning: continue_on_error=true err=%v", err)
 	}
 }

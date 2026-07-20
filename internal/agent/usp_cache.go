@@ -74,7 +74,7 @@ func (c *persistentDataModelCache) Set(ctx context.Context, path string, value w
 	if err := c.backend.Set(ctx, path, value); err != nil {
 		return err
 	}
-	c.refreshAsync()
+	c.refreshAfterMutation(ctx)
 	return nil
 }
 
@@ -82,7 +82,7 @@ func (c *persistentDataModelCache) Delete(ctx context.Context, paths ...string) 
 	if err := c.backend.Delete(ctx, paths...); err != nil {
 		return err
 	}
-	c.refreshAsync()
+	c.refreshAfterMutation(ctx)
 	return nil
 }
 
@@ -93,7 +93,7 @@ func (c *persistentDataModelCache) Add(ctx context.Context, objectPath string, i
 	}
 	paths, err := adder.Add(ctx, objectPath, initial)
 	if err == nil {
-		c.refreshAsync()
+		c.refreshAfterMutation(ctx)
 	}
 	return paths, err
 }
@@ -309,6 +309,15 @@ func (c *persistentDataModelCache) refreshAsync() {
 			log.Printf("[USP] DataModel cache refresh warning: continue_on_error=true err=%v", err)
 		}
 	}()
+}
+
+// refreshAfterMutation keeps the file and in-memory snapshots coherent before
+// the controller performs its immediate post-mutation sync. A refresh failure
+// does not roll back an already successful device operation.
+func (c *persistentDataModelCache) refreshAfterMutation(ctx context.Context) {
+	if err := c.Refresh(ctx); err != nil {
+		log.Printf("[USP] DataModel cache mutation refresh warning: continue_on_error=true err=%v", err)
+	}
 }
 
 func (c *persistentDataModelCache) load() {

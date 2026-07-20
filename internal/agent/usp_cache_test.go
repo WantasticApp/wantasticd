@@ -131,3 +131,49 @@ func TestPersistentDataModelCacheWaitHonorsContext(t *testing.T) {
 		t.Fatal("owner Collect did not finish")
 	}
 }
+
+func TestPreserveLastCompleteCellularSnapshot(t *testing.T) {
+	previous := wusp.NewMessage()
+	previous.Set("Device.DeviceInfo.HostName", wusp.String("before"))
+	previous.Set("Device.Cellular.Interface.1.Name", wusp.String("rmnet_data0"))
+	previous.Set("Device.Cellular.Interface.1.RSRP", wusp.Int(-96))
+	previous.Set("Device.WUSP_CellularTelemetry.Interface.1.Model", wusp.String("RM520N-GL"))
+	previous.Set("Device.WUSP_CellularControl.Interface.1.SupportedOperations", wusp.String("SendSMS"))
+	previous.Set("Device.WUSP_GNSS.Receiver.1.Status", wusp.String("Fix3D"))
+
+	partial := wusp.NewMessage()
+	partial.Set("Device.DeviceInfo.HostName", wusp.String("after"))
+	partial.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
+	partial.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(0))
+
+	merged := preserveLastCompleteCellularSnapshot(previous, partial)
+	if value, ok := merged.Get("Device.DeviceInfo.HostName"); !ok || wusp.ValueToString(value) != "after" {
+		t.Fatalf("host update not preserved: %#v", merged.Fields)
+	}
+	for _, path := range []string{
+		"Device.Cellular.Interface.1.RSRP",
+		"Device.WUSP_CellularTelemetry.Interface.1.Model",
+		"Device.WUSP_CellularControl.Interface.1.SupportedOperations",
+		"Device.WUSP_GNSS.Receiver.1.Status",
+	} {
+		if _, ok := merged.Get(path); !ok {
+			t.Fatalf("missing retained field %s", path)
+		}
+	}
+}
+
+func TestCompleteCellularSnapshotReplacesPreviousFields(t *testing.T) {
+	previous := wusp.NewMessage()
+	previous.Set("Device.Cellular.Interface.1.Name", wusp.String("rmnet_data0"))
+	previous.Set("Device.Cellular.Interface.1.RSRP", wusp.Int(-96))
+
+	current := wusp.NewMessage()
+	current.Set("Device.Cellular.Interface.1.Name", wusp.String("rmnet_data0"))
+	current.Set("Device.Cellular.Interface.1.RSRP", wusp.Int(-88))
+
+	merged := preserveLastCompleteCellularSnapshot(previous, current)
+	value, ok := merged.Get("Device.Cellular.Interface.1.RSRP")
+	if !ok || value.AsInt() != -88 {
+		t.Fatalf("RSRP=%v want -88", value)
+	}
+}

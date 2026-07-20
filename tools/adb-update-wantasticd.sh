@@ -8,7 +8,6 @@ remote_path=${ADB_REMOTE_PATH:-/usr/bin/wantasticd}
 service=${ADB_SERVICE:-wantasticd}
 config_path=${ADB_CONFIG_PATH:-/etc/wantastic}
 stage=/data/local/tmp/wantasticd.new
-backup="${remote_path}.adb-backup"
 unit_path="/etc/systemd/system/${service}.service"
 init_path="/etc/init.d/${service}"
 
@@ -30,11 +29,30 @@ if ! adb_cmd get-state >/dev/null 2>&1; then
 	exit 1
 fi
 
+# Embedded QTI images commonly mount the root filesystem read-only.  Keep the
+# managed binary under persistent writable storage in that case and point the
+# generated service at the resolved path.  This decision happens before the
+# service is stopped, so a read-only system cannot take an agent offline.
+remote_dir=$(dirname "$remote_path")
+remote_writable=$(adb_cmd shell "probe='$remote_dir/.wantasticd-write-test'; if [ -d '$remote_dir' ] && (umask 077; : > \"\$probe\") 2>/dev/null; then rm -f \"\$probe\"; printf writable; else printf readonly; fi" 2>/dev/null | tr -d '\r')
+if [ "$remote_writable" != "writable" ]; then
+	remote_path="/usrdata/wantastic/bin/$(basename "$remote_path")"
+	remote_dir=$(dirname "$remote_path")
+	mkdir_output=$(adb_cmd shell "mkdir -p '$remote_dir' && chmod 0755 '$remote_dir' && probe='$remote_dir/.wantasticd-write-test'; if (umask 077; : > \"\$probe\") 2>/dev/null; then rm -f \"\$probe\"; printf __WANTASTIC_WRITABLE__; fi" 2>&1 || true)
+	printf '%s\n' "$mkdir_output"
+	case "$mkdir_output" in
+		*__WANTASTIC_WRITABLE__*) ;;
+		*) echo "No writable target directory for wantasticd" >&2; exit 1 ;;
+	esac
+fi
+backup="${remote_path}.adb-backup"
+
 echo "Pushing wantasticd to $stage"
 adb_cmd push "$binary" "$stage" >/dev/null
 adb_cmd shell "chmod 0755 '$stage' && '$stage' version >/dev/null"
 
-if adb_cmd shell "command -v systemctl >/dev/null 2>&1 && { [ -d /run/systemd/system ] || [ -S /run/systemd/private ]; }"; then
+service_manager=$(adb_cmd shell "if command -v systemctl >/dev/null 2>&1 && { [ -d /run/systemd/system ] || [ -S /run/systemd/private ]; }; then printf systemd; else printf initd; fi" 2>/dev/null | tr -d '\r')
+if [ "$service_manager" = systemd ]; then
 	service_manager=systemd
 	echo "Ensuring systemd unit $unit_path"
 	adb_cmd shell "mkdir -p /etc/systemd/system || exit 1; if [ ! -f '$unit_path' ] || ! grep -Fqx 'ExecStart=$remote_path connect --config $config_path' '$unit_path' || ! grep -Fqx 'KillMode=control-group' '$unit_path' || ! grep -Fqx 'TimeoutStopSec=10' '$unit_path'; then printf '%s\n' '[Unit]' 'Description=Wantastic Overlay Networking Daemon' 'After=network-online.target' 'Wants=network-online.target' '' '[Service]' 'Type=simple' 'ExecStart=$remote_path connect --config $config_path' 'Restart=on-failure' 'RestartSec=5' 'KillMode=control-group' 'TimeoutStopSec=10' '' '[Install]' 'WantedBy=multi-user.target' > '$unit_path' || exit 1; fi; chmod 0644 '$unit_path' || exit 1; systemctl daemon-reload || exit 1; systemctl enable '$service' >/dev/null || exit 1"
@@ -46,20 +64,35 @@ fi
 
 echo "Updating $remote_path and restarting $service"
 if [ "$service_manager" = systemd ]; then
-	update_command="systemctl stop '$service' || exit 1; killall wantasticd 2>/dev/null || true; cp -p '$remote_path' '$backup' || exit 1; mv '$stage' '$remote_path' || exit 1; chmod 0755 '$remote_path' || exit 1; systemctl start '$service' || exit 1; state=\$(systemctl is-active '$service'); [ \"\$state\" = active ] || exit 1"
-	restore_command="systemctl daemon-reload; systemctl restart '$service'"
-	verify_command="state=\$(systemctl is-active '$service'); [ \"\$state\" = active ] || exit 1; echo \"\$state\""
+	update_command="systemctl stop '$service' && { killall wantasticd 2>/dev/null || true; } && { if [ -f '$remote_path' ]; then cp -p '$remote_path' '$backup'; fi; } && mv '$stage' '$remote_path' && chmod 0755 '$remote_path' && systemctl start '$service' && state=\$(systemctl is-active '$service') && [ \"\$state\" = active ] && printf __WANTASTIC_UPDATE_OK__"
+	restore_command="systemctl daemon-reload; if [ -f '$backup' ]; then mv '$backup' '$remote_path'; chmod 0755 '$remote_path'; fi; systemctl restart '$service'"
+	verify_command="'$remote_path' version >/dev/null && state=\$(systemctl is-active '$service') && [ \"\$state\" = active ] && printf __WANTASTIC_VERIFY_OK__"
 else
-	update_command="'$init_path' stop || true; killall wantasticd 2>/dev/null || true; cp -p '$remote_path' '$backup' || exit 1; mv '$stage' '$remote_path' || exit 1; chmod 0755 '$remote_path' || exit 1; '$init_path' start || exit 1; sleep 1; '$init_path' status || exit 1"
+	update_command="'$init_path' stop || true; killall wantasticd 2>/dev/null || true; if [ -f '$remote_path' ]; then cp -p '$remote_path' '$backup' || exit 1; fi; mv '$stage' '$remote_path' || exit 1; chmod 0755 '$remote_path' || exit 1; '$init_path' start || exit 1; sleep 1; '$init_path' status || exit 1; printf __WANTASTIC_UPDATE_OK__"
 	restore_command="'$init_path' restart"
-	verify_command="'$init_path' status || exit 1; echo active"
+	verify_command="'$remote_path' version >/dev/null && '$init_path' status && printf __WANTASTIC_VERIFY_OK__"
 fi
 
-if ! adb_cmd shell "$update_command"; then
+update_output=$(adb_cmd shell "$update_command" 2>&1 || true)
+printf '%s\n' "$update_output"
+case "$update_output" in
+	*__WANTASTIC_UPDATE_OK__*) ;;
+	*)
 	echo "New wantasticd failed to start; restoring $backup" >&2
-	adb_cmd shell "if [ -f '$backup' ]; then mv '$backup' '$remote_path'; chmod 0755 '$remote_path'; $restore_command; fi"
+	adb_cmd shell "$restore_command" || true
 	exit 1
-fi
+;;
+esac
 
-adb_cmd shell "'$remote_path' version; $verify_command; rm -f '$backup'"
+verify_output=$(adb_cmd shell "$verify_command" 2>&1 || true)
+printf '%s\n' "$verify_output"
+case "$verify_output" in
+	*__WANTASTIC_VERIFY_OK__*) ;;
+	*)
+	echo "Updated wantasticd failed verification; restoring $backup" >&2
+	adb_cmd shell "$restore_command"
+	exit 1
+;;
+esac
+adb_cmd shell "'$remote_path' version; rm -f '$backup'"
 echo "wantasticd update completed"

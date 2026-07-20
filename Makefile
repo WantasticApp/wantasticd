@@ -17,7 +17,7 @@ CMD_PATH=./cmd/wantasticd
 # Live RM520N-GL/WUSP diagnostics over ADB. Override ADB_GOARCH, ADB_SERIAL,
 # ADB_REMOTE_DIR and ADB_TEST_ARGS for the target device.
 ADB_GOOS?=linux
-ADB_GOARCH?=arm64
+ADB_GOARCH?=arm
 ADB_GOARM?=7
 ADB_TEST_BINARY=bin/wusp-device-test
 ADB_AGENT_GOARCH?=arm

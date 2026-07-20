@@ -34,8 +34,9 @@ type report struct {
 }
 
 func main() {
-	action := flag.String("action", "snapshot", "snapshot, gnss-start, gnss-stop, gnss-get, sms-list, sms-send, sms-delete, connect, or disconnect")
+	action := flag.String("action", "snapshot", "snapshot, cache, gnss-start, gnss-stop, gnss-get, sms-list, sms-send, sms-delete, connect, or disconnect")
 	device := flag.String("device", "", "modem path; defaults to the first discovered modem")
+	cachePath := flag.String("cache-path", "/usrdata/wantastic/etc/wusp-datamodel.cache", "persistent WUSP cache path for cache inspection")
 	phone := flag.String("phone", "", "destination number for sms-send")
 	message := flag.String("message", "", "text for sms-send")
 	index := flag.String("index", "", "message index for sms-delete")
@@ -44,6 +45,10 @@ func main() {
 	timeout := flag.Duration("timeout", 45*time.Second, "overall diagnostic timeout")
 	rawOnly := flag.Bool("raw-only", false, "collect only the selected raw modem endpoint; skip WUSP projection")
 	flag.Parse()
+	if *action == "cache" {
+		inspectCache(*cachePath)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -92,6 +97,11 @@ func main() {
 
 	if !*rawOnly {
 		backend := platforms.NewBackend(platforms.Options{Kind: platforms.Kind(strings.ToLower(*kind))})
+		if warmer, ok := backend.(interface{ Warmup(context.Context) error }); ok {
+			if err := warmer.Warmup(ctx); err != nil {
+				out.Errors = append(out.Errors, "WUSP warmup: "+err.Error())
+			}
+		}
 		msg, err := backend.Collect(ctx,
 			"Device.Cellular.", "Device.WUSP_CellularTelemetry.",
 			"Device.WUSP_CellularControl.", "Device.WUSP_GNSS.",
@@ -106,6 +116,26 @@ func main() {
 		}
 	}
 	writeJSON(out)
+}
+
+func inspectCache(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fatal(fmt.Errorf("read WUSP cache: %w", err))
+	}
+	msg, err := wusp.DecodeMessageLenient(data)
+	if err != nil {
+		fatal(fmt.Errorf("decode WUSP cache: %w", err))
+	}
+	writeJSON(struct {
+		Path        string    `json:"path"`
+		CollectedAt time.Time `json:"collected_at"`
+		Fields      []field   `json:"wusp_fields"`
+	}{
+		Path:        path,
+		CollectedAt: time.Now().UTC(),
+		Fields:      messageFields(msg),
+	})
 }
 
 func runAction(ctl modem.Controller, dev, action, phone, message, index, apn string) error {

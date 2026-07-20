@@ -8,8 +8,10 @@ package modem
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -35,6 +37,11 @@ var atBridgeMu sync.Mutex
 
 const smsToolDevicePath = "sms_tool"
 
+// errATBridgeResponseMismatch means the vendor CGI relayed a stale response
+// from the persistent AT bridge. A control operation is deliberately not
+// retried after this error because its effect on the modem is unknown.
+var errATBridgeResponseMismatch = errors.New("AT bridge response did not match command")
+
 func (c *atController) Close() error { return nil }
 
 func (c *atController) Discover() ([]string, error) {
@@ -52,7 +59,12 @@ func (c *atController) Discover() ([]string, error) {
 	}
 
 	if _, err := os.Stat("/dev/ttyOUT2"); err == nil {
-		add("/dev/ttyOUT2")
+		// QTI/Quectel embedded images expose the modem through this persistent
+		// PTY bridge.  rmnet_* is a collection of PDP muxes, while at_mdm* and
+		// at_usb* are endpoints owned by atfwd; none represent another modem.
+		// Probing each one would serialize a complete AT sweep over the same
+		// bridge and starve the WUSP collector for minutes.
+		return []string{"/dev/ttyOUT2"}, nil
 	}
 
 	// 1. sysfs: WWAN network interfaces (most reliable)
@@ -527,16 +539,15 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 	const sendBridge = "/usrdata/simpleadmin/www/cgi-bin/send_sms"
 	if filepath.Base(c.findATPort(devicePath)) == "ttyOUT2" {
 		if info, err := os.Stat(sendBridge); err == nil && !info.IsDir() {
-			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, "timeout", "40", sendBridge)
-			cmd.Env = append(os.Environ(), "QUERY_STRING=number="+url.QueryEscape(phoneNumber)+"&msg="+url.QueryEscape(message))
-			out, err := cmd.CombinedOutput()
-			if ctx.Err() != nil {
+			atBridgeMu.Lock()
+			defer atBridgeMu.Unlock()
+			reapStaleATBridgeHelpers("/dev/ttyOUT2", 10*time.Second)
+			out, err := runVendorCGI(sendBridge, "number="+url.QueryEscape(phoneNumber)+"&msg="+url.QueryEscape(message), 45*time.Second)
+			if errors.Is(err, context.DeadlineExceeded) {
 				return fmt.Errorf("SMS send timed out")
 			}
-			if err != nil || atOutputError(string(out)) {
-				return fmt.Errorf("SMS send failed: %v: %s", err, strings.TrimSpace(string(out)))
+			if err != nil || atOutputError(out) {
+				return fmt.Errorf("SMS send failed: %v: %s", err, strings.TrimSpace(out))
 			}
 			return nil
 		}
@@ -663,6 +674,9 @@ func (c *atController) sendATCommandWithRetry(devicePath, cmd string, timeoutSec
 				return lines, nil
 			}
 			lastErr = err
+			if errors.Is(err, errATBridgeResponseMismatch) {
+				return lines, err
+			}
 			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 		}
 	}
@@ -730,23 +744,15 @@ func (c *atController) openATSessionOnPortWithRetry(port string, attempts int) (
 }
 
 func (c *atController) unlockStaleSocat(port string) {
+	// The SDX/RM520 bridge is a long-lived service owned by the firmware.
+	// Killing socat to "unlock" a transient client failure tears down the only
+	// usable AT path.  The lock left by an interrupted microcom invocation is
+	// the recoverable part, so clear only a demonstrably stale lock.
 	base := filepath.Base(strings.TrimSpace(port))
 	if base == "" || base == "." {
 		return
 	}
-	out, err := exec.Command("pgrep", "-f", "socat.*"+base).Output()
-	if err != nil {
-		return
-	}
-	for _, raw := range strings.Fields(string(out)) {
-		pid, err := strconv.Atoi(raw)
-		if err != nil || pid <= 0 || pid == os.Getpid() {
-			continue
-		}
-		if proc, err := os.FindProcess(pid); err == nil {
-			_ = proc.Signal(syscall.SIGTERM)
-		}
-	}
+	clearStaleMicrocomLock(filepath.Join("/var/lock", "LCK.."+base))
 }
 
 func (c *atController) enrichFromSMSTool(info *Info) bool {
@@ -912,8 +918,18 @@ func cleanATCommandOutput(raw, cmd string) []string {
 		if line == "" || line == cmd || line == "OK" || line == "ERROR" {
 			continue
 		}
+		// Quectel's vendor CGI includes the command that was actually relayed
+		// by microcom. Drop all AT command echoes, including stale ones, before
+		// handing the response to individual parsers.
+		upper := strings.ToUpper(line)
+		if upper == "AT" || strings.HasPrefix(upper, "AT+") || strings.HasPrefix(upper, "AT^") {
+			continue
+		}
+		lower := strings.ToLower(line)
 		if strings.HasPrefix(line, "AT command") || strings.HasPrefix(line, ">") ||
-			strings.HasPrefix(strings.ToLower(line), "content-type:") {
+			strings.HasPrefix(lower, "content-type:") ||
+			strings.HasPrefix(lower, "microcom:") ||
+			strings.HasPrefix(lower, "timeout:") {
 			continue
 		}
 		lines = append(lines, line)
@@ -2924,23 +2940,42 @@ func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string
 	if a.cgiAT != "" {
 		atBridgeMu.Lock()
 		defer atBridgeMu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		seconds := strconv.Itoa(max(1, int(timeout/time.Second)+1))
-		command := exec.CommandContext(ctx, "timeout", seconds, a.cgiAT)
-		command.Env = append(os.Environ(), "QUERY_STRING=atcmd="+url.QueryEscape(cmd))
-		output, err := command.CombinedOutput()
-		lines := cleanATCommandOutput(string(output), cmd)
-		if ctx.Err() != nil {
-			return lines, fmt.Errorf("AT command %q timed out", cmd)
+		// get_atcommand delegates to microcom.  The vendor CGI does not remove
+		// an empty or dead lock itself, causing every query to back off until the
+		// process timeout.  Clean it while holding the shared bridge lock so a
+		// live concurrent request cannot be disturbed.
+		attempts := 1
+		if isBridgeReadOnlyATCommand(cmd) {
+			// The bridge can retain one reply after a restarted caller. Repeating
+			// a read command is safe and drains that stale reply without risking a
+			// duplicated SMS or a repeated modem mutation.
+			attempts = 3
 		}
-		if atOutputError(string(output)) {
-			return lines, fmt.Errorf("AT command %q failed: %s", cmd, atErrorLine(string(output)))
+		var lastLines []string
+		for attempt := 0; attempt < attempts; attempt++ {
+			reapStaleATBridgeHelpers(a.port, 10*time.Second)
+			clearStaleMicrocomLock(filepath.Join("/var/lock", "LCK.."+filepath.Base(a.port)))
+			raw, err := runATBridgeCGI(a.cgiAT, cmd, timeout)
+			lines := cleanATCommandOutput(raw, cmd)
+			lastLines = lines
+			if !cgiATResponseMatches(raw, cmd) {
+				if attempt+1 < attempts {
+					continue
+				}
+				return lines, fmt.Errorf("%w: %q", errATBridgeResponseMismatch, cmd)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return lines, fmt.Errorf("AT command %q timed out", cmd)
+			}
+			if atOutputError(raw) {
+				return lines, fmt.Errorf("AT command %q failed: %s", cmd, atErrorLine(raw))
+			}
+			if err != nil {
+				return lines, fmt.Errorf("AT bridge %q failed: %w", cmd, err)
+			}
+			return lines, nil
 		}
-		if err != nil {
-			return lines, fmt.Errorf("AT bridge %q failed: %w", cmd, err)
-		}
-		return lines, nil
+		return lastLines, fmt.Errorf("%w: %q", errATBridgeResponseMismatch, cmd)
 	}
 	if a.microcom != "" {
 		atBridgeMu.Lock()
@@ -3010,6 +3045,80 @@ func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string
 	}
 }
 
+// runATBridgeCGI executes the vendor get_atcommand CGI in its own process
+// group. The CGI invokes microcom itself; killing only the parent shell leaves
+// that child holding the output pipe and makes exec.Wait block indefinitely.
+// On timeout we kill the CGI group, which releases that transient microcom but
+// intentionally leaves the firmware-owned socat bridge untouched.
+func runATBridgeCGI(cgiPath, atCommand string, timeout time.Duration) (string, error) {
+	return runVendorCGI(cgiPath, "atcmd="+url.QueryEscape(atCommand), timeout)
+}
+
+func runVendorCGI(cgiPath, query string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	command := exec.Command(cgiPath)
+	command.Env = append(os.Environ(), "QUERY_STRING="+query)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		return output.String(), err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		return output.String(), err
+	case <-ctx.Done():
+		// Negative PID addresses the dedicated process group created above.
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		<-done
+		return output.String(), ctx.Err()
+	}
+}
+
+func cgiATResponseMatches(raw, cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return false
+	}
+	// get_atcommand prints its requested command before a blank line, then the
+	// microcom response. Only the latter confirms which command was received by
+	// the modem; the first echo always matches even when the response is stale.
+	normalized := strings.ReplaceAll(raw, "\r", "")
+	_, response, found := strings.Cut(normalized, "\n\n")
+	if !found {
+		return false
+	}
+	for _, line := range strings.Split(response, "\n") {
+		if strings.TrimSpace(line) == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+func isBridgeReadOnlyATCommand(cmd string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(cmd))
+	if upper == "AT" || upper == "ATI" || strings.HasSuffix(upper, "?") {
+		return true
+	}
+	for _, prefix := range []string{
+		"AT+CGMI", "AT+CGMM", "AT+CGMR", "AT+GSN", "AT+CGSN", "AT+CIMI", "AT+CCID", "AT+ICCID", "AT+CNUM",
+		"AT+CSQ", "AT+CESQ", "AT+QCSQ", "AT+QENG=", "AT+QRSRP", "AT+QRSRQ", "AT+QSINR", "AT+QNWINFO", "AT+QSPN",
+		"AT+QCAINFO", "AT+QTEMP", "AT+CGPADDR", "AT+CGCONTRDP", "AT+QMAP=", "AT+QGPSLOC", "AT+QGPSGNMEA=",
+	} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func clearStaleMicrocomLock(path string) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -3023,4 +3132,82 @@ func clearStaleMicrocomLock(path string) {
 	if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
 		_ = os.Remove(path)
 	}
+}
+
+// reapStaleATBridgeHelpers clears orphaned CGI/microcom pairs left behind by
+// older agents. The vendor's permanent socat process is intentionally never a
+// candidate. A normal CGI round trip is measured in milliseconds, so a helper
+// older than the grace period can no longer be a healthy modem operation.
+func reapStaleATBridgeHelpers(port string, grace time.Duration) {
+	if filepath.Base(port) != "ttyOUT2" || grace <= 0 {
+		return
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	var stale []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		command := strings.ReplaceAll(string(cmdline), "\x00", " ")
+		isCGI := strings.Contains(command, "/cgi-bin/get_atcommand")
+		isMicrocom := strings.Contains(command, "microcom") && strings.Contains(command, filepath.Base(port))
+		if !isCGI && !isMicrocom {
+			continue
+		}
+		if age, ok := procAge(pid); ok && age >= grace {
+			stale = append(stale, pid)
+		}
+	}
+	for _, pid := range stale {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+func procAge(pid int) (time.Duration, bool) {
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0, false
+	}
+	end := strings.LastIndex(string(stat), ")")
+	if end < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(string(stat)[end+1:])
+	// /proc/<pid>/stat field 22 is starttime. The command name is field 2,
+	// so it is index 19 after trimming the closing parenthesis.
+	if len(fields) <= 19 {
+		return 0, false
+	}
+	startTicks, err := strconv.ParseFloat(fields[19], 64)
+	if err != nil {
+		return 0, false
+	}
+	uptime, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, false
+	}
+	uptimeFields := strings.Fields(string(uptime))
+	if len(uptimeFields) == 0 {
+		return 0, false
+	}
+	uptimeSeconds, err := strconv.ParseFloat(uptimeFields[0], 64)
+	if err != nil {
+		return 0, false
+	}
+	// Linux embedded targets, including this QTI image, report starttime in
+	// USER_HZ ticks (100Hz). The grace period is deliberately large enough
+	// that a small platform variation cannot affect live requests.
+	ageSeconds := uptimeSeconds - startTicks/100
+	if ageSeconds < 0 {
+		return 0, false
+	}
+	return time.Duration(ageSeconds * float64(time.Second)), true
 }

@@ -2,7 +2,11 @@
 
 package modem
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseQuectelServingCellLTE(t *testing.T) {
 	info := &Info{}
@@ -26,6 +30,38 @@ func TestParseQuectelServingCellLTE(t *testing.T) {
 	}
 	if info.Signal.RSRP != -97 || info.Signal.RSRQ != -8 || info.Signal.RSSI != -68 || info.Signal.SINR != 15 {
 		t.Fatalf("signal=%+v", info.Signal)
+	}
+}
+
+func TestCGIATResponseMatchesOnlyMicrocomReply(t *testing.T) {
+	raw := "Content-type: text/plain\nAT+QENG=\"servingcell\"\n\nAT+QENG=\"servingcell\"\r\n+QENG: \"servingcell\"\r\nOK\r\n"
+	if !cgiATResponseMatches(raw, `AT+QENG="servingcell"`) {
+		t.Fatal("expected matching CGI microcom reply")
+	}
+
+	stale := "Content-type: text/plain\nAT+QENG=\"servingcell\"\n\nAT+QSIMSTAT?\r\n+QSIMSTAT: 0,1\r\nOK\r\n"
+	if cgiATResponseMatches(stale, `AT+QENG="servingcell"`) {
+		t.Fatal("stale CGI reply must not match the requested command")
+	}
+}
+
+func TestCleanATCommandOutputDropsStaleATCommandEcho(t *testing.T) {
+	lines := cleanATCommandOutput("AT+QSIMSTAT?\n+QSIMSTAT: 0,1\nOK\n", "AT+QENG=\"servingcell\"")
+	if len(lines) != 1 || lines[0] != "+QSIMSTAT: 0,1" {
+		t.Fatalf("lines=%q", lines)
+	}
+}
+
+func TestBridgeReadOnlyATCommand(t *testing.T) {
+	for _, cmd := range []string{"AT", "ATI", "AT+QCSQ", `AT+QENG="servingcell"`, "AT+CGDCONT?"} {
+		if !isBridgeReadOnlyATCommand(cmd) {
+			t.Fatalf("%s should be safe to repeat", cmd)
+		}
+	}
+	for _, cmd := range []string{"AT+CMGS=12", "AT+CFUN=1", "AT+CGDCONT=1,\"IP\",\"internet\""} {
+		if isBridgeReadOnlyATCommand(cmd) {
+			t.Fatalf("%s must not be repeated", cmd)
+		}
 	}
 }
 
@@ -285,6 +321,26 @@ func TestParseATTextMessagesMultilineAndInvalidHeader(t *testing.T) {
 	})
 	if len(messages) != 1 || messages[0].Body != "first line\nsecond line" {
 		t.Fatalf("messages=%+v", messages)
+	}
+}
+
+func TestClearStaleMicrocomLockRemovesEmptyAndDeadLocks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "LCK..ttyOUT2")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStaleMicrocomLock(path)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty lock was not removed: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("99999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStaleMicrocomLock(path)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("dead lock was not removed: %v", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -24,6 +25,14 @@ type persistentDataModelCache struct {
 	refreshDone    chan struct{}
 	lastRefreshErr error
 	startOnce      sync.Once
+}
+
+type dataModelCacheRefreshStatus struct {
+	UpdatedAt          time.Time `json:"updated_at"`
+	State              string    `json:"state"`
+	FieldCount         int       `json:"field_count"`
+	CellularFieldCount int       `json:"cellular_field_count"`
+	Error              string    `json:"error,omitempty"`
 }
 
 func newPersistentDataModelCache(backend wusp.DataBackend, path string, interval time.Duration) *persistentDataModelCache {
@@ -164,12 +173,19 @@ func (c *persistentDataModelCache) beginRefresh() (chan struct{}, bool) {
 }
 
 func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan struct{}) (err error) {
+	status := dataModelCacheRefreshStatus{UpdatedAt: time.Now().UTC(), State: "error"}
 	defer func() {
 		c.mu.Lock()
 		c.refreshing = false
 		c.lastRefreshErr = err
 		close(done)
 		c.mu.Unlock()
+		if err != nil {
+			status.Error = err.Error()
+		} else {
+			status.State = "ready"
+		}
+		writeDataModelCacheRefreshStatus(c.path, status)
 	}()
 
 	msg, err := c.backend.Collect(ctx)
@@ -179,6 +195,12 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	if msg == nil || len(msg.Fields) == 0 {
 		return fmt.Errorf("collect data model cache: empty snapshot")
 	}
+	c.mu.RLock()
+	previous := cloneCachedMessage(c.msg)
+	c.mu.RUnlock()
+	msg = preserveLastCompleteCellularSnapshot(previous, msg)
+	status.FieldCount = len(msg.Fields)
+	status.CellularFieldCount = countCellularSnapshotFields(msg)
 	encoded, err := wusp.EncodeMessageLZ4(msg)
 	if err != nil {
 		return fmt.Errorf("encode data model cache: %w", err)
@@ -192,6 +214,91 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	objects, values := dataModelMessageCounts(msg)
 	log.Printf("[USP] DataModel cache refreshed: objects=%d values=%d file=%s", objects, values, c.path)
 	return nil
+}
+
+func countCellularSnapshotFields(msg *wusp.Message) int {
+	if msg == nil {
+		return 0
+	}
+	count := 0
+	for _, field := range msg.Fields {
+		if hasSnapshotPrefix(field.Path, cellularSnapshotPrefixes) {
+			count++
+		}
+	}
+	return count
+}
+
+func writeDataModelCacheRefreshStatus(cachePath string, status dataModelCacheRefreshStatus) {
+	data, err := json.Marshal(status)
+	if err != nil {
+		return
+	}
+	path := cachePath + ".status.json"
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+var cellularSnapshotPrefixes = []string{
+	"Device.Cellular.",
+	"Device.TrustedElements.SIM.",
+	"Device.WUSP_CellularTelemetry.",
+	"Device.WUSP_CellularControl.",
+	"Device.WUSP_GNSS.",
+	"Device.DeviceInfo.Location.1.",
+}
+
+// preserveLastCompleteCellularSnapshot avoids replacing a useful cellular
+// model with the three standard Cellular root values while an embedded modem
+// is rebooting, unavailable, or still being collected through a serialized AT
+// bridge. The host fields continue to refresh; only missing indexed cellular
+// objects are held until the next complete modem snapshot arrives.
+func preserveLastCompleteCellularSnapshot(previous, current *wusp.Message) *wusp.Message {
+	if current == nil || !hasIndexedCellularSnapshot(previous) || hasIndexedCellularSnapshot(current) {
+		return current
+	}
+	merged := cloneCachedMessage(current)
+	seen := make(map[string]struct{}, len(merged.Fields))
+	for _, field := range merged.Fields {
+		seen[field.Path] = struct{}{}
+	}
+	for _, field := range previous.Fields {
+		if !hasSnapshotPrefix(field.Path, cellularSnapshotPrefixes) {
+			continue
+		}
+		if _, exists := seen[field.Path]; exists {
+			continue
+		}
+		merged.Fields = append(merged.Fields, field)
+	}
+	return merged
+}
+
+func hasIndexedCellularSnapshot(msg *wusp.Message) bool {
+	if msg == nil {
+		return false
+	}
+	for _, field := range msg.Fields {
+		if strings.HasPrefix(field.Path, "Device.Cellular.Interface.") ||
+			strings.HasPrefix(field.Path, "Device.WUSP_CellularTelemetry.Interface.") ||
+			strings.HasPrefix(field.Path, "Device.WUSP_CellularControl.Interface.") ||
+			strings.HasPrefix(field.Path, "Device.WUSP_GNSS.Receiver.") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSnapshotPrefix(path string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *persistentDataModelCache) refreshAsync() {

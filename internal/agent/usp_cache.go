@@ -38,7 +38,7 @@ type dataModelCacheRefreshStatus struct {
 func newPersistentDataModelCache(backend wusp.DataBackend, path string, interval time.Duration) *persistentDataModelCache {
 	c := &persistentDataModelCache{backend: backend, path: path, interval: interval}
 	if c.interval <= 0 {
-		c.interval = 15 * time.Second
+		c.interval = time.Minute
 	}
 	c.load()
 	return c
@@ -105,6 +105,25 @@ func (c *persistentDataModelCache) Warmup(ctx context.Context) error {
 		}
 	}
 	return c.Refresh(ctx)
+}
+
+func (c *persistentDataModelCache) Patch(msg *wusp.Message) error {
+	if c == nil || msg == nil || len(msg.Fields) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	merged := mergeCachedMessageFields(c.msg, msg.Fields)
+	c.msg = cloneCachedMessage(merged)
+	c.mu.Unlock()
+
+	encoded, err := wusp.EncodeMessageLZ4(merged)
+	if err != nil {
+		return fmt.Errorf("encode data model cache patch: %w", err)
+	}
+	if err := writeCacheAtomically(c.path, encoded); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *persistentDataModelCache) Start(ctx context.Context) {
@@ -199,6 +218,7 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	previous := cloneCachedMessage(c.msg)
 	c.mu.RUnlock()
 	msg = preserveLastCompleteCellularSnapshot(previous, msg)
+	msg = preserveLastSMSInboxSnapshot(previous, msg)
 	status.FieldCount = len(msg.Fields)
 	status.CellularFieldCount = countCellularSnapshotFields(msg)
 	encoded, err := wusp.EncodeMessageLZ4(msg)
@@ -275,6 +295,46 @@ func preserveLastCompleteCellularSnapshot(previous, current *wusp.Message) *wusp
 		merged.Fields = append(merged.Fields, field)
 	}
 	return merged
+}
+
+func preserveLastSMSInboxSnapshot(previous, current *wusp.Message) *wusp.Message {
+	if previous == nil || current == nil {
+		return current
+	}
+	previousInbox := make([]wusp.Field, 0)
+	for _, field := range previous.Fields {
+		if !isSMSInboxJSONPath(field.Path) {
+			continue
+		}
+		if strings.TrimSpace(wusp.ValueToString(field.Val)) == "" {
+			continue
+		}
+		previousInbox = append(previousInbox, field)
+	}
+	if len(previousInbox) == 0 {
+		return current
+	}
+
+	merged := cloneCachedMessage(current)
+	byPath := make(map[string]int, len(merged.Fields))
+	for i, field := range merged.Fields {
+		byPath[field.Path] = i
+	}
+	for _, previousField := range previousInbox {
+		if i, ok := byPath[previousField.Path]; ok {
+			if strings.TrimSpace(wusp.ValueToString(merged.Fields[i].Val)) == "" {
+				merged.Fields[i] = previousField
+			}
+			continue
+		}
+		byPath[previousField.Path] = len(merged.Fields)
+		merged.Fields = append(merged.Fields, previousField)
+	}
+	return merged
+}
+
+func isSMSInboxJSONPath(path string) bool {
+	return strings.HasPrefix(path, "Device.WUSP_CellularControl.Interface.") && strings.HasSuffix(path, ".SMSInboxJSON")
 }
 
 func hasIndexedCellularSnapshot(msg *wusp.Message) bool {
@@ -354,6 +414,27 @@ func cloneCachedMessage(msg *wusp.Message) *wusp.Message {
 		return &wusp.Message{}
 	}
 	return &wusp.Message{DeviceID: msg.DeviceID, Timestamp: msg.Timestamp, Fields: append([]wusp.Field(nil), msg.Fields...)}
+}
+
+func mergeCachedMessageFields(msg *wusp.Message, fields []wusp.Field) *wusp.Message {
+	out := cloneCachedMessage(msg)
+	byPath := make(map[string]int, len(out.Fields))
+	for i, field := range out.Fields {
+		byPath[field.Path] = i
+	}
+	for _, field := range fields {
+		field.Path = strings.TrimSpace(field.Path)
+		if field.Path == "" {
+			continue
+		}
+		if i, ok := byPath[field.Path]; ok {
+			out.Fields[i] = field
+			continue
+		}
+		byPath[field.Path] = len(out.Fields)
+		out.Fields = append(out.Fields, field)
+	}
+	return out
 }
 
 func subsetCachedMessage(msg *wusp.Message, paths ...string) *wusp.Message {

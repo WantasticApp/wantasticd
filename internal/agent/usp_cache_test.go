@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,6 +46,18 @@ func (b *blockingCacheBackend) callCount() int {
 	defer b.mu.Unlock()
 	return b.calls
 }
+
+type staticCacheBackend struct {
+	msg *wusp.Message
+}
+
+func (b staticCacheBackend) Collect(context.Context, ...string) (*wusp.Message, error) {
+	return cloneCachedMessage(b.msg), nil
+}
+
+func (b staticCacheBackend) Set(context.Context, string, wusp.Value) error { return nil }
+
+func (b staticCacheBackend) Delete(context.Context, ...string) error { return nil }
 
 func TestPersistentDataModelCacheColdCollectSingleFlights(t *testing.T) {
 	backend := &blockingCacheBackend{started: make(chan struct{}), release: make(chan struct{})}
@@ -175,5 +188,61 @@ func TestCompleteCellularSnapshotReplacesPreviousFields(t *testing.T) {
 	value, ok := merged.Get("Device.Cellular.Interface.1.RSRP")
 	if !ok || value.AsInt() != -88 {
 		t.Fatalf("RSRP=%v want -88", value)
+	}
+}
+
+func TestPersistentDataModelCachePatchPersistsSMSInbox(t *testing.T) {
+	cachePath := t.TempDir() + "/model.cache"
+	cache := newPersistentDataModelCache(staticCacheBackend{
+		msg: func() *wusp.Message {
+			msg := wusp.NewMessage()
+			msg.Set("Device.DeviceInfo.HostName", wusp.String("sdx65"))
+			msg.Set("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON", wusp.String(""))
+			return msg
+		}(),
+	}, cachePath, time.Minute)
+
+	patch := cellularOperateStatus(1, "Success", "SMS inbox refreshed", `[{"storage":"ME","index":7,"body":"hello"}]`)
+	if err := cache.Patch(patch); err != nil {
+		t.Fatalf("Patch returned error: %v", err)
+	}
+
+	msg, err := cache.Collect(context.Background(), "Device.WUSP_CellularControl.")
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	value, ok := msg.Get("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON")
+	if !ok || wusp.ValueToString(value) == "" {
+		t.Fatalf("SMSInboxJSON was not patched into cache: %#v", msg.Fields)
+	}
+
+	reloaded := newPersistentDataModelCache(staticCacheBackend{}, cachePath, time.Minute)
+	msg, err = reloaded.Collect(context.Background(), "Device.WUSP_CellularControl.")
+	if err != nil {
+		t.Fatalf("reloaded Collect returned error: %v", err)
+	}
+	value, ok = msg.Get("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON")
+	if !ok || !strings.Contains(wusp.ValueToString(value), `"body":"hello"`) {
+		t.Fatalf("SMSInboxJSON was not persisted: %#v", msg.Fields)
+	}
+}
+
+func TestPreserveLastSMSInboxSnapshot(t *testing.T) {
+	previous := wusp.NewMessage()
+	previous.Set("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON", wusp.String(`[{"body":"kept"}]`))
+	previous.Set("Device.WUSP_CellularControl.Interface.1.LastCommandStatus", wusp.String("Success"))
+
+	current := wusp.NewMessage()
+	current.Set("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON", wusp.String(""))
+	current.Set("Device.WUSP_CellularControl.Interface.1.LastCommandStatus", wusp.String("Idle"))
+
+	merged := preserveLastSMSInboxSnapshot(previous, current)
+	value, ok := merged.Get("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON")
+	if !ok || wusp.ValueToString(value) != `[{"body":"kept"}]` {
+		t.Fatalf("SMSInboxJSON=%q want preserved inbox", wusp.ValueToString(value))
+	}
+	status, ok := merged.Get("Device.WUSP_CellularControl.Interface.1.LastCommandStatus")
+	if !ok || wusp.ValueToString(status) != "Idle" {
+		t.Fatalf("LastCommandStatus=%q want current status", wusp.ValueToString(status))
 	}
 }

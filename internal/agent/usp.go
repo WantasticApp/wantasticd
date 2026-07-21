@@ -363,6 +363,12 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 
 	log.Printf("[USP] handleFrameFromPeer: request id=%d method=%d from peer=%s isController=%v",
 		req.ID, req.Method, peerPublicKeyHex, r.isControllerPeer(peerPublicKeyHex))
+	if req.Method == wusp.USPAgentMethodOperate {
+		commandPath, commandErr := wusp.OperationCommandPath(req.ObjectPath, req.Metadata)
+		hasCommandMetadata := strings.TrimSpace(req.Metadata[wusp.MetadataKeyOperationCommandPath]) != ""
+		log.Printf("[USP] handleFrameFromPeer: operate id=%d object=%q command=%q command_metadata=%t err=%v",
+			req.ID, req.ObjectPath, commandPath, hasCommandMetadata, commandErr)
+	}
 
 	if !r.isControllerPeer(peerPublicKeyHex) {
 		r.stats.unauthorizedRequests.Add(1)
@@ -607,6 +613,9 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		return nil, nil
 	default:
 		if strings.HasPrefix(cmd, "Device.WUSP_CellularControl.Interface.") {
+			if strings.HasSuffix(cmd, ".") {
+				return nil, fmt.Errorf("%w: cellular operation command metadata is missing; update the controller", wusp.ErrUSPPathUnsupported)
+			}
 			return r.handleCellularOperate(ctx, cmd, input)
 		}
 		return nil, wusp.ErrUSPPathUnsupported

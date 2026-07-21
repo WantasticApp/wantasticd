@@ -378,7 +378,14 @@ func (a *USPAgent) Add(objectPath string, initial *Message) ([]string, error) {
 	}
 
 	values := a.snapshotValues()
-	instanceValues, actualObjectPath, err := nextObjectInstance(values, objectPath, canonical)
+	instanceRequestPath := objectPath
+	if canonicalParamPath(objectPath) != canonical {
+		// USP Add addresses a table (for example, Rule.), while the data model
+		// describes the instances that table creates (Rule.{i}.). Materialize the
+		// final instance selector only for the in-memory fallback.
+		instanceRequestPath = strings.TrimSuffix(objectPath, ".") + ".{i}."
+	}
+	instanceValues, actualObjectPath, err := nextObjectInstance(values, instanceRequestPath, canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -1009,6 +1016,16 @@ func lookupObjectDefinition(path string) (Object, string, bool) {
 	for _, object := range AllDeviceObjects {
 		if object.Path == canonical {
 			return object, canonical, true
+		}
+	}
+	// USP Add targets a multi-instance table path without the final instance
+	// selector. The generated TR-181 model contains the row shape instead.
+	// Accept the table spelling while retaining the row canonical path for
+	// instance allocation and parameter validation.
+	addCanonical := strings.TrimSuffix(canonical, ".") + ".{i}."
+	for _, object := range AllDeviceObjects {
+		if object.MultiInstance && object.Path == addCanonical {
+			return object, addCanonical, true
 		}
 	}
 	return Object{}, canonical, false

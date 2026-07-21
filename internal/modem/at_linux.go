@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -34,6 +38,11 @@ type atController struct{}
 // cellular and GNSS collectors. Concurrent CGI/microcom calls corrupt replies
 // and leave helper processes behind.
 var atBridgeMu sync.Mutex
+
+// SMS storage and text mode are modem-global state. Keep send/list/delete
+// operations together so a collector or a second WUSP request cannot change
+// CPMS/CMGF halfway through another SMS transaction.
+var smsOperationMu sync.Mutex
 
 const smsToolDevicePath = "sms_tool"
 
@@ -518,6 +527,9 @@ func (c *atController) readQuectelNMEA(devicePath, sentenceType string) (string,
 }
 
 func (c *atController) SendSMS(devicePath string, phoneNumber, message string) error {
+	smsOperationMu.Lock()
+	defer smsOperationMu.Unlock()
+
 	phoneNumber = strings.TrimSpace(phoneNumber)
 	message = strings.TrimSpace(message)
 	if phoneNumber == "" || message == "" {
@@ -530,8 +542,8 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 		return fmt.Errorf("SMS message exceeds 1600 bytes")
 	}
 	if smsToolAvailable() {
-		cmd := exec.Command("sms_tool", "send", phoneNumber, message)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		out, err := runSMSToolSMS(40*time.Second, "send", phoneNumber, message)
+		if err != nil {
 			return fmt.Errorf("sms_tool send failed: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 		return nil
@@ -556,44 +568,95 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 }
 
 func (c *atController) ListSMS(devicePath string) (string, error) {
+	smsOperationMu.Lock()
+	defer smsOperationMu.Unlock()
+
 	if smsToolAvailable() {
-		out, err := exec.Command("sms_tool", "-j", "recv").CombinedOutput()
+		out, err := runSMSToolSMS(25*time.Second, "-j", "recv")
 		if err != nil {
 			return "", fmt.Errorf("sms_tool recv failed: %w: %s", err, strings.TrimSpace(string(out)))
 		}
-		return strings.TrimSpace(string(out)), nil
+		return normalizeSMSInboxJSON(string(out))
 	}
-	lines, err := c.sendATCommand(devicePath, `AT+CMGF=1;+CPMS="ME","ME","ME";+CMGL="ALL"`, 30)
-	if err != nil {
-		return "", err
+	var messages []atTextMessage
+	var failures []string
+	for _, storage := range []string{"SM", "ME"} {
+		lines, err := c.sendATCommandWithRetry(devicePath, fmt.Sprintf(`AT+CMGF=1;+CPMS="%s";+CMGL="ALL"`, storage), 12, 1)
+		if err != nil {
+			failures = append(failures, storage+": "+err.Error())
+			continue
+		}
+		parsed := parseATTextMessages(lines)
+		for i := range parsed {
+			parsed[i].Storage = storage
+		}
+		messages = append(messages, parsed...)
 	}
-	payload, err := json.Marshal(parseATTextMessages(lines))
+	if len(messages) == 0 && len(failures) == 2 {
+		return "", fmt.Errorf("list SMS failed: %s", strings.Join(failures, "; "))
+	}
+	payload, err := json.Marshal(messages)
 	return string(payload), err
 }
 
 func (c *atController) DeleteSMS(devicePath string, index string) error {
+	smsOperationMu.Lock()
+	defer smsOperationMu.Unlock()
+
 	index = strings.TrimSpace(index)
-	idx, err := strconv.Atoi(index)
-	if err != nil || idx <= 0 {
-		return fmt.Errorf("SMS index must be a positive integer")
-	}
 	if smsToolAvailable() {
-		cmd := exec.Command("sms_tool", "delete", index)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		out, err := runSMSToolSMS(20*time.Second, "delete", index)
+		if err != nil {
 			return fmt.Errorf("sms_tool delete failed: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 		return nil
 	}
-	_, err = c.sendATCommand(devicePath, "AT+CMGD="+strconv.Itoa(idx), 15)
+	if strings.EqualFold(index, "all") {
+		var failures []string
+		for _, storage := range []string{"SM", "ME"} {
+			if _, err := c.sendATCommand(devicePath, fmt.Sprintf(`AT+CMGF=1;+CPMS="%s";+CMGD=1,4`, storage), 20); err != nil {
+				failures = append(failures, storage+": "+err.Error())
+			}
+		}
+		if len(failures) == 2 {
+			return fmt.Errorf("delete all SMS failed: %s", strings.Join(failures, "; "))
+		}
+		return nil
+	}
+	storage := "SM"
+	indexParts := strings.SplitN(index, ":", 2)
+	if len(indexParts) == 2 {
+		storage = strings.ToUpper(strings.TrimSpace(indexParts[0]))
+		index = strings.TrimSpace(indexParts[1])
+	}
+	if storage != "SM" && storage != "ME" {
+		return fmt.Errorf("SMS storage must be SM or ME")
+	}
+	idx, err := strconv.Atoi(index)
+	if err != nil || idx <= 0 {
+		return fmt.Errorf("SMS index must be a positive integer or storage:index")
+	}
+	_, err = c.sendATCommand(devicePath, fmt.Sprintf(`AT+CMGF=1;+CPMS="%s";+CMGD=%d`, storage, idx), 15)
 	return err
 }
 
+func runSMSToolSMS(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sms_tool", args...).CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return out, fmt.Errorf("timed out after %s", timeout)
+	}
+	return out, err
+}
+
 type atTextMessage struct {
-	Index  int    `json:"index"`
-	Status string `json:"status,omitempty"`
-	Number string `json:"number,omitempty"`
-	Time   string `json:"time,omitempty"`
-	Body   string `json:"body,omitempty"`
+	Storage string `json:"storage,omitempty"`
+	Index   int    `json:"index"`
+	Status  string `json:"status,omitempty"`
+	Number  string `json:"number,omitempty"`
+	Time    string `json:"time,omitempty"`
+	Body    string `json:"body,omitempty"`
 }
 
 func parseATTextMessages(lines []string) []atTextMessage {
@@ -626,10 +689,148 @@ func parseATTextMessages(lines []string) []atTextMessage {
 			if out[len(out)-1].Body != "" {
 				out[len(out)-1].Body += "\n"
 			}
-			out[len(out)-1].Body += line
+			out[len(out)-1].Body += normalizeSMSBody(line)
 		}
 	}
+	for i := range out {
+		out[i].Status = sanitizeSMSText(out[i].Status)
+		out[i].Number = sanitizeSMSText(out[i].Number)
+		out[i].Time = sanitizeSMSText(out[i].Time)
+		out[i].Body = normalizeSMSBody(out[i].Body)
+	}
 	return out
+}
+
+// normalizeSMSInboxJSON makes sms_tool output safe to persist and display. It
+// preserves the tool's JSON shape while normalizing textual values, so modem
+// firmware can add metadata without forcing a portal schema change.
+func normalizeSMSInboxJSON(raw string) (string, error) {
+	var payload any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return "", fmt.Errorf("sms_tool returned invalid JSON: %w", err)
+	}
+	normalized, ok := normalizeSMSJSONValue(payload, "")
+	if !ok {
+		return "", errors.New("sms_tool returned an unsupported JSON payload")
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return "", fmt.Errorf("encode normalized SMS inbox: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func normalizeSMSJSONValue(value any, field string) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		normalized := make(map[string]any, len(typed))
+		for key, child := range typed {
+			value, ok := normalizeSMSJSONValue(child, key)
+			if !ok {
+				return nil, false
+			}
+			normalized[key] = value
+		}
+		return normalized, true
+	case []any:
+		normalized := make([]any, len(typed))
+		for i, child := range typed {
+			value, ok := normalizeSMSJSONValue(child, field)
+			if !ok {
+				return nil, false
+			}
+			normalized[i] = value
+		}
+		return normalized, true
+	case string:
+		if isSMSBodyField(field) {
+			return normalizeSMSBody(typed), true
+		}
+		return sanitizeSMSText(typed), true
+	case nil, bool, float64:
+		return value, true
+	default:
+		return nil, false
+	}
+}
+
+func isSMSBodyField(field string) bool {
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "body", "message", "text", "content":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeSMSBody(value string) string {
+	value = strings.TrimSpace(value)
+	if decoded, ok := decodeExplicitUCS2(value); ok {
+		value = decoded
+	}
+	return sanitizeSMSText(value)
+}
+
+// Quectel integrations sometimes mark text-mode UCS-2 explicitly. Decoding
+// only marked or BOM-prefixed data avoids corrupting ordinary hexadecimal OTPs.
+func decodeExplicitUCS2(value string) (string, bool) {
+	encoded := strings.TrimSpace(value)
+	upper := strings.ToUpper(encoded)
+	explicit := false
+	for _, prefix := range []string{"UCS2:", "UCS-2:", "UTF16BE:"} {
+		if strings.HasPrefix(upper, prefix) {
+			encoded = strings.TrimSpace(encoded[len(prefix):])
+			explicit = true
+			break
+		}
+	}
+	if len(encoded) < 4 || len(encoded)%4 != 0 {
+		return "", false
+	}
+	bytes, err := hex.DecodeString(encoded)
+	if err != nil {
+		return "", false
+	}
+
+	littleEndian := len(bytes) >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe
+	hasBOM := littleEndian || (len(bytes) >= 2 && bytes[0] == 0xfe && bytes[1] == 0xff)
+	if !explicit && !hasBOM {
+		return "", false
+	}
+	if hasBOM {
+		bytes = bytes[2:]
+	}
+	if len(bytes) == 0 || len(bytes)%2 != 0 {
+		return "", false
+	}
+
+	units := make([]uint16, 0, len(bytes)/2)
+	for i := 0; i < len(bytes); i += 2 {
+		if littleEndian {
+			units = append(units, uint16(bytes[i])|uint16(bytes[i+1])<<8)
+		} else {
+			units = append(units, uint16(bytes[i])<<8|uint16(bytes[i+1]))
+		}
+	}
+	decoded := string(utf16.Decode(units))
+	if strings.ContainsRune(decoded, unicode.ReplacementChar) {
+		return "", false
+	}
+	return decoded, true
+}
+
+func sanitizeSMSText(value string) string {
+	value = strings.ToValidUTF8(value, string(utf8.RuneError))
+	value = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
+			return -1
+		}
+		return r
+	}, value)
+	return strings.TrimSpace(value)
 }
 
 func validSMSPhoneNumber(value string) bool {

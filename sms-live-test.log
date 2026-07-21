@@ -1,0 +1,3 @@
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -o bin/wusp-device-test ./cmd/test
+No authorized ADB device. Set ADB_SERIAL when more than one device is attached.
+make: *** [Makefile:121: adb-test-run] Error 1

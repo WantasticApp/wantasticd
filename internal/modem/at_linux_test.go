@@ -3,6 +3,7 @@
 package modem
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -321,6 +322,28 @@ func TestParseATTextMessagesMultilineAndInvalidHeader(t *testing.T) {
 	})
 	if len(messages) != 1 || messages[0].Body != "first line\nsecond line" {
 		t.Fatalf("messages=%+v", messages)
+	}
+}
+
+func TestSMSInboxNormalizationSanitizesAndDecodesMarkedUCS2(t *testing.T) {
+	messages := parseATTextMessages([]string{
+		`+CMGL: 8,"REC UNREAD","+212700000000",,"26/07/21,09:04:11+04"`,
+		`UCS2:00480065006C006C006F`,
+	})
+	if len(messages) != 1 || messages[0].Body != "Hello" {
+		t.Fatalf("messages=%+v", messages)
+	}
+
+	payload, err := normalizeSMSInboxJSON(`[{"storage":"SM","index":8,"number":"+212700000000\u0000","body":"UCS2:00480069\u202e"}]`)
+	if err != nil {
+		t.Fatalf("normalizeSMSInboxJSON: %v", err)
+	}
+	var normalized []atTextMessage
+	if err := json.Unmarshal([]byte(payload), &normalized); err != nil {
+		t.Fatalf("unmarshal normalized SMS: %v", err)
+	}
+	if len(normalized) != 1 || normalized[0].Number != "+212700000000" || normalized[0].Body != "Hi" {
+		t.Fatalf("normalized=%+v", normalized)
 	}
 }
 

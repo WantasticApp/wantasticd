@@ -1118,12 +1118,10 @@ func wuspRetryDelay(attempt int) time.Duration {
 	return delay
 }
 
-// uspReannounceInterval is how often we re-send OnBoardRequest after the
-// initial successful send. This handles controller restarts transparently —
-// the controller uses OnBoardRequest as the sole discovery mechanism for new
-// WUSP peers (no probing). Must be less than activeHandshakeWindow (8 min)
-// so the tunnel is always considered live when the re-announce fires.
-const uspReannounceInterval = 2 * time.Minute
+// uspReannounceInterval is the WUSP liveness heartbeat after the initial
+// successful send. It keeps controller reachability fresh across transient
+// routing changes without waiting for a user-triggered sync.
+const uspReannounceInterval = 45 * time.Second
 
 // runInit drives the WUSP initialization loop with grouped retry backoff.
 // After the first successful OnBoardRequest it keeps re-announcing at

@@ -133,6 +133,37 @@ func TestIntegration_GetSupportedProtocol(t *testing.T) {
 
 // ── GetSupportedDM ───────────────────────────────────────────────────────────
 
+// TestIntegration_OperateCommandPathMetadataSurvivesWire verifies the complete
+// controller-to-agent request path keeps the TR-181 command separate from its
+// parent object path. The controller needs the object path for selectors while
+// the agent needs the command path to dispatch the requested action.
+func TestIntegration_OperateCommandPathMetadataSurvivesWire(t *testing.T) {
+	rt := newTestUSPRuntime(t)
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+	const commandPath = objectPath + "RefreshGNSS()"
+
+	var invoked string
+	rt.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
+		OperateHandler: func(_ context.Context, path string, _ *wusp.Message, _ map[string]string) (*wusp.Message, error) {
+			invoked = path
+			return wusp.NewMessage(), nil
+		},
+	})
+
+	resp := ctrlRequest(t, rt, wusp.USPAgentRequest{
+		ID:         integrationNextID(),
+		Method:     wusp.USPAgentMethodOperate,
+		ObjectPath: objectPath,
+		Metadata:   wusp.WithOperationCommandPath(nil, commandPath),
+	})
+	if resp.Error != "" {
+		t.Fatalf("operate response error=%q", resp.Error)
+	}
+	if invoked != commandPath {
+		t.Fatalf("operate command=%q want %q", invoked, commandPath)
+	}
+}
+
 // TestIntegration_GetSupportedDM verifies that the agent returns a populated
 // data-model descriptor (used by the controller for schema-aware gets/sets).
 func TestIntegration_GetSupportedDM(t *testing.T) {

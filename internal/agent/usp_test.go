@@ -68,6 +68,20 @@ func TestUSPRuntimeHandlesControllerRequest(t *testing.T) {
 	}
 }
 
+func TestUSPRuntimeCellularOperateRequiresCommandPath(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+
+	_, err := runtime.handleOperate(
+		context.Background(),
+		"Device.WUSP_CellularControl.Interface.1.",
+		nil,
+		nil,
+	)
+	if !errors.Is(err, wusp.ErrUSPPathUnsupported) {
+		t.Fatalf("cellular operate error=%v, want unsupported path", err)
+	}
+}
+
 func TestUSPRuntimeCallController(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	transport := runtime.transport.(*fakeUSPTransport)

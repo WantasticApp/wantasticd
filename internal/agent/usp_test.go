@@ -82,6 +82,29 @@ func TestUSPRuntimeCellularOperateRequiresCommandPath(t *testing.T) {
 	}
 }
 
+func TestCellularOperateCommandFallbackUsesInputHint(t *testing.T) {
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+	input := wusp.NewMessage()
+	input.Set(objectPath+"LastCommandOutput", wusp.String("SendSMS"))
+
+	commandPath := cellularOperateCommandFallback(objectPath, input)
+	if commandPath != objectPath+"SendSMS()" {
+		t.Fatalf("fallback command=%q want %q", commandPath, objectPath+"SendSMS()")
+	}
+}
+
+func TestCellularOperateCommandFallbackInfersSMS(t *testing.T) {
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+	input := wusp.NewMessage()
+	input.Set(objectPath+"SMS.PhoneNumber", wusp.String("+212709251456"))
+	input.Set(objectPath+"SMS.Message", wusp.String("hello"))
+
+	commandPath := cellularOperateCommandFallback(objectPath, input)
+	if commandPath != objectPath+"SendSMS()" {
+		t.Fatalf("fallback command=%q want %q", commandPath, objectPath+"SendSMS()")
+	}
+}
+
 func TestUSPRuntimeCallController(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	transport := runtime.transport.(*fakeUSPTransport)

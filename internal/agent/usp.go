@@ -617,11 +617,65 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 	default:
 		if strings.HasPrefix(cmd, "Device.WUSP_CellularControl.Interface.") {
 			if strings.HasSuffix(cmd, ".") {
-				return nil, fmt.Errorf("%w: cellular operation command metadata is missing; update the controller", wusp.ErrUSPPathUnsupported)
+				recovered := cellularOperateCommandFallback(cmd, input)
+				if recovered == "" {
+					return nil, fmt.Errorf("%w: cellular operation command metadata is missing; update the controller", wusp.ErrUSPPathUnsupported)
+				}
+				log.Printf("[USP] Recovered cellular Operate command from input hint: %s", recovered)
+				cmd = recovered
 			}
 			return r.handleCellularOperate(ctx, cmd, input)
 		}
 		return nil, wusp.ErrUSPPathUnsupported
+	}
+}
+
+func cellularOperateCommandFallback(objectPath string, input *wusp.Message) string {
+	if !strings.HasPrefix(objectPath, "Device.WUSP_CellularControl.Interface.") || !strings.HasSuffix(objectPath, ".") {
+		return ""
+	}
+	operation := normalizeCellularOperationHint(cellularInputString(input, "Operation", "Command", "LastCommandOutput"))
+	if operation == "" {
+		switch {
+		case cellularInputString(input, "PhoneNumber", "Message", "To", "Body") != "":
+			operation = "SendSMS"
+		case cellularInputString(input, "DeleteIndex", "SMSIndex", "Index") != "":
+			operation = "DeleteSMS"
+		case cellularInputString(input, "APN", "APNPDPType", "APNProfileNumber", "PDPType", "Profile") != "":
+			operation = "ApplyAPN"
+		case cellularInputString(input, "ModemFunctionality", "Mode") != "":
+			operation = "SetFunctionality"
+		case cellularInputString(input, "SIMSlot", "Slot") != "":
+			operation = "SwitchSIM"
+		case cellularInputString(input, "IMEIOverride", "IMEI") != "":
+			operation = "SetIMEI"
+		}
+	}
+	if !supportedCellularOperate(operation) {
+		return ""
+	}
+	return objectPath + operation + "()"
+}
+
+func normalizeCellularOperationHint(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "operation:")
+	value = strings.TrimPrefix(value, "Operation:")
+	value = strings.TrimPrefix(value, "operation=")
+	value = strings.TrimPrefix(value, "Operation=")
+	value = strings.TrimSpace(strings.TrimSuffix(value, "()"))
+	if separator := strings.LastIndex(value, "."); separator >= 0 && separator < len(value)-1 {
+		value = value[separator+1:]
+	}
+	return value
+}
+
+func supportedCellularOperate(operation string) bool {
+	switch operation {
+	case "SetFunctionality", "SwitchSIM", "SetIMEI", "ApplyAPN", "StartGNSS", "StopGNSS", "RefreshGNSS", "SendSMS", "ListSMS", "DeleteSMS":
+		return true
+	default:
+		return false
 	}
 }
 

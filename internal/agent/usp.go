@@ -43,6 +43,7 @@ const (
 
 	uspWarmupAnnounceGrace       = 3 * time.Second
 	uspWarmupReannounceTimeout   = 5 * time.Second
+	uspDataModelCacheRefresh     = 60 * time.Second
 	wuspControlFragmentPaceEvery = 16
 	wuspControlFragmentPaceDelay = time.Millisecond
 )
@@ -50,6 +51,7 @@ const (
 type uspRuntime struct {
 	transport              uspTransport
 	agent                  *wusp.USPAgent
+	dataModelCache         *persistentDataModelCache
 	controllerPublicKeyHex string
 	deviceID               string
 	softwareVersion        string
@@ -226,9 +228,10 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	}
 
 	backend := platforms.NewBackend(platforms.Options{})
-	cachedBackend := newPersistentDataModelCache(backend, auth.PersistentFilePath("wusp-datamodel.cache"), 15*time.Second)
+	cachedBackend := newPersistentDataModelCache(backend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
 	runtime := &uspRuntime{
 		transport:              transport,
+		dataModelCache:         cachedBackend,
 		controllerPublicKeyHex: controllerPublicKeyHex,
 		deviceID:               wuspSerial,
 		softwareVersion:        softwareVersion,
@@ -642,7 +645,7 @@ func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, inpu
 	defer ctl.Close()
 	control, ok := ctl.(modemPkg.ControlController)
 	if !ok {
-		return cellularOperateStatus(index, "Error", "cellular control backend is not available", ""), nil
+		return r.cachedCellularOperateStatus(index, "Error", "cellular control backend is not available", ""), nil
 	}
 	devicePath := cellularOperateDevicePath(ctl, input, index)
 	var output string
@@ -703,12 +706,12 @@ func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, inpu
 	default:
 	}
 	if err != nil {
-		return cellularOperateStatus(index, "Error", err.Error(), ""), nil
+		return r.cachedCellularOperateStatus(index, "Error", err.Error(), ""), nil
 	}
 	if operation == "ListSMS" {
-		return cellularOperateStatus(index, "Success", "SMS inbox refreshed", output), nil
+		return r.cachedCellularOperateStatus(index, "Success", "SMS inbox refreshed", output), nil
 	}
-	return cellularOperateStatus(index, "Success", output, ""), nil
+	return r.cachedCellularOperateStatus(index, "Success", output, ""), nil
 }
 
 func cellularOperateDevicePath(ctl modemPkg.Controller, input *wusp.Message, index int) string {
@@ -760,6 +763,17 @@ func cellularOperateStatus(index int, status, output, smsInbox string) *wusp.Mes
 	msg.Set(prefix+"LastCommandOutput", wusp.String(output))
 	if smsInbox != "" {
 		msg.Set(prefix+"SMSInboxJSON", wusp.String(smsInbox))
+	}
+	return msg
+}
+
+func (r *uspRuntime) cachedCellularOperateStatus(index int, status, output, smsInbox string) *wusp.Message {
+	msg := cellularOperateStatus(index, status, output, smsInbox)
+	if r == nil || r.dataModelCache == nil {
+		return msg
+	}
+	if err := r.dataModelCache.Patch(msg); err != nil {
+		log.Printf("[USP] DataModel cache operation patch warning: continue_on_error=true err=%v", err)
 	}
 	return msg
 }

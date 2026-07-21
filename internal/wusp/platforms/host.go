@@ -456,8 +456,8 @@ type cellularMonitor struct {
 
 func newCellularMonitor() *cellularMonitor {
 	return &cellularMonitor{
-		interval: 10 * time.Second,
-		maxAge:   45 * time.Second,
+		interval: time.Minute,
+		maxAge:   2 * time.Minute,
 	}
 }
 

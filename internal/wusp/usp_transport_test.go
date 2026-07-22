@@ -569,6 +569,73 @@ func TestOperateRequestKeepsObjectAndCommandPathsDistinct(t *testing.T) {
 	}
 }
 
+func TestOperateRequestCarriesCellularSMSInputsByStringPath(t *testing.T) {
+	const commandPath = "Device.WUSP_CellularControl.Interface.1.SendSMS()"
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+
+	input := NewMessage()
+	input.Set(objectPath+"SMS.PhoneNumber", String("+212709251456"))
+	input.Set(objectPath+"SMS.Message", String("hello"))
+
+	frame, err := EncodeUSPAgentRequest(USPAgentRequest{
+		ID:         94,
+		Method:     USPAgentMethodOperate,
+		ObjectPath: objectPath,
+		Message:    input,
+		Metadata:   WithOperationCommandPath(nil, commandPath),
+	})
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest returned error: %v", err)
+	}
+	decoded, err := DecodeUSPAgentRequest(frame)
+	if err != nil {
+		t.Fatalf("DecodeUSPAgentRequest returned error: %v", err)
+	}
+	for path, want := range map[string]string{
+		objectPath + "SMS.PhoneNumber": "+212709251456",
+		objectPath + "SMS.Message":     "hello",
+	} {
+		got, ok := decoded.Message.Get(path)
+		if !ok {
+			t.Fatalf("decoded message missing %s", path)
+		}
+		if ValueToString(got) != want {
+			t.Fatalf("decoded %s=%q want %q", path, ValueToString(got), want)
+		}
+	}
+}
+
+func TestOperateRequestAllowsForwardCompatibleInputFields(t *testing.T) {
+	const commandPath = "Device.WUSP_CellularControl.Interface.1.SendSMS()"
+	const objectPath = "Device.WUSP_CellularControl.Interface.1."
+	const futurePath = objectPath + "SMS.FutureFlag"
+
+	input := NewMessage()
+	input.Set(futurePath, String("enabled"))
+
+	frame, err := EncodeUSPAgentRequest(USPAgentRequest{
+		ID:         95,
+		Method:     USPAgentMethodOperate,
+		ObjectPath: objectPath,
+		Message:    input,
+		Metadata:   WithOperationCommandPath(nil, commandPath),
+	})
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest returned error: %v", err)
+	}
+	decoded, err := DecodeUSPAgentRequest(frame)
+	if err != nil {
+		t.Fatalf("DecodeUSPAgentRequest returned error: %v", err)
+	}
+	got, ok := decoded.Message.Get(futurePath)
+	if !ok {
+		t.Fatalf("decoded message missing forward-compatible input %s", futurePath)
+	}
+	if ValueToString(got) != "enabled" {
+		t.Fatalf("decoded forward-compatible input=%q want enabled", ValueToString(got))
+	}
+}
+
 func TestUSPAgentHandleOperateUsesMetadataCommandPath(t *testing.T) {
 	const commandPath = "Device.WUSP_CellularControl.Interface.1.RefreshGNSS()"
 	const objectPath = "Device.WUSP_CellularControl.Interface.1."

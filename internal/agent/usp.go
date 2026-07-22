@@ -829,7 +829,28 @@ func (r *uspRuntime) cachedCellularOperateStatus(index int, status, output, smsI
 	if err := r.dataModelCache.Patch(msg); err != nil {
 		log.Printf("[USP] DataModel cache operation patch warning: continue_on_error=true err=%v", err)
 	}
+	r.emitCellularOperateValueChanges(msg)
 	return msg
+}
+
+func (r *uspRuntime) emitCellularOperateValueChanges(msg *wusp.Message) {
+	if r == nil || r.agent == nil || msg == nil || len(msg.Fields) == 0 {
+		return
+	}
+	fields := append([]wusp.Field(nil), msg.Fields...)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		for _, field := range fields {
+			if !strings.HasPrefix(field.Path, "Device.WUSP_CellularControl.Interface.") {
+				continue
+			}
+			if err := r.agent.EmitValueChange(ctx, field.Path, wusp.ValueToString(field.Val)); err != nil {
+				log.Printf("[USP] Cellular operate notify warning: continue_on_error=true path=%q err=%v", field.Path, err)
+				return
+			}
+		}
+	}()
 }
 
 func cellularGNSSOutput(info *modemPkg.GNSSInfo) string {

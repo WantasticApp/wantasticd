@@ -347,6 +347,35 @@ func TestSMSInboxNormalizationSanitizesAndDecodesMarkedUCS2(t *testing.T) {
 	}
 }
 
+func TestSMSInboxNormalizationDecodesLikelyBareUCS2Body(t *testing.T) {
+	const bareUCS2 = "00480069002C002000690074002700730020004100540054002E0020005500730065002000570069002D0046006900200074006F002000680065006C0070002E"
+	payload, err := normalizeSMSInboxJSON(`[{"storage":"ME","index":17,"number":"7535","body":"` + bareUCS2 + `"}]`)
+	if err != nil {
+		t.Fatalf("normalizeSMSInboxJSON: %v", err)
+	}
+	var normalized []atTextMessage
+	if err := json.Unmarshal([]byte(payload), &normalized); err != nil {
+		t.Fatalf("unmarshal normalized SMS: %v", err)
+	}
+	if len(normalized) != 1 || normalized[0].Body != "Hi, it's ATT. Use Wi-Fi to help." {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+}
+
+func TestSMSInboxNormalizationLeavesAmbiguousHexBodyAlone(t *testing.T) {
+	payload, err := normalizeSMSInboxJSON(`[{"storage":"ME","index":18,"number":"7535","body":"DEADBEEF12345678"}]`)
+	if err != nil {
+		t.Fatalf("normalizeSMSInboxJSON: %v", err)
+	}
+	var normalized []atTextMessage
+	if err := json.Unmarshal([]byte(payload), &normalized); err != nil {
+		t.Fatalf("unmarshal normalized SMS: %v", err)
+	}
+	if len(normalized) != 1 || normalized[0].Body != "DEADBEEF12345678" {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+}
+
 func TestClearStaleMicrocomLockRemovesEmptyAndDeadLocks(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "LCK..ttyOUT2")

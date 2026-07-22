@@ -767,6 +767,8 @@ func normalizeSMSBody(value string) string {
 	value = strings.TrimSpace(value)
 	if decoded, ok := decodeExplicitUCS2(value); ok {
 		value = decoded
+	} else if decoded, ok := decodeLikelyUCS2Body(value); ok {
+		value = decoded
 	}
 	return sanitizeSMSText(value)
 }
@@ -817,6 +819,69 @@ func decodeExplicitUCS2(value string) (string, bool) {
 		return "", false
 	}
 	return decoded, true
+}
+
+// Some Quectel SMS helpers return UTF-16BE message bodies as bare hex without
+// an encoding marker. Decode only when the shape is strongly text-like so OTPs,
+// IDs, and other genuine hexadecimal payloads remain untouched.
+func decodeLikelyUCS2Body(value string) (string, bool) {
+	encoded := strings.TrimSpace(value)
+	if len(encoded) < 16 || len(encoded)%4 != 0 || strings.ContainsAny(encoded, " \t\r\n") {
+		return "", false
+	}
+	for _, r := range encoded {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return "", false
+		}
+	}
+
+	bytes, err := hex.DecodeString(encoded)
+	if err != nil || len(bytes) < 8 || len(bytes)%2 != 0 {
+		return "", false
+	}
+	zeroHighBytes := 0
+	units := make([]uint16, 0, len(bytes)/2)
+	for i := 0; i < len(bytes); i += 2 {
+		if bytes[i] == 0 {
+			zeroHighBytes++
+		}
+		units = append(units, uint16(bytes[i])<<8|uint16(bytes[i+1]))
+	}
+	if zeroHighBytes*2 < len(units) {
+		return "", false
+	}
+
+	decoded := string(utf16.Decode(units))
+	if strings.ContainsRune(decoded, unicode.ReplacementChar) {
+		return "", false
+	}
+	decoded = sanitizeSMSText(decoded)
+	if !looksLikeHumanSMS(decoded) {
+		return "", false
+	}
+	return decoded, true
+}
+
+func looksLikeHumanSMS(value string) bool {
+	value = strings.TrimSpace(value)
+	if len([]rune(value)) < 4 {
+		return false
+	}
+	printable := 0
+	lettersOrSpaces := 0
+	for _, r := range value {
+		if r == '\n' || r == '\t' || unicode.IsPrint(r) {
+			printable++
+		}
+		if unicode.IsLetter(r) || unicode.IsSpace(r) {
+			lettersOrSpaces++
+		}
+	}
+	runes := len([]rune(value))
+	if runes == 0 || printable*100/runes < 90 {
+		return false
+	}
+	return lettersOrSpaces > 0 && lettersOrSpaces*100/runes >= 15
 }
 
 func sanitizeSMSText(value string) string {

@@ -45,11 +45,17 @@ var atBridgeMu sync.Mutex
 var smsOperationMu sync.Mutex
 
 const smsToolDevicePath = "sms_tool"
+const quectelATBridgePath = "/dev/ttyOUT2"
 
 // errATBridgeResponseMismatch means the vendor CGI relayed a stale response
 // from the persistent AT bridge. A control operation is deliberately not
 // retried after this error because its effect on the modem is unknown.
 var errATBridgeResponseMismatch = errors.New("AT bridge response did not match command")
+
+var atDeviceExists = func(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
 
 func (c *atController) Close() error { return nil }
 
@@ -67,13 +73,13 @@ func (c *atController) Discover() ([]string, error) {
 		}
 	}
 
-	if _, err := os.Stat("/dev/ttyOUT2"); err == nil {
+	if bridge := stableQuectelATBridge(); bridge != "" {
 		// QTI/Quectel embedded images expose the modem through this persistent
 		// PTY bridge.  rmnet_* is a collection of PDP muxes, while at_mdm* and
 		// at_usb* are endpoints owned by atfwd; none represent another modem.
 		// Probing each one would serialize a complete AT sweep over the same
 		// bridge and starve the WUSP collector for minutes.
-		return []string{"/dev/ttyOUT2"}, nil
+		return []string{bridge}, nil
 	}
 
 	// 1. sysfs: WWAN network interfaces (most reliable)
@@ -3140,12 +3146,38 @@ func setIntFromFlat(dst *int, flat map[string]string, keys ...string) {
 	}
 }
 
+func stableQuectelATBridge() string {
+	if atDeviceExists(quectelATBridgePath) {
+		return quectelATBridgePath
+	}
+	return ""
+}
+
+func isContendedQuectelATPort(path string) bool {
+	base := filepath.Base(strings.TrimSpace(path))
+	return strings.HasPrefix(base, "at_usb") || strings.HasPrefix(base, "at_mdm")
+}
+
+func normalizeATPortCandidate(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if isContendedQuectelATPort(path) {
+		if bridge := stableQuectelATBridge(); bridge != "" {
+			return bridge
+		}
+	}
+	return path
+}
+
 func (c *atController) findATPort(devicePath string) string {
+	devicePath = strings.TrimSpace(devicePath)
 	// If devicePath is already a serial port, use it directly
 	if strings.HasPrefix(devicePath, "/dev/tty") ||
 		strings.HasPrefix(devicePath, "/dev/at_mdm") ||
 		strings.HasPrefix(devicePath, "/dev/at_usb") {
-		return devicePath
+		return normalizeATPortCandidate(devicePath)
 	}
 
 	// For QMI/MBIM devices, find the companion AT port
@@ -3161,9 +3193,10 @@ func (c *atController) findATPort(devicePath string) string {
 	realPath, err := filepath.EvalSymlinks(sysPath + "/device")
 	if err != nil {
 		// Fallback: try common serial ports
-		for _, port := range []string{"/dev/at_mdm0", "/dev/at_usb0", "/dev/ttyUSB2", "/dev/ttyUSB1", "/dev/ttyUSB0", "/dev/ttyACM0"} {
-			if _, err := os.Stat(port); err == nil {
-				return port
+		for _, port := range []string{quectelATBridgePath, "/dev/ttyUSB2", "/dev/ttyUSB1", "/dev/ttyUSB0", "/dev/ttyACM0", "/dev/at_mdm0", "/dev/at_usb0"} {
+			candidate := normalizeATPortCandidate(port)
+			if atDeviceExists(candidate) {
+				return candidate
 			}
 		}
 		return ""
@@ -3176,8 +3209,9 @@ func (c *atController) findATPort(devicePath string) string {
 		entries, _ := os.ReadDir(m)
 		for _, e := range entries {
 			port := "/dev/" + e.Name()
-			if _, err := os.Stat(port); err == nil {
-				return port
+			candidate := normalizeATPortCandidate(port)
+			if atDeviceExists(candidate) {
+				return candidate
 			}
 		}
 	}

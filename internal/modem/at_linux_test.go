@@ -66,6 +66,60 @@ func TestBridgeReadOnlyATCommand(t *testing.T) {
 	}
 }
 
+func TestNormalizeATPortCandidatePrefersStableQuectelBridge(t *testing.T) {
+	oldExists := atDeviceExists
+	t.Cleanup(func() { atDeviceExists = oldExists })
+	atDeviceExists = func(path string) bool {
+		return path == quectelATBridgePath
+	}
+
+	for _, port := range []string{"/dev/at_usb0", "/dev/at_usb1", "/dev/at_mdm0"} {
+		if got := normalizeATPortCandidate(port); got != quectelATBridgePath {
+			t.Fatalf("normalizeATPortCandidate(%q)=%q want %q", port, got, quectelATBridgePath)
+		}
+	}
+	if got := normalizeATPortCandidate("/dev/ttyUSB2"); got != "/dev/ttyUSB2" {
+		t.Fatalf("tty candidate was changed: got %q", got)
+	}
+}
+
+func TestFindATPortAvoidsContendedQuectelNodesWhenBridgeExists(t *testing.T) {
+	oldExists := atDeviceExists
+	t.Cleanup(func() { atDeviceExists = oldExists })
+	exists := map[string]bool{
+		quectelATBridgePath: true,
+		"/dev/at_usb0":      true,
+		"/dev/at_mdm0":      true,
+	}
+	atDeviceExists = func(path string) bool {
+		return exists[path]
+	}
+
+	c := &atController{}
+	if got := c.findATPort("/dev/at_usb0"); got != quectelATBridgePath {
+		t.Fatalf("findATPort(/dev/at_usb0)=%q want %q", got, quectelATBridgePath)
+	}
+	if got := c.findATPort("/dev/at_mdm0"); got != quectelATBridgePath {
+		t.Fatalf("findATPort(/dev/at_mdm0)=%q want %q", got, quectelATBridgePath)
+	}
+	if got := c.findATPort("rmnet_data0"); got != quectelATBridgePath {
+		t.Fatalf("findATPort(rmnet_data0)=%q want %q", got, quectelATBridgePath)
+	}
+}
+
+func TestFindATPortKeepsLegacyATNodeWithoutBridge(t *testing.T) {
+	oldExists := atDeviceExists
+	t.Cleanup(func() { atDeviceExists = oldExists })
+	atDeviceExists = func(path string) bool {
+		return path == "/dev/at_usb0"
+	}
+
+	c := &atController{}
+	if got := c.findATPort("cdc-wdm0"); got != "/dev/at_usb0" {
+		t.Fatalf("findATPort(cdc-wdm0)=%q want /dev/at_usb0", got)
+	}
+}
+
 func TestParseQuectelNetworkInfo(t *testing.T) {
 	info := &Info{}
 	c := &atController{}

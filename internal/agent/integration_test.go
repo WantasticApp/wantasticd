@@ -315,28 +315,13 @@ func TestIntegration_OnBoardRequest(t *testing.T) {
 		t.Fatalf("initializeOnce: %v", err)
 	}
 
-	// Drain the transport channel — OnBoardRequest is fire-and-forget via SendWUSPToServer.
-	var frame []byte
-	select {
-	case frame = <-transport.sendCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout: no OnBoardRequest emitted on transport channel")
-	}
-
 	// Controller-side decode
-	req, err := wusp.DecodeUSPAgentRequest(frame)
-	if err != nil {
-		t.Fatalf("controller DecodeUSPAgentRequest: %v", err)
-	}
+	req, event := readMatchingOutboundEvent(t, transport, 2*time.Second, wusp.USPEventTypeOnBoardRequest)
 	if req.Method != wusp.USPAgentMethodNotify {
 		t.Fatalf("method=%v want Notify", req.Method)
 	}
 	if !wusp.IsEventNotifyRequest(req) {
 		t.Fatal("IsEventNotifyRequest returned false for OnBoardRequest")
-	}
-	event, err := wusp.DecodeEventFromRequest(req)
-	if err != nil {
-		t.Fatalf("DecodeEventFromRequest: %v", err)
 	}
 	if event.Type != wusp.USPEventTypeOnBoardRequest {
 		t.Fatalf("event.Type=%d want OnBoardRequest (%d)", event.Type, wusp.USPEventTypeOnBoardRequest)
@@ -652,18 +637,13 @@ func TestIntegration_CallControllerCorrelation(t *testing.T) {
 		resultCh <- callResult{resp, err}
 	}()
 
-	// Capture the outbound request from the agent
-	var outFrame []byte
-	select {
-	case outFrame = <-transport.sendCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout: no outbound frame from CallController")
-	}
-
-	req, err := wusp.DecodeUSPAgentRequest(outFrame)
-	if err != nil {
-		t.Fatalf("DecodeUSPAgentRequest(outbound): %v", err)
-	}
+	// Capture the outbound request from the agent. Value-change notifications
+	// may be in flight, so match the controller call instead of assuming FIFO.
+	req := readMatchingOutboundRequest(t, transport, 2*time.Second, func(req wusp.USPAgentRequest) bool {
+		return req.Method == wusp.USPAgentMethodGet &&
+			len(req.Paths) == 1 &&
+			req.Paths[0] == "Device.DeviceInfo.ModelName"
+	})
 
 	// Simulate the controller responding
 	respFrame, err := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{

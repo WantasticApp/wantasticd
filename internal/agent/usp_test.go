@@ -31,6 +31,47 @@ func (t *fakeUSPTransport) SendWUSPToServer(data []byte) error {
 
 func (t *fakeUSPTransport) IsServerConnected() bool { return true }
 
+func readMatchingOutboundRequest(t *testing.T, transport *fakeUSPTransport, timeout time.Duration, match func(wusp.USPAgentRequest) bool) wusp.USPAgentRequest {
+	t.Helper()
+
+	deadline := time.After(timeout)
+	for {
+		select {
+		case frame := <-transport.sendCh:
+			req, err := wusp.DecodeUSPAgentRequest(frame)
+			if err != nil {
+				t.Fatalf("DecodeUSPAgentRequest(outbound): %v", err)
+			}
+			if match == nil || match(req) {
+				return req
+			}
+		case <-deadline:
+			t.Fatal("timeout: expected outbound WUSP request was not emitted")
+		}
+	}
+}
+
+func readMatchingOutboundEvent(t *testing.T, transport *fakeUSPTransport, timeout time.Duration, eventType wusp.USPEventType) (wusp.USPAgentRequest, wusp.USPEvent) {
+	t.Helper()
+
+	var matchedEvent wusp.USPEvent
+	req := readMatchingOutboundRequest(t, transport, timeout, func(req wusp.USPAgentRequest) bool {
+		if req.Method != wusp.USPAgentMethodNotify || !wusp.IsEventNotifyRequest(req) {
+			return false
+		}
+		event, err := wusp.DecodeEventFromRequest(req)
+		if err != nil {
+			t.Fatalf("DecodeEventFromRequest: %v", err)
+		}
+		if event.Type != eventType {
+			return false
+		}
+		matchedEvent = event
+		return true
+	})
+	return req, matchedEvent
+}
+
 func TestUSPRuntimeHandlesControllerRequest(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 
@@ -105,6 +146,50 @@ func TestCellularOperateCommandFallbackInfersSMS(t *testing.T) {
 	}
 }
 
+func TestCachedCellularOperateStatusEmitsValueChanges(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	transport := runtime.transport.(*fakeUSPTransport)
+	const inbox = `[{"storage":"ME","index":1,"body":"hello"}]`
+
+	runtime.cachedCellularOperateStatus(1, "Success", "SMS inbox refreshed", inbox)
+
+	want := map[string]string{
+		"Device.WUSP_CellularControl.Interface.1.LastCommandStatus": "Success",
+		"Device.WUSP_CellularControl.Interface.1.LastCommandOutput": "SMS inbox refreshed",
+		"Device.WUSP_CellularControl.Interface.1.SMSInboxJSON":      inbox,
+	}
+	seen := make(map[string]string, len(want))
+	deadline := time.After(2 * time.Second)
+	for len(seen) < len(want) {
+		select {
+		case frame := <-transport.sendCh:
+			req, err := wusp.DecodeUSPAgentRequest(frame)
+			if err != nil {
+				t.Fatalf("DecodeUSPAgentRequest: %v", err)
+			}
+			if req.Method != wusp.USPAgentMethodNotify || !wusp.IsEventNotifyRequest(req) {
+				continue
+			}
+			event, err := wusp.DecodeEventFromRequest(req)
+			if err != nil {
+				t.Fatalf("DecodeEventFromRequest: %v", err)
+			}
+			if event.Type == wusp.USPEventTypeValueChange {
+				if _, ok := want[event.ObjPath]; ok {
+					seen[event.ObjPath] = event.ParamValue
+				}
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for cellular value-change events; seen=%v", seen)
+		}
+	}
+	for path, value := range want {
+		if seen[path] != value {
+			t.Fatalf("event %s=%q want %q (all=%v)", path, seen[path], value, seen)
+		}
+	}
+}
+
 func TestUSPRuntimeCallController(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	transport := runtime.transport.(*fakeUSPTransport)
@@ -123,11 +208,11 @@ func TestUSPRuntimeCallController(t *testing.T) {
 		})
 	}()
 
-	requestFrame := <-transport.sendCh
-	req, decodeErr := wusp.DecodeUSPAgentRequest(requestFrame)
-	if decodeErr != nil {
-		t.Fatalf("DecodeUSPAgentRequest: %v", decodeErr)
-	}
+	req := readMatchingOutboundRequest(t, transport, 2*time.Second, func(req wusp.USPAgentRequest) bool {
+		return req.Method == wusp.USPAgentMethodGet &&
+			len(req.Paths) == 1 &&
+			req.Paths[0] == "Device.DeviceInfo.ModelName"
+	})
 
 	responseFrame, encodeErr := wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
 		ID:     req.ID,
@@ -417,29 +502,14 @@ func TestUSPRuntimeOnBoardRequestEmit(t *testing.T) {
 		t.Fatalf("initializeOnce: %v", err)
 	}
 
-	var frame []byte
-	select {
-	case frame = <-transport.sendCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout: no frame sent by initializeOnce")
-	}
-
 	// The frame must decode as a USPAgentRequest with Method == Notify and
 	// event_type == 6 (OnBoardRequest).
-	req, err := wusp.DecodeUSPAgentRequest(frame)
-	if err != nil {
-		t.Fatalf("DecodeUSPAgentRequest: %v", err)
-	}
+	req, event := readMatchingOutboundEvent(t, transport, 2*time.Second, wusp.USPEventTypeOnBoardRequest)
 	if req.Method != wusp.USPAgentMethodNotify {
 		t.Fatalf("method=%v want Notify", req.Method)
 	}
 	if !wusp.IsEventNotifyRequest(req) {
 		t.Fatal("IsEventNotifyRequest returned false for OnBoardRequest frame")
-	}
-
-	event, err := wusp.DecodeEventFromRequest(req)
-	if err != nil {
-		t.Fatalf("DecodeEventFromRequest: %v", err)
 	}
 	if event.Type != wusp.USPEventTypeOnBoardRequest {
 		t.Fatalf("event.Type=%d want %d (OnBoardRequest)", event.Type, wusp.USPEventTypeOnBoardRequest)
@@ -532,7 +602,7 @@ func newTestUSPRuntime(tb testing.TB) *uspRuntime {
 			PublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 		},
 	}
-	transport := &fakeUSPTransport{sendCh: make(chan []byte, 4)}
+	transport := &fakeUSPTransport{sendCh: make(chan []byte, 2048)}
 	runtime, err := newUSPRuntime(cfg, transport, "test-0.0.0")
 	if err != nil {
 		tb.Fatalf("newUSPRuntime: %v", err)

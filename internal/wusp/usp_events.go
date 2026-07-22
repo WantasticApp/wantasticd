@@ -264,17 +264,22 @@ func EncodeEventToRequest(event USPEvent, id uint64) USPAgentRequest {
 	}
 
 	objPath := strings.TrimSpace(event.ObjPath)
+	paths := []string{}
+	if event.Type == USPEventTypeValueChange && objPath != "" && !isObjectPath(objPath) {
+		paths = []string{objPath}
+		objPath = parentObjectPath(objPath)
+	}
 	if isObjectPath(objPath) {
 		return USPAgentRequest{
 			ID:         id,
 			Method:     USPAgentMethodNotify,
 			ObjectPath: objPath,
+			Paths:      paths,
 			Message:    msg,
 			Metadata:   meta,
 		}
 	}
 	// Non-object paths (parameters, empty) go in Paths
-	paths := []string{}
 	if objPath != "" {
 		paths = []string{objPath}
 	}
@@ -285,6 +290,15 @@ func EncodeEventToRequest(event USPEvent, id uint64) USPAgentRequest {
 		Message:  msg,
 		Metadata: meta,
 	}
+}
+
+func parentObjectPath(path string) string {
+	path = strings.TrimSpace(path)
+	separator := strings.LastIndexByte(path, '.')
+	if separator < 0 {
+		return ""
+	}
+	return path[:separator+1]
 }
 
 // DecodeEventFromRequest extracts a USPEvent from an inbound USPAgentRequest.
@@ -307,7 +321,9 @@ func DecodeEventFromRequest(req USPAgentRequest) (USPEvent, error) {
 	}
 
 	objPath := req.ObjectPath
-	if objPath == "" && len(req.Paths) > 0 {
+	if USPEventType(typeVal) == USPEventTypeValueChange && len(req.Paths) > 0 {
+		objPath = req.Paths[0]
+	} else if objPath == "" && len(req.Paths) > 0 {
 		objPath = req.Paths[0]
 	}
 

@@ -454,6 +454,13 @@ func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPA
 
 func EncodeUSPAgentRequest(req USPAgentRequest) ([]byte, error) {
 	req = compactRequestSelectors(req)
+	// Use string paths instead of binary codes — the controller and agent ship
+	// independent wusp packages whose path-code registries drift, so encoding
+	// fields by string path is the only durable cross-boundary wire format.
+	// Mirrors the symmetric reset on EncodeUSPAgentResponse.
+	if req.Message != nil {
+		req.Message.ResetAllFieldIDs()
+	}
 	if err := validateUSPAgentRequest(req); err != nil {
 		return nil, err
 	}
@@ -553,7 +560,7 @@ func DecodeUSPAgentRequest(data []byte) (USPAgentRequest, error) {
 		if err != nil {
 			return USPAgentRequest{}, err
 		}
-		req.Message, err = DecodeMessage(msgFrame)
+		req.Message, err = decodeUSPAgentRequestMessage(req.Method, msgFrame)
 		if err != nil {
 			return USPAgentRequest{}, err
 		}
@@ -576,6 +583,13 @@ func DecodeUSPAgentRequest(data []byte) (USPAgentRequest, error) {
 	}
 	req = resolveFastRequestPaths(req)
 	return req, validateUSPAgentRequest(req)
+}
+
+func decodeUSPAgentRequestMessage(method USPAgentMethod, data []byte) (*Message, error) {
+	if method == USPAgentMethodOperate {
+		return DecodeMessageLenient(data)
+	}
+	return DecodeMessage(data)
 }
 
 func EncodeUSPAgentResponse(resp USPAgentResponse) ([]byte, error) {
@@ -769,10 +783,8 @@ func validateUSPAgentRequest(req USPAgentRequest) error {
 			return &ValidationError{Reason: "request missing path selector"}
 		}
 	}
-	if req.Message != nil {
-		if err := ValidateMessageFast(req.Message); err != nil {
-			return err
-		}
+	if err := validateUSPAgentRequestMessage(req); err != nil {
+		return err
 	}
 	if req.Transfer != nil {
 		if err := validateTransferRequest(*req.Transfer); err != nil {
@@ -805,6 +817,75 @@ func validateUSPAgentRequest(req USPAgentRequest) error {
 		if req.Transfer == nil {
 			return &ValidationError{Reason: "transfer request missing transfer block"}
 		}
+	}
+	return nil
+}
+
+func validateUSPAgentRequestMessage(req USPAgentRequest) error {
+	if req.Message == nil {
+		return nil
+	}
+	if req.Method == USPAgentMethodOperate {
+		return validateOperateInputMessage(req.ObjectPath, req.Message)
+	}
+	return ValidateMessageFast(req.Message)
+}
+
+func validateOperateInputMessage(objectPath string, msg *Message) error {
+	if msg == nil {
+		return errNilMessage
+	}
+	seen := make(map[string]struct{}, len(msg.Fields))
+	for i := range msg.Fields {
+		field := msg.Fields[i]
+		if field.Path == "" {
+			return &ValidationError{Reason: fmt.Sprintf("field[%d] has empty path", i)}
+		}
+		if _, ok := seen[field.Path]; ok {
+			return &ValidationError{Path: field.Path, Reason: "duplicate field path"}
+		}
+		seen[field.Path] = struct{}{}
+		if err := ValidateFieldFast(field); err == nil {
+			continue
+		} else if !isUnknownParameterValidationError(err) {
+			return err
+		}
+		if err := validateUnknownOperateInputField(objectPath, field); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isUnknownParameterValidationError(err error) bool {
+	var validationErr *ValidationError
+	return errors.As(err, &validationErr) && validationErr.Reason == "unknown parameter path"
+}
+
+func validateUnknownOperateInputField(objectPath string, field Field) error {
+	path := strings.TrimSpace(field.Path)
+	if path != field.Path {
+		return &ValidationError{Path: field.Path, Reason: "operation input path contains surrounding whitespace"}
+	}
+	if !strings.HasPrefix(path, "Device.") {
+		return &ValidationError{Path: path, Reason: "operation input path must be rooted at Device."}
+	}
+	if strings.Contains(path, "{i}") {
+		return &ValidationError{Path: path, Reason: "operation input path must use a concrete instance"}
+	}
+	if strings.HasSuffix(path, "()") {
+		return &ValidationError{Path: path, Reason: "operation input cannot be a command path"}
+	}
+	if objectPath = strings.TrimSpace(objectPath); objectPath != "" &&
+		!strings.Contains(objectPath, "{i}") &&
+		!strings.HasPrefix(path, objectPath) {
+		return &ValidationError{Path: path, Reason: "operation input path does not belong to request object path"}
+	}
+	if len(path) > 512 {
+		return &ValidationError{Path: path, Reason: "operation input path is too long"}
+	}
+	if len(ValueToString(field.Val)) > 16384 {
+		return &ValidationError{Path: path, Reason: "operation input value is too large"}
 	}
 	return nil
 }

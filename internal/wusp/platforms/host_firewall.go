@@ -252,7 +252,7 @@ func (b *hostBackend) addHostFirewallRule(ctx context.Context, objectPath string
 			if convErr != nil {
 				return nil, convErr
 			}
-			if flag != "" {
+			if flag != "" && rendered != "" {
 				args = append(args, flag, rendered)
 			}
 		}
@@ -287,17 +287,21 @@ func parseFirewallRulePath(path string) (int, int, string, bool) {
 func firewallLeafArgument(leaf string, value wusp.Value) (string, string, error) {
 	switch leaf {
 	case "Target":
-		return "-j", strings.ToUpper(value.AsString()), nil
+		target, err := normalizeFirewallTarget(wusp.ValueToString(value))
+		return "-j", target, err
 	case "Protocol":
-		return "-p", strconv.FormatInt(value.AsInt(), 10), nil
+		protocol, err := normalizeFirewallProtocol(wusp.ValueToString(value))
+		return "-p", protocol, err
 	case "SourceIP":
-		return "-s", value.AsString(), nil
+		return "-s", normalizeFirewallAddress(wusp.ValueToString(value)), nil
 	case "DestIP":
-		return "-d", value.AsString(), nil
+		return "-d", normalizeFirewallAddress(wusp.ValueToString(value)), nil
 	case "SourcePort":
-		return "--sport", strconv.FormatInt(value.AsInt(), 10), nil
+		port, err := normalizeFirewallPort(wusp.ValueToString(value))
+		return "--sport", port, err
 	case "DestPort":
-		return "--dport", strconv.FormatInt(value.AsInt(), 10), nil
+		port, err := normalizeFirewallPort(wusp.ValueToString(value))
+		return "--dport", port, err
 	case "Enable":
 		return "", "", nil
 	default:
@@ -306,11 +310,28 @@ func firewallLeafArgument(leaf string, value wusp.Value) (string, string, error)
 }
 
 func replaceCLIOption(args []string, flag, value string) []string {
-	for i := 0; i+1 < len(args); i++ {
+	if flag == "" {
+		return args
+	}
+	for i := 0; i < len(args); i++ {
 		if args[i] == flag {
-			args[i+1] = value
+			if value == "" {
+				end := i + 1
+				if end < len(args) {
+					end++
+				}
+				return append(args[:i], args[end:]...)
+			}
+			if i+1 < len(args) {
+				args[i+1] = value
+				return args
+			}
+			args = append(args, value)
 			return args
 		}
+	}
+	if value == "" {
+		return args
 	}
 	return append(args, flag, value)
 }
@@ -322,4 +343,79 @@ func containsCLIOption(args []string, flag string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeFirewallTarget(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "accept":
+		return "ACCEPT", nil
+	case "drop":
+		return "DROP", nil
+	case "reject":
+		return "REJECT", nil
+	case "return":
+		return "RETURN", nil
+	case "log":
+		return "LOG", nil
+	case "":
+		return "", fmt.Errorf("firewall target is required")
+	default:
+		return "", wusp.ErrUSPPathUnsupported
+	}
+}
+
+func normalizeFirewallProtocol(value string) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "", "any", "all", "-1", "0":
+		return "", nil
+	case "1", "icmp":
+		return "icmp", nil
+	case "2", "igmp":
+		return "igmp", nil
+	case "6", "tcp":
+		return "tcp", nil
+	case "17", "udp":
+		return "udp", nil
+	case "47", "gre":
+		return "gre", nil
+	case "50", "esp":
+		return "esp", nil
+	case "51", "ah":
+		return "ah", nil
+	case "58", "icmpv6", "ipv6-icmp":
+		return "icmpv6", nil
+	case "89", "ospf":
+		return "ospf", nil
+	case "132", "sctp":
+		return "sctp", nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > 255 {
+		return "", fmt.Errorf("invalid firewall protocol %q", value)
+	}
+	return strconv.Itoa(n), nil
+}
+
+func normalizeFirewallAddress(value string) string {
+	v := strings.TrimSpace(value)
+	switch strings.ToLower(v) {
+	case "", "any", "all", "0.0.0.0", "0.0.0.0/0", "::", "::/0":
+		return ""
+	default:
+		return v
+	}
+}
+
+func normalizeFirewallPort(value string) (string, error) {
+	v := strings.TrimSpace(value)
+	switch strings.ToLower(v) {
+	case "", "any", "all", "0":
+		return "", nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("invalid firewall port %q", value)
+	}
+	return strconv.Itoa(n), nil
 }

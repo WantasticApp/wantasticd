@@ -56,13 +56,64 @@ func TestHostFirewallAddEditDeleteCommands(t *testing.T) {
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
-		"iptables -t filter -A INPUT -j ACCEPT -p 17",
+		"iptables -t filter -A INPUT -j ACCEPT -p udp",
 		"iptables -t filter -R INPUT 1 -p tcp --dport 80 -j ACCEPT",
 		"iptables -t filter -D INPUT 1",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in\n%s", want, joined)
 		}
+	}
+}
+
+func TestHostFirewallEditClearsOptionalMatches(t *testing.T) {
+	fixture := "*filter\n-A INPUT -s 10.0.0.0/8 -p tcp --dport 443 -j DROP\nCOMMIT\n"
+	var calls []string
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+		if name == "iptables-save" {
+			return []byte(fixture), nil
+		}
+		return nil, nil
+	}
+	b := newHostBackend(KindLinux, Options{CommandRunner: runner})
+	if err := b.Set(context.Background(), "Device.Firewall.Chain.1.Rule.1.DestPort", wusp.String("")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set(context.Background(), "Device.Firewall.Chain.1.Rule.1.SourceIP", wusp.String("Any")); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"iptables -t filter -R INPUT 1 -s 10.0.0.0/8 -p tcp -j DROP",
+		"iptables -t filter -R INPUT 1 -p tcp --dport 443 -j DROP",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "--dport 0") || strings.Contains(joined, "-s Any") {
+		t.Fatalf("optional match was not cleared cleanly:\n%s", joined)
+	}
+}
+
+func TestHostFirewallDeleteUsesRequestedRuleIndex(t *testing.T) {
+	fixture := "*filter\n-A INPUT -p tcp --dport 443 -j DROP\n-A INPUT -p tcp --dport 80 -j DROP\nCOMMIT\n"
+	var calls []string
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+		if name == "iptables-save" {
+			return []byte(fixture), nil
+		}
+		return nil, nil
+	}
+	b := newHostBackend(KindLinux, Options{CommandRunner: runner})
+	if err := b.Delete(context.Background(), "Device.Firewall.Chain.1.Rule.2."); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "iptables -t filter -D INPUT 2") {
+		t.Fatalf("delete did not use requested index:\n%s", joined)
 	}
 }
 

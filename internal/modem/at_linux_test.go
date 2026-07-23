@@ -379,6 +379,35 @@ func TestParseATTextMessagesMultilineAndInvalidHeader(t *testing.T) {
 	}
 }
 
+func TestSanitizeOutgoingSMSTextPreservesParagraphs(t *testing.T) {
+	input := "  hello world\r\nsecond paragraph with spaces\tand tabs  "
+	got := sanitizeOutgoingSMSText(input)
+	want := "hello world\nsecond paragraph with spaces\tand tabs"
+	if got != want {
+		t.Fatalf("sanitizeOutgoingSMSText=%q want %q", got, want)
+	}
+}
+
+func TestSanitizeOutgoingSMSTextStripsDangerousControls(t *testing.T) {
+	input := "AT+QSIMSTAT?\x1atesting\u202e\nok"
+	got := sanitizeOutgoingSMSText(input)
+	want := "AT+QSIMSTAT?testing\nok"
+	if got != want {
+		t.Fatalf("sanitizeOutgoingSMSText=%q want %q", got, want)
+	}
+}
+
+func TestSMSToolSendSupportsOnlySingleTokenFallback(t *testing.T) {
+	if !smsToolSendSupportsMessage("hello") {
+		t.Fatal("single-token sms_tool fallback should be allowed")
+	}
+	for _, value := range []string{"hello world", "hello\tworld", "hello\nworld"} {
+		if smsToolSendSupportsMessage(value) {
+			t.Fatalf("sms_tool fallback should reject %q", value)
+		}
+	}
+}
+
 func TestSMSInboxNormalizationSanitizesAndDecodesMarkedUCS2(t *testing.T) {
 	messages := parseATTextMessages([]string{
 		`+CMGL: 8,"REC UNREAD","+212700000000",,"26/07/21,09:04:11+04"`,

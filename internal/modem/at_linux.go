@@ -537,7 +537,7 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 	defer smsOperationMu.Unlock()
 
 	phoneNumber = strings.TrimSpace(phoneNumber)
-	message = strings.TrimSpace(message)
+	message = sanitizeOutgoingSMSText(message)
 	if phoneNumber == "" || message == "" {
 		return fmt.Errorf("phone number and message are required")
 	}
@@ -547,20 +547,17 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 	if len(message) > 1600 {
 		return fmt.Errorf("SMS message exceeds 1600 bytes")
 	}
-	if smsToolAvailable() {
-		out, err := runSMSToolSMS(40*time.Second, "send", phoneNumber, message)
-		if err != nil {
-			return fmt.Errorf("sms_tool send failed: %w: %s", err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
 	const sendBridge = "/usrdata/simpleadmin/www/cgi-bin/send_sms"
 	if filepath.Base(c.findATPort(devicePath)) == "ttyOUT2" {
 		if info, err := os.Stat(sendBridge); err == nil && !info.IsDir() {
 			atBridgeMu.Lock()
 			defer atBridgeMu.Unlock()
 			reapStaleATBridgeHelpers("/dev/ttyOUT2", 10*time.Second)
-			out, err := runVendorCGI(sendBridge, "number="+url.QueryEscape(phoneNumber)+"&msg="+url.QueryEscape(message), 45*time.Second)
+			query := url.Values{
+				"number": []string{phoneNumber},
+				"msg":    []string{message},
+			}.Encode()
+			out, err := runVendorCGI(sendBridge, query, 45*time.Second)
 			if errors.Is(err, context.DeadlineExceeded) {
 				return fmt.Errorf("SMS send timed out")
 			}
@@ -569,6 +566,16 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 			}
 			return nil
 		}
+	}
+	if smsToolAvailable() {
+		if !smsToolSendSupportsMessage(message) {
+			return fmt.Errorf("SMS bridge unavailable and sms_tool send cannot safely send multiline or spaced messages")
+		}
+		out, err := runSMSToolSMS(40*time.Second, "send", phoneNumber, message)
+		if err != nil {
+			return fmt.Errorf("sms_tool send failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
 	return fmt.Errorf("no native WMS or SMS AT bridge is available")
 }
@@ -902,6 +909,26 @@ func sanitizeSMSText(value string) string {
 		return r
 	}, value)
 	return strings.TrimSpace(value)
+}
+
+func sanitizeOutgoingSMSText(value string) string {
+	value = strings.ToValidUTF8(value, string(utf8.RuneError))
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	value = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if r == utf8.RuneError || r == 0x1a || unicode.IsControl(r) || (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
+			return -1
+		}
+		return r
+	}, value)
+	return strings.TrimSpace(value)
+}
+
+func smsToolSendSupportsMessage(value string) bool {
+	return !strings.ContainsAny(value, " \t\n")
 }
 
 func validSMSPhoneNumber(value string) bool {

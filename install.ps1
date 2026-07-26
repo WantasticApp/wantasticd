@@ -16,6 +16,20 @@ $InstallPath = Join-Path $InstallDir "wantasticd.exe"
 $ConfigDir   = "C:\ProgramData\Wantastic"
 $ConfigFile  = Join-Path $ConfigDir "config.conf"
 
+function Invoke-ScChecked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [string]$Action
+    )
+
+    & sc.exe @Arguments | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to $Action (sc.exe exit code $LASTEXITCODE)."
+    }
+}
+
 Write-Host "Wantastic Agent — Windows Installer" -ForegroundColor Cyan
 Write-Host "====================================`n"
 
@@ -118,32 +132,45 @@ Write-Host "`n=== Installing Windows Service ==="
 # Remove stale service if present
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Removing existing service…"
-    sc.exe delete $ServiceName | Out-Null
+    Invoke-ScChecked -Arguments @("delete", $ServiceName) -Action "remove the existing service"
     Start-Sleep -Seconds 1
 }
 
 # sc.exe create — binPath must include all arguments quoted as a single string
 $binPath = "`"$InstallPath`" connect --config `"$ConfigFile`""
-sc.exe create $ServiceName `
-    binPath= $binPath `
-    start=   auto `
-    DisplayName= "Wantastic Overlay Networking" | Out-Null
+Invoke-ScChecked `
+    -Arguments @("create", $ServiceName, "binPath=", $binPath, "start=", "auto", "DisplayName=", "Wantastic Overlay Networking") `
+    -Action "create the Windows service"
 
 # Description
-sc.exe description $ServiceName "Wantastic secure overlay networking agent." | Out-Null
+Invoke-ScChecked `
+    -Arguments @("description", $ServiceName, "Wantastic secure overlay networking agent.") `
+    -Action "set the service description"
 
 # Recovery: restart on failure (1st: 5s, 2nd: 10s, subsequent: 30s)
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+Invoke-ScChecked `
+    -Arguments @("failure", $ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000") `
+    -Action "configure service recovery"
 
 Write-Host "Starting service…"
-sc.exe start $ServiceName | Out-Null
+Invoke-ScChecked -Arguments @("start", $ServiceName) -Action "start the Windows service"
 
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($svc -and $svc.Status -eq "Running") {
-    Write-Host "`nwantasticd $Version is installed and running as a Windows Service." -ForegroundColor Green
-} else {
-    Write-Warning "Service may not have started. Check: sc.exe query $ServiceName"
+if (-not $svc) {
+    throw "The wantasticd service was not found after installation."
 }
+$svc.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(20))
+$svc.Refresh()
+if ($svc.Status -ne "Running") {
+    throw "The wantasticd service did not reach the Running state."
+}
+
+$serviceConfig = sc.exe qc $ServiceName
+if ($LASTEXITCODE -ne 0 -or $serviceConfig -notmatch "AUTO_START") {
+    throw "The wantasticd service was not configured for automatic startup."
+}
+
+Write-Host "`nwantasticd $Version is installed and running as a Windows Service." -ForegroundColor Green
 
 Write-Host "`nUseful commands:"
 Write-Host "  sc.exe query   $ServiceName   — check status"

@@ -55,18 +55,86 @@ esac
 
 echo "Platform: $OS/$ARCH"
 
-# ── readonly filesystem (OpenWrt / embedded) ──────────────────────────────────
-NEED_REMOUNT_RO=0
-if [ "$OS" = "linux" ]; then
-  if grep -qE " / .*\bro\b" /proc/mounts 2>/dev/null; then
-    echo "Root filesystem is read-only — remounting rw…"
-    if mount -o remount,rw / 2>/dev/null; then
-      NEED_REMOUNT_RO=1
-    else
-      echo "  Warning: remount failed, install may fail"
-    fi
+# ── writable filesystem helpers (OpenWrt / embedded) ─────────────────────────
+REMOUNTED_MOUNTS=""
+TMP_DIR=""
+
+cleanup() {
+  if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
   fi
-fi
+  for _mountpoint in $REMOUNTED_MOUNTS; do
+    echo "Restoring read-only mount: $_mountpoint"
+    mount -o remount,ro "$_mountpoint" 2>/dev/null ||
+      echo "  Warning: could not remount $_mountpoint read-only"
+  done
+}
+trap cleanup EXIT HUP INT TERM
+
+mountpoint_for() {
+  _path="$1"
+  while [ ! -e "$_path" ] && [ "$_path" != "/" ]; do
+    _path=$(dirname "$_path")
+  done
+  df -P "$_path" 2>/dev/null | awk 'END { print $6 }'
+}
+
+mountpoint_is_readonly() {
+  _mountpoint="$1"
+  if command -v findmnt >/dev/null 2>&1; then
+    _options=$(findmnt -n -o OPTIONS --target "$_mountpoint" 2>/dev/null || true)
+  else
+    _options=$(awk -v target="$_mountpoint" '$2 == target { print $4; exit }' /proc/mounts 2>/dev/null)
+  fi
+  case ",$_options," in
+    *,ro,*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_writable_dir() {
+  _dir="$1"
+  _probe="$_dir/.wantastic-write-test-$$"
+
+  if mkdir -p "$_dir" 2>/dev/null && : > "$_probe" 2>/dev/null; then
+    rm -f "$_probe"
+    return 0
+  fi
+
+  [ "$OS" = "linux" ] || {
+    echo "Error: $_dir is not writable. Run this installer as root."
+    exit 1
+  }
+
+  _mountpoint=$(mountpoint_for "$_dir")
+  [ -n "$_mountpoint" ] || {
+    echo "Error: could not determine the mount containing $_dir"
+    exit 1
+  }
+
+  if ! mountpoint_is_readonly "$_mountpoint"; then
+    echo "Error: $_dir is not writable, but $_mountpoint is already read-write. Run this installer as root."
+    exit 1
+  fi
+
+  echo "$_dir is not writable — remounting $_mountpoint read-write…"
+  if ! mount -o remount,rw "$_mountpoint" 2>/dev/null &&
+     ! mount -o rw,remount "$_mountpoint" 2>/dev/null; then
+    echo "Error: could not remount $_mountpoint read-write. Run as root or unlock the filesystem."
+    exit 1
+  fi
+
+  case " $REMOUNTED_MOUNTS " in
+    *" $_mountpoint "*) ;;
+    *) REMOUNTED_MOUNTS="$REMOUNTED_MOUNTS $_mountpoint" ;;
+  esac
+
+  if ! mkdir -p "$_dir" 2>/dev/null || ! : > "$_probe" 2>/dev/null; then
+    echo "Error: $_dir is still not writable after remounting $_mountpoint"
+    exit 1
+  fi
+  rm -f "$_probe"
+}
 
 # ── download helpers ──────────────────────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -99,7 +167,6 @@ VERSION=$(http_text "${BASE_URL}/latest" | tr -d '[:space:]')
 echo "Version: $VERSION"
 
 TMP_DIR=$(mktemp -d 2>/dev/null || { mkdir -p /tmp/wantastic_install; printf '/tmp/wantastic_install'; })
-trap 'rm -rf "$TMP_DIR"' EXIT
 
 ARCHIVE_URL="${BASE_URL}/latest/wantasticd-${OS}-${ARCH}.tar.gz"
 echo "Downloading $ARCHIVE_URL…"
@@ -124,6 +191,7 @@ fi
 INSTALL_PATH="${INSTALL_DIR}/wantasticd"
 
 echo "Installing to $INSTALL_PATH…"
+ensure_writable_dir "$INSTALL_DIR"
 cp "$EXTRACTED" "${INSTALL_PATH}.new"
 chmod +x "${INSTALL_PATH}.new"
 mv -f "${INSTALL_PATH}.new" "$INSTALL_PATH"
@@ -145,7 +213,7 @@ else
 fi
 
 CONFIG_DIR=$(dirname "$CONFIG_FILE")
-mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+ensure_writable_dir "$CONFIG_DIR"
 quote_sh() {
   printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
 }
@@ -215,6 +283,7 @@ detect_init() {
 
 # ── service installation ──────────────────────────────────────────────────────
 install_service_systemd() {
+  ensure_writable_dir /etc/systemd/system
   cat > /etc/systemd/system/wantasticd.service <<EOF
 [Unit]
 Description=Wantastic Overlay Networking Daemon
@@ -234,11 +303,21 @@ EOF
   systemctl daemon-reload
   systemctl enable wantasticd
   systemctl restart wantasticd
+  systemctl is-enabled --quiet wantasticd || {
+    echo "Error: systemd service was not enabled"
+    return 1
+  }
+  systemctl is-active --quiet wantasticd || {
+    echo "Error: systemd service did not start"
+    systemctl status wantasticd --no-pager 2>/dev/null || true
+    return 1
+  }
   echo "Service registered with systemd and started."
 }
 
 install_service_procd() {
   # procd init script (OpenWrt / embedded)
+  ensure_writable_dir /etc/init.d
   cat > /etc/init.d/wantasticd <<EOF
 #!/bin/sh /etc/rc.common
 START=99
@@ -257,10 +336,15 @@ EOF
   /etc/init.d/wantasticd enable
   /etc/init.d/wantasticd stop 2>/dev/null || true
   /etc/init.d/wantasticd start
+  [ -x /etc/init.d/wantasticd ] || {
+    echo "Error: procd service script was not installed"
+    return 1
+  }
   echo "Service registered with procd and started."
 }
 
 install_service_openrc() {
+  ensure_writable_dir /etc/init.d
   cat > /etc/init.d/wantasticd <<EOF
 #!/sbin/openrc-run
 description="Wantastic Overlay Networking Daemon"
@@ -273,10 +357,15 @@ EOF
   chmod +x /etc/init.d/wantasticd
   rc-update add wantasticd default
   rc-service wantasticd restart
+  rc-update show default 2>/dev/null | grep -qE '(^|[[:space:]])wantasticd([[:space:]]|$)' || {
+    echo "Error: OpenRC service was not enabled"
+    return 1
+  }
   echo "Service registered with OpenRC and started."
 }
 
 install_service_sysv() {
+  ensure_writable_dir /etc/init.d
   cat > /etc/init.d/wantasticd <<EOF
 #!/bin/sh
 ### BEGIN INIT INFO
@@ -306,6 +395,8 @@ EOF
 
 install_service_busybox() {
   # Minimal embedded: respawn via /etc/inittab
+  ensure_writable_dir /etc/init.d
+  ensure_writable_dir /etc
   INIT_SCRIPT=/etc/init.d/wantasticd
   printf '#!/bin/sh\nexec %s connect --config %s\n' \
     "$INSTALL_PATH_Q" "$CONFIG_FILE_Q" > "$INIT_SCRIPT"
@@ -323,6 +414,7 @@ install_service_busybox() {
 
 install_service_launchd() {
   PLIST=/Library/LaunchDaemons/com.wantastic.wantasticd.plist
+  ensure_writable_dir /Library/LaunchDaemons
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -365,12 +457,6 @@ case "$INIT_SYS" in
     echo "Unknown init system — start manually: wantasticd connect --config $CONFIG_FILE"
     ;;
 esac
-
-# ── restore read-only filesystem ──────────────────────────────────────────────
-if [ "$NEED_REMOUNT_RO" = "1" ]; then
-  echo "Restoring read-only filesystem…"
-  mount -o remount,ro / 2>/dev/null || echo "  Warning: could not remount ro"
-fi
 
 echo ""
 echo "Done. wantasticd $VERSION is installed and running."

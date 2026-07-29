@@ -273,16 +273,19 @@ func TestOpenWrtBackendCollectMeshTopologyRootsFlatDevices(t *testing.T) {
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
 
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Hostname", "G1TK7EY001160")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Role", "Controller")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 0)
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.HopCount", 0)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress", "02:00:00:4b:e9:21")
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 1)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress", "02:00:00:4b:e9:21")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetMACAddress", "02:00:00:4b:e5:16")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 0)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.HopCount", 0)
+	for _, path := range []string{
+		"Device.WUSP_MeshTelemetry.Node.2.ParentNode",
+		"Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress",
+		"Device.WUSP_MeshTelemetry.Node.3.ParentNode",
+	} {
+		if value, ok := msg.Get(path); ok {
+			t.Fatalf("%s must be absent without parent evidence, got %#v", path, value)
+		}
+	}
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(flat rooted mesh topology): %v", err)
 	}

@@ -89,7 +89,12 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 		msg.Set("Device.WUSP_MeshTelemetry.Protocol.1.StandardMultiAPReference", wusp.String("Device.WiFi.MultiAP."))
 	}
 
-	roots := ensureMeshTreeRoot(attachMeshParentHints(normalizedMeshRoots(snapshot.topology)))
+	// Keep independent roots independent. Choosing one node heuristically and
+	// attaching every other root to it fabricates parent MACs and hop counts,
+	// producing a convincing but incorrect star topology. Explicit children,
+	// parent hints and collector link evidence are still assembled by
+	// attachMeshParentHints.
+	roots := attachMeshParentHints(normalizedMeshRoots(snapshot.topology))
 	nodes := flattenMeshForest(roots)
 	msg.Set("Device.WUSP_MeshTelemetry.NodeNumberOfEntries", wusp.Uint(uint64(len(nodes))))
 	msg.Set("Device.WUSP_MeshTelemetry.LinkNumberOfEntries", wusp.Uint(uint64(countMeshLinksForRoots(roots))))

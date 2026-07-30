@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"wantastic-agent/internal/iwinfo"
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 )
@@ -39,6 +40,8 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, "openwrt_release"), "DISTRIB_ID='OpenWrt'\nDISTRIB_RELEASE='24.10'\nDISTRIB_DESCRIPTION='OpenWrt 24.10'\n")
 	mustWriteFile(t, filepath.Join(root, "serial"), "SN123456\n")
 	mustWriteFile(t, filepath.Join(netClassDir, "address"), "e0:5d:54:4b:e6:fa\n")
+	mustWriteFile(t, filepath.Join(root, "dhcp.leases"), "1700003600 e0:5d:54:4b:e5:92 192.168.10.22 phone 01:e0:5d:54:4b:e5:92\n")
+	mustWriteFile(t, filepath.Join(root, "arp"), "IP address       HW type     Flags       HW address            Mask     Device\n192.168.10.21 0x1 0x2 e0:5d:54:4b:e6:fa * br-lan\n192.168.10.30 0x1 0x2 f0:00:00:00:00:30 * eth0\n")
 
 	stateBytes, err := json.Marshal(openWrtState{
 		FriendlyName:     "Living Room AP",
@@ -60,8 +63,25 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 		OpenWrtReleasePath:    filepath.Join(root, "openwrt_release"),
 		SerialNumberPath:      filepath.Join(root, "serial"),
 		NetClassDir:           filepath.Join(root, "sys", "class", "net"),
+		DHCPLeasesPath:        filepath.Join(root, "dhcp.leases"),
+		ARPPath:               filepath.Join(root, "arp"),
 		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
 			return nil, errors.New("disabled in test")
+		},
+		WiFiAssocList: func(ifName string) ([]iwinfo.AssocEntry, error) {
+			if ifName != "wlan0" {
+				return nil, errors.New("not an access point")
+			}
+			first, _ := net.ParseMAC("e0:5d:54:4b:e5:92")
+			second, _ := net.ParseMAC("e0:5d:54:4b:e6:fa")
+			return []iwinfo.AssocEntry{
+				{
+					MAC: first, Signal: -50, Noise: -95, ConnectedTime: 120,
+					RxRate: 24000, TxRate: 36000, RxBytes: 1200, TxBytes: 3400,
+					RxPackets: 12, TxPackets: 34, TxRetries: 2, TxFailed: 1,
+				},
+				{MAC: second, Signal: -62, Noise: -96, RxRate: 12000, TxRate: 18000},
+			}, nil
 		},
 		Now: func() time.Time {
 			return time.Unix(1700000000, 0).UTC()
@@ -110,8 +130,26 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	assertStringField(t, msg, "Device.WiFi.Radio.1.OperatingFrequencyBand", "5GHz")
 	assertUintField(t, msg, "Device.WiFi.Radio.1.Channel", 36)
 	assertStringField(t, msg, "Device.WiFi.SSID.1.SSID", "SkyNet-5G")
-	assertStringField(t, msg, "Device.WiFi.SSID.1.LowerLayers", "Device.WiFi.Radio.1.")
+	assertListContains(t, msg, "Device.WiFi.SSID.1.LowerLayers", "Device.WiFi.Radio.1.")
 	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries", 2)
+	assertMACField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.MACAddress", "e0:5d:54:4b:e5:92")
+	assertIntField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.SignalStrength", -50)
+	assertIntField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Noise", -95)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.SNR", 45)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.LastDataDownlinkRate", 36000)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.LastDataUplinkRate", 24000)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Stats.BytesSent", 3400)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Stats.BytesReceived", 1200)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Stats.RetransCount", 2)
+	assertUintField(t, msg, "Device.Hosts.HostNumberOfEntries", 3)
+	assertStringField(t, msg, "Device.Hosts.Host.1.PhysAddress", "e0:5d:54:4b:e5:92")
+	assertStringField(t, msg, "Device.Hosts.Host.1.IPAddress", "192.168.10.22")
+	assertStringField(t, msg, "Device.Hosts.Host.1.HostName", "phone")
+	assertStringField(t, msg, "Device.Hosts.Host.1.InterfaceType", "Wi-Fi")
+	assertStringField(t, msg, "Device.Hosts.Host.1.AssociatedDevice", "Device.WiFi.AccessPoint.1.AssociatedDevice.1.")
+	assertUintField(t, msg, "Device.Hosts.Host.1.IPv4AddressNumberOfEntries", 1)
+	assertBoolField(t, msg, "Device.Hosts.Host.1.Active", true)
+	assertStringField(t, msg, "Device.Hosts.Host.3.InterfaceType", "Ethernet")
 
 	ula, ok := msg.Get("Device.IP.ULAPrefix")
 	if !ok {
@@ -119,6 +157,9 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	}
 	if ula.Tag != wusp.TagIP6Pfx {
 		t.Fatalf("Device.IP.ULAPrefix tag=%v want TagIP6Pfx", ula.Tag)
+	}
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(OpenWrt snapshot): %v", err)
 	}
 }
 

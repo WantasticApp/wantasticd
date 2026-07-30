@@ -199,6 +199,42 @@ func TestOpenWrtBackendCollectMeshTopologyFromRealTopo(t *testing.T) {
 	}
 }
 
+func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testing.T) {
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object != "device" || method != "getRealTopo" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			return []byte(`{"topo":[
+				{"mac":"E0:5D:54:4B:E9:21","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":"G1TK7EY001160"},
+				{"mac":"E0:5D:54:4B:E9:2A","pMac":"E0:5D:54:4B:E9:21","hops":1,"ip":"192.168.200.109","backhaul":"L","name":"G1TK7EY001177"},
+				{"mac":"E0:5D:54:4B:E5:16","pMac":"E0:5D:54:4B:E9:2A","hops":2,"ip":"192.168.200.193","backhaul":"H","name":"G1TK7EY000012"},
+				{"mac":"E0:5D:54:4B:E7:3B","pMac":"E0:5D:54:4B:E5:16","hops":3,"ip":"192.168.200.178","backhaul":"L","name":"G1TK7EY000624"}
+			]}`), nil
+		},
+		Now: time.Now,
+	})
+
+	msg := &wusp.Message{}
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 4)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 3)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.HopCount", 0)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 1)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.HopCount", 2)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.4.HopCount", 3)
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress", "e0:5d:54:4b:e9:21")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentMACAddress", "e0:5d:54:4b:e9:2a")
+	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.4.ParentMACAddress", "e0:5d:54:4b:e5:16")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.4.Address", "192.168.200.178")
+	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.2.BackhaulLinkType", "Ethernet")
+	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.3.BackhaulLinkType", "Wi-Fi")
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(flat vendor topology): %v", err)
+	}
+}
+
 func TestOpenWrtBackendCollectMeshTopologyFallsBackToCLI(t *testing.T) {
 	var calls []string
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{

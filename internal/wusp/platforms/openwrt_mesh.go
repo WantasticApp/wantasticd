@@ -336,11 +336,21 @@ func meshNodeFromMap(payload map[string]any, hint string, depth int) *meshNode {
 		"backhaul_parent", "backhaulParent",
 	)
 	node.parentMAC = firstStringCI(payload,
+		"pMac", "pmac",
 		"parent_mac", "parentMac", "parent_mac_address", "parentMacAddress",
 		"parent_al_mac", "parentAlMac", "parentALMAC",
 		"uplink_mac", "uplinkMac", "upstream_mac", "upstreamMac",
 		"backhaul_parent_mac", "backhaulParentMAC",
 	)
+	node.sourceHop, node.hasHop = firstPresentIntCI(payload, "hops", "hop", "hop_count", "hopCount")
+	node.backhaul = firstStringCI(payload, "backhaul", "backhaul_type", "backhaulType", "backhaul_media", "backhaulMedia")
+	if node.role == "" && node.hasHop {
+		if node.sourceHop == 0 {
+			node.role = "controller"
+		} else {
+			node.role = "agent"
+		}
+	}
 	if node.parentMAC == "" {
 		if mac, ok := parseMeshMAC(node.parentID); ok {
 			node.parentMAC = mac.String()
@@ -603,6 +613,19 @@ func firstIntCI(payload map[string]any, keys ...string) int {
 	return 0
 }
 
+func firstPresentIntCI(payload map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		value, ok := lookupAnyCI(payload, key)
+		if !ok {
+			continue
+		}
+		if parsed, valid := intFromAny(value); valid {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
 func lookupAnyCIValue(payload map[string]any, key string) any {
 	value, _ := lookupAnyCI(payload, key)
 	return value
@@ -737,6 +760,7 @@ func isOpenWrtMeshScalarKey(key string) bool {
 		"role", "type", "device_role", "devicerole", "mode", "node_type", "nodetype",
 		"parent", "parent_id", "parentid", "parent_node", "parentnode", "parent_al_id", "parentalid", "parent_ieee1905_id", "parentieee1905id",
 		"parent_mac", "parentmac", "parent_mac_address", "parentmacaddress", "parent_al_mac", "parentalmac",
+		"pmac", "hops", "hop", "hop_count", "hopcount", "backhaul", "backhaul_type", "backhaultype",
 		"uplink", "uplink_id", "uplinkid", "uplink_mac", "uplinkmac",
 		"upstream", "upstream_id", "upstreamid", "upstream_mac", "upstreammac",
 		"backhaul_parent", "backhaulparent", "backhaul_parent_mac", "backhaulparentmac",

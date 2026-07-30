@@ -19,6 +19,9 @@ type meshNode struct {
 	role      string
 	parentID  string
 	parentMAC string
+	sourceHop int
+	hasHop    bool
+	backhaul  string
 	children  []*meshNode
 }
 
@@ -129,7 +132,11 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 		} else if parentMAC, ok := parseMeshMAC(node.parentMAC); ok {
 			msg.Set(prefix+"ParentMACAddress", wusp.MAC(parentMAC))
 		}
-		msg.Set(prefix+"HopCount", wusp.Uint(uint64(depthByNode[node])))
+		hop := depthByNode[node]
+		if node.hasHop && node.sourceHop >= 0 {
+			hop = node.sourceHop
+		}
+		msg.Set(prefix+"HopCount", wusp.Uint(uint64(hop)))
 		if node.name != "" {
 			msg.Set(prefix+"Hostname", wusp.String(node.name))
 		}
@@ -148,11 +155,7 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 			if protocol == "EasyMesh" || protocol == "MultiAP" || protocol == "OpenMesh" {
 				msg.Set(apPrefix+"AssocIEEE1905DeviceRef", wusp.String(dataElementsPrefix))
 			}
-			if index == 1 || normalizeMeshRole(firstNonEmpty(node.role, snapshot.role)) == "Controller" {
-				msg.Set(apPrefix+"BackhaulLinkType", wusp.String("None"))
-			} else {
-				msg.Set(apPrefix+"BackhaulLinkType", wusp.String("Wi-Fi"))
-			}
+			msg.Set(apPrefix+"BackhaulLinkType", wusp.String(meshBackhaulLinkType(node, index, snapshot.role)))
 			msg.Set(apPrefix+"BackhaulMACAddress", wusp.MAC(mac))
 			if node.signal != 0 {
 				msg.Set(apPrefix+"BackhaulSignalStrength", wusp.Uint(uint64(signalDBMToRCPI(node.signal))))
@@ -164,6 +167,22 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 
 	linkIndex := 0
 	appendMeshLinksForRoots(msg, roots, nodeIndex, &linkIndex)
+}
+
+func meshBackhaulLinkType(node *meshNode, index int, snapshotRole string) string {
+	if node == nil || index == 1 || normalizeMeshRole(firstNonEmpty(node.role, snapshotRole)) == "Controller" {
+		return "None"
+	}
+	switch strings.ToUpper(strings.TrimSpace(node.backhaul)) {
+	case "L", "LAN", "ETH", "ETHERNET", "WIRED":
+		return "Ethernet"
+	case "H", "W", "WIFI", "WI-FI", "WIRELESS":
+		return "Wi-Fi"
+	case "B", "NONE", "ROOT":
+		return "None"
+	default:
+		return "Wi-Fi"
+	}
 }
 
 func normalizedMeshRoots(root *meshNode) []*meshNode {

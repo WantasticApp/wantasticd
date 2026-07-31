@@ -158,6 +158,7 @@ func TestPreserveLastCompleteCellularSnapshot(t *testing.T) {
 	partial.Set("Device.DeviceInfo.HostName", wusp.String("after"))
 	partial.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
 	partial.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(0))
+	partial.Set("Device.WUSP_CellularTelemetry.DiscoveryState", wusp.String("Unknown"))
 
 	merged := preserveLastCompleteCellularSnapshot(previous, partial)
 	if value, ok := merged.Get("Device.DeviceInfo.HostName"); !ok || wusp.ValueToString(value) != "after" {
@@ -172,6 +173,26 @@ func TestPreserveLastCompleteCellularSnapshot(t *testing.T) {
 		if _, ok := merged.Get(path); !ok {
 			t.Fatalf("missing retained field %s", path)
 		}
+	}
+	if value, ok := merged.Get("Device.WUSP_CellularTelemetry.Interface.1.Presence"); !ok || wusp.ValueToString(value) != "Stale" {
+		t.Fatalf("retained modem was not marked stale: %#v", merged.Fields)
+	}
+}
+
+func TestConfirmedAbsentCellularSnapshotDoesNotRestorePreviousModem(t *testing.T) {
+	previous := wusp.NewMessage()
+	previous.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(1))
+	previous.Set("Device.Cellular.Interface.1.Name", wusp.String("rmnet_data0"))
+	previous.Set("Device.WUSP_CellularTelemetry.Interface.1.Model", wusp.String("RM520N-GL"))
+
+	current := wusp.NewMessage()
+	current.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
+	current.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(0))
+	current.Set("Device.WUSP_CellularTelemetry.DiscoveryState", wusp.String("Absent"))
+
+	merged := preserveLastCompleteCellularSnapshot(previous, current)
+	if _, ok := merged.Get("Device.Cellular.Interface.1.Name"); ok {
+		t.Fatalf("confirmed absence restored cached modem: %#v", merged.Fields)
 	}
 }
 

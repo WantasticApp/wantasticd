@@ -432,53 +432,103 @@ func collectCellularStatic(msg *wusp.Message) {
 
 func (b *hostBackend) collectCellularStatic(msg *wusp.Message) {
 	if b != nil && b.cellular != nil {
-		collectCellularSnapshot(msg, b.cellular.snapshot())
+		collectCellularSnapshotWithState(msg, b.cellular.snapshotWithState())
 		return
 	}
 	collectCellularStatic(msg)
 }
+
+const (
+	cellularDiscoveryPresent = "Present"
+	cellularDiscoveryStale   = "Stale"
+	cellularDiscoveryAbsent  = "Absent"
+	cellularDiscoveryUnknown = "Unknown"
+)
 
 type cellularEntry struct {
 	devicePath string
 	info       *modemPkg.Info
 }
 
+type cellularDiscoverySnapshot struct {
+	entries            []cellularEntry
+	state              string
+	lastDiscovery      time.Time
+	lastSeen           time.Time
+	consecutiveEmpties int
+}
+
 type cellularMonitor struct {
-	mu         sync.RWMutex
-	controller modemPkg.Controller
-	entries    []cellularEntry
-	last       time.Time
-	started    bool
-	refreshing bool
-	interval   time.Duration
-	maxAge     time.Duration
+	mu                   sync.RWMutex
+	controller           modemPkg.Controller
+	entries              []cellularEntry
+	state                string
+	lastDiscovery        time.Time
+	lastSeen             time.Time
+	consecutiveEmpties   int
+	clearAfterEmptyScans int
+	started              bool
+	refreshing           bool
+	interval             time.Duration
+	maxAge               time.Duration
 }
 
 func newCellularMonitor() *cellularMonitor {
 	return &cellularMonitor{
-		interval: time.Minute,
-		maxAge:   2 * time.Minute,
+		state:                cellularDiscoveryUnknown,
+		interval:             time.Minute,
+		maxAge:               2 * time.Minute,
+		clearAfterEmptyScans: 3,
 	}
 }
 
 func (m *cellularMonitor) snapshot() []cellularEntry {
+	return m.snapshotWithState().entries
+}
+
+func (m *cellularMonitor) snapshotWithState() cellularDiscoverySnapshot {
 	if m == nil {
-		return collectCellularEntries()
+		controller := newModemController()
+		if controller == nil {
+			return cellularDiscoverySnapshot{state: cellularDiscoveryUnknown, lastDiscovery: time.Now()}
+		}
+		defer controller.Close()
+		entries, err := discoverCellularEntriesWithController(controller)
+		state := cellularDiscoveryAbsent
+		if err != nil {
+			state = cellularDiscoveryUnknown
+		} else if len(entries) > 0 {
+			state = cellularDiscoveryPresent
+		}
+		return cellularDiscoverySnapshot{entries: entries, state: state, lastDiscovery: time.Now()}
 	}
 	m.start()
 	m.mu.RLock()
-	entries := cloneCellularEntries(m.entries)
-	last := m.last
+	snapshot := m.snapshotLocked()
 	maxAge := m.maxAge
 	m.mu.RUnlock()
-	if !last.IsZero() && time.Since(last) < maxAge {
-		return entries
+	if !snapshot.lastDiscovery.IsZero() && time.Since(snapshot.lastDiscovery) < maxAge {
+		return snapshot
 	}
 	// Live modem queries can take tens of seconds and are serialized by the AT
 	// transport. Never block a USP Get request on them; refresh single-flight in
 	// the background and return the latest complete snapshot immediately.
 	go m.refresh()
-	return entries
+	return snapshot
+}
+
+func (m *cellularMonitor) snapshotLocked() cellularDiscoverySnapshot {
+	state := m.state
+	if state == "" {
+		state = cellularDiscoveryUnknown
+	}
+	return cellularDiscoverySnapshot{
+		entries:            cloneCellularEntries(m.entries),
+		state:              state,
+		lastDiscovery:      m.lastDiscovery,
+		lastSeen:           m.lastSeen,
+		consecutiveEmpties: m.consecutiveEmpties,
+	}
 }
 
 func (m *cellularMonitor) start() {
@@ -517,15 +567,40 @@ func (m *cellularMonitor) refresh() []cellularEntry {
 	}
 	controller := m.controller
 	m.mu.Unlock()
-	entries := collectCellularEntriesWithController(controller)
+	entries, discoveryErr := discoverCellularEntriesWithController(controller)
+	now := time.Now()
 
 	m.mu.Lock()
-	if len(entries) > 0 {
+	m.lastDiscovery = now
+	switch {
+	case discoveryErr != nil:
+		if len(m.entries) > 0 {
+			m.state = cellularDiscoveryStale
+		} else {
+			m.state = cellularDiscoveryUnknown
+		}
+	case len(entries) > 0:
+		for index := range entries {
+			if entries[index].info != nil && entries[index].info.CollectedAt.IsZero() {
+				entries[index].info.CollectedAt = now
+			}
+		}
 		m.entries = cloneCellularEntries(entries)
-		m.last = time.Now()
-	} else if m.last.IsZero() {
-		m.entries = nil
-		m.last = time.Now()
+		m.state = cellularDiscoveryPresent
+		m.lastSeen = now
+		m.consecutiveEmpties = 0
+	default:
+		m.consecutiveEmpties++
+		clearAfter := m.clearAfterEmptyScans
+		if clearAfter <= 0 {
+			clearAfter = 3
+		}
+		if len(m.entries) > 0 && m.consecutiveEmpties < clearAfter {
+			m.state = cellularDiscoveryStale
+		} else {
+			m.entries = nil
+			m.state = cellularDiscoveryAbsent
+		}
 	}
 	m.refreshing = false
 	out := cloneCellularEntries(m.entries)
@@ -555,23 +630,32 @@ func collectCellularEntries() []cellularEntry {
 }
 
 func collectCellularEntriesWithController(ctl modemPkg.Controller) []cellularEntry {
+	entries, err := discoverCellularEntriesWithController(ctl)
+	if err != nil {
+		logCollectorError("cellular.discover", err)
+	}
+	return entries
+}
+
+func discoverCellularEntriesWithController(ctl modemPkg.Controller) ([]cellularEntry, error) {
 	if ctl == nil {
-		return nil
+		return nil, fmt.Errorf("cellular controller is unavailable")
 	}
 	devices, err := ctl.Discover()
 	if err != nil {
-		logCollectorError("cellular.discover", err)
-		return nil
+		return nil, err
 	}
 	if len(devices) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	entries := make([]cellularEntry, 0, len(devices))
+	infoFailures := 0
 	for _, dev := range devices {
 		info, err := ctl.GetInfo(dev)
 		if err != nil {
 			logCollectorError("cellular.info."+dev, err)
+			infoFailures++
 			continue
 		}
 		if info == nil {
@@ -580,7 +664,11 @@ func collectCellularEntriesWithController(ctl modemPkg.Controller) []cellularEnt
 		infoCopy := *info
 		entries = append(entries, cellularEntry{devicePath: dev, info: &infoCopy})
 	}
-	return coalesceCellularEntries(entries)
+	entries = coalesceCellularEntries(entries)
+	if len(entries) == 0 && infoFailures > 0 {
+		return nil, fmt.Errorf("cellular information failed for %d discovered device(s)", infoFailures)
+	}
+	return entries, nil
 }
 
 func coalesceCellularEntries(entries []cellularEntry) []cellularEntry {
@@ -632,24 +720,48 @@ func coalesceCellularEntries(entries []cellularEntry) []cellularEntry {
 }
 
 func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
+	state := cellularDiscoveryAbsent
+	lastSeen := time.Time{}
+	if len(entries) > 0 {
+		state = cellularDiscoveryPresent
+		lastSeen = time.Now()
+	}
+	collectCellularSnapshotWithState(msg, cellularDiscoverySnapshot{
+		entries:       entries,
+		state:         state,
+		lastDiscovery: time.Now(),
+		lastSeen:      lastSeen,
+	})
+}
+
+func collectCellularSnapshotWithState(msg *wusp.Message, snapshot cellularDiscoverySnapshot) {
 	msg.Set("Device.Cellular.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.Cellular.RoamingEnabled", wusp.Bool(false))
 	msg.Set("Device.TrustedElements.SIMNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.WUSP_CellularTelemetry.InterfaceNumberOfEntries", wusp.Uint(0))
+	msg.Set("Device.WUSP_CellularTelemetry.DiscoveryState", wusp.String(firstNonEmpty(snapshot.state, cellularDiscoveryUnknown)))
+	msg.Set("Device.WUSP_CellularTelemetry.ConsecutiveEmptyDiscoveries", wusp.Uint(uint64(max(0, snapshot.consecutiveEmpties))))
+	if !snapshot.lastDiscovery.IsZero() {
+		msg.Set("Device.WUSP_CellularTelemetry.LastDiscoveryTime", wusp.Time(snapshot.lastDiscovery.UTC()))
+	}
+	if !snapshot.lastSeen.IsZero() {
+		msg.Set("Device.WUSP_CellularTelemetry.LastSeenTime", wusp.Time(snapshot.lastSeen.UTC()))
+	}
 	msg.Set("Device.WUSP_CellularControl.InterfaceNumberOfEntries", wusp.Uint(0))
 	msg.Set("Device.WUSP_GNSS.ReceiverNumberOfEntries", wusp.Uint(0))
 
-	if len(entries) == 0 {
+	if len(snapshot.entries) == 0 {
 		return
 	}
 
+	stale := snapshot.state == cellularDiscoveryStale
 	ifaceIdx := 0
 	simIdx := 0
 	apnIdx := 0
 	anyRoaming := false
 	seenModems := make(map[string]struct{})
-	for _, entry := range entries {
+	for _, entry := range snapshot.entries {
 		dev := entry.devicePath
 		info := entry.info
 		if info == nil || !shouldPublishCellularInfo(dev, info) {
@@ -666,6 +778,13 @@ func collectCellularSnapshot(msg *wusp.Message, entries []cellularEntry) {
 			anyRoaming = true
 		}
 		prefix := setCellularInterfaceFields(msg, ifaceIdx, dev, info)
+		presence := cellularDiscoveryPresent
+		if stale {
+			presence = cellularDiscoveryStale
+			msg.Set(prefix+"Enable", wusp.Bool(false))
+			msg.Set(prefix+"Status", wusp.String("Unknown"))
+		}
+		msg.Set(fmt.Sprintf("Device.WUSP_CellularTelemetry.Interface.%d.Presence", ifaceIdx), wusp.String(presence))
 		if cellularHasSIM(info) {
 			simIdx++
 			simRef := fmt.Sprintf("Device.TrustedElements.SIM.%d.", simIdx)
@@ -858,7 +977,12 @@ func cellularStatus(info *modemPkg.Info) string {
 		return "Error"
 	}
 	if info.SIMStatus == modemPkg.SIMAbsent {
-		return "NotPresent"
+		// The interface models the modem radio, not the removable SIM. A
+		// positively identified modem without a SIM is administratively
+		// available but operationally down; SIM absence is reported under
+		// Device.TrustedElements.SIM instead of pretending the modem hardware
+		// itself is missing.
+		return "Down"
 	}
 	return "Down"
 }

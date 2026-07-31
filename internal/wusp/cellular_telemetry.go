@@ -11,8 +11,13 @@ var WUSPCellularTelemetryObjects = []Object{
 
 var AllWUSPCellularTelemetryParams = []Param{
 	{Path: WUSPCellularTelemetryPrefix + "InterfaceNumberOfEntries", Type: TypeUnsignedInt, Access: ReadOnly, SinceVersion: "1.0", Description: "Number of cellular modem telemetry interface rows.", Limits: Limits{Min: iptr(0)}},
+	{Path: WUSPCellularTelemetryPrefix + "DiscoveryState", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Current cellular hardware discovery result. Stale retains last-known modem rows without asserting current presence.", Limits: Limits{Enums: []string{"Present", "Stale", "Absent", "Unknown"}}},
+	{Path: WUSPCellularTelemetryPrefix + "LastDiscoveryTime", Type: TypeDateTime, Access: ReadOnly, SinceVersion: "1.0", Description: "Time of the most recent completed cellular hardware discovery attempt."},
+	{Path: WUSPCellularTelemetryPrefix + "LastSeenTime", Type: TypeDateTime, Access: ReadOnly, SinceVersion: "1.0", Description: "Time when a cellular modem was most recently positively identified."},
+	{Path: WUSPCellularTelemetryPrefix + "ConsecutiveEmptyDiscoveries", Type: TypeUnsignedInt, Access: ReadOnly, SinceVersion: "1.0", Description: "Number of consecutive successful discovery passes that found no cellular modem.", Limits: Limits{Min: iptr(0)}},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.Alias", Type: TypeAlias, Access: ReadOnly, SinceVersion: "1.0", Description: "USP non-functional unique key for this cellular telemetry interface."},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.InterfaceReference", Type: TypePathRef, Access: ReadOnly, SinceVersion: "1.0", Description: "Reference to the matching Device.Cellular.Interface row."},
+	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.Presence", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Whether this modem row is currently present or retained from the last valid discovery.", Limits: Limits{Enums: []string{"Present", "Stale"}}},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.ModemPath", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Linux modem device path or network interface used by the collector.", Limits: Limits{MaxLength: 128}},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.Protocol", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Collection protocol used for this modem.", Limits: Limits{Enums: []string{"at", "qmi", "mbim", "modemmanager", "sms_tool", "sysfs", "unknown"}}},
 	{Path: WUSPCellularTelemetryPrefix + "Interface.{i}.NRMode", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "5G NR mode detected from modem telemetry.", Limits: Limits{Enums: []string{"Standalone", "NonStandalone", "Unknown"}}},

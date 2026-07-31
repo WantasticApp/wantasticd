@@ -280,6 +280,13 @@ func preserveLastCompleteCellularSnapshot(previous, current *wusp.Message) *wusp
 	if current == nil || !hasIndexedCellularSnapshot(previous) || hasIndexedCellularSnapshot(current) {
 		return current
 	}
+	discoveryState := cellularDiscoveryState(current)
+	// A completed series of empty hardware scans is authoritative. Cached
+	// history must never resurrect a modem after the collector declares it
+	// absent.
+	if strings.EqualFold(discoveryState, "Absent") {
+		return current
+	}
 	merged := cloneCachedMessage(current)
 	seen := make(map[string]struct{}, len(merged.Fields))
 	for _, field := range merged.Fields {
@@ -294,7 +301,44 @@ func preserveLastCompleteCellularSnapshot(previous, current *wusp.Message) *wusp
 		}
 		merged.Fields = append(merged.Fields, field)
 	}
+	// Unknown startup/error state may retain the previous complete model, but
+	// it is explicitly historical. Consumers can render it without treating it
+	// as current hardware presence.
+	for _, field := range previous.Fields {
+		if !strings.HasSuffix(field.Path, "NumberOfEntries") ||
+			!hasSnapshotPrefix(field.Path, cellularSnapshotPrefixes) {
+			continue
+		}
+		merged.Set(field.Path, field.Val)
+	}
+	staleInterfaces := make(map[string]struct{})
+	for _, field := range previous.Fields {
+		const prefix = "Device.WUSP_CellularTelemetry.Interface."
+		if !strings.HasPrefix(field.Path, prefix) {
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(field.Path, prefix), ".")
+		if len(parts) > 1 && parts[0] != "" {
+			staleInterfaces[parts[0]] = struct{}{}
+		}
+	}
+	for index := range staleInterfaces {
+		merged.Set("Device.WUSP_CellularTelemetry.Interface."+index+".Presence", wusp.String("Stale"))
+		merged.Set("Device.Cellular.Interface."+index+".Enable", wusp.Bool(false))
+		merged.Set("Device.Cellular.Interface."+index+".Status", wusp.String("Unknown"))
+	}
 	return merged
+}
+
+func cellularDiscoveryState(msg *wusp.Message) string {
+	if msg == nil {
+		return ""
+	}
+	value, ok := msg.Get("Device.WUSP_CellularTelemetry.DiscoveryState")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(wusp.ValueToString(value))
 }
 
 func preserveLastSMSInboxSnapshot(previous, current *wusp.Message) *wusp.Message {

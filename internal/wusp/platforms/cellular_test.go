@@ -34,8 +34,8 @@ func TestCellularStatusMapping(t *testing.T) {
 	if got := cellularStatus(&modemPkg.Info{Status: modemPkg.RegSearching}); got != "Dormant" {
 		t.Fatalf("searching status=%q want Dormant", got)
 	}
-	if got := cellularStatus(&modemPkg.Info{SIMStatus: modemPkg.SIMAbsent}); got != "NotPresent" {
-		t.Fatalf("absent SIM status=%q want NotPresent", got)
+	if got := cellularStatus(&modemPkg.Info{SIMStatus: modemPkg.SIMAbsent}); got != "Down" {
+		t.Fatalf("absent SIM status=%q want Down", got)
 	}
 }
 
@@ -126,12 +126,51 @@ func TestCellularMonitorPreservesLastRichSnapshotOnEmptyRefresh(t *testing.T) {
 	}
 
 	fake.infos = map[string]*modemPkg.Info{}
-	second := monitor.snapshot()
+	second := monitor.refresh()
 	if len(second) != 1 {
 		t.Fatalf("second snapshot entries=%d want preserved entry", len(second))
 	}
 	if second[0].info.IMEI != "123456789012345" {
 		t.Fatalf("second snapshot IMEI=%q want preserved modem identity", second[0].info.IMEI)
+	}
+	state := monitor.snapshotWithState()
+	if state.state != cellularDiscoveryStale {
+		t.Fatalf("state after failed refresh=%q want Stale", state.state)
+	}
+}
+
+func TestCellularMonitorClearsRememberedModemAfterConfirmedEmptyDiscoveries(t *testing.T) {
+	fake := &fakeModemController{
+		devices: []string{"/dev/ttyUSB2"},
+		infos: map[string]*modemPkg.Info{
+			"/dev/ttyUSB2": {
+				IMEI:  "123456789012345",
+				Model: "RG520N",
+			},
+		},
+	}
+	monitor := newCellularMonitor()
+	monitor.controller = fake
+	monitor.clearAfterEmptyScans = 3
+	if got := monitor.refresh(); len(got) != 1 {
+		t.Fatalf("initial entries=%d want 1", len(got))
+	}
+
+	fake.devices = nil
+	for attempt := 1; attempt <= 2; attempt++ {
+		if got := monitor.refresh(); len(got) != 1 {
+			t.Fatalf("attempt %d prematurely cleared cached modem", attempt)
+		}
+		if state := monitor.snapshotWithState().state; state != cellularDiscoveryStale {
+			t.Fatalf("attempt %d state=%q want Stale", attempt, state)
+		}
+	}
+	if got := monitor.refresh(); len(got) != 0 {
+		t.Fatalf("confirmed absence retained %d modem(s)", len(got))
+	}
+	state := monitor.snapshotWithState()
+	if state.state != cellularDiscoveryAbsent || state.consecutiveEmpties != 3 {
+		t.Fatalf("confirmed empty state=%+v", state)
 	}
 }
 
@@ -186,6 +225,8 @@ func TestCellularPublishIncludesIdentityAndStats(t *testing.T) {
 	})
 
 	assertUintField(t, msg, "Device.Cellular.InterfaceNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.DiscoveryState", "Present")
+	assertStringField(t, msg, "Device.WUSP_CellularTelemetry.Interface.1.Presence", "Present")
 	assertStringField(t, msg, "Device.Cellular.Interface.1.Name", "rmnet_data0")
 	assertStringField(t, msg, "Device.Cellular.Interface.1.IMEI", "123456789012345")
 	assertUintField(t, msg, "Device.TrustedElements.SIMNumberOfEntries", 1)

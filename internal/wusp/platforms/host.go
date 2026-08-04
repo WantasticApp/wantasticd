@@ -315,7 +315,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		msg.Set("Device.IP.InterfaceNumberOfEntries", wusp.Uint(uint64(interfaceCount)))
 	}
 
-	_ = runCollector("network.interfaces", func() error { collectNetworkInterfacesStatic(msg); return nil })
+	_ = runCollector("network.interfaces", func() error { collectNetworkInterfacesStatic(msg, b.netClassDir); return nil })
 	_ = runCollector("firewall", func() error { collectHostFirewallStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("cellular", func() error { b.collectCellularStatic(msg); return nil })
@@ -327,7 +327,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 
 // collectNetworkInterfacesStatic enumerates network interfaces via net.Interfaces()
 // (getifaddrs on Unix) and populates Device.IP.Interface.{n}. entries.
-func collectNetworkInterfacesStatic(msg *wusp.Message) {
+func collectNetworkInterfacesStatic(msg *wusp.Message, netClassDir string) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		logCollectorError("network.interfaces", err)
@@ -350,6 +350,7 @@ func collectNetworkInterfacesStatic(msg *wusp.Message) {
 		msg.Set(prefix+"Status", wusp.String(ifaceStatus(iface.Flags)))
 		msg.Set(prefix+"Type", wusp.String(ifaceType(iface.Name)))
 		msg.Set(prefix+"MaxMTUSize", wusp.Uint(uint64(iface.MTU)))
+		appendNetworkInterfaceStats(msg, prefix, netClassDir, iface.Name)
 
 		addrs, err := iface.Addrs()
 		if err != nil {
@@ -378,6 +379,32 @@ func collectNetworkInterfacesStatic(msg *wusp.Message) {
 			}
 		}
 		idx++
+	}
+}
+
+func appendNetworkInterfaceStats(msg *wusp.Message, prefix, netClassDir, interfaceName string) {
+	if msg == nil || strings.TrimSpace(netClassDir) == "" || strings.TrimSpace(interfaceName) == "" {
+		return
+	}
+	stats := map[string]string{
+		"BytesReceived":          "rx_bytes",
+		"BytesSent":              "tx_bytes",
+		"PacketsReceived":        "rx_packets",
+		"PacketsSent":            "tx_packets",
+		"ErrorsReceived":         "rx_errors",
+		"ErrorsSent":             "tx_errors",
+		"DiscardPacketsReceived": "rx_dropped",
+		"DiscardPacketsSent":     "tx_dropped",
+	}
+	for parameter, filename := range stats {
+		raw, err := os.ReadFile(filepath.Join(netClassDir, interfaceName, "statistics", filename))
+		if err != nil {
+			continue
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+		if err == nil {
+			msg.Set(prefix+"Stats."+parameter, wusp.Uint(value))
+		}
 	}
 }
 

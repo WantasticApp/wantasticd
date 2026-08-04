@@ -83,7 +83,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		workerCount++
 	}
 	if a.usp != nil {
-		workerCount++
+		workerCount += 2
 	}
 	a.wg.Add(workerCount)
 
@@ -92,6 +92,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	if a.usp != nil {
 		go a.runWUSPInit(ctx)
+		go a.runNetworkSpeedMonitor(ctx)
 	}
 
 	if a.config.AutoUpdate {
@@ -140,6 +141,11 @@ func (a *Agent) Stop() error {
 func (a *Agent) runWUSPInit(ctx context.Context) {
 	defer a.wg.Done()
 	a.usp.runInit(ctx)
+}
+
+func (a *Agent) runNetworkSpeedMonitor(ctx context.Context) {
+	defer a.wg.Done()
+	a.usp.runNetworkSpeedMonitor(ctx, a.stopCh)
 }
 
 func (a *Agent) runHealthCheck(ctx context.Context) {

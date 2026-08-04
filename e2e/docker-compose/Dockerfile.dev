@@ -1,8 +1,8 @@
 # =============================================================================
-# Dev image: real openwrt/rootfs:x86-64-23.05.5 + LuCI + Go 1.24 + air
+# Dev image: real openwrt/rootfs:x86-64-23.05.5 + LuCI + Go 1.25.12 + air
 #
 # Multi-stage:
-#   1. golang:1.24-bookworm — Go toolchain, build static air, prefetch modules.
+#   1. golang:1.25.12-bookworm — patched Go toolchain, build static air, prefetch modules.
 #   2. openwrt/rootfs:x86-64-23.05.5 — real OpenWrt with LuCI + uhttpd, then
 #      we drop in the static Go toolchain and air from stage 1.
 #
@@ -13,15 +13,14 @@
 # =============================================================================
 
 # ---------- Stage 1: Go toolchain, air, prefetched module cache ----------
-FROM golang:1.24-bookworm AS gobuild
+FROM golang:1.25.12-bookworm AS gobuild
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates git && \
     rm -rf /var/lib/apt/lists/*
 
-# Static air binary. Air's master branch now requires Go 1.25 which we don't
-# have, so we use the upstream install script — it grabs a pre-built static
-# binary from the release page and doesn't need a Go compile step.
+# Use the upstream install script for a pre-built static air binary so the
+# OpenWrt development image does not need to compile this auxiliary tool.
 RUN mkdir -p /out && \
     curl -sSfL https://raw.githubusercontent.com/air-verse/air/master/install.sh \
         | sh -s -- -b /out

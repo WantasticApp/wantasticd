@@ -425,7 +425,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	_ = runCollector("openwrt.wifi", func() error { b.appendWiFiFields(msg); return nil })
 
 	// Network interface details via getifaddrs (pure Go)
-	_ = runCollector("openwrt.network.interfaces", func() error { collectNetworkInterfacesStatic(msg); return nil })
+	_ = runCollector("openwrt.network.interfaces", func() error { collectNetworkInterfacesStatic(msg, b.netClassDir); return nil })
 	_ = runCollector("openwrt.cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("openwrt.cellular.runtime", func() error {
 		if b.cellular != nil {

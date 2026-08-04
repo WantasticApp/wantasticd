@@ -52,6 +52,8 @@ type uspRuntime struct {
 	transport              uspTransport
 	agent                  *wusp.USPAgent
 	dataModelCache         *persistentDataModelCache
+	rawBackend             wusp.DataBackend
+	networkSpeed           *networkSpeedManager
 	controllerPublicKeyHex string
 	deviceID               string
 	softwareVersion        string
@@ -228,10 +230,14 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	}
 
 	backend := platforms.NewBackend(platforms.Options{})
-	cachedBackend := newPersistentDataModelCache(backend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
+	networkSpeed := newNetworkSpeedManager(auth.PersistentFilePath("network-speed.json"))
+	telemetryBackend := &networkTelemetryBackend{backend: backend, speed: networkSpeed}
+	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
 	runtime := &uspRuntime{
 		transport:              transport,
 		dataModelCache:         cachedBackend,
+		rawBackend:             backend,
+		networkSpeed:           networkSpeed,
 		controllerPublicKeyHex: controllerPublicKeyHex,
 		deviceID:               wuspSerial,
 		softwareVersion:        softwareVersion,

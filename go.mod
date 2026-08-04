@@ -1,6 +1,6 @@
 module wantastic-agent
 
-go 1.24.5
+go 1.25.12
 
 require (
 	github.com/andybalholm/brotli v1.2.0
@@ -12,10 +12,11 @@ require (
 	github.com/mdlayher/wifi v0.7.2
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/prometheus/procfs v0.19.2
+	github.com/showwin/speedtest-go v1.7.11
 	github.com/stratoberry/go-gpsd v1.3.0
-	golang.org/x/crypto v0.47.0
-	golang.org/x/net v0.48.0
-	golang.org/x/sys v0.40.0
+	golang.org/x/crypto v0.50.0
+	golang.org/x/net v0.53.0
+	golang.org/x/sys v0.43.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.10
@@ -37,10 +38,10 @@ require (
 	github.com/maltegrosse/go-modemmanager v0.1.4 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
-	github.com/stretchr/testify v1.5.1 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/term v0.39.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	github.com/stretchr/testify v1.10.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/term v0.42.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
 	rsc.io/qr v0.2.0 // indirect

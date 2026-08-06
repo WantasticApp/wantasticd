@@ -37,15 +37,33 @@ type networkSpeedResult struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type networkSpeedCache struct {
+	Version           int                `json:"version"`
+	Result            networkSpeedResult `json:"result"`
+	LastAttemptAt     time.Time          `json:"last_attempt_at,omitempty"`
+	NextAttemptAt     time.Time          `json:"next_attempt_at,omitempty"`
+	LastAttemptFailed bool               `json:"last_attempt_failed,omitempty"`
+}
+
+type networkSpeedTelemetry struct {
+	Result        networkSpeedResult
+	HasResult     bool
+	Status        string
+	LastAttemptAt time.Time
+	NextAttemptAt time.Time
+}
+
 type networkSpeedManager struct {
 	path string
 	now  func() time.Time
 	run  func(context.Context) (networkSpeedResult, error)
 
-	mu        sync.RWMutex
-	result    networkSpeedResult
-	nextTryAt time.Time
-	running   bool
+	mu         sync.RWMutex
+	result     networkSpeedResult
+	lastTryAt  time.Time
+	nextTryAt  time.Time
+	lastFailed bool
+	running    bool
 }
 
 func newNetworkSpeedManager(path string) *networkSpeedManager {
@@ -100,6 +118,35 @@ func (m *networkSpeedManager) snapshot() (networkSpeedResult, bool) {
 	return m.result, m.result.DownloadBPS > 0 && m.result.UploadBPS > 0 && !m.result.ObservedAt.IsZero()
 }
 
+func (m *networkSpeedManager) telemetry() networkSpeedTelemetry {
+	if m == nil {
+		return networkSpeedTelemetry{Status: "Unavailable"}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	hasResult := validNetworkSpeedResult(m.result)
+	status := "Scheduled"
+	switch {
+	case m.running:
+		status = "Running"
+	case m.lastFailed:
+		status = "RetryScheduled"
+	case hasResult:
+		status = "Ready"
+	}
+	return networkSpeedTelemetry{
+		Result:        m.result,
+		HasResult:     hasResult,
+		Status:        status,
+		LastAttemptAt: m.lastTryAt,
+		NextAttemptAt: m.nextTryAt,
+	}
+}
+
+func validNetworkSpeedResult(result networkSpeedResult) bool {
+	return result.DownloadBPS > 0 && result.UploadBPS > 0 && !result.ObservedAt.IsZero()
+}
+
 func (m *networkSpeedManager) due() bool {
 	now := m.now().UTC()
 	m.mu.RLock()
@@ -110,36 +157,71 @@ func (m *networkSpeedManager) due() bool {
 	return m.result.ObservedAt.IsZero() || now.Sub(m.result.ObservedAt) >= networkSpeedInterval
 }
 
-func (m *networkSpeedManager) measure(ctx context.Context) error {
-	if m == nil || !m.due() {
-		return nil
+func (m *networkSpeedManager) nextCheckDelay() time.Duration {
+	if m == nil {
+		return networkSpeedInterval
+	}
+	now := m.now().UTC()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.running {
+		return time.Minute
+	}
+	next := m.nextTryAt
+	if next.IsZero() && !m.result.ObservedAt.IsZero() {
+		next = m.result.ObservedAt.Add(networkSpeedInterval)
+	}
+	if next.IsZero() || !next.After(now) {
+		return 0
+	}
+	return next.Sub(now)
+}
+
+func (m *networkSpeedManager) scheduleInitialAttempt(at time.Time) {
+	if m == nil || at.IsZero() {
+		return
 	}
 	m.mu.Lock()
-	if m.running {
+	if m.nextTryAt.IsZero() {
+		m.nextTryAt = at.UTC()
+	}
+	m.mu.Unlock()
+}
+
+func (m *networkSpeedManager) measure(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	now := m.now().UTC()
+	m.mu.Lock()
+	if m.running || (!m.nextTryAt.IsZero() && now.Before(m.nextTryAt)) ||
+		(!m.result.ObservedAt.IsZero() && now.Sub(m.result.ObservedAt) < networkSpeedInterval) {
 		m.mu.Unlock()
 		return nil
 	}
 	m.running = true
+	m.lastTryAt = now
 	m.mu.Unlock()
 	result, err := m.run(ctx)
-	now := m.now().UTC()
+	now = m.now().UTC()
 	m.mu.Lock()
 	m.running = false
 	if err != nil {
+		m.lastFailed = true
 		m.nextTryAt = now.Add(networkSpeedRetry)
 		m.mu.Unlock()
+		if persistErr := m.persist(); persistErr != nil {
+			return errors.Join(err, fmt.Errorf("persist speed-test retry state: %w", persistErr))
+		}
 		return err
 	}
 	result.ObservedAt = now
 	result.Source = "speedtest.net"
 	m.result = result
+	m.lastFailed = false
 	m.nextTryAt = now.Add(networkSpeedInterval)
 	m.mu.Unlock()
-	encoded, err := json.Marshal(result)
-	if err != nil {
-		return err
-	}
-	return writeCacheAtomically(m.path, encoded)
+	return m.persist()
 }
 
 func (m *networkSpeedManager) load() {
@@ -147,11 +229,47 @@ func (m *networkSpeedManager) load() {
 	if err != nil {
 		return
 	}
+	var cached networkSpeedCache
+	if json.Unmarshal(data, &cached) == nil && cached.Version > 0 {
+		if validNetworkSpeedResult(cached.Result) {
+			m.result = cached.Result
+		}
+		m.lastTryAt = cached.LastAttemptAt
+		m.nextTryAt = cached.NextAttemptAt
+		m.lastFailed = cached.LastAttemptFailed
+		if m.nextTryAt.IsZero() && validNetworkSpeedResult(m.result) {
+			m.nextTryAt = m.result.ObservedAt.Add(networkSpeedInterval)
+		}
+		return
+	}
+	// Backward compatibility with the original cache, which stored the result
+	// directly at the root of network-speed.json.
 	var result networkSpeedResult
-	if json.Unmarshal(data, &result) == nil && result.DownloadBPS > 0 && result.UploadBPS > 0 && !result.ObservedAt.IsZero() {
+	if json.Unmarshal(data, &result) == nil && validNetworkSpeedResult(result) {
 		m.result = result
+		m.lastTryAt = result.ObservedAt
 		m.nextTryAt = result.ObservedAt.Add(networkSpeedInterval)
 	}
+}
+
+func (m *networkSpeedManager) persist() error {
+	if m == nil || strings.TrimSpace(m.path) == "" {
+		return nil
+	}
+	m.mu.RLock()
+	cached := networkSpeedCache{
+		Version:           1,
+		Result:            m.result,
+		LastAttemptAt:     m.lastTryAt,
+		NextAttemptAt:     m.nextTryAt,
+		LastAttemptFailed: m.lastFailed,
+	}
+	m.mu.RUnlock()
+	encoded, err := json.Marshal(cached)
+	if err != nil {
+		return err
+	}
+	return writeCacheAtomically(m.path, encoded)
 }
 
 var osReadFile = func(path string) ([]byte, error) { return os.ReadFile(path) }
@@ -166,9 +284,7 @@ func (b *networkTelemetryBackend) Collect(ctx context.Context, paths ...string) 
 	if err != nil {
 		return nil, err
 	}
-	if result, ok := b.speed.snapshot(); ok {
-		appendNetworkSpeedFields(msg, result)
-	}
+	appendNetworkSpeedTelemetry(msg, b.speed.telemetry())
 	if len(paths) == 0 {
 		return msg, nil
 	}
@@ -202,6 +318,24 @@ func appendNetworkSpeedFields(msg *wusp.Message, result networkSpeedResult) {
 	msg.Set(prefix+"ObservedAt", wusp.Time(result.ObservedAt))
 }
 
+func appendNetworkSpeedTelemetry(msg *wusp.Message, telemetry networkSpeedTelemetry) {
+	if msg == nil {
+		return
+	}
+	prefix := wusp.WUSPNetworkTelemetryPrefix + "SpeedTest."
+	msg.Set(prefix+"Status", wusp.String(telemetry.Status))
+	msg.Set(prefix+"IntervalSeconds", wusp.Uint(uint64(networkSpeedInterval/time.Second)))
+	if !telemetry.LastAttemptAt.IsZero() {
+		msg.Set(prefix+"LastAttemptAt", wusp.Time(telemetry.LastAttemptAt))
+	}
+	if !telemetry.NextAttemptAt.IsZero() {
+		msg.Set(prefix+"NextRunAt", wusp.Time(telemetry.NextAttemptAt))
+	}
+	if telemetry.HasResult {
+		appendNetworkSpeedFields(msg, telemetry.Result)
+	}
+}
+
 func (b *networkTelemetryBackend) Set(ctx context.Context, path string, value wusp.Value) error {
 	return b.backend.Set(ctx, path, value)
 }
@@ -222,23 +356,6 @@ func (b *networkTelemetryBackend) Warmup(ctx context.Context) error {
 	return nil
 }
 
-func hasNativeInternetCapacity(ctx context.Context, backend wusp.DataBackend) bool {
-	msg, err := backend.Collect(ctx, "Device.Cellular.Interface.")
-	if err != nil || msg == nil {
-		return false
-	}
-	var downstream, upstream bool
-	for _, field := range msg.Fields {
-		if strings.HasSuffix(field.Path, ".DownstreamMaxBitRate") && field.Val.AsUint() > 0 {
-			downstream = true
-		}
-		if strings.HasSuffix(field.Path, ".UpstreamMaxBitRate") && field.Val.AsUint() > 0 {
-			upstream = true
-		}
-	}
-	return downstream && upstream
-}
-
 func networkSpeedInitialDelay(deviceID string) time.Duration {
 	hash := fnv.New32a()
 	_, _ = hash.Write([]byte(strings.TrimSpace(deviceID)))
@@ -246,47 +363,53 @@ func networkSpeedInitialDelay(deviceID string) time.Duration {
 }
 
 func (r *uspRuntime) runNetworkSpeedMonitor(ctx context.Context, stop <-chan struct{}) {
-	if r == nil || r.networkSpeed == nil || r.rawBackend == nil {
+	if r == nil || r.networkSpeed == nil {
 		return
 	}
-	initial := time.NewTimer(networkSpeedInitialDelay(r.deviceID))
+	initialDelay := networkSpeedInitialDelay(r.deviceID)
+	r.networkSpeed.scheduleInitialAttempt(time.Now().UTC().Add(initialDelay))
+	initial := time.NewTimer(initialDelay)
 	defer initial.Stop()
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
 	check := func() {
 		if !r.networkSpeed.due() {
-			return
-		}
-		capacityCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		hasNative := hasNativeInternetCapacity(capacityCtx, r.rawBackend)
-		cancel()
-		if hasNative {
 			return
 		}
 		testCtx, testCancel := context.WithTimeout(ctx, networkSpeedTimeout)
 		err := r.networkSpeed.measure(testCtx)
 		testCancel()
+		patch := wusp.NewMessage()
+		appendNetworkSpeedTelemetry(patch, r.networkSpeed.telemetry())
+		_ = r.dataModelCache.Patch(patch)
 		if err != nil {
 			log.Printf("[USP] daily internet speed measurement failed; retained last valid result: %v", err)
 			return
 		}
 		if result, ok := r.networkSpeed.snapshot(); ok {
-			patch := wusp.NewMessage()
-			appendNetworkSpeedFields(patch, result)
-			_ = r.dataModelCache.Patch(patch)
 			log.Printf("[USP] daily internet speed measurement complete: down=%d bps up=%d bps", result.DownloadBPS, result.UploadBPS)
 		}
 	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-stop:
+		return
+	case <-initial.C:
+	}
 	for {
+		check()
+		delay := r.networkSpeed.nextCheckDelay()
+		if delay < time.Minute {
+			delay = time.Minute
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-stop:
+			timer.Stop()
 			return
-		case <-initial.C:
-			check()
-		case <-ticker.C:
-			check()
+		case <-timer.C:
 		}
 	}
 }

@@ -200,6 +200,18 @@ static int c_iwinfo_assoclist(const char *ifname, char *buf, int *len) {
     return *len / sizeof(struct iwinfo_assoclist_entry);
 }
 
+static int c_iwinfo_assoc_authenticated(struct iwinfo_assoclist_entry *entry) {
+    return entry->is_authenticated && entry->is_authorized;
+}
+
+static int c_iwinfo_rate_standard(struct iwinfo_rate_entry *rx, struct iwinfo_rate_entry *tx) {
+    if (rx->is_eht || tx->is_eht) return 4;
+    if (rx->is_he  || tx->is_he)  return 3;
+    if (rx->is_vht || tx->is_vht) return 2;
+    if (rx->is_ht  || tx->is_ht)  return 1;
+    return 0;
+}
+
 static int c_iwinfo_survey(const char *ifname, char *buf, int *len) {
     const struct iwinfo_ops *ops = iwinfo_backend(ifname);
     if (!ops || !ops->survey) return -1;
@@ -239,23 +251,51 @@ func GetInfo(ifname string) (*InterfaceInfo, error) {
 	info := &InterfaceInfo{Name: ifname}
 
 	// Integer fields
-	if v := int(C.c_iwinfo_int(cName, 0)); v != -256 { info.Signal = v }
-	if v := int(C.c_iwinfo_int(cName, 1)); v != -256 { info.Noise = v }
-	if v := int(C.c_iwinfo_int(cName, 2)); v != -256 { info.Bitrate = v }
-	if v := int(C.c_iwinfo_int(cName, 3)); v != -256 { info.Channel = v }
-	if v := int(C.c_iwinfo_int(cName, 4)); v != -256 { info.Frequency = v }
-	if v := int(C.c_iwinfo_int(cName, 5)); v != -256 { info.TxPower = v }
-	if v := int(C.c_iwinfo_int(cName, 6)); v != -256 { info.Quality = v }
-	if v := int(C.c_iwinfo_int(cName, 7)); v != -256 { info.QualityMax = v }
-	if v := int(C.c_iwinfo_int(cName, 8)); v != -256 { info.Mode = v }
+	if v := int(C.c_iwinfo_int(cName, 0)); v != -256 {
+		info.Signal = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 1)); v != -256 {
+		info.Noise = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 2)); v != -256 {
+		info.Bitrate = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 3)); v != -256 {
+		info.Channel = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 4)); v != -256 {
+		info.Frequency = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 5)); v != -256 {
+		info.TxPower = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 6)); v != -256 {
+		info.Quality = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 7)); v != -256 {
+		info.QualityMax = v
+	}
+	if v := int(C.c_iwinfo_int(cName, 8)); v != -256 {
+		info.Mode = v
+	}
 
 	// String fields
 	var buf [256]C.char
-	if C.c_iwinfo_str(cName, 0, &buf[0], 256) == 0 { info.SSID = C.GoString(&buf[0]) }
-	if C.c_iwinfo_str(cName, 1, &buf[0], 256) == 0 { info.BSSID = C.GoString(&buf[0]) }
-	if C.c_iwinfo_str(cName, 2, &buf[0], 256) == 0 { info.Country = C.GoString(&buf[0]) }
-	if C.c_iwinfo_str(cName, 3, &buf[0], 256) == 0 { info.HardwareName = C.GoString(&buf[0]) }
-	if C.c_iwinfo_str(cName, 4, &buf[0], 256) == 0 { info.PHYName = C.GoString(&buf[0]) }
+	if C.c_iwinfo_str(cName, 0, &buf[0], 256) == 0 {
+		info.SSID = C.GoString(&buf[0])
+	}
+	if C.c_iwinfo_str(cName, 1, &buf[0], 256) == 0 {
+		info.BSSID = C.GoString(&buf[0])
+	}
+	if C.c_iwinfo_str(cName, 2, &buf[0], 256) == 0 {
+		info.Country = C.GoString(&buf[0])
+	}
+	if C.c_iwinfo_str(cName, 3, &buf[0], 256) == 0 {
+		info.HardwareName = C.GoString(&buf[0])
+	}
+	if C.c_iwinfo_str(cName, 4, &buf[0], 256) == 0 {
+		info.PHYName = C.GoString(&buf[0])
+	}
 
 	return info, nil
 }
@@ -407,27 +447,45 @@ func GetAssocList(ifname string) ([]AssocEntry, error) {
 			mac[j] = byte(ptr.mac[j])
 		}
 		entries = append(entries, AssocEntry{
-			MAC:           mac,
-			Signal:        int8(ptr.signal),
-			SignalAvg:     int8(ptr.signal_avg),
-			Noise:         int8(ptr.noise),
-			Inactive:      uint32(ptr.inactive),
-			ConnectedTime: uint32(ptr.connected_time),
-			RxPackets:     uint32(ptr.rx_packets),
-			TxPackets:     uint32(ptr.tx_packets),
-			RxBytes:       uint64(ptr.rx_bytes),
-			TxBytes:       uint64(ptr.tx_bytes),
-			TxRetries:     uint32(ptr.tx_retries),
-			TxFailed:      uint32(ptr.tx_failed),
-			RxRate:        uint32(ptr.rx_rate.rate),
-			TxRate:        uint32(ptr.tx_rate.rate),
-			RxMCS:         int8(ptr.rx_rate.mcs),
-			TxMCS:         int8(ptr.tx_rate.mcs),
-			RxNSS:         uint8(ptr.rx_rate.nss),
-			TxNSS:         uint8(ptr.tx_rate.nss),
+			MAC:                 mac,
+			Signal:              int8(ptr.signal),
+			SignalAvg:           int8(ptr.signal_avg),
+			Noise:               int8(ptr.noise),
+			AuthenticationKnown: true,
+			Authenticated:       C.c_iwinfo_assoc_authenticated(ptr) != 0,
+			OperatingStandard:   cgoRateOperatingStandard(&ptr.rx_rate, &ptr.tx_rate),
+			Inactive:            uint32(ptr.inactive),
+			ConnectedTime:       uint32(ptr.connected_time),
+			RxPackets:           uint32(ptr.rx_packets),
+			TxPackets:           uint32(ptr.tx_packets),
+			RxBytes:             uint64(ptr.rx_bytes),
+			TxBytes:             uint64(ptr.tx_bytes),
+			TxRetries:           uint32(ptr.tx_retries),
+			TxFailed:            uint32(ptr.tx_failed),
+			RxRate:              uint32(ptr.rx_rate.rate),
+			TxRate:              uint32(ptr.tx_rate.rate),
+			RxMCS:               int8(ptr.rx_rate.mcs),
+			TxMCS:               int8(ptr.tx_rate.mcs),
+			RxNSS:               uint8(ptr.rx_rate.nss),
+			TxNSS:               uint8(ptr.tx_rate.nss),
 		})
 	}
 	return entries, nil
+}
+
+func cgoRateOperatingStandard(rx, tx *C.struct_iwinfo_rate_entry) string {
+	switch C.c_iwinfo_rate_standard(rx, tx) {
+	case 4:
+		return "be"
+	case 3:
+		return "ax"
+	case 2:
+		return "ac"
+	case 1:
+		return "n"
+	default:
+		return ""
+	}
 }
 
 // ── Channel Survey ──────────────────────────────────────────────────────────

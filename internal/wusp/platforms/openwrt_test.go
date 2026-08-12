@@ -240,6 +240,79 @@ func TestOpenWrtBackendCollectMeshTopologyFromRealTopo(t *testing.T) {
 	}
 }
 
+func TestOpenWrtStockHostapdStationsPopulateTR181(t *testing.T) {
+	stationMAC, _ := net.ParseMAC("02:11:22:33:44:55")
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "ip" && strings.Join(args, " ") == "neigh show" {
+				return []byte("192.168.50.20 dev br-lan lladdr 02:11:22:33:44:55 REACHABLE\nfe80::20 dev br-lan lladdr 02:11:22:33:44:55 STALE\n"), nil
+			}
+			return nil, errors.New("CLI disabled in test")
+		},
+		WiFiAssocList: func(ifName string) ([]iwinfo.AssocEntry, error) {
+			if ifName != "phy0-ap0" {
+				return nil, errors.New("unexpected interface")
+			}
+			// Direct nl80211 supplies timing/retry/average signal fields while
+			// hostapd supplies authentication and negotiated standard fields.
+			return []iwinfo.AssocEntry{{
+				MAC: stationMAC, Signal: -53, SignalAvg: -55, Noise: -96,
+				ConnectedTime: 90, TxRetries: 7, TxFailed: 1,
+			}}, nil
+		},
+		Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			switch {
+			case object == "network.wireless" && method == "status":
+				return []byte(`{"radio0":{"up":true,"config":{"band":"5g","channel":"44","htmode":"HE80"},"interfaces":[{"section":"default_radio0","ifname":"phy0-ap0","up":true,"config":{"mode":"ap","ssid":"Stock-OpenWrt"}}]}}`), nil
+			case object == "hostapd.phy0-ap0" && method == "get_clients":
+				return []byte(`{
+					"freq":5220,
+					"clients":{
+						"02:11:22:33:44:55":{
+							"auth":true,"assoc":true,"authorized":true,
+							"ht":true,"vht":true,"he":true,
+							"signal":-53,
+							"bytes":{"rx":1234,"tx":5678},
+							"packets":{"rx":12,"tx":34},
+							"rate":{"rx":24000,"tx":36000}
+						},
+						"02:11:22:33:44:66":{"auth":true,"assoc":false,"authorized":false}
+					}
+				}`), nil
+			default:
+				// In particular, stock OpenWrt has no device.getStaList method.
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendWiFiFields(msg)
+
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries", 1)
+	assertMACField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.MACAddress", stationMAC.String())
+	assertStringField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.OperatingStandard", "ax")
+	assertBoolField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.AuthenticationState", true)
+	assertBoolField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Active", true)
+	assertIntField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.SignalStrength", -55)
+	assertIntField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Noise", -96)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.SNR", 41)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.LastDataDownlinkRate", 36000)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.LastDataUplinkRate", 24000)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Stats.BytesSent", 5678)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Stats.BytesReceived", 1234)
+	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.Stats.RetransCount", 7)
+	assertUintField(t, msg, "Device.Hosts.HostNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.Hosts.Host.1.AssociatedDevice", "Device.WiFi.AccessPoint.1.AssociatedDevice.1.")
+	assertStringField(t, msg, "Device.Hosts.Host.1.IPAddress", "192.168.50.20")
+	assertUintField(t, msg, "Device.Hosts.Host.1.IPv4AddressNumberOfEntries", 1)
+	assertUintField(t, msg, "Device.Hosts.Host.1.IPv6AddressNumberOfEntries", 1)
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(stock hostapd stations): %v", err)
+	}
+}
+
 func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {

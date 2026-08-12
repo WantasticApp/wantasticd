@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
+	linuxwifi "github.com/mdlayher/wifi"
 	"wantastic-agent/internal/netctl"
 )
 
@@ -92,6 +94,13 @@ func GetPHYName(ifname string) (string, error) {
 }
 
 func GetAssocList(ifname string) ([]AssocEntry, error) {
+	nlEntries, err := assocListFromNL80211(ifname)
+	if err == nil {
+		return nlEntries, nil
+	}
+
+	// Some vendor drivers do not implement nl80211. Keep debugfs as a final
+	// no-dependency fallback, although it is commonly unavailable on OpenWrt.
 	stations, err := ctl.WiFiGetStations(ifname)
 	if err != nil {
 		return nil, err
@@ -109,7 +118,136 @@ func GetAssocList(ifname string) ([]AssocEntry, error) {
 	return entries, nil
 }
 
-func GetSurvey(ifname string) ([]SurveyEntry, error) { return nil, nil }
+func assocListFromNL80211(ifname string) ([]AssocEntry, error) {
+	client, iface, err := nl80211Interface(ifname)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+
+	stations, err := client.StationInfo(iface)
+	if err != nil {
+		return nil, fmt.Errorf("nl80211 station dump for %s: %w", ifname, err)
+	}
+	entries := make([]AssocEntry, 0, len(stations))
+	for _, station := range stations {
+		if station == nil {
+			continue
+		}
+		entries = append(entries, AssocEntry{
+			MAC:           append(net.HardwareAddr(nil), station.HardwareAddr...),
+			Signal:        clampInt8(station.Signal),
+			SignalAvg:     clampInt8(station.SignalAverage),
+			Inactive:      durationUint32(station.Inactive, time.Millisecond),
+			ConnectedTime: durationUint32(station.Connected, time.Second),
+			RxPackets:     nonNegativeUint32(station.ReceivedPackets),
+			TxPackets:     nonNegativeUint32(station.TransmittedPackets),
+			RxBytes:       nonNegativeUint64(station.ReceivedBytes),
+			TxBytes:       nonNegativeUint64(station.TransmittedBytes),
+			TxRetries:     nonNegativeUint32(station.TransmitRetries),
+			TxFailed:      nonNegativeUint32(station.TransmitFailed),
+			// mdlayher/wifi reports bit/s; libiwinfo and AssocEntry use kbit/s.
+			RxRate: nonNegativeUint32(station.ReceiveBitrate / 1000),
+			TxRate: nonNegativeUint32(station.TransmitBitrate / 1000),
+		})
+	}
+	return entries, nil
+}
+
+func GetSurvey(ifname string) ([]SurveyEntry, error) {
+	client, iface, err := nl80211Interface(ifname)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+
+	survey, err := client.SurveyInfo(iface)
+	if err != nil {
+		return nil, fmt.Errorf("nl80211 survey dump for %s: %w", ifname, err)
+	}
+	entries := make([]SurveyEntry, 0, len(survey))
+	for _, item := range survey {
+		if item == nil {
+			continue
+		}
+		entries = append(entries, SurveyEntry{
+			InUse:      item.InUse,
+			ActiveTime: durationUint64(item.ChannelTimeActive, time.Microsecond),
+			BusyTime:   durationUint64(item.ChannelTimeBusy, time.Microsecond),
+			RxTime:     durationUint64(item.ChannelTimeRx, time.Microsecond),
+			TxTime:     durationUint64(item.ChannelTimeTx, time.Microsecond),
+			Frequency:  nonNegativeUint32(item.Frequency),
+			Noise:      clampInt8(item.Noise),
+		})
+	}
+	return entries, nil
+}
+
+func nl80211Interface(ifname string) (*linuxwifi.Client, *linuxwifi.Interface, error) {
+	client, err := linuxwifi.New()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open nl80211: %w", err)
+	}
+	// Do not let a broken vendor driver stall a USP collection indefinitely.
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	interfaces, err := client.Interfaces()
+	if err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("list nl80211 interfaces: %w", err)
+	}
+	for _, iface := range interfaces {
+		if iface != nil && iface.Name == ifname {
+			return client, iface, nil
+		}
+	}
+	client.Close()
+	return nil, nil, fmt.Errorf("nl80211 interface %s not found", ifname)
+}
+
+func clampInt8(value int) int8 {
+	if value < -128 {
+		return -128
+	}
+	if value > 127 {
+		return 127
+	}
+	return int8(value)
+}
+
+func nonNegativeUint32(value int) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	if uint64(value) > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(value)
+}
+
+func nonNegativeUint64(value int) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value)
+}
+
+func durationUint32(value time.Duration, unit time.Duration) uint32 {
+	if value <= 0 || unit <= 0 {
+		return 0
+	}
+	units := uint64(value / unit)
+	if units > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(units)
+}
+
+func durationUint64(value time.Duration, unit time.Duration) uint64 {
+	if value <= 0 || unit <= 0 {
+		return 0
+	}
+	return uint64(value / unit)
+}
 
 func Close() {}
 

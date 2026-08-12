@@ -195,6 +195,35 @@ type openWrtWiFiStation struct {
 	TxRate        uint32 `json:"tx_rate"`
 }
 
+// openWrtHostapdClients is the stock OpenWrt hostapd.<ifname>.get_clients
+// response. Unlike the vendor-specific device.getStaList call, this object is
+// supplied by wpad/hostapd on normal OpenWrt access points.
+type openWrtHostapdClients struct {
+	Frequency int `json:"freq"`
+	Clients   map[string]struct {
+		Auth       *bool `json:"auth"`
+		Assoc      *bool `json:"assoc"`
+		Authorized *bool `json:"authorized"`
+		HT         bool  `json:"ht"`
+		VHT        bool  `json:"vht"`
+		HE         bool  `json:"he"`
+		EHT        bool  `json:"eht"`
+		Signal     int   `json:"signal"`
+		Bytes      struct {
+			RX uint64 `json:"rx"`
+			TX uint64 `json:"tx"`
+		} `json:"bytes"`
+		Packets struct {
+			RX uint32 `json:"rx"`
+			TX uint32 `json:"tx"`
+		} `json:"packets"`
+		Rate struct {
+			RX uint32 `json:"rx"`
+			TX uint32 `json:"tx"`
+		} `json:"rate"`
+	} `json:"clients"`
+}
+
 var _ wusp.DataBackend = (*OpenWrtBackend)(nil)
 
 func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
@@ -617,7 +646,11 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 				appendField(msg, apPath+"Enable", wusp.Bool(ssidEnabled))
 				appendField(msg, apPath+"Status", wusp.String(wifiAccessPointStatusValue(ssidEnabled, iface.Up)))
 				appendField(msg, apPath+"SSIDReference", wusp.String(ssidPath))
-				stations := mergeWiFiAssociations(ubusStations[ifName], b.readIWInfoAssociations(ifName))
+				// Stock OpenWrt exposes clients through hostapd.<ifname>.get_clients.
+				// Merge it with the optional vendor call and the direct nl80211/
+				// libiwinfo collector so each source fills the fields it knows.
+				stations := mergeWiFiAssociations(ubusStations[ifName], b.readHostapdAssociations(ifName))
+				stations = mergeWiFiAssociations(stations, b.readIWInfoAssociations(ifName))
 				appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(len(stations))))
 				for stationIndex, station := range stations {
 					stationPath := fmt.Sprintf("%sAssociatedDevice.%d.", apPath, stationIndex+1)
@@ -645,7 +678,122 @@ func (b *OpenWrtBackend) readIWInfoAssociations(ifName string) []iwinfo.AssocEnt
 	if err != nil {
 		return nil
 	}
+	if len(associations) == 0 {
+		return associations
+	}
+	// nl80211 station dumps do not carry per-station noise. The in-use channel
+	// survey is the correct available radio-level fallback for SNR reporting.
+	noise := int8(0)
+	if survey, surveyErr := iwinfo.GetSurvey(ifName); surveyErr == nil {
+		for _, entry := range survey {
+			if entry.InUse && entry.Noise < 0 {
+				noise = entry.Noise
+				break
+			}
+		}
+		if noise == 0 {
+			for _, entry := range survey {
+				if entry.Noise < 0 {
+					noise = entry.Noise
+					break
+				}
+			}
+		}
+	}
+	if noise < 0 {
+		for index := range associations {
+			if associations[index].Noise == 0 {
+				associations[index].Noise = noise
+			}
+		}
+	}
 	return associations
+}
+
+func (b *OpenWrtBackend) readHostapdAssociations(ifName string) []iwinfo.AssocEntry {
+	ifName = strings.TrimSpace(ifName)
+	if ifName == "" || b.ubusCaller == nil {
+		return nil
+	}
+	data, err := b.ubusCaller("hostapd."+ifName, "get_clients", b.ubusTimeout)
+	if err != nil && b.commandRunner != nil {
+		// The HTTP ubus anonymous session can lack hostapd ACLs even though the
+		// local agent is privileged. The local ubus CLI reaches the same stock
+		// object without requiring rpcd HTTP permissions.
+		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
+		data, err = b.commandRunner(ctx, "ubus", "call", "hostapd."+ifName, "get_clients")
+		cancel()
+	}
+	if err != nil {
+		return nil
+	}
+	var payload openWrtHostapdClients
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+
+	stations := make([]iwinfo.AssocEntry, 0, len(payload.Clients))
+	for macText, client := range payload.Clients {
+		// hostapd can briefly retain authenticated-but-not-associated peers.
+		if client.Assoc != nil && !*client.Assoc {
+			continue
+		}
+		mac := validClientMAC(macText)
+		if mac == nil {
+			continue
+		}
+		authenticated, authenticationKnown := true, false
+		if client.Authorized != nil {
+			authenticated = *client.Authorized
+			authenticationKnown = true
+		} else if client.Auth != nil {
+			authenticated = *client.Auth
+			authenticationKnown = true
+		}
+		stations = append(stations, iwinfo.AssocEntry{
+			MAC:                 mac,
+			Signal:              boundedWiFiDBM(client.Signal),
+			AuthenticationKnown: authenticationKnown,
+			Authenticated:       authenticated,
+			OperatingStandard:   hostapdOperatingStandard(client.HT, client.VHT, client.HE, client.EHT, payload.Frequency),
+			RxPackets:           client.Packets.RX,
+			TxPackets:           client.Packets.TX,
+			RxBytes:             client.Bytes.RX,
+			TxBytes:             client.Bytes.TX,
+			RxRate:              client.Rate.RX,
+			TxRate:              client.Rate.TX,
+		})
+	}
+	return stations
+}
+
+func boundedWiFiDBM(value int) int8 {
+	if value < -128 {
+		return -128
+	}
+	if value > 0 {
+		return 0
+	}
+	return int8(value)
+}
+
+func hostapdOperatingStandard(ht, vht, he, eht bool, frequency int) string {
+	switch {
+	case eht:
+		return "be"
+	case he:
+		return "ax"
+	case vht:
+		return "ac"
+	case ht:
+		return "n"
+	case frequency >= 4900:
+		return "a"
+	case frequency > 0:
+		return "g"
+	default:
+		return ""
+	}
 }
 
 func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.AssocEntry {
@@ -661,6 +809,13 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 			return
 		}
 		if prefer {
+			if station.OperatingStandard == "" {
+				station.OperatingStandard = existing.OperatingStandard
+			}
+			if !station.AuthenticationKnown {
+				station.AuthenticationKnown = existing.AuthenticationKnown
+				station.Authenticated = existing.Authenticated
+			}
 			if station.SignalAvg == 0 {
 				station.SignalAvg = existing.SignalAvg
 			}
@@ -733,7 +888,16 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 
 func (b *OpenWrtBackend) appendWiFiAssociatedDeviceFields(msg *wusp.Message, path string, station iwinfo.AssocEntry) {
 	appendField(msg, path+"MACAddress", wusp.MAC(station.MAC))
-	appendField(msg, path+"AuthenticationState", wusp.Bool(true))
+	if station.OperatingStandard != "" {
+		appendField(msg, path+"OperatingStandard", wusp.String(station.OperatingStandard))
+	}
+	if station.AuthenticationKnown {
+		appendField(msg, path+"AuthenticationState", wusp.Bool(station.Authenticated))
+	} else {
+		// A station returned by an associated-station dump is authenticated on
+		// platforms which do not expose the flag separately.
+		appendField(msg, path+"AuthenticationState", wusp.Bool(true))
+	}
 	appendField(msg, path+"Active", wusp.Bool(true))
 	if station.TxRate >= 1000 {
 		appendField(msg, path+"LastDataDownlinkRate", wusp.Uint(uint64(station.TxRate)))
@@ -744,13 +908,17 @@ func (b *OpenWrtBackend) appendWiFiAssociatedDeviceFields(msg *wusp.Message, pat
 	if station.ConnectedTime > 0 {
 		appendField(msg, path+"AssociationTime", wusp.Time(b.now().UTC().Add(-time.Duration(station.ConnectedTime)*time.Second)))
 	}
-	if station.Signal < 0 {
-		appendField(msg, path+"SignalStrength", wusp.Int(int64(station.Signal)))
+	signal := station.SignalAvg
+	if signal >= 0 {
+		signal = station.Signal
+	}
+	if signal < 0 {
+		appendField(msg, path+"SignalStrength", wusp.Int(int64(signal)))
 	}
 	if station.Noise < 0 {
 		appendField(msg, path+"Noise", wusp.Int(int64(station.Noise)))
-		if station.Signal < 0 && station.Signal >= station.Noise {
-			appendField(msg, path+"SNR", wusp.Uint(uint64(int(station.Signal)-int(station.Noise))))
+		if signal < 0 && signal >= station.Noise {
+			appendField(msg, path+"SNR", wusp.Uint(uint64(int(signal)-int(station.Noise))))
 		}
 	}
 	appendField(msg, path+"Stats.BytesSent", wusp.Uint(station.TxBytes))

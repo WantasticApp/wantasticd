@@ -44,28 +44,34 @@ type HWModes struct {
 
 // AssocEntry represents a connected WiFi station (client).
 type AssocEntry struct {
-	MAC           net.HardwareAddr
-	Signal        int8
-	SignalAvg     int8
-	Noise         int8
-	Inactive      uint32 // ms since last activity
-	ConnectedTime uint32 // seconds
-	RxPackets     uint32
-	TxPackets     uint32
-	RxBytes       uint64
-	TxBytes       uint64
-	TxRetries     uint32
-	TxFailed      uint32
-	RxRate        uint32 // kbit/s
-	TxRate        uint32 // kbit/s
-	RxMCS         int8
-	TxMCS         int8
-	RxNSS         uint8
-	TxNSS         uint8
+	MAC       net.HardwareAddr
+	Signal    int8
+	SignalAvg int8
+	Noise     int8
+	// AuthenticationKnown distinguishes a real false authentication state
+	// from collectors (such as nl80211 station dumps) which do not expose it.
+	AuthenticationKnown bool
+	Authenticated       bool
+	OperatingStandard   string // a, b, g, n, ac, ax, or be
+	Inactive            uint32 // ms since last activity
+	ConnectedTime       uint32 // seconds
+	RxPackets           uint32
+	TxPackets           uint32
+	RxBytes             uint64
+	TxBytes             uint64
+	TxRetries           uint32
+	TxFailed            uint32
+	RxRate              uint32 // kbit/s
+	TxRate              uint32 // kbit/s
+	RxMCS               int8
+	TxMCS               int8
+	RxNSS               uint8
+	TxNSS               uint8
 }
 
 // SurveyEntry represents channel survey / utilization data.
 type SurveyEntry struct {
+	InUse      bool   // currently operating channel, when the backend exposes it
 	ActiveTime uint64 // total active time (µs)
 	BusyTime   uint64 // channel busy time (µs)
 	RxTime     uint64 // time spent receiving (µs)

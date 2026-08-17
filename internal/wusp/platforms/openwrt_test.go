@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +279,49 @@ func TestOpenWrtBackendSetRadioControls(t *testing.T) {
 	data, _ = os.ReadFile(wirelessPath)
 	if strings.Contains(string(data), "option txpower") {
 		t.Fatalf("automatic transmit power did not remove txpower option:\n%s", data)
+	}
+}
+
+func TestOpenWrtBackendSetRadioUsesCollectedUCISectionName(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	wirelessPath := filepath.Join(configDir, "wireless")
+	mustWriteFile(t, wirelessPath, "config wifi-device 'wifi0'\n\toption band '5g'\n\toption channel '36'\nconfig wifi-iface 'main_ap'\n\toption device 'wifi0'\n\toption ifname 'phy0-ap0'\n\toption mode 'ap'\n")
+
+	var commands []string
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			commands = append(commands, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+			if name == "ubus" && strings.Join(args, " ") == "call network.wireless status" {
+				return []byte(`{"wifi0":{"up":true,"config":{"band":"5g","channel":"36"},"interfaces":[{"section":"main_ap","ifname":"phy0-ap0","up":true,"config":{"mode":"ap"}}]}}`), nil
+			}
+			if name == "ubus" && strings.Join(args, " ") == "call network reload" {
+				return []byte(`{}`), nil
+			}
+			return nil, errors.New("command unavailable")
+		},
+		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+			return nil, errors.New("HTTP ubus denied")
+		},
+	})
+
+	if err := backend.Set(context.Background(), "Device.WiFi.Radio.1.Channel", wusp.Uint(44)); err != nil {
+		t.Fatalf("Set(Channel): %v", err)
+	}
+	data, err := os.ReadFile(wirelessPath)
+	if err != nil {
+		t.Fatalf("read wireless config: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "config wifi-device 'wifi0'\n\toption band '5g'\n\toption channel '44'") {
+		t.Fatalf("wifi0 was not updated:\n%s", text)
+	}
+	if strings.Contains(text, "config radio0") || strings.Contains(text, "config wifi-device 'radio0'") {
+		t.Fatalf("Set created an unused radio0 section:\n%s", text)
+	}
+	if !slices.Contains(commands, "ubus call network reload") {
+		t.Fatalf("wireless reload did not use netifd ubus: %v", commands)
 	}
 }
 

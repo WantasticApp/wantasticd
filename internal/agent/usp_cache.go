@@ -24,6 +24,7 @@ type persistentDataModelCache struct {
 	refreshing     bool
 	refreshDone    chan struct{}
 	lastRefreshErr error
+	changeObserver func(previous, current *wusp.Message)
 	startOnce      sync.Once
 }
 
@@ -74,7 +75,16 @@ func (c *persistentDataModelCache) Set(ctx context.Context, path string, value w
 	if err := c.backend.Set(ctx, path, value); err != nil {
 		return err
 	}
-	c.refreshAfterMutation(ctx)
+	// A device mutation is already complete at this point. Patch the requested
+	// value into the cache immediately so the WUSP Set response is not held up by
+	// a full modem/Wi-Fi collection, then reconcile actual runtime state in the
+	// background. Some embedded sweeps legitimately take tens of seconds.
+	patch := wusp.NewMessage()
+	patch.Set(path, value)
+	if err := c.Patch(patch); err != nil {
+		log.Printf("[USP] DataModel cache mutation patch warning: continue_on_error=true err=%v", err)
+	}
+	c.refreshAfterMutation()
 	return nil
 }
 
@@ -82,7 +92,7 @@ func (c *persistentDataModelCache) Delete(ctx context.Context, paths ...string) 
 	if err := c.backend.Delete(ctx, paths...); err != nil {
 		return err
 	}
-	c.refreshAfterMutation(ctx)
+	c.refreshAfterMutation()
 	return nil
 }
 
@@ -93,7 +103,7 @@ func (c *persistentDataModelCache) Add(ctx context.Context, objectPath string, i
 	}
 	paths, err := adder.Add(ctx, objectPath, initial)
 	if err == nil {
-		c.refreshAfterMutation(ctx)
+		c.refreshAfterMutation()
 	}
 	return paths, err
 }
@@ -105,6 +115,12 @@ func (c *persistentDataModelCache) Warmup(ctx context.Context) error {
 		}
 	}
 	return c.Refresh(ctx)
+}
+
+func (c *persistentDataModelCache) SetChangeObserver(observer func(previous, current *wusp.Message)) {
+	c.mu.Lock()
+	c.changeObserver = observer
+	c.mu.Unlock()
 }
 
 func (c *persistentDataModelCache) Patch(msg *wusp.Message) error {
@@ -194,17 +210,17 @@ func (c *persistentDataModelCache) beginRefresh() (chan struct{}, bool) {
 func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan struct{}) (err error) {
 	status := dataModelCacheRefreshStatus{UpdatedAt: time.Now().UTC(), State: "error"}
 	defer func() {
-		c.mu.Lock()
-		c.refreshing = false
-		c.lastRefreshErr = err
-		close(done)
-		c.mu.Unlock()
 		if err != nil {
 			status.Error = err.Error()
 		} else {
 			status.State = "ready"
 		}
 		writeDataModelCacheRefreshStatus(c.path, status)
+		c.mu.Lock()
+		c.refreshing = false
+		c.lastRefreshErr = err
+		close(done)
+		c.mu.Unlock()
 	}()
 
 	msg, err := c.backend.Collect(ctx)
@@ -230,9 +246,13 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	}
 	c.mu.Lock()
 	c.msg = cloneCachedMessage(msg)
+	observer := c.changeObserver
 	c.mu.Unlock()
 	objects, values := dataModelMessageCounts(msg)
 	log.Printf("[USP] DataModel cache refreshed: objects=%d values=%d file=%s", objects, values, c.path)
+	if observer != nil && previous != nil && len(previous.Fields) > 0 {
+		observer(previous, cloneCachedMessage(msg))
+	}
 	return nil
 }
 
@@ -415,13 +435,11 @@ func (c *persistentDataModelCache) refreshAsync() {
 	}()
 }
 
-// refreshAfterMutation keeps the file and in-memory snapshots coherent before
-// the controller performs its immediate post-mutation sync. A refresh failure
-// does not roll back an already successful device operation.
-func (c *persistentDataModelCache) refreshAfterMutation(ctx context.Context) {
-	if err := c.ensureSnapshot(ctx); err != nil {
-		log.Printf("[USP] DataModel cache mutation refresh warning: continue_on_error=true err=%v", err)
-	}
+// refreshAfterMutation reconciles the optimistic cache patch without delaying
+// the Set/Add/Delete response. Refresh is single-flight, so a burst of related
+// writes still causes at most one platform collection.
+func (c *persistentDataModelCache) refreshAfterMutation() {
+	c.refreshAsync()
 }
 
 func (c *persistentDataModelCache) load() {

@@ -145,6 +145,45 @@ func TestPersistentDataModelCacheWaitHonorsContext(t *testing.T) {
 	}
 }
 
+func TestPersistentDataModelCacheSetDoesNotWaitForFullRefresh(t *testing.T) {
+	backend := &blockingCacheBackend{started: make(chan struct{}), release: make(chan struct{})}
+	cache := newPersistentDataModelCache(backend, t.TempDir()+"/model.cache", time.Minute)
+	cache.mu.Lock()
+	cache.msg = wusp.NewMessage()
+	cache.msg.Set("Device.WiFi.Radio.1.Channel", wusp.Uint(36))
+	cache.mu.Unlock()
+
+	startedAt := time.Now()
+	if err := cache.Set(context.Background(), "Device.WiFi.Radio.1.Channel", wusp.Uint(44)); err != nil {
+		t.Fatalf("Set returned error: %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 100*time.Millisecond {
+		t.Fatalf("Set waited for full refresh: %s", elapsed)
+	}
+	msg, err := cache.Collect(context.Background(), "Device.WiFi.Radio.1.Channel")
+	if err != nil {
+		t.Fatalf("Collect patched cache: %v", err)
+	}
+	value, ok := msg.Get("Device.WiFi.Radio.1.Channel")
+	if !ok || value.AsUint() != 44 {
+		t.Fatalf("patched channel=%v present=%t want 44", value, ok)
+	}
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("asynchronous reconciliation did not start")
+	}
+	cache.mu.RLock()
+	refreshDone := cache.refreshDone
+	cache.mu.RUnlock()
+	close(backend.release)
+	select {
+	case <-refreshDone:
+	case <-time.After(time.Second):
+		t.Fatal("asynchronous reconciliation did not finish")
+	}
+}
+
 func TestPreserveLastCompleteCellularSnapshot(t *testing.T) {
 	previous := wusp.NewMessage()
 	previous.Set("Device.DeviceInfo.HostName", wusp.String("before"))

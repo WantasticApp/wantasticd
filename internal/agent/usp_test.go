@@ -190,6 +190,52 @@ func TestCachedCellularOperateStatusEmitsValueChanges(t *testing.T) {
 	}
 }
 
+func TestChangedDataModelParamsIncludesAuthoritativeCurrentRows(t *testing.T) {
+	previous := wusp.NewMessage()
+	previous.Set("Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries", wusp.Uint(2))
+	previous.Set("Device.WiFi.AccessPoint.1.AssociatedDevice.1.MACAddress", wusp.String("02:00:00:00:00:01"))
+	previous.Set("Device.WiFi.AccessPoint.1.AssociatedDevice.2.MACAddress", wusp.String("02:00:00:00:00:02"))
+	previous.Set("Device.WiFi.AccessPoint.1.Security.KeyPassphrase", wusp.String("never-push"))
+
+	current := wusp.NewMessage()
+	current.Set("Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries", wusp.Uint(1))
+	current.Set("Device.WiFi.AccessPoint.1.AssociatedDevice.1.MACAddress", wusp.String("02:00:00:00:00:01"))
+	current.Set("Device.WiFi.AccessPoint.1.Security.KeyPassphrase", wusp.String("still-never-push"))
+
+	params := changedDataModelParams(previous, current)
+	if params["Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries"] != "1" {
+		t.Fatalf("authoritative count missing: %v", params)
+	}
+	if params["Device.WiFi.AccessPoint.1.AssociatedDevice.1.MACAddress"] != "02:00:00:00:00:01" {
+		t.Fatalf("unchanged retained row was not included: %v", params)
+	}
+	if _, ok := params["Device.WiFi.AccessPoint.1.AssociatedDevice.2.MACAddress"]; ok {
+		t.Fatalf("removed station was pushed as current: %v", params)
+	}
+	if _, ok := params["Device.WiFi.AccessPoint.1.Security.KeyPassphrase"]; ok {
+		t.Fatalf("sensitive path was pushed: %v", params)
+	}
+}
+
+func TestUSPRuntimePushesBatchedDataModelChangeEvent(t *testing.T) {
+	transport := &fakeUSPTransport{sendCh: make(chan []byte, 8)}
+	runtime := &uspRuntime{transport: transport}
+	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{EventSender: runtime})
+	previous := wusp.NewMessage()
+	previous.Set("Device.WiFi.Radio.1.Channel", wusp.Uint(36))
+	current := wusp.NewMessage()
+	current.Set("Device.WiFi.Radio.1.Channel", wusp.Uint(44))
+
+	runtime.emitDataModelChanges(previous, current)
+	_, event := readMatchingOutboundEvent(t, transport, 2*time.Second, wusp.USPEventTypeEvent)
+	if event.EventName != dataModelChangeEventName {
+		t.Fatalf("event name=%q want %q", event.EventName, dataModelChangeEventName)
+	}
+	if event.Params["Device.WiFi.Radio.1.Channel"] != "44" {
+		t.Fatalf("event params=%v", event.Params)
+	}
+}
+
 func TestUSPRuntimeCallController(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	transport := runtime.transport.(*fakeUSPTransport)

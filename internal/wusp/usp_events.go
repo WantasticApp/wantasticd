@@ -86,6 +86,12 @@ type USPEvent struct {
 	//   - other types:                  nil
 	Params map[string]string
 
+	// ParamMessage optionally carries the same parameters with their native
+	// TR-181 wire types. Agents use this for batched data-model changes so
+	// unsigned counters, dates, IPs, and lists are not downgraded to strings.
+	// DecodeEventFromRequest always exposes the received values through Params.
+	ParamMessage *Message
+
 	// ParamValue is the new value of ObjPath. Set only for
 	// USPEventTypeValueChange.
 	ParamValue string
@@ -213,7 +219,10 @@ func EncodeEventToRequest(event USPEvent, id uint64) USPAgentRequest {
 		if event.EventName != "" {
 			meta[eventMetaName] = event.EventName
 		}
-		msg = eventParamsToMessage(event.Params)
+		msg = event.ParamMessage
+		if msg == nil {
+			msg = eventParamsToMessage(event.Params)
+		}
 
 	case USPEventTypeValueChange:
 		meta[eventMetaParamValue] = event.ParamValue
@@ -535,7 +544,7 @@ func eventMessageToParams(msg *Message) map[string]string {
 	}
 	out := make(map[string]string, len(msg.Fields))
 	for _, field := range msg.Fields {
-		out[field.Path] = field.Val.AsString()
+		out[field.Path] = ValueToString(field.Val)
 	}
 	return out
 }

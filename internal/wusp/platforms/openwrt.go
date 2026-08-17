@@ -1553,7 +1553,10 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 
 	switch objType {
 	case "radio":
-		section := fmt.Sprintf("radio%d", idx-1) // Radio.1 → radio0
+		section := b.resolveWiFiRadioSection(idx)
+		if section == "" {
+			return wusp.ErrUSPPathNotFound
+		}
 		switch param {
 		case "Enable":
 			disabled := "1"
@@ -1633,6 +1636,44 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 		}
 	}
 	return wusp.ErrUSPPathUnsupported
+}
+
+// resolveWiFiRadioSection maps the TR-181 instance to the same sorted runtime
+// radio key used by appendWiFiFields. OpenWrt derivatives commonly name their
+// wifi-device sections wifi0, wifi1, qcawifi, or use a sparse radio sequence;
+// assuming Radio.1 == radio0 writes a new, unused UCI section on those devices.
+func (b *OpenWrtBackend) resolveWiFiRadioSection(radioIndex int) string {
+	if radioIndex <= 0 {
+		return ""
+	}
+	runtimeRadios := b.readWirelessRadioStatus()
+	uciRadios := b.readWirelessRadioStatusFromUCI()
+	radios := runtimeRadios
+	if len(radios) == 0 {
+		radios = uciRadios
+	}
+	radios = b.enrichWirelessRuntime(radios)
+	keys := make([]string, 0, len(radios))
+	for key := range radios {
+		if key = strings.TrimSpace(key); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	if radioIndex > len(keys) {
+		return ""
+	}
+	section := keys[radioIndex-1]
+	if _, ok := runtimeRadios[section]; ok {
+		return section
+	}
+	if _, ok := uciRadios[section]; ok {
+		return section
+	}
+	// A pure nl80211/sysfs discovery has no persistent configuration owner.
+	// Reporting it is useful, but pretending it maps to radioN can reconfigure
+	// an unrelated device on sparse/mixed CPE layouts.
+	return ""
 }
 
 // resolveWiFiIfaceSection maps a WUSP SSID/AP index (1-based) to the actual UCI
@@ -2239,11 +2280,27 @@ func (b *OpenWrtBackend) reloadScript(ctx context.Context, script string) error 
 		return nil
 	}
 
-	// "wifi" is a standalone command (not an init script) — run without args.
+	// Wireless reload differs between stock OpenWrt and CPE derivatives. Prefer
+	// netifd's ubus method, then the modern `wifi reload`, and finally the legacy
+	// no-argument form. This keeps radio writes live without vendor-only APIs.
 	// Init scripts like /etc/init.d/network take "reload" as an argument.
 	if script == "wifi" {
-		_, err := b.commandRunner(ctx, "wifi")
-		return err
+		var lastErr error
+		for _, command := range []struct {
+			name string
+			args []string
+		}{
+			{name: "ubus", args: []string{"call", "network", "reload"}},
+			{name: "wifi", args: []string{"reload"}},
+			{name: "wifi"},
+		} {
+			if _, err := b.commandRunner(ctx, command.name, command.args...); err == nil {
+				return nil
+			} else {
+				lastErr = err
+			}
+		}
+		return lastErr
 	}
 
 	if _, err := os.Stat(script); err != nil {

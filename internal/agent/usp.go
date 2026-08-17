@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,6 +256,9 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		DownloadHandler: runtime.handleDownload,
 		OperateHandler:  runtime.handleOperate,
 		EventSender:     runtime, // uspRuntime implements wusp.USPEventSender
+	})
+	cachedBackend.SetChangeObserver(func(previous, current *wusp.Message) {
+		go runtime.emitDataModelChanges(previous, current)
 	})
 	if err := runtime.agent.Bootstrap(wusp.FillOptions{
 		Profile:   wusp.FillProfileRealistic,
@@ -1189,6 +1193,127 @@ func (r *uspRuntime) SendUSPNotify(ctx context.Context, data []byte) error {
 		return fmt.Errorf("usp transport unavailable")
 	}
 	return r.transport.SendWUSPToServer(data)
+}
+
+const dataModelChangeEventName = "DataModelChange!"
+
+// emitDataModelChanges turns each successful periodic platform collection into
+// compact push updates. The transport fragments large events, while bounded
+// batches avoid making one changed counter hold every other update hostage.
+func (r *uspRuntime) emitDataModelChanges(previous, current *wusp.Message) {
+	if r == nil || r.agent == nil {
+		return
+	}
+	params := changedDataModelParams(previous, current)
+	if len(params) == 0 {
+		return
+	}
+	currentValues := make(map[string]wusp.Value, len(current.Fields))
+	for _, field := range current.Fields {
+		currentValues[field.Path] = field.Val
+	}
+	keys := make([]string, 0, len(params))
+	for path := range params {
+		keys = append(keys, path)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		leftCount := authoritativeDataModelCountPath(keys[i])
+		rightCount := authoritativeDataModelCountPath(keys[j])
+		if leftCount != rightCount {
+			return leftCount
+		}
+		if leftCount && len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+
+	const maxParamsPerEvent = 96
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for offset := 0; offset < len(keys); offset += maxParamsPerEvent {
+		end := offset + maxParamsPerEvent
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := make(map[string]string, end-offset)
+		batchMessage := wusp.NewMessage()
+		for _, path := range keys[offset:end] {
+			batch[path] = params[path]
+			if value, ok := currentValues[path]; ok {
+				batchMessage.Set(path, value)
+			}
+		}
+		if err := r.agent.Emit(ctx, wusp.USPEvent{
+			Type:         wusp.USPEventTypeEvent,
+			EventName:    dataModelChangeEventName,
+			ObjPath:      "Device.",
+			Params:       batch,
+			ParamMessage: batchMessage,
+		}); err != nil {
+			log.Printf("[USP] DataModel change notify warning: continue_on_error=true fields=%d err=%v", len(batch), err)
+			return
+		}
+	}
+	log.Printf("[USP] DataModel changes pushed: fields=%d", len(params))
+}
+
+func changedDataModelParams(previous, current *wusp.Message) map[string]string {
+	if previous == nil || current == nil || len(previous.Fields) == 0 {
+		return nil
+	}
+	previousValues := make(map[string]string, len(previous.Fields))
+	for _, field := range previous.Fields {
+		previousValues[field.Path] = wusp.ValueToString(field.Val)
+	}
+	currentValues := make(map[string]string, len(current.Fields))
+	changed := make(map[string]string)
+	for _, field := range current.Fields {
+		path := strings.TrimSpace(field.Path)
+		if !safeDataModelEventPath(path) {
+			continue
+		}
+		value := strings.ReplaceAll(wusp.ValueToString(field.Val), "\x00", "")
+		currentValues[path] = value
+		if previousValue, exists := previousValues[path]; !exists || previousValue != value {
+			changed[path] = value
+		}
+	}
+
+	// Count changes are authoritative table boundaries. Include the current
+	// rows with the count so the controller and portal can remove disconnected
+	// stations/hosts without losing unchanged rows that remain in the table.
+	for path := range changed {
+		if !strings.HasSuffix(path, "NumberOfEntries") ||
+			(!strings.HasPrefix(path, "Device.WiFi.") && !strings.HasPrefix(path, "Device.Hosts.")) {
+			continue
+		}
+		prefix := strings.TrimSuffix(path, "NumberOfEntries") + "."
+		for currentPath, value := range currentValues {
+			if strings.HasPrefix(currentPath, prefix) {
+				changed[currentPath] = value
+			}
+		}
+	}
+	return changed
+}
+
+func safeDataModelEventPath(path string) bool {
+	if !strings.HasPrefix(path, "Device.") {
+		return false
+	}
+	lower := strings.ToLower(path)
+	for _, token := range []string{"password", "passphrase", "username", "secret", "privatekey", "token", "credential", "psk", "certificate"} {
+		if strings.Contains(lower, token) {
+			return false
+		}
+	}
+	return true
+}
+
+func authoritativeDataModelCountPath(path string) bool {
+	return strings.HasSuffix(path, "NumberOfEntries") &&
+		(strings.HasPrefix(path, "Device.WiFi.") || strings.HasPrefix(path, "Device.Hosts."))
 }
 
 // IsReady reports whether WUSP initialization has completed successfully.

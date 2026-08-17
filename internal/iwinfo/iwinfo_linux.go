@@ -113,6 +113,10 @@ func GetAssocList(ifname string) ([]AssocEntry, error) {
 			RxBytes: sta.RxBytes, TxBytes: sta.TxBytes,
 			ConnectedTime: sta.ConnectedSecs, Inactive: sta.Inactive,
 			RxRate: sta.RxRate, TxRate: sta.TxRate,
+			SignalKnown: sta.Signal != 0, NoiseKnown: sta.Noise != 0,
+			RxBytesKnown: true, TxBytesKnown: true,
+			ConnectedTimeKnown: true, InactiveKnown: true,
+			RxRateKnown: true, TxRateKnown: true,
 		})
 	}
 	return entries, nil
@@ -147,8 +151,20 @@ func assocListFromNL80211(ifname string) ([]AssocEntry, error) {
 			TxRetries:     nonNegativeUint32(station.TransmitRetries),
 			TxFailed:      nonNegativeUint32(station.TransmitFailed),
 			// mdlayher/wifi reports bit/s; libiwinfo and AssocEntry use kbit/s.
-			RxRate: nonNegativeUint32(station.ReceiveBitrate / 1000),
-			TxRate: nonNegativeUint32(station.TransmitBitrate / 1000),
+			RxRate:             nonNegativeUint32(station.ReceiveBitrate / 1000),
+			TxRate:             nonNegativeUint32(station.TransmitBitrate / 1000),
+			SignalKnown:        true,
+			SignalAvgKnown:     true,
+			InactiveKnown:      true,
+			ConnectedTimeKnown: true,
+			RxPacketsKnown:     true,
+			TxPacketsKnown:     true,
+			RxBytesKnown:       true,
+			TxBytesKnown:       true,
+			TxRetriesKnown:     true,
+			TxFailedKnown:      true,
+			RxRateKnown:        true,
+			TxRateKnown:        true,
 		})
 	}
 	return entries, nil
@@ -197,7 +213,12 @@ func nl80211Interface(ifname string) (*linuxwifi.Client, *linuxwifi.Interface, e
 	}
 	for _, iface := range interfaces {
 		if iface != nil && iface.Name == ifname {
-			return client, iface, nil
+			// StationInfo and SurveyInfo are dump operations scoped by IFINDEX.
+			// Supplying the AP's own MAC filters the dump to that address on
+			// kernels which honor NL80211_ATTR_MAC, yielding no AP clients.
+			copyIface := *iface
+			copyIface.HardwareAddr = nil
+			return client, &copyIface, nil
 		}
 	}
 	client.Close()

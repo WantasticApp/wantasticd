@@ -620,8 +620,8 @@ func signalDBMToRCPI(signal int) int {
 	if rcpi < 0 {
 		return 0
 	}
-	if rcpi > 255 {
-		return 255
+	if rcpi > 220 {
+		return 220
 	}
 	return rcpi
 }

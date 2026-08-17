@@ -10,7 +10,10 @@
 // CGo-accelerated backends where available.
 package iwinfo
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 // InterfaceInfo holds WiFi radio state for a single interface.
 type InterfaceInfo struct {
@@ -67,6 +70,22 @@ type AssocEntry struct {
 	TxMCS               int8
 	RxNSS               uint8
 	TxNSS               uint8
+	// The Known flags preserve the distinction between a measured zero and a
+	// field which the source did not report. Callers should also treat legacy
+	// non-zero values as present so out-of-tree collectors remain compatible.
+	SignalKnown        bool
+	SignalAvgKnown     bool
+	NoiseKnown         bool
+	InactiveKnown      bool
+	ConnectedTimeKnown bool
+	RxPacketsKnown     bool
+	TxPacketsKnown     bool
+	RxBytesKnown       bool
+	TxBytesKnown       bool
+	TxRetriesKnown     bool
+	TxFailedKnown      bool
+	RxRateKnown        bool
+	TxRateKnown        bool
 }
 
 // SurveyEntry represents channel survey / utilization data.
@@ -78,4 +97,32 @@ type SurveyEntry struct {
 	TxTime     uint64 // time spent transmitting (µs)
 	Frequency  uint32 // MHz
 	Noise      int8   // dBm
+}
+
+// WirelessInterface is the runtime nl80211 view of a Linux WiFi interface.
+// PHY is stable only for the current boot and is used solely for grouping
+// multiple AP/AP-VLAN/station interfaces which share one physical radio.
+type WirelessInterface struct {
+	Index        int
+	Name         string
+	PHY          int
+	Mode         string
+	Up           bool
+	HardwareAddr net.HardwareAddr
+	Frequency    int
+	ChannelWidth string
+}
+
+// ScanEntry represents one BSS from the kernel scan cache.
+type ScanEntry struct {
+	SSID                    string
+	BSSID                   net.HardwareAddr
+	Frequency               int
+	SignalDBM               int
+	ChannelBandwidth        string
+	LastSeen                time.Duration
+	BSSLoadKnown            bool
+	StationCount            uint16
+	ChannelUtilization      uint8
+	ChannelUtilizationKnown bool
 }

@@ -272,7 +272,7 @@ func assertListContains(t *testing.T, msg *wusp.Message, path, want string) {
 		t.Fatalf("%s missing from message", path)
 	}
 	for _, item := range got.AsList() {
-		if item.AsString() == want {
+		if wusp.ValueToString(item) == want {
 			return
 		}
 	}

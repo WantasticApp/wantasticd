@@ -163,6 +163,124 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	}
 }
 
+func TestOpenWrtBackendCollectRadioCapabilities(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	if err := os.MkdirAll(filepath.Join(netClassDir, "wlan0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), "config wifi-device 'radio0'\n\toption band '5g'\n\toption channel '36'\n\toption htmode 'HE80'\n\toption txpower '20'\nconfig wifi-iface 'default_radio0'\n\toption device 'radio0'\n\toption ifname 'wlan0'\n\toption mode 'ap'\n\toption ssid 'Radio-Test'\n")
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "iwinfo" && strings.Join(args, " ") == "wlan0 txpowerlist" {
+				return []byte("  0 dBm (1 mW)\n 10 dBm (10 mW)\n* 20 dBm (100 mW)\n 30 dBm (1000 mW)\n"), nil
+			}
+			return nil, errors.New("disabled in test")
+		},
+		WiFiHWModeList: func(ifName string) (*iwinfo.HWModes, error) {
+			if ifName != "wlan0" {
+				return nil, errors.New("unexpected interface")
+			}
+			return &iwinfo.HWModes{A: true, N: true, AC: true, AX: true}, nil
+		},
+		WiFiHTModeList: func(ifName string) ([]string, error) {
+			if ifName != "wlan0" {
+				return nil, errors.New("unexpected interface")
+			}
+			return []string{"HT20", "HT40", "VHT80", "HE80", "HE160"}, nil
+		},
+	})
+
+	msg := &wusp.Message{}
+	backend.appendWiFiFields(context.Background(), msg)
+
+	assertListContains(t, msg, "Device.WiFi.Radio.1.SupportedStandards", "a")
+	assertListContains(t, msg, "Device.WiFi.Radio.1.SupportedStandards", "ax")
+	assertListContains(t, msg, "Device.WiFi.Radio.1.OperatingStandards", "ac")
+	assertListContains(t, msg, "Device.WiFi.Radio.1.SupportedOperatingChannelBandwidths", "160MHz")
+	assertStringField(t, msg, "Device.WiFi.Radio.1.CurrentOperatingChannelBandwidth", "80MHz")
+	assertListContains(t, msg, "Device.WiFi.Radio.1.TransmitPowerSupported", "-1")
+	assertListContains(t, msg, "Device.WiFi.Radio.1.TransmitPowerSupported", "100")
+	assertIntField(t, msg, "Device.WiFi.Radio.1.TransmitPower", 10)
+}
+
+func TestOpenWrtBackendSetRadioControls(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	wirelessPath := filepath.Join(configDir, "wireless")
+	mustWriteFile(t, wirelessPath, "config wifi-device 'radio0'\n\toption band '5g'\n\toption channel '36'\n\toption htmode 'HE80'\n\toption legacy_rates '0'\nconfig wifi-iface 'default_radio0'\n\toption device 'radio0'\n\toption ifname 'wlan0'\n\toption mode 'ap'\n")
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "iwinfo" && strings.Join(args, " ") == "wlan0 txpowerlist" {
+				return []byte("0 dBm (1 mW)\n10 dBm (10 mW)\n20 dBm (100 mW)\n30 dBm (1000 mW)\n"), nil
+			}
+			return nil, nil
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
+				return []byte(`{"radio0":{"up":true,"config":{"band":"5g","channel":"36","htmode":"HE80"},"interfaces":[{"section":"default_radio0","ifname":"wlan0","up":true,"config":{"mode":"ap"}}]}}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+		WiFiHWModeList: func(string) (*iwinfo.HWModes, error) {
+			return &iwinfo.HWModes{A: true, N: true, AC: true, AX: true}, nil
+		},
+		WiFiHTModeList: func(string) ([]string, error) {
+			return []string{"HT20", "HT40", "VHT80", "HE80", "HE160"}, nil
+		},
+	})
+
+	ctx := context.Background()
+	if err := backend.Set(ctx, "Device.WiFi.Radio.1.OperatingChannelBandwidth", wusp.String("160MHz")); err != nil {
+		t.Fatalf("Set(OperatingChannelBandwidth): %v", err)
+	}
+	if err := backend.Set(ctx, "Device.WiFi.Radio.1.OperatingStandards", wusp.List(wusp.String("a"), wusp.String("n"), wusp.String("ac"), wusp.String("ax"))); err != nil {
+		t.Fatalf("Set(OperatingStandards): %v", err)
+	}
+	if err := backend.Set(ctx, "Device.WiFi.Radio.1.TransmitPower", wusp.Int(10)); err != nil {
+		t.Fatalf("Set(TransmitPower): %v", err)
+	}
+	if err := backend.Set(ctx, "Device.WiFi.Radio.1.AutoChannelEnable", wusp.Bool(true)); err != nil {
+		t.Fatalf("Set(AutoChannelEnable): %v", err)
+	}
+
+	data, err := os.ReadFile(wirelessPath)
+	if err != nil {
+		t.Fatalf("read wireless config: %v", err)
+	}
+	text := string(data)
+	for _, expected := range []string{
+		"option htmode 'HE160'",
+		"option legacy_rates '0'",
+		"option txpower '20'",
+		"option channel 'auto'",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("wireless config missing %q:\n%s", expected, text)
+		}
+	}
+	if strings.Contains(text, "option require_mode") {
+		t.Fatalf("compatible standards profile unexpectedly set require_mode:\n%s", text)
+	}
+
+	if err := backend.Set(ctx, "Device.WiFi.Radio.1.TransmitPower", wusp.Int(50)); err == nil {
+		t.Fatal("unsupported TransmitPower=50 unexpectedly succeeded")
+	}
+	if err := backend.Set(ctx, "Device.WiFi.Radio.1.TransmitPower", wusp.Int(-1)); err != nil {
+		t.Fatalf("Set(TransmitPower auto): %v", err)
+	}
+	data, _ = os.ReadFile(wirelessPath)
+	if strings.Contains(string(data), "option txpower") {
+		t.Fatalf("automatic transmit power did not remove txpower option:\n%s", data)
+	}
+}
+
 func TestOpenWrtBackendCollectMeshTopologyFromRealTopo(t *testing.T) {
 	sampleTime := time.Unix(1700000300, 0).UTC()
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
@@ -288,7 +406,7 @@ func TestOpenWrtStockHostapdStationsPopulateTR181(t *testing.T) {
 	})
 
 	msg := &wusp.Message{}
-	backend.appendWiFiFields(msg)
+	backend.appendWiFiFields(context.Background(), msg)
 
 	assertUintField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries", 1)
 	assertMACField(t, msg, "Device.WiFi.AccessPoint.1.AssociatedDevice.1.MACAddress", stationMAC.String())

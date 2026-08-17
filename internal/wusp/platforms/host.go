@@ -320,9 +320,21 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	_ = runCollector("cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("cellular", func() error { b.collectCellularStatic(msg); return nil })
 	_ = runCollector("gnss", func() error { collectGPSStatic(msg); return nil })
+	if hostKindSupportsLinuxWiFi(b.kind) {
+		_ = runCollector("linux.wifi", func() error {
+			return appendLinuxWiFiFields(ctx, msg, b.commandRunner, now)
+		})
+	}
 	_ = runCollector("mesh", func() error { collectMeshStatic(msg); return nil })
+	if hostKindSupportsLinuxWiFi(b.kind) {
+		_ = runCollector("linux.wifi.scan", func() error { return appendWiFiScanFields(msg) })
+	}
 
 	return msg
+}
+
+func hostKindSupportsLinuxWiFi(kind Kind) bool {
+	return kind == KindLinux || kind == KindAndroid || kind == KindONU
 }
 
 // collectNetworkInterfacesStatic enumerates network interfaces via net.Interfaces()

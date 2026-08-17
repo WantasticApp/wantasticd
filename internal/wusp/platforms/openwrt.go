@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -44,6 +46,9 @@ type OpenWrtBackendOptions struct {
 	UbusClient            *ubus.Client
 	CommandRunner         func(context.Context, string, ...string) ([]byte, error)
 	WiFiAssocList         func(string) ([]iwinfo.AssocEntry, error)
+	WiFiInfo              func(string) (*iwinfo.InterfaceInfo, error)
+	WiFiHWModeList        func(string) (*iwinfo.HWModes, error)
+	WiFiHTModeList        func(string) ([]string, error)
 	Now                   func() time.Time
 }
 
@@ -69,6 +74,9 @@ type OpenWrtBackend struct {
 	ubusCaller            func(string, string, time.Duration) ([]byte, error)
 	commandRunner         func(context.Context, string, ...string) ([]byte, error)
 	wifiAssocList         func(string) ([]iwinfo.AssocEntry, error)
+	wifiInfo              func(string) (*iwinfo.InterfaceInfo, error)
+	wifiHWModeList        func(string) (*iwinfo.HWModes, error)
+	wifiHTModeList        func(string) ([]string, error)
 	cellular              *cellularMonitor
 	now                   func() time.Time
 }
@@ -179,20 +187,20 @@ type openWrtWirelessIfaceStatus struct {
 }
 
 type openWrtWiFiStation struct {
-	MAC           string `json:"mac"`
-	RSSI          int    `json:"rssi"`
-	Noise         int    `json:"noise"`
-	Iface         string `json:"iface"`
-	Inactive      uint32 `json:"inactive"`
-	ConnectedTime uint32 `json:"connected_time"`
-	RxPackets     uint32 `json:"rx_packets"`
-	TxPackets     uint32 `json:"tx_packets"`
-	RxBytes       uint64 `json:"rx_bytes"`
-	TxBytes       uint64 `json:"tx_bytes"`
-	TxRetries     uint32 `json:"tx_retries"`
-	TxFailed      uint32 `json:"tx_failed"`
-	RxRate        uint32 `json:"rx_rate"`
-	TxRate        uint32 `json:"tx_rate"`
+	MAC           string  `json:"mac"`
+	RSSI          *int    `json:"rssi"`
+	Noise         *int    `json:"noise"`
+	Iface         string  `json:"iface"`
+	Inactive      *uint32 `json:"inactive"`
+	ConnectedTime *uint32 `json:"connected_time"`
+	RxPackets     *uint32 `json:"rx_packets"`
+	TxPackets     *uint32 `json:"tx_packets"`
+	RxBytes       *uint64 `json:"rx_bytes"`
+	TxBytes       *uint64 `json:"tx_bytes"`
+	TxRetries     *uint32 `json:"tx_retries"`
+	TxFailed      *uint32 `json:"tx_failed"`
+	RxRate        *uint32 `json:"rx_rate"`
+	TxRate        *uint32 `json:"tx_rate"`
 }
 
 // openWrtHostapdClients is the stock OpenWrt hostapd.<ifname>.get_clients
@@ -208,18 +216,18 @@ type openWrtHostapdClients struct {
 		VHT        bool  `json:"vht"`
 		HE         bool  `json:"he"`
 		EHT        bool  `json:"eht"`
-		Signal     int   `json:"signal"`
+		Signal     *int  `json:"signal"`
 		Bytes      struct {
-			RX uint64 `json:"rx"`
-			TX uint64 `json:"tx"`
+			RX *uint64 `json:"rx"`
+			TX *uint64 `json:"tx"`
 		} `json:"bytes"`
 		Packets struct {
-			RX uint32 `json:"rx"`
-			TX uint32 `json:"tx"`
+			RX *uint32 `json:"rx"`
+			TX *uint32 `json:"tx"`
 		} `json:"packets"`
 		Rate struct {
-			RX uint32 `json:"rx"`
-			TX uint32 `json:"tx"`
+			RX *uint32 `json:"rx"`
+			TX *uint32 `json:"tx"`
 		} `json:"rate"`
 	} `json:"clients"`
 }
@@ -249,6 +257,9 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		ubusCaller:            opts.UbusCaller,
 		commandRunner:         opts.CommandRunner,
 		wifiAssocList:         opts.WiFiAssocList,
+		wifiInfo:              opts.WiFiInfo,
+		wifiHWModeList:        opts.WiFiHWModeList,
+		wifiHTModeList:        opts.WiFiHTModeList,
 		cellular:              newCellularMonitor(),
 		now:                   opts.Now,
 	}
@@ -271,6 +282,15 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	}
 	if backend.wifiAssocList == nil {
 		backend.wifiAssocList = iwinfo.GetAssocList
+	}
+	if backend.wifiInfo == nil {
+		backend.wifiInfo = iwinfo.GetInfo
+	}
+	if backend.wifiHWModeList == nil {
+		backend.wifiHWModeList = iwinfo.GetHWModeList
+	}
+	if backend.wifiHTModeList == nil {
+		backend.wifiHTModeList = iwinfo.GetHTModeList
 	}
 	if backend.now == nil {
 		backend.now = time.Now
@@ -451,7 +471,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	}
 	appendField(msg, "Device.Firewall.Type", wusp.String("Stateful"))
 	_ = runCollector("openwrt.firewall", func() error { b.appendFirewallFields(msg); return nil })
-	_ = runCollector("openwrt.wifi", func() error { b.appendWiFiFields(msg); return nil })
+	_ = runCollector("openwrt.wifi", func() error { b.appendWiFiFields(ctx, msg); return nil })
 
 	// Network interface details via getifaddrs (pure Go)
 	_ = runCollector("openwrt.network.interfaces", func() error { collectNetworkInterfacesStatic(msg, b.netClassDir); return nil })
@@ -469,6 +489,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	_ = runCollector("openwrt.mesh.runtime", func() error { collectMeshStatic(msg); return nil })
 	_ = runCollector("openwrt.mesh.topology", func() error { b.appendOpenWrtMeshTopology(ctx, msg); return nil })
 	_ = runCollector("openwrt.mesh.config", func() error { b.appendOpenWrtMeshConfig(ctx, msg); return nil })
+	_ = runCollector("openwrt.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 
 	return msg, nil
 }
@@ -560,11 +581,12 @@ func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
 	}
 }
 
-func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
+func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message) {
 	radios := b.readWirelessRadioStatus()
 	if len(radios) == 0 {
 		radios = b.readWirelessRadioStatusFromUCI()
 	}
+	radios = b.enrichWirelessRuntime(radios)
 
 	radioKeys := make([]string, 0, len(radios))
 	for key := range radios {
@@ -574,7 +596,7 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 	}
 	sort.Strings(radioKeys)
 
-	ubusStations := b.readWiFiStations()
+	ubusStations, ubusStationsErr := b.readWiFiStations()
 	defer iwinfo.Close()
 
 	ssidCount := 0
@@ -593,10 +615,24 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Status", radioIndex), wusp.String(wifiStatusValue(radioEnabled, radio.Up)))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Name", radioIndex), wusp.String(key))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingFrequencyBand", radioIndex), wusp.String(wifiBandFromConfig(radio.Config)))
+		channelValue := strings.TrimSpace(configString(radio.Config, "channel"))
 		if channel := configInt(radio.Config, "channel"); channel > 0 {
 			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), wusp.Uint(uint64(channel)))
 		}
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingChannelBandwidth", radioIndex), wusp.String(wifiBandwidthFromConfig(radio.Config)))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.AutoChannelSupported", radioIndex), wusp.Bool(true))
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.AutoChannelEnable", radioIndex), wusp.Bool(strings.EqualFold(channelValue, "auto")))
+		bandwidth := wifiBandwidthFromConfig(radio.Config)
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingChannelBandwidth", radioIndex), wusp.String(bandwidth))
+		if bandwidth != "Unknown" && bandwidth != "Auto" {
+			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.CurrentOperatingChannelBandwidth", radioIndex), wusp.String(bandwidth))
+		}
+		radioIfName := ""
+		for _, iface := range radio.Interfaces {
+			if radioIfName = strings.TrimSpace(iface.IfName); radioIfName != "" {
+				break
+			}
+		}
+		b.appendWiFiRadioCapabilities(ctx, msg, key, radioIfName, radioIndex, radio.Config)
 
 		interfaces := append([]openWrtWirelessIfaceStatus(nil), radio.Interfaces...)
 		sort.SliceStable(interfaces, func(i, j int) bool {
@@ -609,14 +645,14 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 			ssidCount++
 			ssidPath := fmt.Sprintf("Device.WiFi.SSID.%d.", ssidCount)
 
-			ifName := firstNonEmpty(iface.IfName, configString(iface.Config, "ifname"), iface.Section)
+			ifName := firstNonEmpty(iface.IfName, b.existingWiFiIfName(configString(iface.Config, "ifname")))
 			mode := strings.ToLower(firstNonEmpty(configString(iface.Config, "mode"), "ap"))
 			ssidEnabled := !parseOpenWrtBool(configString(iface.Config, "disabled"), false)
 			ssidValue := configString(iface.Config, "ssid")
 			bssidValue := ""
 
-			if ifName != "" && iwinfo.Available(ifName) {
-				if info, err := iwinfo.GetInfo(ifName); err == nil {
+			if ifName != "" && b.wifiInfo != nil {
+				if info, err := b.wifiInfo(ifName); err == nil {
 					if strings.TrimSpace(info.SSID) != "" {
 						ssidValue = strings.TrimSpace(info.SSID)
 					}
@@ -649,14 +685,38 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 				// Stock OpenWrt exposes clients through hostapd.<ifname>.get_clients.
 				// Merge it with the optional vendor call and the direct nl80211/
 				// libiwinfo collector so each source fills the fields it knows.
-				stations := mergeWiFiAssociations(ubusStations[ifName], b.readHostapdAssociations(ifName))
-				stations = mergeWiFiAssociations(stations, b.readIWInfoAssociations(ifName))
-				appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(len(stations))))
-				for stationIndex, station := range stations {
-					stationPath := fmt.Sprintf("%sAssociatedDevice.%d.", apPath, stationIndex+1)
-					b.appendWiFiAssociatedDeviceFields(msg, stationPath, station)
-					wifiHosts[strings.ToLower(station.MAC.String())] = stationPath
+				stations := append([]iwinfo.AssocEntry(nil), ubusStations[ifName]...)
+				succeeded := ubusStationsErr == nil
+				errorsBySource := make([]string, 0, 4)
+				if ubusStationsErr != nil {
+					errorsBySource = append(errorsBySource, "device.getStaList: "+ubusStationsErr.Error())
 				}
+				for _, source := range []struct {
+					name string
+					read func(string) ([]iwinfo.AssocEntry, error)
+				}{
+					{name: "hostapd", read: b.readHostapdAssociations},
+					{name: "iwinfo-ubus", read: b.readIWInfoUBusAssociations},
+					{name: "nl80211", read: b.readIWInfoAssociations},
+				} {
+					observed, err := source.read(ifName)
+					if err != nil {
+						errorsBySource = append(errorsBySource, source.name+": "+err.Error())
+						continue
+					}
+					succeeded = true
+					stations = mergeWiFiAssociations(stations, observed)
+				}
+				if succeeded {
+					appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(len(stations))))
+					for stationIndex, station := range stations {
+						stationPath := fmt.Sprintf("%sAssociatedDevice.%d.", apPath, stationIndex+1)
+						b.appendWiFiAssociatedDeviceFields(msg, stationPath, station)
+						wifiHosts[strings.ToLower(station.MAC.String())] = stationPath
+					}
+				}
+				log.Printf("[USP] wifi_collection_summary interface=%q sources_attempted=%q successful=%t selected_station_count=%d errors=%q",
+					ifName, "device.getStaList,hostapd,iwinfo-ubus,nl80211", succeeded, len(stations), strings.Join(errorsBySource, "; "))
 			} else if wifiInterfaceModeIsEndpoint(mode) {
 				endPointCount++
 			}
@@ -670,16 +730,16 @@ func (b *OpenWrtBackend) appendWiFiFields(msg *wusp.Message) {
 	b.appendHostFields(msg, wifiHosts)
 }
 
-func (b *OpenWrtBackend) readIWInfoAssociations(ifName string) []iwinfo.AssocEntry {
+func (b *OpenWrtBackend) readIWInfoAssociations(ifName string) ([]iwinfo.AssocEntry, error) {
 	if strings.TrimSpace(ifName) == "" || b.wifiAssocList == nil {
-		return nil
+		return nil, fmt.Errorf("missing runtime interface")
 	}
 	associations, err := b.wifiAssocList(ifName)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	if len(associations) == 0 {
-		return associations
+		return associations, nil
 	}
 	// nl80211 station dumps do not carry per-station noise. The in-use channel
 	// survey is the correct available radio-level fallback for SNR reporting.
@@ -702,36 +762,63 @@ func (b *OpenWrtBackend) readIWInfoAssociations(ifName string) []iwinfo.AssocEnt
 	}
 	if noise < 0 {
 		for index := range associations {
-			if associations[index].Noise == 0 {
+			if !associations[index].NoiseKnown && associations[index].Noise == 0 {
 				associations[index].Noise = noise
+				associations[index].NoiseKnown = true
 			}
 		}
 	}
-	return associations
+	return associations, nil
 }
 
-func (b *OpenWrtBackend) readHostapdAssociations(ifName string) []iwinfo.AssocEntry {
+func (b *OpenWrtBackend) readHostapdAssociations(ifName string) ([]iwinfo.AssocEntry, error) {
 	ifName = strings.TrimSpace(ifName)
-	if ifName == "" || b.ubusCaller == nil {
-		return nil
+	if ifName == "" {
+		return nil, fmt.Errorf("missing runtime interface")
 	}
-	data, err := b.ubusCaller("hostapd."+ifName, "get_clients", b.ubusTimeout)
-	if err != nil && b.commandRunner != nil {
-		// The HTTP ubus anonymous session can lack hostapd ACLs even though the
-		// local agent is privileged. The local ubus CLI reaches the same stock
-		// object without requiring rpcd HTTP permissions.
+	var data []byte
+	var err error
+	if b.commandRunner != nil {
+		// Local ubus is authoritative and does not depend on anonymous rpcd ACLs.
 		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
 		data, err = b.commandRunner(ctx, "ubus", "call", "hostapd."+ifName, "get_clients")
 		cancel()
 	}
-	if err != nil {
-		return nil
-	}
 	var payload openWrtHostapdClients
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil
+	if err == nil {
+		err = json.Unmarshal(data, &payload)
+		if err == nil && payload.Clients != nil {
+			return associationsFromHostapdPayload(payload), nil
+		}
 	}
+	if b.ubusCaller != nil {
+		data, err = b.ubusCaller("hostapd."+ifName, "get_clients", b.ubusTimeout)
+		if err == nil {
+			payload = openWrtHostapdClients{}
+			err = json.Unmarshal(data, &payload)
+			if err == nil && payload.Clients != nil {
+				return associationsFromHostapdPayload(payload), nil
+			}
+		}
+	}
+	if b.commandRunner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
+		data, cliErr := b.commandRunner(ctx, "hostapd_cli", "-i", ifName, "all_sta")
+		cancel()
+		if cliErr == nil && !strings.EqualFold(strings.TrimSpace(string(data)), "FAIL") {
+			return parseHostapdCLIStations(string(data)), nil
+		}
+		if cliErr != nil {
+			err = cliErr
+		}
+	}
+	if err == nil {
+		err = fmt.Errorf("hostapd returned no clients object")
+	}
+	return nil, err
+}
 
+func associationsFromHostapdPayload(payload openWrtHostapdClients) []iwinfo.AssocEntry {
 	stations := make([]iwinfo.AssocEntry, 0, len(payload.Clients))
 	for macText, client := range payload.Clients {
 		// hostapd can briefly retain authenticated-but-not-associated peers.
@@ -750,21 +837,194 @@ func (b *OpenWrtBackend) readHostapdAssociations(ifName string) []iwinfo.AssocEn
 			authenticated = *client.Auth
 			authenticationKnown = true
 		}
-		stations = append(stations, iwinfo.AssocEntry{
+		entry := iwinfo.AssocEntry{
 			MAC:                 mac,
-			Signal:              boundedWiFiDBM(client.Signal),
 			AuthenticationKnown: authenticationKnown,
 			Authenticated:       authenticated,
 			OperatingStandard:   hostapdOperatingStandard(client.HT, client.VHT, client.HE, client.EHT, payload.Frequency),
-			RxPackets:           client.Packets.RX,
-			TxPackets:           client.Packets.TX,
-			RxBytes:             client.Bytes.RX,
-			TxBytes:             client.Bytes.TX,
-			RxRate:              client.Rate.RX,
-			TxRate:              client.Rate.TX,
-		})
+		}
+		if client.Signal != nil {
+			entry.Signal, entry.SignalKnown = boundedWiFiDBM(*client.Signal), true
+		}
+		if client.Packets.RX != nil {
+			entry.RxPackets, entry.RxPacketsKnown = *client.Packets.RX, true
+		}
+		if client.Packets.TX != nil {
+			entry.TxPackets, entry.TxPacketsKnown = *client.Packets.TX, true
+		}
+		if client.Bytes.RX != nil {
+			entry.RxBytes, entry.RxBytesKnown = *client.Bytes.RX, true
+		}
+		if client.Bytes.TX != nil {
+			entry.TxBytes, entry.TxBytesKnown = *client.Bytes.TX, true
+		}
+		if client.Rate.RX != nil {
+			entry.RxRate, entry.RxRateKnown = *client.Rate.RX, true
+		}
+		if client.Rate.TX != nil {
+			entry.TxRate, entry.TxRateKnown = *client.Rate.TX, true
+		}
+		stations = append(stations, entry)
 	}
 	return stations
+}
+
+// readIWInfoUBusAssociations uses rpcd-mod-iwinfo when installed. It is an
+// optional enrichment source; stock wpad hostapd and direct nl80211 remain the
+// dependency-free paths.
+func (b *OpenWrtBackend) readIWInfoUBusAssociations(ifName string) ([]iwinfo.AssocEntry, error) {
+	ifName = strings.TrimSpace(ifName)
+	if ifName == "" || b.commandRunner == nil {
+		return nil, fmt.Errorf("iwinfo ubus unavailable")
+	}
+	request, _ := json.Marshal(map[string]string{"device": ifName})
+	ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
+	data, err := b.commandRunner(ctx, "ubus", "call", "iwinfo", "assoclist", string(request))
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty iwinfo ubus response")
+	}
+	stations, decodeErr := decodeIWInfoAssociationsKnown(data)
+	return stations, decodeErr
+}
+
+func decodeIWInfoAssociations(data []byte) []iwinfo.AssocEntry {
+	stations, _ := decodeIWInfoAssociationsKnown(data)
+	return stations
+}
+
+func decodeIWInfoAssociationsKnown(data []byte) ([]iwinfo.AssocEntry, error) {
+	var payload map[string]any
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, err
+	}
+	rawResults, ok := payload["results"].([]any)
+	if !ok {
+		rawResults, _ = payload["assoclist"].([]any)
+	}
+	if rawResults == nil {
+		return nil, fmt.Errorf("missing iwinfo association results")
+	}
+	entries := make([]iwinfo.AssocEntry, 0, len(rawResults))
+	for _, raw := range rawResults {
+		result, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		mac := validClientMAC(configString(result, "mac", "bssid"))
+		if mac == nil {
+			continue
+		}
+		entry := iwinfo.AssocEntry{MAC: mac}
+		if value, present := configIntKnown(result, "signal"); present {
+			entry.Signal, entry.SignalKnown = boundedWiFiDBM(value), true
+		}
+		if value, present := configIntKnown(result, "signal_avg"); present {
+			entry.SignalAvg, entry.SignalAvgKnown = boundedWiFiDBM(value), true
+		}
+		if value, present := configIntKnown(result, "noise"); present {
+			entry.Noise, entry.NoiseKnown = boundedWiFiDBM(value), true
+		}
+		entry.Inactive, entry.InactiveKnown = configUint32Known(result, "inactive")
+		entry.ConnectedTime, entry.ConnectedTimeKnown = configUint32Known(result, "connected_time")
+		entry.RxBytes, entry.RxBytesKnown = configNestedUint64Known(result, "rx", "bytes", "rx_bytes")
+		entry.TxBytes, entry.TxBytesKnown = configNestedUint64Known(result, "tx", "bytes", "tx_bytes")
+		entry.RxPackets, entry.RxPacketsKnown = configNestedUint32Known(result, "rx", "packets", "rx_packets")
+		entry.TxPackets, entry.TxPacketsKnown = configNestedUint32Known(result, "tx", "packets", "tx_packets")
+		entry.RxRate, entry.RxRateKnown = configNestedUint32Known(result, "rx", "rate", "rx_rate")
+		entry.TxRate, entry.TxRateKnown = configNestedUint32Known(result, "tx", "rate", "tx_rate")
+		entry.TxRetries, entry.TxRetriesKnown = configNestedUint32Known(result, "tx", "retries", "tx_retries")
+		entry.TxFailed, entry.TxFailedKnown = configNestedUint32Known(result, "tx", "failed", "tx_failed")
+		if value, present := result["authorized"]; present {
+			entry.AuthenticationKnown = true
+			entry.Authenticated = configAnyBool(value)
+		} else if value, present := result["authenticated"]; present {
+			entry.AuthenticationKnown = true
+			entry.Authenticated = configAnyBool(value)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func configIntKnown(config map[string]any, key string) (int, bool) {
+	value, ok := config[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, err := strconv.ParseInt(typed.String(), 10, 64)
+		return int(parsed), err == nil
+	case float64:
+		return int(typed), true
+	case int:
+		return typed, true
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func configUint64Known(config map[string]any, key string) (uint64, bool) {
+	value, ok := configIntKnown(config, key)
+	if !ok || value < 0 {
+		return 0, false
+	}
+	return uint64(value), true
+}
+
+func configUint32Known(config map[string]any, key string) (uint32, bool) {
+	value, ok := configUint64Known(config, key)
+	if !ok {
+		return 0, false
+	}
+	if value > uint64(^uint32(0)) {
+		return ^uint32(0), true
+	}
+	return uint32(value), true
+}
+
+func configNestedUint64Known(config map[string]any, object, key, flat string) (uint64, bool) {
+	if nested, ok := config[object].(map[string]any); ok {
+		if value, present := configUint64Known(nested, key); present {
+			return value, true
+		}
+	}
+	return configUint64Known(config, flat)
+}
+
+func configNestedUint32Known(config map[string]any, object, key, flat string) (uint32, bool) {
+	value, ok := configNestedUint64Known(config, object, key, flat)
+	if !ok {
+		return 0, false
+	}
+	if value > uint64(^uint32(0)) {
+		return ^uint32(0), true
+	}
+	return uint32(value), true
+}
+
+func configAnyBool(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return parseOpenWrtBool(typed, false)
+	case json.Number:
+		return typed.String() != "0"
+	case float64:
+		return typed != 0
+	default:
+		return false
+	}
 }
 
 func boundedWiFiDBM(value int) int8 {
@@ -816,44 +1076,57 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 				station.AuthenticationKnown = existing.AuthenticationKnown
 				station.Authenticated = existing.Authenticated
 			}
-			if station.SignalAvg == 0 {
+			if !assocSignedKnown(station.SignalAvgKnown, station.SignalAvg) {
 				station.SignalAvg = existing.SignalAvg
+				station.SignalAvgKnown = existing.SignalAvgKnown
 			}
-			if station.Signal == 0 {
+			if !assocSignedKnown(station.SignalKnown, station.Signal) {
 				station.Signal = existing.Signal
+				station.SignalKnown = existing.SignalKnown
 			}
-			if station.Noise == 0 {
+			if !assocSignedKnown(station.NoiseKnown, station.Noise) {
 				station.Noise = existing.Noise
+				station.NoiseKnown = existing.NoiseKnown
 			}
-			if station.Inactive == 0 {
+			if !assocUint32Known(station.InactiveKnown, station.Inactive) {
 				station.Inactive = existing.Inactive
+				station.InactiveKnown = existing.InactiveKnown
 			}
-			if station.ConnectedTime == 0 {
+			if !assocUint32Known(station.ConnectedTimeKnown, station.ConnectedTime) {
 				station.ConnectedTime = existing.ConnectedTime
+				station.ConnectedTimeKnown = existing.ConnectedTimeKnown
 			}
-			if station.RxPackets == 0 {
+			if !assocUint32Known(station.RxPacketsKnown, station.RxPackets) {
 				station.RxPackets = existing.RxPackets
+				station.RxPacketsKnown = existing.RxPacketsKnown
 			}
-			if station.TxPackets == 0 {
+			if !assocUint32Known(station.TxPacketsKnown, station.TxPackets) {
 				station.TxPackets = existing.TxPackets
+				station.TxPacketsKnown = existing.TxPacketsKnown
 			}
-			if station.RxBytes == 0 {
+			if !assocUint64Known(station.RxBytesKnown, station.RxBytes) {
 				station.RxBytes = existing.RxBytes
+				station.RxBytesKnown = existing.RxBytesKnown
 			}
-			if station.TxBytes == 0 {
+			if !assocUint64Known(station.TxBytesKnown, station.TxBytes) {
 				station.TxBytes = existing.TxBytes
+				station.TxBytesKnown = existing.TxBytesKnown
 			}
-			if station.TxRetries == 0 {
+			if !assocUint32Known(station.TxRetriesKnown, station.TxRetries) {
 				station.TxRetries = existing.TxRetries
+				station.TxRetriesKnown = existing.TxRetriesKnown
 			}
-			if station.TxFailed == 0 {
+			if !assocUint32Known(station.TxFailedKnown, station.TxFailed) {
 				station.TxFailed = existing.TxFailed
+				station.TxFailedKnown = existing.TxFailedKnown
 			}
-			if station.RxRate == 0 {
+			if !assocUint32Known(station.RxRateKnown, station.RxRate) {
 				station.RxRate = existing.RxRate
+				station.RxRateKnown = existing.RxRateKnown
 			}
-			if station.TxRate == 0 {
+			if !assocUint32Known(station.TxRateKnown, station.TxRate) {
 				station.TxRate = existing.TxRate
+				station.TxRateKnown = existing.TxRateKnown
 			}
 			if station.RxMCS == 0 {
 				station.RxMCS = existing.RxMCS
@@ -886,48 +1159,66 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 	return out
 }
 
+func assocSignedKnown(known bool, value int8) bool   { return known || value != 0 }
+func assocUint32Known(known bool, value uint32) bool { return known || value != 0 }
+func assocUint64Known(known bool, value uint64) bool { return known || value != 0 }
+
 func (b *OpenWrtBackend) appendWiFiAssociatedDeviceFields(msg *wusp.Message, path string, station iwinfo.AssocEntry) {
+	appendWiFiAssociatedDeviceFields(msg, path, station, b.now())
+}
+
+func appendWiFiAssociatedDeviceFields(msg *wusp.Message, path string, station iwinfo.AssocEntry, now time.Time) {
 	appendField(msg, path+"MACAddress", wusp.MAC(station.MAC))
 	if station.OperatingStandard != "" {
 		appendField(msg, path+"OperatingStandard", wusp.String(station.OperatingStandard))
 	}
 	if station.AuthenticationKnown {
 		appendField(msg, path+"AuthenticationState", wusp.Bool(station.Authenticated))
-	} else {
-		// A station returned by an associated-station dump is authenticated on
-		// platforms which do not expose the flag separately.
-		appendField(msg, path+"AuthenticationState", wusp.Bool(true))
 	}
 	appendField(msg, path+"Active", wusp.Bool(true))
-	if station.TxRate >= 1000 {
+	if assocUint32Known(station.TxRateKnown, station.TxRate) {
 		appendField(msg, path+"LastDataDownlinkRate", wusp.Uint(uint64(station.TxRate)))
 	}
-	if station.RxRate >= 1000 {
+	if assocUint32Known(station.RxRateKnown, station.RxRate) {
 		appendField(msg, path+"LastDataUplinkRate", wusp.Uint(uint64(station.RxRate)))
 	}
-	if station.ConnectedTime > 0 {
-		appendField(msg, path+"AssociationTime", wusp.Time(b.now().UTC().Add(-time.Duration(station.ConnectedTime)*time.Second)))
+	if assocUint32Known(station.ConnectedTimeKnown, station.ConnectedTime) {
+		appendField(msg, path+"AssociationTime", wusp.Time(now.UTC().Add(-time.Duration(station.ConnectedTime)*time.Second)))
 	}
 	signal := station.SignalAvg
-	if signal >= 0 {
+	signalKnown := assocSignedKnown(station.SignalAvgKnown, station.SignalAvg)
+	if !signalKnown || signal >= 0 {
 		signal = station.Signal
+		signalKnown = assocSignedKnown(station.SignalKnown, station.Signal)
 	}
-	if signal < 0 {
+	if signalKnown && signal < 0 {
 		appendField(msg, path+"SignalStrength", wusp.Int(int64(signal)))
 	}
-	if station.Noise < 0 {
+	if assocSignedKnown(station.NoiseKnown, station.Noise) && station.Noise < 0 {
 		appendField(msg, path+"Noise", wusp.Int(int64(station.Noise)))
-		if signal < 0 && signal >= station.Noise {
+		if signalKnown && signal < 0 && signal >= station.Noise {
 			appendField(msg, path+"SNR", wusp.Uint(uint64(int(signal)-int(station.Noise))))
 		}
 	}
-	appendField(msg, path+"Stats.BytesSent", wusp.Uint(station.TxBytes))
-	appendField(msg, path+"Stats.BytesReceived", wusp.Uint(station.RxBytes))
-	appendField(msg, path+"Stats.PacketsSent", wusp.Uint(uint64(station.TxPackets)))
-	appendField(msg, path+"Stats.PacketsReceived", wusp.Uint(uint64(station.RxPackets)))
-	appendField(msg, path+"Stats.ErrorsSent", wusp.Uint(uint64(station.TxFailed)))
-	appendField(msg, path+"Stats.RetransCount", wusp.Uint(uint64(station.TxRetries)))
-	appendField(msg, path+"Stats.FailedRetransCount", wusp.Uint(uint64(station.TxFailed)))
+	if assocUint64Known(station.TxBytesKnown, station.TxBytes) {
+		appendField(msg, path+"Stats.BytesSent", wusp.Uint(station.TxBytes))
+	}
+	if assocUint64Known(station.RxBytesKnown, station.RxBytes) {
+		appendField(msg, path+"Stats.BytesReceived", wusp.Uint(station.RxBytes))
+	}
+	if assocUint32Known(station.TxPacketsKnown, station.TxPackets) {
+		appendField(msg, path+"Stats.PacketsSent", wusp.Uint(uint64(station.TxPackets)))
+	}
+	if assocUint32Known(station.RxPacketsKnown, station.RxPackets) {
+		appendField(msg, path+"Stats.PacketsReceived", wusp.Uint(uint64(station.RxPackets)))
+	}
+	if assocUint32Known(station.TxFailedKnown, station.TxFailed) {
+		appendField(msg, path+"Stats.ErrorsSent", wusp.Uint(uint64(station.TxFailed)))
+		appendField(msg, path+"Stats.FailedRetransCount", wusp.Uint(uint64(station.TxFailed)))
+	}
+	if assocUint32Known(station.TxRetriesKnown, station.TxRetries) {
+		appendField(msg, path+"Stats.RetransCount", wusp.Uint(uint64(station.TxRetries)))
+	}
 }
 
 type openWrtLANHost struct {
@@ -936,6 +1227,7 @@ type openWrtLANHost struct {
 	interfaceName      string
 	interfaceType      string
 	associatedDevice   string
+	layer3Interface    string
 	addressSource      string
 	leaseTimeRemaining int64
 	active             bool
@@ -1016,6 +1308,25 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 		host.active = true
 	}
 
+	interfacePaths := ipInterfacePathByName()
+	if neighbors, err := readRouteNeighbors(); err == nil {
+		for _, neighbor := range neighbors {
+			host := ensure(neighbor.MAC.String())
+			if host == nil {
+				continue
+			}
+			addHostIP(host, neighbor.IP.String())
+			host.interfaceName = neighbor.InterfaceName
+			if host.interfaceType == "" {
+				host.interfaceType = hostInterfaceType(neighbor.InterfaceName)
+			}
+			host.layer3Interface = interfacePaths[neighbor.InterfaceName]
+			host.active = host.active || neighbor.Active
+		}
+	} else {
+		logCollectorError("openwrt.hosts.rtnetlink", err)
+	}
+
 	nowUnix := b.now().Unix()
 	for _, line := range strings.Split(b.readTextFile(b.dhcpLeasesPath), "\n") {
 		fields := strings.Fields(line)
@@ -1062,6 +1373,9 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 		if host.interfaceType == "" {
 			host.interfaceType = hostInterfaceType(fields[5])
 		}
+		if host.layer3Interface == "" {
+			host.layer3Interface = interfacePaths[fields[5]]
+		}
 		flags, _ := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(fields[2]), "0x"), 16, 32)
 		host.active = host.active || flags&0x2 != 0
 	}
@@ -1098,6 +1412,9 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 					if host.interfaceType == "" {
 						host.interfaceType = hostInterfaceType(host.interfaceName)
 					}
+					if host.layer3Interface == "" {
+						host.layer3Interface = interfacePaths[host.interfaceName]
+					}
 				}
 				state := strings.ToUpper(fields[len(fields)-1])
 				host.active = host.active || (state != "FAILED" && state != "INCOMPLETE")
@@ -1123,6 +1440,10 @@ func bytesCompareIP(left, right net.IP) int {
 
 func (b *OpenWrtBackend) appendHostFields(msg *wusp.Message, wifiHosts map[string]string) {
 	hosts := b.collectLANHosts(wifiHosts)
+	appendLANHostFields(msg, hosts)
+}
+
+func appendLANHostFields(msg *wusp.Message, hosts []*openWrtLANHost) {
 	appendField(msg, "Device.Hosts.HostNumberOfEntries", wusp.Uint(uint64(len(hosts))))
 	for index, host := range hosts {
 		path := fmt.Sprintf("Device.Hosts.Host.%d.", index+1)
@@ -1138,6 +1459,9 @@ func (b *OpenWrtBackend) appendHostFields(msg *wusp.Message, wifiHosts map[strin
 		}
 		if host.associatedDevice != "" {
 			appendField(msg, path+"AssociatedDevice", wusp.String(host.associatedDevice))
+		}
+		if host.layer3Interface != "" {
+			appendField(msg, path+"Layer3Interface", wusp.String(host.layer3Interface))
 		}
 		if host.interfaceType != "" {
 			appendField(msg, path+"InterfaceType", wusp.String(host.interfaceType))
@@ -1155,6 +1479,26 @@ func (b *OpenWrtBackend) appendHostFields(msg *wusp.Message, wifiHosts map[strin
 			appendField(msg, fmt.Sprintf("%sIPv6Address.%d.IPAddress", path, addressIndex+1), wusp.IP6(ip))
 		}
 	}
+}
+
+func ipInterfacePathByName() map[string]string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	paths := make(map[string]string, len(ifaces))
+	index := 0
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if len(iface.HardwareAddr) == 0 && !isCellularNetdev(iface.Name) {
+			continue
+		}
+		index++
+		paths[iface.Name] = fmt.Sprintf("Device.IP.Interface.%d.", index)
+	}
+	return paths
 }
 
 // setHostname persists the hostname via UCI and applies it live by writing
@@ -1219,9 +1563,56 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 			return b.setUCIOption(ctx, "wireless", section, "disabled", disabled, true, wirelessReloadScript)
 		case "Channel":
 			return b.setUCIOption(ctx, "wireless", section, "channel", wusp.ValueToString(value), true, wirelessReloadScript)
+		case "AutoChannelEnable":
+			if value.AsBool() {
+				return b.setUCIOption(ctx, "wireless", section, "channel", "auto", true, wirelessReloadScript)
+			}
+			if strings.EqualFold(b.readUCIValue(ctx, "wireless", section, "channel"), "auto") {
+				return fmt.Errorf("wusp openwrt radio channel must be selected before automatic channel selection can be disabled")
+			}
+			return nil
+		case "OperatingFrequencyBand":
+			band, err := normalizeOpenWrtWiFiBand(wusp.ValueToString(value))
+			if err != nil {
+				return err
+			}
+			if err := b.setUCIOption(ctx, "wireless", section, "band", band, false, ""); err != nil {
+				return err
+			}
+			// The previous channel might be illegal in the new band. Let OpenWrt's
+			// ACS select a regulatory-valid channel on the single ensuing reload.
+			return b.setUCIOption(ctx, "wireless", section, "channel", "auto", true, wirelessReloadScript)
 		case "OperatingChannelBandwidth":
-			htmode := bandwidthToHTMode(wusp.ValueToString(value), section, b, ctx)
+			requested := normalizeWiFiBandwidth(wusp.ValueToString(value))
+			if requested == "" {
+				return fmt.Errorf("wusp openwrt invalid WiFi channel bandwidth %q", wusp.ValueToString(value))
+			}
+			if err := b.validateWiFiBandwidth(section, requested); err != nil {
+				return err
+			}
+			htmode := bandwidthToHTMode(requested, section, b, ctx)
 			return b.setUCIOption(ctx, "wireless", section, "htmode", htmode, true, wirelessReloadScript)
+		case "OperatingStandards":
+			standards, err := parseWiFiStandardsValue(value)
+			if err != nil {
+				return err
+			}
+			return b.setWiFiOperatingStandards(ctx, section, standards)
+		case "TransmitPower":
+			percent, err := strconv.Atoi(strings.TrimSpace(wusp.ValueToString(value)))
+			if err != nil || percent < -1 || percent > 100 {
+				return fmt.Errorf("wusp openwrt transmit power must be -1 or 0..100 percent")
+			}
+			if percent == -1 {
+				return b.deleteUCIOption(ctx, "wireless", section, "txpower", true, wirelessReloadScript)
+			}
+			ifName := b.radioToIfname(section)
+			levels := b.readWiFiTxPowerLevels(ctx, ifName)
+			dbm, ok := txPowerLevelForPercent(levels, percent)
+			if !ok {
+				return fmt.Errorf("wusp openwrt transmit power %d is not supported; refresh TransmitPowerSupported", percent)
+			}
+			return b.setUCIOption(ctx, "wireless", section, "txpower", strconv.Itoa(dbm), true, wirelessReloadScript)
 		}
 	case "ssid", "ap":
 		// Resolve the UCI section name for this SSID/AP index by iterating
@@ -1941,33 +2332,297 @@ func (b *OpenWrtBackend) readNetworkInterfaceDump() (openWrtInterfaceDump, error
 }
 
 func (b *OpenWrtBackend) readWirelessRadioStatus() map[string]openWrtWirelessRadioStatus {
+	decode := func(data []byte) (map[string]openWrtWirelessRadioStatus, bool) {
+		var radios map[string]openWrtWirelessRadioStatus
+		if len(data) == 0 || json.Unmarshal(data, &radios) != nil || radios == nil {
+			return nil, false
+		}
+		return radios, true
+	}
+	if b.commandRunner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
+		data, err := b.commandRunner(ctx, "ubus", "call", "network.wireless", "status")
+		cancel()
+		if err == nil {
+			if radios, ok := decode(data); ok {
+				return radios
+			}
+		}
+	}
+	if b.ubusCaller == nil {
+		return nil
+	}
 	data, err := b.ubusCaller("network.wireless", "status", b.ubusTimeout)
 	if err != nil {
 		return nil
 	}
+	radios, _ := decode(data)
+	return radios
+}
 
-	var radios map[string]openWrtWirelessRadioStatus
-	if err := json.Unmarshal(data, &radios); err != nil {
-		return nil
+func (b *OpenWrtBackend) existingWiFiIfName(candidate string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || strings.ContainsAny(candidate, " /\t\r\n") {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(b.netClassDir, candidate)); err == nil {
+		return candidate
+	}
+	if iface, err := net.InterfaceByName(candidate); err == nil && iface != nil {
+		return candidate
+	}
+	return ""
+}
+
+// enrichWirelessRuntime merges runtime-only interfaces into netifd/UCI
+// configuration. UCI section labels are configuration identifiers, not Linux
+// interface names; this function only admits links proven by nl80211, ubus
+// object discovery, iwinfo devices, or sysfs.
+func (b *OpenWrtBackend) enrichWirelessRuntime(radios map[string]openWrtWirelessRadioStatus) map[string]openWrtWirelessRadioStatus {
+	if radios == nil {
+		radios = make(map[string]openWrtWirelessRadioStatus)
+	}
+	runtimeInterfaces, runtimeErr := iwinfo.RuntimeInterfaces()
+	if runtimeErr != nil {
+		logCollectorError("openwrt.wifi.nl80211.interfaces", runtimeErr)
+	}
+
+	discovered := make(map[string]iwinfo.WirelessInterface, len(runtimeInterfaces))
+	for _, iface := range runtimeInterfaces {
+		if strings.TrimSpace(iface.Name) != "" {
+			discovered[iface.Name] = iface
+		}
+	}
+	for _, ifName := range b.discoverWiFiInterfacesFromCommands() {
+		if _, ok := discovered[ifName]; ok {
+			continue
+		}
+		discovered[ifName] = iwinfo.WirelessInterface{
+			Name:         ifName,
+			PHY:          b.runtimePHYIndex(ifName),
+			Mode:         b.runtimeWiFiMode(ifName),
+			HardwareAddr: b.runtimeHardwareAddr(ifName),
+		}
+	}
+
+	known := make(map[string]bool)
+	for key, radio := range radios {
+		for index := range radio.Interfaces {
+			// netifd status and nl80211 entries are runtime evidence in their
+			// own right. Only the UCI-only path needs existence validation.
+			ifName := strings.TrimSpace(radio.Interfaces[index].IfName)
+			if ifName != "" {
+				known[ifName] = true
+				if runtime, ok := discovered[ifName]; ok {
+					radio.Interfaces[index].Up = b.runtimeInterfaceUp(ifName)
+					if radio.Interfaces[index].Config == nil {
+						radio.Interfaces[index].Config = map[string]any{}
+					}
+					if configString(radio.Interfaces[index].Config, "mode") == "" {
+						radio.Interfaces[index].Config["mode"] = runtime.Mode
+					}
+				}
+			}
+		}
+		radios[key] = radio
+	}
+
+	for _, iface := range discovered {
+		if known[iface.Name] {
+			continue
+		}
+		radioKey := b.runtimeRadioKey(radios, iface.PHY)
+		radio := radios[radioKey]
+		if radio.Config == nil {
+			radio.Config = map[string]any{}
+		}
+		if radio.Config["band"] == nil && iface.Frequency > 0 {
+			radio.Config["band"] = wifiBandFromFrequency(iface.Frequency)
+		}
+		radio.Up = radio.Up || b.runtimeInterfaceUp(iface.Name)
+		radio.Interfaces = append(radio.Interfaces, openWrtWirelessIfaceStatus{
+			Section: iface.Name,
+			IfName:  iface.Name,
+			Up:      b.runtimeInterfaceUp(iface.Name),
+			Config: map[string]any{
+				"mode":   iface.Mode,
+				"ifname": iface.Name,
+			},
+		})
+		radios[radioKey] = radio
 	}
 	return radios
 }
 
-func (b *OpenWrtBackend) readWiFiStations() map[string][]iwinfo.AssocEntry {
-	data, err := b.ubusCaller("device", "getStaList", b.ubusTimeout)
-	if err != nil {
-		return map[string][]iwinfo.AssocEntry{}
+func (b *OpenWrtBackend) discoverWiFiInterfacesFromCommands() []string {
+	seen := make(map[string]bool)
+	add := func(value string) {
+		value = strings.TrimSpace(strings.TrimPrefix(value, "hostapd."))
+		if value != "" && len(value) < 16 && !strings.ContainsAny(value, " /\t\r\n") {
+			seen[value] = true
+		}
 	}
+	if b.commandRunner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
+		if output, err := b.commandRunner(ctx, "ubus", "list", "hostapd.*"); err == nil {
+			for _, line := range strings.Split(string(output), "\n") {
+				add(line)
+			}
+		}
+		cancel()
+		ctx, cancel = context.WithTimeout(context.Background(), b.ubusTimeout)
+		if output, err := b.commandRunner(ctx, "ubus", "call", "iwinfo", "devices"); err == nil {
+			var payload struct {
+				Devices []string `json:"devices"`
+			}
+			if json.Unmarshal(output, &payload) == nil {
+				for _, ifName := range payload.Devices {
+					add(ifName)
+				}
+			}
+		}
+		cancel()
+		ctx, cancel = context.WithTimeout(context.Background(), b.ubusTimeout)
+		if output, err := b.commandRunner(ctx, "iwinfo"); err == nil {
+			for _, line := range strings.Split(string(output), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) > 0 {
+					add(strings.Trim(fields[0], " ,:[]"))
+				}
+			}
+		}
+		cancel()
+	}
+	// sysfs remains available on minimal images with no ubus/iw/iwinfo CLI.
+	if entries, err := os.ReadDir(b.netClassDir); err == nil {
+		for _, entry := range entries {
+			if _, err := os.Stat(filepath.Join(b.netClassDir, entry.Name(), "phy80211")); err == nil {
+				add(entry.Name())
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for ifName := range seen {
+		out = append(out, ifName)
+	}
+	sort.Strings(out)
+	return out
+}
 
+func (b *OpenWrtBackend) runtimeRadioKey(radios map[string]openWrtWirelessRadioStatus, phy int) string {
+	candidates := []string{fmt.Sprintf("radio%d", phy), fmt.Sprintf("phy%d", phy)}
+	for _, candidate := range candidates {
+		if _, ok := radios[candidate]; ok {
+			return candidate
+		}
+	}
+	if len(radios) == 1 {
+		for key := range radios {
+			return key
+		}
+	}
+	return fmt.Sprintf("phy%d", phy)
+}
+
+func (b *OpenWrtBackend) runtimePHYIndex(ifName string) int {
+	value := strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, ifName, "phy80211", "index")))
+	if phy, err := strconv.Atoi(value); err == nil {
+		return phy
+	}
+	name := strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, ifName, "phy80211", "name")))
+	if strings.HasPrefix(name, "phy") {
+		if phy, err := strconv.Atoi(strings.TrimPrefix(name, "phy")); err == nil {
+			return phy
+		}
+	}
+	if resolved, err := filepath.EvalSymlinks(filepath.Join(b.netClassDir, ifName, "phy80211")); err == nil {
+		name = filepath.Base(resolved)
+		if strings.HasPrefix(name, "phy") {
+			if phy, err := strconv.Atoi(strings.TrimPrefix(name, "phy")); err == nil {
+				return phy
+			}
+		}
+	}
+	return 0
+}
+
+func (b *OpenWrtBackend) runtimeWiFiMode(ifName string) string {
+	if info, err := b.wifiInfo(ifName); err == nil && info != nil {
+		switch info.Mode {
+		case 1:
+			return "ap"
+		case 3:
+			return "station"
+		}
+	}
+	return "ap"
+}
+
+func (b *OpenWrtBackend) runtimeHardwareAddr(ifName string) net.HardwareAddr {
+	mac, _ := net.ParseMAC(strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, ifName, "address"))))
+	return mac
+}
+
+func (b *OpenWrtBackend) runtimeInterfaceUp(ifName string) bool {
+	state := strings.ToLower(strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, ifName, "operstate"))))
+	if state != "" {
+		return state != "down" && state != "notpresent" && state != "lowerlayerdown"
+	}
+	iface, err := net.InterfaceByName(ifName)
+	return err == nil && iface.Flags&net.FlagUp != 0
+}
+
+func wifiBandFromFrequency(frequency int) string {
+	switch {
+	case frequency >= 5925:
+		return "6g"
+	case frequency >= 4900:
+		return "5g"
+	case frequency >= 2300:
+		return "2g"
+	default:
+		return ""
+	}
+}
+
+func (b *OpenWrtBackend) readWiFiStations() (map[string][]iwinfo.AssocEntry, error) {
+	var data []byte
+	var err error
+	if b.commandRunner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
+		data, err = b.commandRunner(ctx, "ubus", "call", "device", "getStaList")
+		cancel()
+	}
 	var payload struct {
 		Station []openWrtWiFiStation `json:"station"`
 	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return map[string][]iwinfo.AssocEntry{}
+	if err == nil && len(data) > 0 {
+		if decodeErr := json.Unmarshal(data, &payload); decodeErr == nil && payload.Station != nil {
+			return mapOpenWrtWiFiStations(payload.Station), nil
+		}
 	}
+	if b.ubusCaller == nil {
+		if err == nil {
+			err = fmt.Errorf("device.getStaList unavailable")
+		}
+		return map[string][]iwinfo.AssocEntry{}, err
+	}
+	data, err = b.ubusCaller("device", "getStaList", b.ubusTimeout)
+	if err != nil {
+		return map[string][]iwinfo.AssocEntry{}, err
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return map[string][]iwinfo.AssocEntry{}, err
+	}
+	if payload.Station == nil {
+		return map[string][]iwinfo.AssocEntry{}, fmt.Errorf("device.getStaList missing station array")
+	}
+	return mapOpenWrtWiFiStations(payload.Station), nil
+}
 
+func mapOpenWrtWiFiStations(observations []openWrtWiFiStation) map[string][]iwinfo.AssocEntry {
 	stations := make(map[string][]iwinfo.AssocEntry)
-	for _, station := range payload.Station {
+	for _, station := range observations {
 		iface := strings.TrimSpace(station.Iface)
 		if iface == "" {
 			continue
@@ -1976,21 +2631,44 @@ func (b *OpenWrtBackend) readWiFiStations() map[string][]iwinfo.AssocEntry {
 		if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
 			continue
 		}
-		stations[iface] = append(stations[iface], iwinfo.AssocEntry{
-			MAC:           mac,
-			Signal:        int8(station.RSSI),
-			Noise:         int8(station.Noise),
-			Inactive:      station.Inactive,
-			ConnectedTime: station.ConnectedTime,
-			RxPackets:     station.RxPackets,
-			TxPackets:     station.TxPackets,
-			RxBytes:       station.RxBytes,
-			TxBytes:       station.TxBytes,
-			TxRetries:     station.TxRetries,
-			TxFailed:      station.TxFailed,
-			RxRate:        station.RxRate,
-			TxRate:        station.TxRate,
-		})
+		entry := iwinfo.AssocEntry{MAC: mac}
+		if station.RSSI != nil {
+			entry.Signal, entry.SignalKnown = boundedWiFiDBM(*station.RSSI), true
+		}
+		if station.Noise != nil {
+			entry.Noise, entry.NoiseKnown = boundedWiFiDBM(*station.Noise), true
+		}
+		if station.Inactive != nil {
+			entry.Inactive, entry.InactiveKnown = *station.Inactive, true
+		}
+		if station.ConnectedTime != nil {
+			entry.ConnectedTime, entry.ConnectedTimeKnown = *station.ConnectedTime, true
+		}
+		if station.RxPackets != nil {
+			entry.RxPackets, entry.RxPacketsKnown = *station.RxPackets, true
+		}
+		if station.TxPackets != nil {
+			entry.TxPackets, entry.TxPacketsKnown = *station.TxPackets, true
+		}
+		if station.RxBytes != nil {
+			entry.RxBytes, entry.RxBytesKnown = *station.RxBytes, true
+		}
+		if station.TxBytes != nil {
+			entry.TxBytes, entry.TxBytesKnown = *station.TxBytes, true
+		}
+		if station.TxRetries != nil {
+			entry.TxRetries, entry.TxRetriesKnown = *station.TxRetries, true
+		}
+		if station.TxFailed != nil {
+			entry.TxFailed, entry.TxFailedKnown = *station.TxFailed, true
+		}
+		if station.RxRate != nil {
+			entry.RxRate, entry.RxRateKnown = *station.RxRate, true
+		}
+		if station.TxRate != nil {
+			entry.TxRate, entry.TxRateKnown = *station.TxRate, true
+		}
+		stations[iface] = append(stations[iface], entry)
 	}
 	return stations
 }
@@ -2041,11 +2719,13 @@ func (b *OpenWrtBackend) readWirelessRadioStatusFromUCI() map[string]openWrtWire
 		for key, value := range section.Options {
 			config[key] = value
 		}
+		configuredIfName := b.existingWiFiIfName(section.Options["ifname"])
 		iface := openWrtWirelessIfaceStatus{
 			Section: section.Name,
-			IfName:  firstNonEmpty(section.Options["ifname"], section.Name, fmt.Sprintf("wlan%d", ifaceIndex)),
-			Up:      !parseOpenWrtBool(section.Options["disabled"], false),
-			Config:  config,
+			IfName:  configuredIfName,
+			// UCI is desired configuration, not proof that a link exists.
+			Up:     false,
+			Config: config,
 		}
 		if iface.Section == "" {
 			iface.Section = fmt.Sprintf("wifi-iface-%d", ifaceIndex)
@@ -2758,7 +3438,7 @@ func wifiBandwidthFromConfig(config map[string]any) string {
 	case value == "":
 		return "Unknown"
 	case strings.Contains(value, "320"):
-		return "320MHz"
+		return "320MHz-1"
 	case strings.Contains(value, "160"):
 		return "160MHz"
 	case strings.Contains(value, "80"):
@@ -2771,6 +3451,474 @@ func wifiBandwidthFromConfig(config map[string]any) string {
 		return "Auto"
 	default:
 		return "Unknown"
+	}
+}
+
+func normalizeOpenWrtWiFiBand(value string) (string, error) {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), " ", "")) {
+	case "2g", "2.4g", "2.4ghz":
+		return "2g", nil
+	case "5g", "5ghz":
+		return "5g", nil
+	case "6g", "6ghz":
+		return "6g", nil
+	default:
+		return "", fmt.Errorf("wusp openwrt WiFi band must be 2.4GHz, 5GHz, or 6GHz")
+	}
+}
+
+func normalizeWiFiBandwidth(value string) string {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(value), " ", ""))
+	switch normalized {
+	case "AUTO":
+		return "Auto"
+	case "20", "20MHZ":
+		return "20MHz"
+	case "40", "40MHZ":
+		return "40MHz"
+	case "80", "80MHZ":
+		return "80MHz"
+	case "160", "160MHZ":
+		return "160MHz"
+	case "80+80", "80+80MHZ":
+		return "80+80MHz"
+	case "320", "320MHZ", "320MHZ-1":
+		return "320MHz-1"
+	case "320MHZ-2":
+		return "320MHz-2"
+	default:
+		return ""
+	}
+}
+
+func parseWiFiStandardsValue(value wusp.Value) ([]string, error) {
+	raw := make([]string, 0, 7)
+	if value.Tag == wusp.TagList {
+		for _, item := range value.AsList() {
+			raw = append(raw, strings.Split(wusp.ValueToString(item), ",")...)
+		}
+	} else {
+		raw = strings.Split(wusp.ValueToString(value), ",")
+	}
+	seen := map[string]bool{}
+	for _, standard := range raw {
+		standard = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(standard, "802.11")))
+		valid := false
+		for _, candidate := range wifiStandardOrder {
+			if standard == candidate {
+				valid = true
+				break
+			}
+		}
+		if standard != "" && !valid {
+			return nil, fmt.Errorf("wusp openwrt unsupported 802.11 standard %q", standard)
+		}
+		if valid {
+			seen[standard] = true
+		}
+	}
+	standards := orderedWiFiStandards(seen)
+	if len(standards) == 0 {
+		return nil, fmt.Errorf("wusp openwrt OperatingStandards cannot be empty")
+	}
+	return standards, nil
+}
+
+func containsWiFiStandard(standards []string, want string) bool {
+	for _, standard := range standards {
+		if standard == want {
+			return true
+		}
+	}
+	return false
+}
+
+func wifiStandardModePrefix(standards []string) string {
+	switch {
+	case containsWiFiStandard(standards, "be"):
+		return "EHT"
+	case containsWiFiStandard(standards, "ax"):
+		return "HE"
+	case containsWiFiStandard(standards, "ac"):
+		return "VHT"
+	case containsWiFiStandard(standards, "n"):
+		return "HT"
+	default:
+		return "NOHT"
+	}
+}
+
+func wifiBandwidthMHz(value string) int {
+	switch normalizeWiFiBandwidth(value) {
+	case "20MHz":
+		return 20
+	case "40MHz":
+		return 40
+	case "80MHz", "80+80MHz":
+		return 80
+	case "160MHz":
+		return 160
+	case "320MHz-1", "320MHz-2":
+		return 320
+	default:
+		return 20
+	}
+}
+
+func wifiModeForStandards(prefix, currentBandwidth string, supported []string) (string, error) {
+	if prefix == "NOHT" {
+		return "NOHT", nil
+	}
+	wantedWidth := wifiBandwidthMHz(currentBandwidth)
+	bestMode := ""
+	bestWidth := -1
+	for _, mode := range supported {
+		upper := strings.ToUpper(strings.TrimSpace(mode))
+		if !strings.HasPrefix(upper, prefix) {
+			continue
+		}
+		width, _ := strconv.Atoi(strings.TrimPrefix(upper, prefix))
+		if width == wantedWidth {
+			return upper, nil
+		}
+		if width <= wantedWidth && width > bestWidth {
+			bestMode, bestWidth = upper, width
+		}
+	}
+	if bestMode != "" {
+		return bestMode, nil
+	}
+	if len(supported) > 0 {
+		return "", fmt.Errorf("wusp openwrt requested 802.11 generation is not supported by this radio")
+	}
+	if prefix == "HT" && wantedWidth > 40 {
+		wantedWidth = 40
+	}
+	return prefix + strconv.Itoa(wantedWidth), nil
+}
+
+func (b *OpenWrtBackend) validateWiFiBandwidth(section, requested string) error {
+	ifName := b.radioToIfname(section)
+	if ifName == "" || b.wifiHTModeList == nil {
+		return nil
+	}
+	modes, err := b.wifiHTModeList(ifName)
+	if err != nil || len(modes) == 0 {
+		return nil
+	}
+	supported := wifiSupportedBandwidths(modes, "")
+	for _, bandwidth := range supported {
+		if bandwidth == requested {
+			return nil
+		}
+	}
+	return fmt.Errorf("wusp openwrt channel bandwidth %s is not supported; valid values are %s", requested, strings.Join(supported, ","))
+}
+
+func (b *OpenWrtBackend) setWiFiOperatingStandards(ctx context.Context, section string, standards []string) error {
+	band := wifiBandFromConfig(map[string]any{
+		"band":   b.readUCIValue(ctx, "wireless", section, "band"),
+		"hwmode": b.readUCIValue(ctx, "wireless", section, "hwmode"),
+	})
+	allowed := map[string]bool{}
+	switch band {
+	case "2.4GHz":
+		for _, standard := range []string{"b", "g", "n", "ax", "be"} {
+			allowed[standard] = true
+		}
+	case "5GHz":
+		for _, standard := range []string{"a", "n", "ac", "ax", "be"} {
+			allowed[standard] = true
+		}
+	case "6GHz":
+		allowed["ax"], allowed["be"] = true, true
+	default:
+		return fmt.Errorf("wusp openwrt radio band must be known before setting OperatingStandards")
+	}
+	for _, standard := range standards {
+		if !allowed[standard] {
+			return fmt.Errorf("wusp openwrt 802.11%s is not valid in %s", standard, band)
+		}
+	}
+
+	ifName := b.radioToIfname(section)
+	var supportedModes []string
+	if b.wifiHWModeList != nil && ifName != "" {
+		if modes, err := b.wifiHWModeList(ifName); err == nil {
+			supported := wifiSupportedStandards(modes, band)
+			for _, standard := range standards {
+				if !containsWiFiStandard(supported, standard) {
+					return fmt.Errorf("wusp openwrt 802.11%s is not supported by this radio", standard)
+				}
+			}
+		}
+	}
+	if b.wifiHTModeList != nil && ifName != "" {
+		supportedModes, _ = b.wifiHTModeList(ifName)
+	}
+	currentHTMode := b.readUCIValue(ctx, "wireless", section, "htmode")
+	mode, err := wifiModeForStandards(wifiStandardModePrefix(standards), wifiBandwidthFromConfig(map[string]any{"htmode": currentHTMode}), supportedModes)
+	if err != nil {
+		return err
+	}
+
+	requireMode := ""
+	if !containsWiFiStandard(standards, "a") && !containsWiFiStandard(standards, "b") && !containsWiFiStandard(standards, "g") {
+		switch {
+		case containsWiFiStandard(standards, "n"):
+			requireMode = "n"
+		case containsWiFiStandard(standards, "ac"):
+			requireMode = "ac"
+		case band != "6GHz":
+			return fmt.Errorf("wusp openwrt cannot enforce an ax/be-only profile on this radio; include the compatible n/ac standards")
+		}
+	}
+	legacyRates := "0"
+	if containsWiFiStandard(standards, "b") {
+		legacyRates = "1"
+	}
+	if err := b.setUCIOption(ctx, "wireless", section, "htmode", mode, false, ""); err != nil {
+		return err
+	}
+	if err := b.setUCIOption(ctx, "wireless", section, "legacy_rates", legacyRates, false, ""); err != nil {
+		return err
+	}
+	if requireMode == "" {
+		return b.deleteUCIOption(ctx, "wireless", section, "require_mode", true, wirelessReloadScript)
+	}
+	return b.setUCIOption(ctx, "wireless", section, "require_mode", requireMode, true, wirelessReloadScript)
+}
+
+var wifiStandardOrder = []string{"a", "b", "g", "n", "ac", "ax", "be"}
+
+func wifiStringList(values []string) wusp.Value {
+	items := make([]wusp.Value, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			items = append(items, wusp.String(value))
+		}
+	}
+	return wusp.List(items...)
+}
+
+func orderedWiFiStandards(in map[string]bool) []string {
+	out := make([]string, 0, len(in))
+	for _, standard := range wifiStandardOrder {
+		if in[standard] {
+			out = append(out, standard)
+		}
+	}
+	return out
+}
+
+func wifiSupportedStandards(modes *iwinfo.HWModes, band string) []string {
+	standards := map[string]bool{}
+	if modes != nil {
+		standards["a"] = modes.A && band == "5GHz"
+		standards["b"] = modes.B && band == "2.4GHz"
+		standards["g"] = modes.G && band == "2.4GHz"
+		standards["n"] = modes.N && band != "6GHz"
+		standards["ac"] = modes.AC && band == "5GHz"
+		standards["ax"] = modes.AX
+		standards["be"] = modes.BE
+	}
+	return orderedWiFiStandards(standards)
+}
+
+func wifiOperatingStandards(config map[string]any) []string {
+	band := wifiBandFromConfig(config)
+	htmode := strings.ToUpper(strings.TrimSpace(configString(config, "htmode")))
+	requireMode := strings.ToLower(strings.TrimSpace(configString(config, "require_mode")))
+	legacyRates := parseOpenWrtBool(configString(config, "legacy_rates"), false)
+	standards := map[string]bool{}
+
+	switch band {
+	case "2.4GHz":
+		standards["g"] = true
+		standards["b"] = legacyRates
+	case "5GHz":
+		standards["a"] = true
+	}
+
+	if strings.HasPrefix(htmode, "HT") || strings.HasPrefix(htmode, "VHT") ||
+		strings.HasPrefix(htmode, "HE") || strings.HasPrefix(htmode, "EHT") {
+		standards["n"] = band != "6GHz"
+	}
+	if strings.HasPrefix(htmode, "VHT") || strings.HasPrefix(htmode, "HE") || strings.HasPrefix(htmode, "EHT") {
+		standards["ac"] = band == "5GHz"
+	}
+	if strings.HasPrefix(htmode, "HE") || strings.HasPrefix(htmode, "EHT") {
+		standards["ax"] = true
+	}
+	if strings.HasPrefix(htmode, "EHT") {
+		standards["be"] = true
+	}
+
+	// OpenWrt's require_mode removes older client generations from the
+	// advertised operating profile while htmode selects the newest PHY mode.
+	switch requireMode {
+	case "n":
+		delete(standards, "a")
+		delete(standards, "b")
+		delete(standards, "g")
+	case "ac":
+		delete(standards, "a")
+		delete(standards, "b")
+		delete(standards, "g")
+		delete(standards, "n")
+	}
+	return orderedWiFiStandards(standards)
+}
+
+func wifiSupportedBandwidths(htModes []string, current string) []string {
+	seen := map[string]bool{"Auto": true}
+	for _, mode := range htModes {
+		upper := strings.ToUpper(strings.TrimSpace(mode))
+		switch {
+		case strings.Contains(upper, "320"):
+			seen["320MHz-1"] = true
+		case strings.Contains(upper, "160"):
+			seen["160MHz"] = true
+		case strings.Contains(upper, "80"):
+			seen["80MHz"] = true
+		case strings.Contains(upper, "40"):
+			seen["40MHz"] = true
+		case strings.Contains(upper, "20"), upper == "NOHT":
+			seen["20MHz"] = true
+		}
+	}
+	if current != "" && current != "Unknown" {
+		seen[current] = true
+	}
+	order := []string{"Auto", "20MHz", "40MHz", "80MHz", "160MHz", "80+80MHz", "320MHz-1", "320MHz-2"}
+	out := make([]string, 0, len(seen))
+	for _, value := range order {
+		if seen[value] {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func parseIWInfoTxPowerLevels(output []byte) []int {
+	seen := map[int]bool{}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "*")))
+		if len(fields) < 2 || !strings.EqualFold(fields[1], "dBm") {
+			continue
+		}
+		level, err := strconv.Atoi(fields[0])
+		if err == nil && level >= 0 {
+			seen[level] = true
+		}
+	}
+	levels := make([]int, 0, len(seen))
+	for level := range seen {
+		levels = append(levels, level)
+	}
+	sort.Ints(levels)
+	return levels
+}
+
+func txPowerPercentForDBM(dbm, maxDBM int) int {
+	if maxDBM <= 0 {
+		return 100
+	}
+	percent := int(math.Round(math.Pow(10, float64(dbm-maxDBM)/10) * 100))
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func txPowerSupportedPercentages(levels []int) []int {
+	if len(levels) == 0 {
+		return []int{-1}
+	}
+	maxDBM := levels[len(levels)-1]
+	seen := map[int]bool{-1: true}
+	for _, level := range levels {
+		seen[txPowerPercentForDBM(level, maxDBM)] = true
+	}
+	percentages := make([]int, 0, len(seen))
+	for percent := range seen {
+		percentages = append(percentages, percent)
+	}
+	sort.Ints(percentages)
+	return percentages
+}
+
+func txPowerLevelForPercent(levels []int, percent int) (int, bool) {
+	if len(levels) == 0 {
+		return 0, false
+	}
+	maxDBM := levels[len(levels)-1]
+	match := 0
+	found := false
+	for _, level := range levels {
+		if txPowerPercentForDBM(level, maxDBM) == percent {
+			match = level
+			found = true
+		}
+	}
+	return match, found
+}
+
+func (b *OpenWrtBackend) readWiFiTxPowerLevels(ctx context.Context, ifName string) []int {
+	if b.commandRunner == nil || strings.TrimSpace(ifName) == "" {
+		return nil
+	}
+	output, err := b.commandRunner(ctx, "iwinfo", ifName, "txpowerlist")
+	if err != nil {
+		return nil
+	}
+	return parseIWInfoTxPowerLevels(output)
+}
+
+func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *wusp.Message, section, ifName string, radioIndex int, config map[string]any) {
+	if strings.TrimSpace(ifName) == "" {
+		ifName = b.radioToIfname(section)
+	}
+	base := fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex)
+	band := wifiBandFromConfig(config)
+	operatingStandards := wifiOperatingStandards(config)
+	supportedStandards := append([]string(nil), operatingStandards...)
+	if b.wifiHWModeList != nil && ifName != "" {
+		if modes, err := b.wifiHWModeList(ifName); err == nil {
+			if discovered := wifiSupportedStandards(modes, band); len(discovered) > 0 {
+				supportedStandards = discovered
+			}
+		}
+	}
+	if len(supportedStandards) > 0 {
+		appendField(msg, base+"SupportedStandards", wifiStringList(supportedStandards))
+	}
+	if len(operatingStandards) > 0 {
+		appendField(msg, base+"OperatingStandards", wifiStringList(operatingStandards))
+	}
+
+	var htModes []string
+	if b.wifiHTModeList != nil && ifName != "" {
+		htModes, _ = b.wifiHTModeList(ifName)
+	}
+	bandwidths := wifiSupportedBandwidths(htModes, wifiBandwidthFromConfig(config))
+	appendField(msg, base+"SupportedOperatingChannelBandwidths", wifiStringList(bandwidths))
+
+	levels := b.readWiFiTxPowerLevels(ctx, ifName)
+	percentages := txPowerSupportedPercentages(levels)
+	powerValues := make([]wusp.Value, 0, len(percentages))
+	for _, percent := range percentages {
+		powerValues = append(powerValues, wusp.Int(int64(percent)))
+	}
+	appendField(msg, base+"TransmitPowerSupported", wusp.List(powerValues...))
+	configuredPower := strings.TrimSpace(configString(config, "txpower"))
+	if configuredPower == "" {
+		appendField(msg, base+"TransmitPower", wusp.Int(-1))
+	} else if dbm, err := strconv.Atoi(configuredPower); err == nil && len(levels) > 0 {
+		appendField(msg, base+"TransmitPower", wusp.Int(int64(txPowerPercentForDBM(dbm, levels[len(levels)-1]))))
 	}
 }
 
@@ -2832,10 +3980,12 @@ func bandwidthToHTMode(bw, section string, b *OpenWrtBackend, ctx context.Contex
 		}
 	}
 
-	// Normalize: "Auto", "20MHz", "80MHz" → width string
-	width := strings.ToLower(strings.TrimSuffix(bw, "MHz"))
+	// Normalize TR-181 labels into OpenWrt htmode width suffixes.
+	normalized := normalizeWiFiBandwidth(bw)
+	width := strings.TrimSuffix(strings.TrimSuffix(strings.ToLower(normalized), "mhz-1"), "mhz-2")
+	width = strings.TrimSuffix(width, "mhz")
 
-	if width == "auto" {
+	if normalized == "Auto" {
 		return pickBestAutoMode(supported)
 	}
 	return pickModeForWidth(supported, width)

@@ -468,6 +468,19 @@ func GetAssocList(ifname string) ([]AssocEntry, error) {
 			TxMCS:               int8(ptr.tx_rate.mcs),
 			RxNSS:               uint8(ptr.rx_rate.nss),
 			TxNSS:               uint8(ptr.tx_rate.nss),
+			SignalKnown:         true,
+			SignalAvgKnown:      true,
+			NoiseKnown:          true,
+			InactiveKnown:       true,
+			ConnectedTimeKnown:  true,
+			RxPacketsKnown:      true,
+			TxPacketsKnown:      true,
+			RxBytesKnown:        true,
+			TxBytesKnown:        true,
+			TxRetriesKnown:      true,
+			TxFailedKnown:       true,
+			RxRateKnown:         true,
+			TxRateKnown:         true,
 		})
 	}
 	return entries, nil

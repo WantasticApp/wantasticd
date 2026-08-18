@@ -42,6 +42,14 @@ func (c *linuxController) LinkSetDown(ifname string) error {
 	return netlinkSetLink(iface.Index, false)
 }
 
+func (c *linuxController) LinkSetMTU(ifname string, mtu int) error {
+	iface, err := net.InterfaceByName(ifname)
+	if err != nil {
+		return err
+	}
+	return netlinkSetLinkMTU(iface.Index, mtu)
+}
+
 // ── Address management ──────────────────────────────────────────────────────
 
 func (c *linuxController) AddrAdd(ifname string, addr netip.Prefix) error {
@@ -383,6 +391,22 @@ func netlinkSetLink(idx int, up bool) error {
 	binary.LittleEndian.PutUint32(buf[off+8:], flags)
 	binary.LittleEndian.PutUint32(buf[off+12:], syscall.IFF_UP)
 	off += int(unsafe.Sizeof(ifInfoMsg{}))
+	binary.LittleEndian.PutUint32(buf[0:], uint32(off))
+	binary.LittleEndian.PutUint16(buf[4:], _RTM_NEWLINK)
+	binary.LittleEndian.PutUint16(buf[6:], _NLM_F_REQUEST|_NLM_F_ACK)
+	binary.LittleEndian.PutUint32(buf[8:], 1)
+	return netlinkExec(buf[:off])
+}
+
+func netlinkSetLinkMTU(idx, mtu int) error {
+	buf := make([]byte, 256)
+	off := int(unsafe.Sizeof(nlMsgHdr{}))
+	buf[off] = syscall.AF_UNSPEC
+	binary.LittleEndian.PutUint32(buf[off+4:], uint32(idx))
+	off += int(unsafe.Sizeof(ifInfoMsg{}))
+	value := make([]byte, 4)
+	binary.LittleEndian.PutUint32(value, uint32(mtu))
+	off = putAttr(buf, off, syscall.IFLA_MTU, value)
 	binary.LittleEndian.PutUint32(buf[0:], uint32(off))
 	binary.LittleEndian.PutUint16(buf[4:], _RTM_NEWLINK)
 	binary.LittleEndian.PutUint16(buf[6:], _NLM_F_REQUEST|_NLM_F_ACK)

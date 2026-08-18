@@ -25,6 +25,10 @@ func (c *windowsController) LinkSetDown(ifname string) error {
 	return exec.Command("netsh", "interface", "set", "interface", ifname, "admin=disable").Run()
 }
 
+func (c *windowsController) LinkSetMTU(ifname string, mtu int) error {
+	return exec.Command("netsh", "interface", "ipv4", "set", "subinterface", ifname, fmt.Sprintf("mtu=%d", mtu), "store=active").Run()
+}
+
 func (c *windowsController) AddrAdd(ifname string, addr netip.Prefix) error {
 	family := "ipv4"
 	if addr.Addr().Is6() {

@@ -118,17 +118,18 @@ func TestHostFirewallDeleteUsesRequestedRuleIndex(t *testing.T) {
 }
 
 func TestSetIPInterfaceParamUsesLiveIndex(t *testing.T) {
-	var call string
-	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
-		call = strings.Join(append([]string{name}, args...), " ")
-		return nil, nil
+	var gotName string
+	var gotMTU int
+	b := newHostBackend(KindLinux, Options{})
+	b.linkSetMTU = func(name string, mtu int) error {
+		gotName, gotMTU = name, mtu
+		return nil
 	}
-	b := newHostBackend(KindLinux, Options{CommandRunner: runner})
 	if err := b.Set(context.Background(), "Device.IP.Interface.1.MaxMTUSize", wusp.Uint(1400)); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(call, "ip link set dev") || !strings.HasSuffix(call, "mtu 1400") {
-		t.Fatalf("call=%q", call)
+	if gotName == "" || gotMTU != 1400 {
+		t.Fatalf("native link update=(%q,%d), want a live interface and MTU 1400", gotName, gotMTU)
 	}
 }
 

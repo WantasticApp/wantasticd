@@ -22,6 +22,9 @@ type meshNode struct {
 	sourceHop int
 	hasHop    bool
 	backhaul  string
+	linkType  string
+	linkIface string
+	discovery string
 	children  []*meshNode
 }
 
@@ -159,8 +162,17 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 			if protocol == "EasyMesh" || protocol == "MultiAP" || protocol == "OpenMesh" {
 				msg.Set(apPrefix+"AssocIEEE1905DeviceRef", wusp.String(dataElementsPrefix))
 			}
-			msg.Set(apPrefix+"BackhaulLinkType", wusp.String(meshBackhaulLinkType(node, index, snapshot.role)))
-			msg.Set(apPrefix+"BackhaulMACAddress", wusp.MAC(mac))
+			parent := parentByNode[node]
+			if linkType := meshBackhaulLinkTypeForParent(node, parent != nil, snapshot.role); linkType != "" {
+				msg.Set(apPrefix+"BackhaulLinkType", wusp.String(linkType))
+			}
+			if parent != nil {
+				if parentMAC, ok := parseMeshMAC(parent.mac); ok {
+					msg.Set(apPrefix+"BackhaulMACAddress", wusp.MAC(parentMAC))
+				}
+			} else if parentMAC, ok := parseMeshMAC(node.parentMAC); ok {
+				msg.Set(apPrefix+"BackhaulMACAddress", wusp.MAC(parentMAC))
+			}
 			if node.signal != 0 {
 				msg.Set(apPrefix+"BackhaulSignalStrength", wusp.Uint(uint64(signalDBMToRCPI(node.signal))))
 			}
@@ -174,8 +186,15 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 }
 
 func meshBackhaulLinkType(node *meshNode, index int, snapshotRole string) string {
-	if node == nil || index == 1 || normalizeMeshRole(firstNonEmpty(node.role, snapshotRole)) == "Controller" {
+	return meshBackhaulLinkTypeForParent(node, index > 1, snapshotRole)
+}
+
+func meshBackhaulLinkTypeForParent(node *meshNode, hasParent bool, snapshotRole string) string {
+	if node == nil || !hasParent || normalizeMeshRole(firstNonEmpty(node.role, snapshotRole)) == "Controller" {
 		return "None"
+	}
+	if explicit := normalizeMeshLinkType(node.linkType); explicit != "" {
+		return explicit
 	}
 	switch strings.ToUpper(strings.TrimSpace(node.backhaul)) {
 	case "LAN", "ETH", "ETHERNET", "WIRED":
@@ -188,7 +207,23 @@ func meshBackhaulLinkType(node *meshNode, index int, snapshotRole string) string
 	case "B", "NONE", "ROOT":
 		return "None"
 	default:
+		if node.signal != 0 {
+			return "Wi-Fi"
+		}
+		return ""
+	}
+}
+
+func normalizeMeshLinkType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "wifi", "wi-fi", "wireless", "wlan", "802.11":
 		return "Wi-Fi"
+	case "ethernet", "wired", "eth", "lan":
+		return "Ethernet"
+	case "none", "root":
+		return "None"
+	default:
+		return ""
 	}
 }
 
@@ -279,6 +314,9 @@ func mergeMeshNodeObservation(dst, src *meshNode) {
 	fill(&dst.ip, src.ip)
 	fill(&dst.role, src.role)
 	fill(&dst.backhaul, src.backhaul)
+	fill(&dst.linkType, src.linkType)
+	fill(&dst.linkIface, src.linkIface)
+	fill(&dst.discovery, src.discovery)
 	if dst.signal == 0 || (src.signal != 0 && src.signal > dst.signal) {
 		dst.signal = src.signal
 	}
@@ -417,6 +455,15 @@ func appendMeshLinks(msg *wusp.Message, node *meshNode, nodeIndex map[*meshNode]
 				msg.Set(prefix+"TargetMACAddress", wusp.MAC(mac))
 			}
 			msg.Set(prefix+"Status", wusp.String("Up"))
+			if linkType := meshBackhaulLinkTypeForParent(child, true, ""); linkType != "" && linkType != "None" {
+				msg.Set(prefix+"LinkType", wusp.String(linkType))
+			}
+			if strings.TrimSpace(child.linkIface) != "" {
+				msg.Set(prefix+"InterfaceName", wusp.String(strings.TrimSpace(child.linkIface)))
+			}
+			if strings.TrimSpace(child.discovery) != "" {
+				msg.Set(prefix+"DiscoveryProtocol", wusp.String(strings.TrimSpace(child.discovery)))
+			}
 			if child.signal != 0 {
 				quality := signalDBMToQuality(child.signal)
 				msg.Set(prefix+"SignalQuality", wusp.Uint(uint64(quality)))

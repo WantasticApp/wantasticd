@@ -2,7 +2,6 @@ package platforms
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"wantastic-agent/internal/iwinfo"
+	"wantastic-agent/internal/linkdiscovery"
 	"wantastic-agent/internal/wusp"
 )
 
@@ -169,6 +169,8 @@ type linuxStationCollection struct {
 }
 
 func collectLinuxStations(ctx context.Context, ifName string, commandRunner CommandRunner) linuxStationCollection {
+	_ = ctx
+	_ = commandRunner
 	collection := linuxStationCollection{}
 	mergeSuccess := func(source string, stations []iwinfo.AssocEntry, err error) {
 		collection.Attempted = append(collection.Attempted, source)
@@ -180,53 +182,9 @@ func collectLinuxStations(ctx context.Context, ifName string, commandRunner Comm
 		collection.Stations = mergeWiFiAssociations(collection.Stations, stations)
 	}
 
-	if commandRunner != nil {
-		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		data, err := commandRunner(callCtx, "ubus", "call", "hostapd."+ifName, "get_clients")
-		cancel()
-		if err == nil {
-			var payload openWrtHostapdClients
-			if decodeErr := json.Unmarshal(data, &payload); decodeErr != nil {
-				err = decodeErr
-			} else if payload.Clients == nil {
-				err = fmt.Errorf("missing clients object")
-			}
-			mergeSuccess("hostapd-ubus", associationsFromHostapdPayload(payload), err)
-		} else {
-			mergeSuccess("hostapd-ubus", nil, err)
-		}
-
-		callCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
-		data, err = commandRunner(callCtx, "hostapd_cli", "-i", ifName, "all_sta")
-		cancel()
-		if err == nil && strings.EqualFold(strings.TrimSpace(string(data)), "FAIL") {
-			err = fmt.Errorf("hostapd_cli returned FAIL")
-		}
-		if err == nil {
-			mergeSuccess("hostapd-cli", parseHostapdCLIStations(string(data)), nil)
-		} else {
-			mergeSuccess("hostapd-cli", nil, err)
-		}
-
-		callCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
-		data, err = commandRunner(callCtx, "iw", "dev", ifName, "station", "dump")
-		cancel()
-		if err == nil {
-			mergeSuccess("iw", parseIWStationDump(string(data)), nil)
-		} else {
-			mergeSuccess("iw", nil, err)
-		}
-
-		callCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
-		data, err = commandRunner(callCtx, "iwinfo", ifName, "assoclist")
-		cancel()
-		if err == nil {
-			mergeSuccess("iwinfo-cli", parseIWInfoCLIStations(string(data)), nil)
-		} else {
-			mergeSuccess("iwinfo-cli", nil, err)
-		}
-	}
-	stations, err := iwinfo.GetAssocList(ifName)
+	stations, err := iwinfo.GetHostapdAssocList(ifName)
+	mergeSuccess("hostapd-control", stations, err)
+	stations, err = iwinfo.GetAssocList(ifName)
 	mergeSuccess("nl80211", stations, err)
 
 	log.Printf("[USP] wifi_collection_summary interface=%q sources_attempted=%q successful=%t selected_station_count=%d errors=%q",
@@ -446,6 +404,7 @@ func parseCLIUint32(value string) (uint32, bool) {
 }
 
 func appendGenericLinuxHosts(msg *wusp.Message, wifiHosts map[string]string, commandRunner CommandRunner, now time.Time) {
+	_ = commandRunner
 	hosts := make(map[string]*openWrtLANHost)
 	ensure := func(macText string) *openWrtLANHost {
 		mac := validClientMAC(macText)
@@ -504,45 +463,6 @@ func appendGenericLinuxHosts(msg *wusp.Message, wifiHosts map[string]string, com
 			host.active = host.active || flags&0x2 != 0
 		}
 	}
-	if commandRunner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		data, err := commandRunner(ctx, "ip", "neigh", "show")
-		cancel()
-		if err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
-				fields := strings.Fields(line)
-				if len(fields) < 5 {
-					continue
-				}
-				devIndex, lladdrIndex := -1, -1
-				for index, field := range fields {
-					switch field {
-					case "dev":
-						devIndex = index
-					case "lladdr":
-						lladdrIndex = index
-					}
-				}
-				if lladdrIndex < 0 || lladdrIndex+1 >= len(fields) {
-					continue
-				}
-				host := ensure(fields[lladdrIndex+1])
-				if host == nil {
-					continue
-				}
-				addHostIP(host, fields[0])
-				if devIndex >= 0 && devIndex+1 < len(fields) {
-					host.interfaceName = fields[devIndex+1]
-					host.layer3Interface = interfacePaths[host.interfaceName]
-					if host.interfaceType == "" {
-						host.interfaceType = hostInterfaceType(host.interfaceName)
-					}
-				}
-				state := strings.ToUpper(fields[len(fields)-1])
-				host.active = host.active || (state != "FAILED" && state != "INCOMPLETE")
-			}
-		}
-	}
 	for _, leasePath := range []string{"/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases", "/var/lib/dnsmasq/dnsmasq.leases"} {
 		data, err := os.ReadFile(filepath.Clean(leasePath))
 		if err != nil {
@@ -576,6 +496,7 @@ func appendGenericLinuxHosts(msg *wusp.Message, wifiHosts map[string]string, com
 		break
 	}
 
+	mergeMNDPHosts(hosts, linkdiscovery.DefaultSnapshot())
 	out := make([]*openWrtLANHost, 0, len(hosts))
 	for _, host := range hosts {
 		sort.Slice(host.ipv4, func(i, j int) bool { return bytesCompareIP(host.ipv4[i], host.ipv4[j]) < 0 })

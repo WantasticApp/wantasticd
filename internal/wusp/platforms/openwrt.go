@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"wantastic-agent/internal/iwinfo"
+	"wantastic-agent/internal/linkdiscovery"
 	"wantastic-agent/internal/netctl"
 	"wantastic-agent/internal/wusp"
 	"wantastic-agent/internal/wusp/platforms/ubus"
@@ -49,6 +50,7 @@ type OpenWrtBackendOptions struct {
 	WiFiInfo              func(string) (*iwinfo.InterfaceInfo, error)
 	WiFiHWModeList        func(string) (*iwinfo.HWModes, error)
 	WiFiHTModeList        func(string) ([]string, error)
+	WiFiTxPowerLevels     func(context.Context, string) []int
 	Now                   func() time.Time
 }
 
@@ -72,16 +74,19 @@ type OpenWrtBackend struct {
 	ubusClient            *ubus.Client
 	ubusTimeout           time.Duration
 	ubusCaller            func(string, string, time.Duration) ([]byte, error)
+	ubusCallerInjected    bool
 	commandRunner         func(context.Context, string, ...string) ([]byte, error)
 	wifiAssocList         func(string) ([]iwinfo.AssocEntry, error)
 	wifiInfo              func(string) (*iwinfo.InterfaceInfo, error)
 	wifiHWModeList        func(string) (*iwinfo.HWModes, error)
 	wifiHTModeList        func(string) ([]string, error)
+	wifiTxPowerLevels     func(context.Context, string) []int
 	cellular              *cellularMonitor
 	now                   func() time.Time
 }
 
 func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
+	linkdiscovery.StartDefault()
 	if b == nil || b.cellular == nil {
 		return nil
 	}
@@ -97,6 +102,19 @@ func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
 	case <-done:
 		return nil
 	}
+}
+
+func (b *OpenWrtBackend) callUbus(ctx context.Context, object, method string, params map[string]any) ([]byte, error) {
+	if b == nil {
+		return nil, fmt.Errorf("nil OpenWrt backend")
+	}
+	if b.ubusCaller != nil && (len(params) == 0 || b.ubusCallerInjected) {
+		return b.ubusCaller(object, method, b.ubusTimeout)
+	}
+	if b.ubusClient == nil {
+		return nil, fmt.Errorf("ubus unavailable")
+	}
+	return b.ubusClient.Call(ctx, object, method, params, b.ubusTimeout)
 }
 
 type openWrtState struct {
@@ -260,11 +278,13 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		ubusClient:            opts.UbusClient,
 		ubusTimeout:           opts.UbusTimeout,
 		ubusCaller:            opts.UbusCaller,
+		ubusCallerInjected:    opts.UbusCaller != nil,
 		commandRunner:         opts.CommandRunner,
 		wifiAssocList:         opts.WiFiAssocList,
 		wifiInfo:              opts.WiFiInfo,
 		wifiHWModeList:        opts.WiFiHWModeList,
 		wifiHTModeList:        opts.WiFiHTModeList,
+		wifiTxPowerLevels:     opts.WiFiTxPowerLevels,
 		cellular:              newCellularMonitor(),
 		now:                   opts.Now,
 	}
@@ -416,6 +436,7 @@ const (
 )
 
 func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) {
+	linkdiscovery.StartDefault()
 	var snapshot openWrtSnapshot
 	_ = runCollector("openwrt.snapshot", func() error {
 		snapshot = b.collectSnapshot(ctx)
@@ -494,6 +515,10 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	_ = runCollector("openwrt.mesh.runtime", func() error { collectMeshStatic(msg); return nil })
 	_ = runCollector("openwrt.mesh.topology", func() error { b.appendOpenWrtMeshTopology(ctx, msg); return nil })
 	_ = runCollector("openwrt.mesh.config", func() error { b.appendOpenWrtMeshConfig(ctx, msg); return nil })
+	_ = runCollector("openwrt.link.discovery", func() error {
+		appendLinkDiscoveryFields(msg, linkdiscovery.DefaultSnapshot(), b.openWrtWiFiInterfaceSet())
+		return nil
+	})
 	_ = runCollector("openwrt.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 
 	return msg, nil
@@ -777,14 +802,11 @@ func (b *OpenWrtBackend) readHostapdAssociations(ifName string) ([]iwinfo.AssocE
 	if ifName == "" {
 		return nil, fmt.Errorf("missing runtime interface")
 	}
-	var data []byte
-	var err error
-	if b.commandRunner != nil {
-		// Local ubus is authoritative and does not depend on anonymous rpcd ACLs.
-		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
-		data, err = b.commandRunner(ctx, "ubus", "call", "hostapd."+ifName, "get_clients")
-		cancel()
+	stations, socketErr := iwinfo.GetHostapdAssocList(ifName)
+	if socketErr == nil {
+		return stations, nil
 	}
+	data, err := b.callUbus(context.Background(), "hostapd."+ifName, "get_clients", nil)
 	var payload openWrtHostapdClients
 	if err == nil {
 		err = json.Unmarshal(data, &payload)
@@ -792,31 +814,10 @@ func (b *OpenWrtBackend) readHostapdAssociations(ifName string) ([]iwinfo.AssocE
 			return associationsFromHostapdPayload(payload), nil
 		}
 	}
-	if b.ubusCaller != nil {
-		data, err = b.ubusCaller("hostapd."+ifName, "get_clients", b.ubusTimeout)
-		if err == nil {
-			payload = openWrtHostapdClients{}
-			err = json.Unmarshal(data, &payload)
-			if err == nil && payload.Clients != nil {
-				return associationsFromHostapdPayload(payload), nil
-			}
-		}
-	}
-	if b.commandRunner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
-		data, cliErr := b.commandRunner(ctx, "hostapd_cli", "-i", ifName, "all_sta")
-		cancel()
-		if cliErr == nil && !strings.EqualFold(strings.TrimSpace(string(data)), "FAIL") {
-			return parseHostapdCLIStations(string(data)), nil
-		}
-		if cliErr != nil {
-			err = cliErr
-		}
-	}
 	if err == nil {
 		err = fmt.Errorf("hostapd returned no clients object")
 	}
-	return nil, err
+	return nil, fmt.Errorf("hostapd socket: %v; ubus: %w", socketErr, err)
 }
 
 func associationsFromHostapdPayload(payload openWrtHostapdClients) []iwinfo.AssocEntry {
@@ -875,13 +876,10 @@ func associationsFromHostapdPayload(payload openWrtHostapdClients) []iwinfo.Asso
 // dependency-free paths.
 func (b *OpenWrtBackend) readIWInfoUBusAssociations(ifName string) ([]iwinfo.AssocEntry, error) {
 	ifName = strings.TrimSpace(ifName)
-	if ifName == "" || b.commandRunner == nil {
+	if ifName == "" {
 		return nil, fmt.Errorf("iwinfo ubus unavailable")
 	}
-	request, _ := json.Marshal(map[string]string{"device": ifName})
-	ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
-	data, err := b.commandRunner(ctx, "ubus", "call", "iwinfo", "assoclist", string(request))
-	cancel()
+	data, err := b.callUbus(context.Background(), "iwinfo", "assoclist", map[string]any{"device": ifName})
 	if err != nil {
 		return nil, err
 	}
@@ -1287,6 +1285,7 @@ func hostInterfaceType(name string) string {
 
 func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrtLANHost {
 	hosts := make(map[string]*openWrtLANHost)
+	wifiInterfaces := b.openWrtWiFiInterfaceSet()
 	ensure := func(macText string) *openWrtLANHost {
 		mac := validClientMAC(macText)
 		if mac == nil {
@@ -1318,7 +1317,9 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 			}
 			addHostIP(host, neighbor.IP.String())
 			host.interfaceName = neighbor.InterfaceName
-			if host.interfaceType == "" {
+			if openWrtWiFiInterfaceMatch(neighbor.InterfaceName, wifiInterfaces) {
+				host.interfaceType = "Wi-Fi"
+			} else if host.interfaceType == "" {
 				host.interfaceType = hostInterfaceType(neighbor.InterfaceName)
 			}
 			host.layer3Interface = interfacePaths[neighbor.InterfaceName]
@@ -1371,7 +1372,9 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 		}
 		addHostIP(host, fields[0])
 		host.interfaceName = fields[5]
-		if host.interfaceType == "" {
+		if openWrtWiFiInterfaceMatch(fields[5], wifiInterfaces) {
+			host.interfaceType = "Wi-Fi"
+		} else if host.interfaceType == "" {
 			host.interfaceType = hostInterfaceType(fields[5])
 		}
 		if host.layer3Interface == "" {
@@ -1381,48 +1384,7 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 		host.active = host.active || flags&0x2 != 0
 	}
 
-	if b.commandRunner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		output, err := b.commandRunner(ctx, "ip", "neigh", "show")
-		cancel()
-		if err == nil {
-			for _, line := range strings.Split(string(output), "\n") {
-				fields := strings.Fields(line)
-				if len(fields) < 5 {
-					continue
-				}
-				devIndex, lladdrIndex := -1, -1
-				for index, field := range fields {
-					switch field {
-					case "dev":
-						devIndex = index
-					case "lladdr":
-						lladdrIndex = index
-					}
-				}
-				if lladdrIndex < 0 || lladdrIndex+1 >= len(fields) {
-					continue
-				}
-				host := ensure(fields[lladdrIndex+1])
-				if host == nil {
-					continue
-				}
-				addHostIP(host, fields[0])
-				if devIndex >= 0 && devIndex+1 < len(fields) {
-					host.interfaceName = fields[devIndex+1]
-					if host.interfaceType == "" {
-						host.interfaceType = hostInterfaceType(host.interfaceName)
-					}
-					if host.layer3Interface == "" {
-						host.layer3Interface = interfacePaths[host.interfaceName]
-					}
-				}
-				state := strings.ToUpper(fields[len(fields)-1])
-				host.active = host.active || (state != "FAILED" && state != "INCOMPLETE")
-			}
-		}
-	}
-
+	mergeMNDPHosts(hosts, linkdiscovery.DefaultSnapshot())
 	out := make([]*openWrtLANHost, 0, len(hosts))
 	for _, host := range hosts {
 		sort.Slice(host.ipv4, func(i, j int) bool { return bytesCompareIP(host.ipv4[i], host.ipv4[j]) < 0 })
@@ -2384,20 +2346,7 @@ func (b *OpenWrtBackend) readWirelessRadioStatus() map[string]openWrtWirelessRad
 		}
 		return radios, true
 	}
-	if b.commandRunner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
-		data, err := b.commandRunner(ctx, "ubus", "call", "network.wireless", "status")
-		cancel()
-		if err == nil {
-			if radios, ok := decode(data); ok {
-				return radios
-			}
-		}
-	}
-	if b.ubusCaller == nil {
-		return nil
-	}
-	data, err := b.ubusCaller("network.wireless", "status", b.ubusTimeout)
+	data, err := b.callUbus(context.Background(), "network.wireless", "status", nil)
 	if err != nil {
 		return nil
 	}
@@ -2559,7 +2508,7 @@ func (b *OpenWrtBackend) enrichWirelessRuntime(radios map[string]openWrtWireless
 			discovered[iface.Name] = iface
 		}
 	}
-	for _, ifName := range b.discoverWiFiInterfacesFromCommands() {
+	for _, ifName := range b.discoverWiFiInterfacesFromSysfs() {
 		if _, ok := discovered[ifName]; ok {
 			continue
 		}
@@ -2620,44 +2569,13 @@ func (b *OpenWrtBackend) enrichWirelessRuntime(radios map[string]openWrtWireless
 	return radios
 }
 
-func (b *OpenWrtBackend) discoverWiFiInterfacesFromCommands() []string {
+func (b *OpenWrtBackend) discoverWiFiInterfacesFromSysfs() []string {
 	seen := make(map[string]bool)
 	add := func(value string) {
 		value = strings.TrimSpace(strings.TrimPrefix(value, "hostapd."))
 		if value != "" && len(value) < 16 && !strings.ContainsAny(value, " /\t\r\n") {
 			seen[value] = true
 		}
-	}
-	if b.commandRunner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
-		if output, err := b.commandRunner(ctx, "ubus", "list", "hostapd.*"); err == nil {
-			for _, line := range strings.Split(string(output), "\n") {
-				add(line)
-			}
-		}
-		cancel()
-		ctx, cancel = context.WithTimeout(context.Background(), b.ubusTimeout)
-		if output, err := b.commandRunner(ctx, "ubus", "call", "iwinfo", "devices"); err == nil {
-			var payload struct {
-				Devices []string `json:"devices"`
-			}
-			if json.Unmarshal(output, &payload) == nil {
-				for _, ifName := range payload.Devices {
-					add(ifName)
-				}
-			}
-		}
-		cancel()
-		ctx, cancel = context.WithTimeout(context.Background(), b.ubusTimeout)
-		if output, err := b.commandRunner(ctx, "iwinfo"); err == nil {
-			for _, line := range strings.Split(string(output), "\n") {
-				fields := strings.Fields(line)
-				if len(fields) > 0 {
-					add(strings.Trim(fields[0], " ,:[]"))
-				}
-			}
-		}
-		cancel()
 	}
 	// sysfs remains available on minimal images with no ubus/iw/iwinfo CLI.
 	if entries, err := os.ReadDir(b.netClassDir); err == nil {
@@ -2764,13 +2682,7 @@ func wifiBandFromFrequency(frequency int) string {
 }
 
 func (b *OpenWrtBackend) readWiFiStations() (map[string][]iwinfo.AssocEntry, error) {
-	var data []byte
-	var err error
-	if b.commandRunner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), b.ubusTimeout)
-		data, err = b.commandRunner(ctx, "ubus", "call", "device", "getStaList")
-		cancel()
-	}
+	data, err := b.callUbus(context.Background(), "device", "getStaList", nil)
 	var payload struct {
 		Station []openWrtWiFiStation `json:"station"`
 	}
@@ -2779,13 +2691,6 @@ func (b *OpenWrtBackend) readWiFiStations() (map[string][]iwinfo.AssocEntry, err
 			return mapOpenWrtWiFiStations(payload.Station), nil
 		}
 	}
-	if b.ubusCaller == nil {
-		if err == nil {
-			err = fmt.Errorf("device.getStaList unavailable")
-		}
-		return map[string][]iwinfo.AssocEntry{}, err
-	}
-	data, err = b.ubusCaller("device", "getStaList", b.ubusTimeout)
 	if err != nil {
 		return map[string][]iwinfo.AssocEntry{}, err
 	}
@@ -2872,34 +2777,9 @@ func (b *OpenWrtBackend) readOpenWrtWiFiCapabilities(ctx context.Context, ifName
 	// rpcd-mod-iwinfo exposes both lists using the runtime netdev. Prefer the
 	// local ubus socket so stock OpenWrt does not depend on anonymous HTTP ubus.
 	var rpcCapabilities openWrtIWInfoCapabilities
-	if b.commandRunner != nil {
-		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		payload := fmt.Sprintf(`{"device":%q}`, ifName)
-		data, err := b.commandRunner(callCtx, "ubus", "call", "iwinfo", "info", payload)
-		cancel()
-		if err == nil && json.Unmarshal(data, &rpcCapabilities) == nil {
-			mergeWiFiHWModes(hwModes, parseWiFiHWModes(rpcCapabilities.HWModes))
-			htModes = mergeWiFiHTModes(htModes, rpcCapabilities.HTModes)
-		}
-	}
-	// Minimal derivative images sometimes ship iwinfo without rpcd-mod-iwinfo.
-	if b.commandRunner != nil && (!hasAnyWiFiHWMode(hwModes) || len(htModes) == 0) {
-		if !hasAnyWiFiHWMode(hwModes) {
-			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			data, err := b.commandRunner(callCtx, "iwinfo", ifName, "hwmodes")
-			cancel()
-			if err == nil {
-				mergeWiFiHWModes(hwModes, parseWiFiHWModes(strings.Fields(string(data))))
-			}
-		}
-		if len(htModes) == 0 {
-			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			data, err := b.commandRunner(callCtx, "iwinfo", ifName, "htmodes")
-			cancel()
-			if err == nil {
-				htModes = mergeWiFiHTModes(htModes, strings.Fields(string(data)))
-			}
-		}
+	if data, err := b.callUbus(ctx, "iwinfo", "info", map[string]any{"device": ifName}); err == nil && json.Unmarshal(data, &rpcCapabilities) == nil {
+		mergeWiFiHWModes(hwModes, parseWiFiHWModes(rpcCapabilities.HWModes))
+		htModes = mergeWiFiHTModes(htModes, rpcCapabilities.HTModes)
 	}
 	if !hasAnyWiFiHWMode(hwModes) {
 		hwModes = nil
@@ -4182,14 +4062,13 @@ func txPowerLevelForPercent(levels []int, percent int) (int, bool) {
 }
 
 func (b *OpenWrtBackend) readWiFiTxPowerLevels(ctx context.Context, ifName string) []int {
-	if b.commandRunner == nil || strings.TrimSpace(ifName) == "" {
-		return nil
+	if b.wifiTxPowerLevels != nil {
+		return b.wifiTxPowerLevels(ctx, ifName)
 	}
-	output, err := b.commandRunner(ctx, "iwinfo", ifName, "txpowerlist")
-	if err != nil {
-		return nil
-	}
-	return parseIWInfoTxPowerLevels(output)
+	// Neither nl80211 nor stock netifd exposes the discrete vendor calibration
+	// table portably. Keep this unknown instead of invoking iwinfo or inventing
+	// percentage choices.
+	return nil
 }
 
 func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *wusp.Message, section, ifName string, radioIndex int, config map[string]any) {

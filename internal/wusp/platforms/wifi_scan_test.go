@@ -40,6 +40,19 @@ func TestWiFiScanCoordinatorDeduplicatesCapsAndExcludesOwnBSSID(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("asynchronous scan did not complete")
 	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		coordinator.mu.Lock()
+		complete := coordinator.states[0] != nil && !coordinator.states[0].scanning
+		coordinator.mu.Unlock()
+		if complete {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("asynchronous scan did not publish its completed state")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	snapshot := coordinator.snapshotsAndTrigger(interfaces)[0]
 	if len(snapshot.Entries) != wifiScanMaxBSS {
 		t.Fatalf("neighbor count=%d want cap %d", len(snapshot.Entries), wifiScanMaxBSS)

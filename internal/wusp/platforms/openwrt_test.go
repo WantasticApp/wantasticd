@@ -504,7 +504,7 @@ func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testin
 	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.3.ParentMACAddress", "e0:5d:54:4b:e9:2a")
 	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.4.ParentMACAddress", "e0:5d:54:4b:e5:16")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.4.Address", "192.168.200.178")
-	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.2.BackhaulLinkType", "Ethernet")
+	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.2.BackhaulLinkType", "Wi-Fi")
 	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.3.BackhaulLinkType", "Wi-Fi")
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(flat vendor topology): %v", err)

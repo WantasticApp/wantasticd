@@ -97,7 +97,11 @@ func appendMeshSnapshot(msg *wusp.Message, snapshot meshSnapshot) {
 	// producing a convincing but incorrect star topology. Explicit children,
 	// parent hints and collector link evidence are still assembled by
 	// attachMeshParentHints.
-	roots := attachMeshParentHints(normalizedMeshRoots(snapshot.topology))
+	// Vendor topology payloads often repeat the same device below multiple
+	// parents (or repeat a complete branch on every poll). Canonicalize by the
+	// reported identity before assigning TR-181 instances so one physical mesh
+	// node cannot become several Device.WUSP_MeshTelemetry.Node rows.
+	roots := attachMeshParentHints(dedupeMeshForest(normalizedMeshRoots(snapshot.topology)))
 	nodes := flattenMeshForest(roots)
 	msg.Set("Device.WUSP_MeshTelemetry.NodeNumberOfEntries", wusp.Uint(uint64(len(nodes))))
 	msg.Set("Device.WUSP_MeshTelemetry.LinkNumberOfEntries", wusp.Uint(uint64(countMeshLinksForRoots(roots))))
@@ -174,9 +178,12 @@ func meshBackhaulLinkType(node *meshNode, index int, snapshotRole string) string
 		return "None"
 	}
 	switch strings.ToUpper(strings.TrimSpace(node.backhaul)) {
-	case "L", "LAN", "ETH", "ETHERNET", "WIRED":
+	case "LAN", "ETH", "ETHERNET", "WIRED":
 		return "Ethernet"
-	case "H", "W", "WIFI", "WI-FI", "WIRELESS":
+	// getRealTopo firmware uses H and L for the high- and low-band radio
+	// backhauls. L does not mean LAN; treating it as wired made most real mesh
+	// links appear as Ethernet in the controller's geographic topology.
+	case "H", "L", "W", "WIFI", "WI-FI", "WIRELESS":
 		return "Wi-Fi"
 	case "B", "NONE", "ROOT":
 		return "None"
@@ -193,6 +200,126 @@ func normalizedMeshRoots(root *meshNode) []*meshNode {
 		return dedupeMeshChildren(root.children)
 	}
 	return []*meshNode{root}
+}
+
+// dedupeMeshForest retains the first topology placement for each physical
+// identity and merges useful fields/children from later observations. Keeping
+// one placement is important: attaching the same canonical pointer below two
+// parents would still publish duplicate links even if the node table itself
+// were pointer-deduplicated.
+func dedupeMeshForest(roots []*meshNode) []*meshNode {
+	if len(roots) < 2 && (len(roots) == 0 || roots[0] == nil || len(roots[0].children) == 0) {
+		return roots
+	}
+	canonicalByKey := make(map[string]*meshNode)
+	visited := make(map[*meshNode]struct{})
+	var visit func(*meshNode) *meshNode
+	visit = func(node *meshNode) *meshNode {
+		if node == nil {
+			return nil
+		}
+		if _, ok := visited[node]; ok {
+			return nil
+		}
+		visited[node] = struct{}{}
+
+		var canonical *meshNode
+		for _, key := range meshDedupeIdentityKeys(node) {
+			if existing := canonicalByKey[key]; existing != nil {
+				canonical = existing
+				break
+			}
+		}
+		children := append([]*meshNode(nil), node.children...)
+		if canonical == nil {
+			canonical = node
+			canonical.children = nil
+		} else if canonical != node {
+			mergeMeshNodeObservation(canonical, node)
+		}
+		for _, key := range meshDedupeIdentityKeys(canonical) {
+			canonicalByKey[key] = canonical
+		}
+
+		for _, child := range children {
+			placed := visit(child)
+			if placed == nil || placed == canonical || hasMeshChild(canonical, placed) {
+				continue
+			}
+			canonical.children = append(canonical.children, placed)
+		}
+		if canonical != node {
+			// The canonical node is already owned by its first observed parent.
+			return nil
+		}
+		return canonical
+	}
+
+	deduped := make([]*meshNode, 0, len(roots))
+	for _, root := range roots {
+		if canonical := visit(root); canonical != nil {
+			deduped = append(deduped, canonical)
+		}
+	}
+	return deduped
+}
+
+func mergeMeshNodeObservation(dst, src *meshNode) {
+	if dst == nil || src == nil {
+		return
+	}
+	fill := func(target *string, value string) {
+		if strings.TrimSpace(*target) == "" && strings.TrimSpace(value) != "" {
+			*target = value
+		}
+	}
+	fill(&dst.id, src.id)
+	fill(&dst.name, src.name)
+	fill(&dst.mac, src.mac)
+	fill(&dst.ip, src.ip)
+	fill(&dst.role, src.role)
+	fill(&dst.backhaul, src.backhaul)
+	if dst.signal == 0 || (src.signal != 0 && src.signal > dst.signal) {
+		dst.signal = src.signal
+	}
+	if !dst.hasHop && src.hasHop {
+		dst.sourceHop = src.sourceHop
+		dst.hasHop = true
+	}
+	// Do not merge parentID/parentMAC. A duplicate observation commonly exists
+	// precisely because the vendor payload reports conflicting parent paths;
+	// the first structural placement remains authoritative.
+}
+
+func meshDedupeIdentityKeys(node *meshNode) []string {
+	if node == nil {
+		return nil
+	}
+	keys := make([]string, 0, 4)
+	addMAC := func(value string) bool {
+		if mac, ok := parseMeshMAC(value); ok {
+			keys = append(keys, "mac:"+mac.String())
+			return true
+		}
+		return false
+	}
+	addMAC(node.mac)
+	if !addMAC(node.id) {
+		if id := strings.ToLower(strings.TrimSpace(node.id)); id != "" {
+			keys = append(keys, "id:"+id)
+		}
+	}
+	if ip := strings.ToLower(strings.TrimSpace(node.ip)); ip != "" {
+		keys = append(keys, "ip:"+ip)
+	}
+	// A hostname alone is weaker than a MAC, node ID, or address and is often
+	// reused on factory-default devices. Use it only as the last available key.
+	if len(keys) == 0 {
+		if name := strings.ToLower(strings.TrimSpace(node.name)); name != "" {
+			keys = append(keys, "name:"+name)
+		}
+	}
+	return keys
 }
 
 func isSyntheticMeshRoot(node *meshNode) bool {

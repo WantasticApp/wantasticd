@@ -67,6 +67,13 @@ func DetectKind(opts Options) Kind {
 	if fileExists(coalesceString(opts.OpenWrtReleasePath, "/etc/openwrt_release")) {
 		return KindOpenWrt
 	}
+	// Several OpenWrt-derived CPE/LTE images replace or omit
+	// /etc/openwrt_release while retaining the canonical UCI wireless model.
+	// A real wifi-device section is stronger evidence than kernel PHY names and
+	// ensures writable WiFi controls use UCI rather than the generic Linux path.
+	if hasOpenWrtWirelessUCI(coalesceString(opts.UCIConfigDir, "/etc/config")) {
+		return KindOpenWrt
+	}
 	if fileExists(coalesceString(opts.BuildPropPath, "/system/build.prop")) || runtime.GOOS == "android" {
 		return KindAndroid
 	}
@@ -114,6 +121,20 @@ func fileExists(path string) bool {
 	}
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+func hasOpenWrtWirelessUCI(configDir string) bool {
+	data, err := os.ReadFile(strings.TrimSpace(configDir) + string(os.PathSeparator) + "wireless")
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 && fields[0] == "config" && fields[1] == "wifi-device" {
+			return true
+		}
+	}
+	return false
 }
 
 func subsetPlatformMessageByPaths(msg *wusp.Message, paths ...string) *wusp.Message {

@@ -500,6 +500,7 @@ type cellularDiscoverySnapshot struct {
 type cellularMonitor struct {
 	mu                   sync.RWMutex
 	controller           modemPkg.Controller
+	newController        func() modemPkg.Controller
 	entries              []cellularEntry
 	state                string
 	lastDiscovery        time.Time
@@ -515,6 +516,7 @@ type cellularMonitor struct {
 func newCellularMonitor() *cellularMonitor {
 	return &cellularMonitor{
 		state:                cellularDiscoveryUnknown,
+		newController:        newModemController,
 		interval:             time.Minute,
 		maxAge:               2 * time.Minute,
 		clearAfterEmptyScans: 3,
@@ -602,7 +604,11 @@ func (m *cellularMonitor) refresh() []cellularEntry {
 
 	m.mu.Lock()
 	if m.controller == nil {
-		m.controller = newModemController()
+		factory := m.newController
+		if factory == nil {
+			factory = newModemController
+		}
+		m.controller = factory()
 	}
 	controller := m.controller
 	m.mu.Unlock()

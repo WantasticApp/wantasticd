@@ -100,9 +100,6 @@ func TestCoalesceCellularEntriesMergesStatsIntoModem(t *testing.T) {
 }
 
 func TestCellularMonitorPreservesLastRichSnapshotOnEmptyRefresh(t *testing.T) {
-	originalNewModemController := newModemController
-	defer func() { newModemController = originalNewModemController }()
-
 	fake := &fakeModemController{
 		devices: []string{"/dev/ttyUSB2"},
 		infos: map[string]*modemPkg.Info{
@@ -114,9 +111,8 @@ func TestCellularMonitorPreservesLastRichSnapshotOnEmptyRefresh(t *testing.T) {
 			},
 		},
 	}
-	newModemController = func() modemPkg.Controller { return fake }
-
 	monitor := newCellularMonitor()
+	monitor.newController = func() modemPkg.Controller { return fake }
 	monitor.interval = time.Hour
 	monitor.maxAge = 0
 
@@ -175,12 +171,10 @@ func TestCellularMonitorClearsRememberedModemAfterConfirmedEmptyDiscoveries(t *t
 }
 
 func TestCellularMonitorSnapshotDoesNotBlockOnSlowModem(t *testing.T) {
-	originalNewModemController := newModemController
-	defer func() { newModemController = originalNewModemController }()
-	newModemController = func() modemPkg.Controller {
+	monitor := newCellularMonitor()
+	monitor.newController = func() modemPkg.Controller {
 		return fakeModemController{delay: 500 * time.Millisecond}
 	}
-	monitor := newCellularMonitor()
 	started := time.Now()
 	_ = monitor.snapshot()
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {

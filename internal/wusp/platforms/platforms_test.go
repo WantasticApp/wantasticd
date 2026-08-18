@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,40 @@ func TestDetectKindOpenWrt(t *testing.T) {
 	})
 	if kind != KindOpenWrt {
 		t.Fatalf("DetectKind()=%s want %s", kind, KindOpenWrt)
+	}
+}
+
+func TestDetectKindOpenWrtDerivativeFromUCIWireless(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), "config wifi-device 'qcawifi0'\n\toption band '5g'\n")
+
+	kind := DetectKind(Options{
+		UCIConfigDir:       configDir,
+		OpenWrtReleasePath: filepath.Join(root, "missing-openwrt-release"),
+		BuildPropPath:      filepath.Join(root, "missing-build.prop"),
+		DeviceModelPath:    filepath.Join(root, "missing-model"),
+		ONUReleasePath:     filepath.Join(root, "missing-onu-release"),
+	})
+	if kind != KindOpenWrt {
+		t.Fatalf("DetectKind()=%s want %s for UCI-based derivative", kind, KindOpenWrt)
+	}
+}
+
+func TestDetectKindDoesNotTreatArbitraryWirelessFileAsOpenWrt(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), "managed=true\ninterface=wlan0\n")
+
+	kind := DetectKind(Options{
+		UCIConfigDir:       configDir,
+		OpenWrtReleasePath: filepath.Join(root, "missing-openwrt-release"),
+		BuildPropPath:      filepath.Join(root, "missing-build.prop"),
+		DeviceModelPath:    filepath.Join(root, "missing-model"),
+		ONUReleasePath:     filepath.Join(root, "missing-onu-release"),
+	})
+	if runtime.GOOS == "linux" && kind != KindLinux {
+		t.Fatalf("DetectKind()=%s want %s for non-UCI file", kind, KindLinux)
 	}
 }
 

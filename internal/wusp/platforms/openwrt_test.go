@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -209,14 +210,56 @@ func TestOpenWrtBackendCollectRadioCapabilities(t *testing.T) {
 	assertIntField(t, msg, "Device.WiFi.Radio.1.TransmitPower", 10)
 }
 
+func TestOpenWrtRadioCapabilitiesFromLocalRPCDIWInfo(t *testing.T) {
+	var capabilityCalls int
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "ubus" && len(args) == 4 && args[0] == "call" && args[1] == "iwinfo" && args[2] == "info" {
+				capabilityCalls++
+				if args[3] != `{"device":"wlan0"}` {
+					t.Fatalf("iwinfo payload=%q", args[3])
+				}
+				return []byte(`{"hwmodes":["a","n","ac","ax","be"],"htmodes":["HE80","EHT160","EHT320"]}`), nil
+			}
+			return nil, errors.New("unavailable")
+		},
+		WiFiHWModeList: func(string) (*iwinfo.HWModes, error) {
+			return nil, errors.New("pure-Go sysfs capabilities unavailable")
+		},
+		WiFiHTModeList: func(string) ([]string, error) {
+			return nil, errors.New("pure-Go sysfs capabilities unavailable")
+		},
+	})
+
+	msg := wusp.NewMessage()
+	backend.appendWiFiRadioCapabilities(context.Background(), msg, "radio3", "wlan0", 4, map[string]any{
+		"band":   "6g",
+		"htmode": "EHT320",
+	})
+	if capabilityCalls != 1 {
+		t.Fatalf("local rpcd iwinfo calls=%d want 1", capabilityCalls)
+	}
+	assertListContains(t, msg, "Device.WiFi.Radio.4.SupportedStandards", "ax")
+	assertListContains(t, msg, "Device.WiFi.Radio.4.SupportedStandards", "be")
+	assertListContains(t, msg, "Device.WiFi.Radio.4.SupportedOperatingChannelBandwidths", "320MHz-1")
+	if value, ok := msg.Get("Device.WiFi.Radio.4.SupportedStandards"); !ok || strings.Contains(wusp.ValueToString(value), "ac") {
+		t.Fatalf("6GHz SupportedStandards=%v must exclude 802.11ac", value)
+	}
+}
+
 func TestOpenWrtBackendSetRadioControls(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	if err := os.MkdirAll(filepath.Join(netClassDir, "wlan0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	wirelessPath := filepath.Join(configDir, "wireless")
 	mustWriteFile(t, wirelessPath, "config wifi-device 'radio0'\n\toption band '5g'\n\toption channel '36'\n\toption htmode 'HE80'\n\toption legacy_rates '0'\nconfig wifi-iface 'default_radio0'\n\toption device 'radio0'\n\toption ifname 'wlan0'\n\toption mode 'ap'\n")
 
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			if name == "iwinfo" && strings.Join(args, " ") == "wlan0 txpowerlist" {
 				return []byte("0 dBm (1 mW)\n10 dBm (10 mW)\n20 dBm (100 mW)\n30 dBm (1000 mW)\n"), nil
@@ -279,6 +322,106 @@ func TestOpenWrtBackendSetRadioControls(t *testing.T) {
 	data, _ = os.ReadFile(wirelessPath)
 	if strings.Contains(string(data), "option txpower") {
 		t.Fatalf("automatic transmit power did not remove txpower option:\n%s", data)
+	}
+}
+
+func TestOpenWrtBackendSetOperatingStandardsUCIRoundTrip(t *testing.T) {
+	tests := []struct {
+		name        string
+		band        string
+		initial     string
+		standards   []string
+		wantHTMode  string
+		wantRequire string
+		wantLegacy  string
+	}{
+		{name: "2g legacy through ax", band: "2g", initial: "HE40", standards: []string{"b", "g", "n", "ax"}, wantHTMode: "HE40", wantLegacy: "1"},
+		{name: "2g n through ax", band: "2g", initial: "HE40", standards: []string{"n", "ax"}, wantHTMode: "HE40", wantRequire: "n", wantLegacy: "0"},
+		{name: "5g all through ax", band: "5g", initial: "HE80", standards: []string{"a", "n", "ac", "ax"}, wantHTMode: "HE80", wantLegacy: "0"},
+		{name: "5g ac through ax", band: "5g", initial: "HE80", standards: []string{"ac", "ax"}, wantHTMode: "HE80", wantRequire: "ac", wantLegacy: "0"},
+		{name: "6g ax", band: "6g", initial: "HE80", standards: []string{"ax"}, wantHTMode: "HE80", wantLegacy: "0"},
+		{name: "6g ax and be", band: "6g", initial: "EHT80", standards: []string{"ax", "be"}, wantHTMode: "EHT80", wantLegacy: "0"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			configDir := filepath.Join(root, "etc", "config")
+			netClassDir := filepath.Join(root, "sys", "class", "net")
+			if err := os.MkdirAll(filepath.Join(netClassDir, "wlan0"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			mustWriteFile(t, filepath.Join(configDir, "wireless"), fmt.Sprintf("config wifi-device 'wifi-main'\n\toption band '%s'\n\toption htmode '%s'\nconfig wifi-iface 'main_ap'\n\toption device 'wifi-main'\n\toption ifname 'wlan0'\n\toption mode 'ap'\n", test.band, test.initial))
+			backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+				UCIConfigDir: configDir,
+				NetClassDir:  netClassDir,
+				CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+					return nil, errors.New("runtime command unavailable")
+				},
+				UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+					return nil, errors.New("ubus unavailable")
+				},
+				WiFiHWModeList: func(string) (*iwinfo.HWModes, error) {
+					return &iwinfo.HWModes{A: true, B: true, G: true, N: true, AC: true, AX: true, BE: true}, nil
+				},
+				WiFiHTModeList: func(string) ([]string, error) {
+					return []string{"HT20", "HT40", "VHT80", "HE40", "HE80", "HE160", "EHT80", "EHT160", "EHT320"}, nil
+				},
+			})
+
+			items := make([]wusp.Value, 0, len(test.standards))
+			for _, standard := range test.standards {
+				items = append(items, wusp.String(standard))
+			}
+			if err := backend.Set(context.Background(), "Device.WiFi.Radio.1.OperatingStandards", wusp.List(items...)); err != nil {
+				t.Fatalf("Set(OperatingStandards): %v", err)
+			}
+			radio := backend.readWirelessRadioStatusFromUCI()["wifi-main"]
+			if got := configString(radio.Config, "htmode"); got != test.wantHTMode {
+				t.Fatalf("htmode=%q want %q", got, test.wantHTMode)
+			}
+			if got := configString(radio.Config, "require_mode"); got != test.wantRequire {
+				t.Fatalf("require_mode=%q want %q", got, test.wantRequire)
+			}
+			if got := configString(radio.Config, "legacy_rates"); got != test.wantLegacy {
+				t.Fatalf("legacy_rates=%q want %q", got, test.wantLegacy)
+			}
+			if got := wifiOperatingStandards(radio.Config); !sameWiFiStandards(got, test.standards) {
+				t.Fatalf("OperatingStandards round trip=%v want %v", got, test.standards)
+			}
+		})
+	}
+}
+
+func TestOpenWrtBackendRejectsUnrepresentableOperatingStandards(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	if err := os.MkdirAll(filepath.Join(netClassDir, "wlan0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), "config wifi-device 'wifi-main'\n\toption band '5g'\n\toption htmode 'HE80'\nconfig wifi-iface 'main_ap'\n\toption device 'wifi-main'\n\toption ifname 'wlan0'\n")
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		CommandRunner: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, errors.New("runtime command unavailable")
+		},
+		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+			return nil, errors.New("ubus unavailable")
+		},
+		WiFiHWModeList: func(string) (*iwinfo.HWModes, error) {
+			return &iwinfo.HWModes{A: true, N: true, AC: true, AX: true, BE: true}, nil
+		},
+		WiFiHTModeList: func(string) ([]string, error) {
+			return []string{"HT20", "HT40", "VHT80", "HE80", "EHT80"}, nil
+		},
+	})
+
+	if err := backend.Set(context.Background(), "Device.WiFi.Radio.1.OperatingStandards", wusp.List(wusp.String("a"), wusp.String("ac"))); err == nil || !strings.Contains(err.Error(), "cannot represent") {
+		t.Fatalf("Set(a,ac) error=%v want exact UCI representation error", err)
+	}
+	if err := backend.Set(context.Background(), "Device.WiFi.Radio.1.OperatingStandards", wusp.List(wusp.String("b"))); err == nil || !strings.Contains(err.Error(), "not valid in 5GHz") {
+		t.Fatalf("Set(b) error=%v want band validation", err)
 	}
 }
 

@@ -203,6 +203,11 @@ type openWrtWiFiStation struct {
 	TxRate        *uint32 `json:"tx_rate"`
 }
 
+type openWrtIWInfoCapabilities struct {
+	HWModes []string `json:"hwmodes"`
+	HTModes []string `json:"htmodes"`
+}
+
 // openWrtHostapdClients is the stock OpenWrt hostapd.<ifname>.get_clients
 // response. Unlike the vendor-specific device.getStaList call, this object is
 // supplied by wpad/hostapd on normal OpenWrt access points.
@@ -582,11 +587,7 @@ func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
 }
 
 func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message) {
-	radios := b.readWirelessRadioStatus()
-	if len(radios) == 0 {
-		radios = b.readWirelessRadioStatusFromUCI()
-	}
-	radios = b.enrichWirelessRuntime(radios)
+	radios := b.openWrtWirelessRadios()
 
 	radioKeys := make([]string, 0, len(radios))
 	for key := range radios {
@@ -1590,7 +1591,7 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 			if requested == "" {
 				return fmt.Errorf("wusp openwrt invalid WiFi channel bandwidth %q", wusp.ValueToString(value))
 			}
-			if err := b.validateWiFiBandwidth(section, requested); err != nil {
+			if err := b.validateWiFiBandwidth(ctx, section, requested); err != nil {
 				return err
 			}
 			htmode := bandwidthToHTMode(requested, section, b, ctx)
@@ -1646,15 +1647,12 @@ func (b *OpenWrtBackend) resolveWiFiRadioSection(radioIndex int) string {
 	if radioIndex <= 0 {
 		return ""
 	}
-	runtimeRadios := b.readWirelessRadioStatus()
+	// A writable TR-181 Radio instance is backed only by an actual UCI
+	// wifi-device section. Runtime PHY names are observation sources, not
+	// persistent configuration object names.
 	uciRadios := b.readWirelessRadioStatusFromUCI()
-	radios := runtimeRadios
-	if len(radios) == 0 {
-		radios = uciRadios
-	}
-	radios = b.enrichWirelessRuntime(radios)
-	keys := make([]string, 0, len(radios))
-	for key := range radios {
+	keys := make([]string, 0, len(uciRadios))
+	for key := range uciRadios {
 		if key = strings.TrimSpace(key); key != "" {
 			keys = append(keys, key)
 		}
@@ -1663,17 +1661,7 @@ func (b *OpenWrtBackend) resolveWiFiRadioSection(radioIndex int) string {
 	if radioIndex > len(keys) {
 		return ""
 	}
-	section := keys[radioIndex-1]
-	if _, ok := runtimeRadios[section]; ok {
-		return section
-	}
-	if _, ok := uciRadios[section]; ok {
-		return section
-	}
-	// A pure nl80211/sysfs discovery has no persistent configuration owner.
-	// Reporting it is useful, but pretending it maps to radioN can reconfigure
-	// an unrelated device on sparse/mixed CPE layouts.
-	return ""
+	return keys[radioIndex-1]
 }
 
 // resolveWiFiIfaceSection maps a WUSP SSID/AP index (1-based) to the actual UCI
@@ -2417,6 +2405,127 @@ func (b *OpenWrtBackend) readWirelessRadioStatus() map[string]openWrtWirelessRad
 	return radios
 }
 
+// openWrtWirelessRadios builds the TR-181 radio inventory around persistent
+// UCI wifi-device sections whenever they exist. netifd, nl80211, hostapd and
+// sysfs remain the authoritative sources for live state, but a runtime phyN
+// must never become the configuration identity of an OpenWrt radio.
+func (b *OpenWrtBackend) openWrtWirelessRadios() map[string]openWrtWirelessRadioStatus {
+	configured := b.readWirelessRadioStatusFromUCI()
+	runtimeRadios := b.readWirelessRadioStatus()
+	if len(configured) == 0 {
+		return b.enrichWirelessRuntime(runtimeRadios)
+	}
+
+	configuredKeys := make(map[string]bool, len(configured))
+	for key := range configured {
+		configuredKeys[key] = true
+	}
+	for runtimeKey, runtimeRadio := range runtimeRadios {
+		target := b.configuredRadioForRuntime(configured, runtimeKey, runtimeRadio)
+		if target == "" {
+			// An unowned runtime PHY is still useful to the generic Linux
+			// collector, but it must not create a writable OpenWrt Radio row.
+			continue
+		}
+		configured[target] = mergeOpenWrtRadioStatus(configured[target], runtimeRadio)
+	}
+
+	configured = b.enrichWirelessRuntime(configured)
+	// enrichWirelessRuntime can discover interfaces absent from netifd. Keep
+	// only the UCI-backed radio identities while retaining those interfaces on
+	// the best matching configured radio.
+	for key := range configured {
+		if !configuredKeys[key] {
+			delete(configured, key)
+		}
+	}
+	return configured
+}
+
+func (b *OpenWrtBackend) configuredRadioForRuntime(configured map[string]openWrtWirelessRadioStatus, runtimeKey string, runtimeRadio openWrtWirelessRadioStatus) string {
+	runtimeKey = strings.TrimSpace(runtimeKey)
+	if _, ok := configured[runtimeKey]; ok {
+		return runtimeKey
+	}
+	for configuredKey, configuredRadio := range configured {
+		if wirelessRadiosShareInterface(configuredRadio, runtimeRadio) {
+			return configuredKey
+		}
+	}
+	for _, prefix := range []string{"phy", "radio"} {
+		if strings.HasPrefix(runtimeKey, prefix) {
+			if phy, err := strconv.Atoi(strings.TrimPrefix(runtimeKey, prefix)); err == nil {
+				return b.runtimeRadioKey(configured, phy)
+			}
+		}
+	}
+	return ""
+}
+
+func wirelessRadiosShareInterface(left, right openWrtWirelessRadioStatus) bool {
+	sections := make(map[string]bool)
+	ifNames := make(map[string]bool)
+	for _, iface := range left.Interfaces {
+		if section := strings.TrimSpace(iface.Section); section != "" {
+			sections[section] = true
+		}
+		if ifName := strings.TrimSpace(iface.IfName); ifName != "" {
+			ifNames[ifName] = true
+		}
+	}
+	for _, iface := range right.Interfaces {
+		if sections[strings.TrimSpace(iface.Section)] || ifNames[strings.TrimSpace(iface.IfName)] {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeOpenWrtRadioStatus(configured, runtimeRadio openWrtWirelessRadioStatus) openWrtWirelessRadioStatus {
+	configured.Up = runtimeRadio.Up
+	// UCI is the desired source for disabled/config values. Runtime values fill
+	// fields that are absent from the persistent section without replacing it.
+	mergedConfig := make(map[string]any, len(runtimeRadio.Config)+len(configured.Config))
+	for key, value := range runtimeRadio.Config {
+		mergedConfig[key] = value
+	}
+	for key, value := range configured.Config {
+		mergedConfig[key] = value
+	}
+	configured.Config = mergedConfig
+
+	for _, runtimeIface := range runtimeRadio.Interfaces {
+		matched := false
+		for index := range configured.Interfaces {
+			configuredIface := configured.Interfaces[index]
+			sectionMatches := strings.TrimSpace(runtimeIface.Section) != "" && strings.TrimSpace(runtimeIface.Section) == strings.TrimSpace(configuredIface.Section)
+			ifNameMatches := strings.TrimSpace(runtimeIface.IfName) != "" && strings.TrimSpace(runtimeIface.IfName) == strings.TrimSpace(configuredIface.IfName)
+			if !sectionMatches && !ifNameMatches {
+				continue
+			}
+			mergedIfaceConfig := make(map[string]any, len(runtimeIface.Config)+len(configuredIface.Config))
+			for key, value := range runtimeIface.Config {
+				mergedIfaceConfig[key] = value
+			}
+			for key, value := range configuredIface.Config {
+				mergedIfaceConfig[key] = value
+			}
+			if strings.TrimSpace(configuredIface.IfName) == "" {
+				configuredIface.IfName = runtimeIface.IfName
+			}
+			configuredIface.Up = runtimeIface.Up
+			configuredIface.Config = mergedIfaceConfig
+			configured.Interfaces[index] = configuredIface
+			matched = true
+			break
+		}
+		if !matched {
+			configured.Interfaces = append(configured.Interfaces, runtimeIface)
+		}
+	}
+	return configured
+}
+
 func (b *OpenWrtBackend) existingWiFiIfName(candidate string) string {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" || strings.ContainsAny(candidate, " /\t\r\n") {
@@ -2573,6 +2682,18 @@ func (b *OpenWrtBackend) runtimeRadioKey(radios map[string]openWrtWirelessRadioS
 			return candidate
 		}
 	}
+	// Vendor images frequently name UCI wifi-device sections wifi0, wifi1,
+	// qcawifi0, etc. When explicit interface/section evidence is unavailable,
+	// align the stable UCI section order with the kernel PHY index for runtime
+	// enrichment only. Set operations still resolve directly to this UCI key.
+	keys := make([]string, 0, len(radios))
+	for key := range radios {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if phy >= 0 && phy < len(keys) {
+		return keys[phy]
+	}
 	if len(radios) == 1 {
 		for key := range radios {
 			return key
@@ -2728,6 +2849,123 @@ func mapOpenWrtWiFiStations(observations []openWrtWiFiStation) map[string][]iwin
 		stations[iface] = append(stations[iface], entry)
 	}
 	return stations
+}
+
+func (b *OpenWrtBackend) readOpenWrtWiFiCapabilities(ctx context.Context, ifName string) (*iwinfo.HWModes, []string) {
+	ifName = strings.TrimSpace(ifName)
+	if ifName == "" {
+		return nil, nil
+	}
+	hwModes := &iwinfo.HWModes{}
+	var htModes []string
+	if b.wifiHWModeList != nil {
+		if modes, err := b.wifiHWModeList(ifName); err == nil && modes != nil {
+			mergeWiFiHWModes(hwModes, modes)
+		}
+	}
+	if b.wifiHTModeList != nil {
+		if modes, err := b.wifiHTModeList(ifName); err == nil {
+			htModes = mergeWiFiHTModes(htModes, modes)
+		}
+	}
+
+	// rpcd-mod-iwinfo exposes both lists using the runtime netdev. Prefer the
+	// local ubus socket so stock OpenWrt does not depend on anonymous HTTP ubus.
+	var rpcCapabilities openWrtIWInfoCapabilities
+	if b.commandRunner != nil {
+		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		payload := fmt.Sprintf(`{"device":%q}`, ifName)
+		data, err := b.commandRunner(callCtx, "ubus", "call", "iwinfo", "info", payload)
+		cancel()
+		if err == nil && json.Unmarshal(data, &rpcCapabilities) == nil {
+			mergeWiFiHWModes(hwModes, parseWiFiHWModes(rpcCapabilities.HWModes))
+			htModes = mergeWiFiHTModes(htModes, rpcCapabilities.HTModes)
+		}
+	}
+	// Minimal derivative images sometimes ship iwinfo without rpcd-mod-iwinfo.
+	if b.commandRunner != nil && (!hasAnyWiFiHWMode(hwModes) || len(htModes) == 0) {
+		if !hasAnyWiFiHWMode(hwModes) {
+			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			data, err := b.commandRunner(callCtx, "iwinfo", ifName, "hwmodes")
+			cancel()
+			if err == nil {
+				mergeWiFiHWModes(hwModes, parseWiFiHWModes(strings.Fields(string(data))))
+			}
+		}
+		if len(htModes) == 0 {
+			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			data, err := b.commandRunner(callCtx, "iwinfo", ifName, "htmodes")
+			cancel()
+			if err == nil {
+				htModes = mergeWiFiHTModes(htModes, strings.Fields(string(data)))
+			}
+		}
+	}
+	if !hasAnyWiFiHWMode(hwModes) {
+		hwModes = nil
+	}
+	return hwModes, htModes
+}
+
+func parseWiFiHWModes(values []string) *iwinfo.HWModes {
+	modes := &iwinfo.HWModes{}
+	for _, value := range values {
+		for _, token := range strings.FieldsFunc(strings.ToLower(value), func(r rune) bool {
+			return r == ',' || r == '/' || r == '|' || r == '[' || r == ']' || r == '"'
+		}) {
+			token = strings.TrimSpace(strings.TrimPrefix(token, "802.11"))
+			switch token {
+			case "a":
+				modes.A = true
+			case "b":
+				modes.B = true
+			case "g":
+				modes.G = true
+			case "n":
+				modes.N = true
+			case "ac":
+				modes.AC = true
+			case "ax":
+				modes.AX = true
+			case "be":
+				modes.BE = true
+			}
+		}
+	}
+	return modes
+}
+
+func mergeWiFiHWModes(target, source *iwinfo.HWModes) {
+	if target == nil || source == nil {
+		return
+	}
+	target.A = target.A || source.A
+	target.B = target.B || source.B
+	target.G = target.G || source.G
+	target.N = target.N || source.N
+	target.AC = target.AC || source.AC
+	target.AX = target.AX || source.AX
+	target.BE = target.BE || source.BE
+}
+
+func hasAnyWiFiHWMode(modes *iwinfo.HWModes) bool {
+	return modes != nil && (modes.A || modes.B || modes.G || modes.N || modes.AC || modes.AX || modes.BE)
+}
+
+func mergeWiFiHTModes(current, observed []string) []string {
+	seen := make(map[string]bool, len(current)+len(observed))
+	for _, value := range append(append([]string(nil), current...), observed...) {
+		value = strings.ToUpper(strings.Trim(strings.TrimSpace(value), "[],\"'"))
+		if value == "NOHT" || strings.HasPrefix(value, "HT") || strings.HasPrefix(value, "VHT") || strings.HasPrefix(value, "HE") || strings.HasPrefix(value, "EHT") {
+			seen[value] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (b *OpenWrtBackend) readWirelessRadioStatusFromUCI() map[string]openWrtWirelessRadioStatus {
@@ -3654,13 +3892,13 @@ func wifiModeForStandards(prefix, currentBandwidth string, supported []string) (
 	return prefix + strconv.Itoa(wantedWidth), nil
 }
 
-func (b *OpenWrtBackend) validateWiFiBandwidth(section, requested string) error {
+func (b *OpenWrtBackend) validateWiFiBandwidth(ctx context.Context, section, requested string) error {
 	ifName := b.radioToIfname(section)
-	if ifName == "" || b.wifiHTModeList == nil {
+	if ifName == "" {
 		return nil
 	}
-	modes, err := b.wifiHTModeList(ifName)
-	if err != nil || len(modes) == 0 {
+	_, modes := b.readOpenWrtWiFiCapabilities(ctx, ifName)
+	if len(modes) == 0 {
 		return nil
 	}
 	supported := wifiSupportedBandwidths(modes, "")
@@ -3699,19 +3937,14 @@ func (b *OpenWrtBackend) setWiFiOperatingStandards(ctx context.Context, section 
 	}
 
 	ifName := b.radioToIfname(section)
-	var supportedModes []string
-	if b.wifiHWModeList != nil && ifName != "" {
-		if modes, err := b.wifiHWModeList(ifName); err == nil {
-			supported := wifiSupportedStandards(modes, band)
-			for _, standard := range standards {
-				if !containsWiFiStandard(supported, standard) {
-					return fmt.Errorf("wusp openwrt 802.11%s is not supported by this radio", standard)
-				}
+	hardwareModes, supportedModes := b.readOpenWrtWiFiCapabilities(ctx, ifName)
+	if hardwareModes != nil {
+		supported := wifiSupportedStandards(hardwareModes, band)
+		for _, standard := range standards {
+			if !containsWiFiStandard(supported, standard) {
+				return fmt.Errorf("wusp openwrt 802.11%s is not supported by this radio", standard)
 			}
 		}
-	}
-	if b.wifiHTModeList != nil && ifName != "" {
-		supportedModes, _ = b.wifiHTModeList(ifName)
 	}
 	currentHTMode := b.readUCIValue(ctx, "wireless", section, "htmode")
 	mode, err := wifiModeForStandards(wifiStandardModePrefix(standards), wifiBandwidthFromConfig(map[string]any{"htmode": currentHTMode}), supportedModes)
@@ -3734,6 +3967,18 @@ func (b *OpenWrtBackend) setWiFiOperatingStandards(ctx context.Context, section 
 	if containsWiFiStandard(standards, "b") {
 		legacyRates = "1"
 	}
+	projected := wifiOperatingStandards(map[string]any{
+		"band":         band,
+		"htmode":       mode,
+		"legacy_rates": legacyRates,
+		"require_mode": requireMode,
+	})
+	if !sameWiFiStandards(projected, standards) {
+		return fmt.Errorf(
+			"wusp openwrt cannot represent OperatingStandards %s exactly with UCI htmode/legacy_rates/require_mode; resulting set would be %s",
+			strings.Join(standards, ","), strings.Join(projected, ","),
+		)
+	}
 	if err := b.setUCIOption(ctx, "wireless", section, "htmode", mode, false, ""); err != nil {
 		return err
 	}
@@ -3744,6 +3989,18 @@ func (b *OpenWrtBackend) setWiFiOperatingStandards(ctx context.Context, section 
 		return b.deleteUCIOption(ctx, "wireless", section, "require_mode", true, wirelessReloadScript)
 	}
 	return b.setUCIOption(ctx, "wireless", section, "require_mode", requireMode, true, wirelessReloadScript)
+}
+
+func sameWiFiStandards(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 var wifiStandardOrder = []string{"a", "b", "g", "n", "ac", "ax", "be"}
@@ -3943,11 +4200,10 @@ func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *w
 	band := wifiBandFromConfig(config)
 	operatingStandards := wifiOperatingStandards(config)
 	supportedStandards := append([]string(nil), operatingStandards...)
-	if b.wifiHWModeList != nil && ifName != "" {
-		if modes, err := b.wifiHWModeList(ifName); err == nil {
-			if discovered := wifiSupportedStandards(modes, band); len(discovered) > 0 {
-				supportedStandards = discovered
-			}
+	hardwareModes, htModes := b.readOpenWrtWiFiCapabilities(ctx, ifName)
+	if hardwareModes != nil {
+		if discovered := wifiSupportedStandards(hardwareModes, band); len(discovered) > 0 {
+			supportedStandards = discovered
 		}
 	}
 	if len(supportedStandards) > 0 {
@@ -3957,10 +4213,6 @@ func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *w
 		appendField(msg, base+"OperatingStandards", wifiStringList(operatingStandards))
 	}
 
-	var htModes []string
-	if b.wifiHTModeList != nil && ifName != "" {
-		htModes, _ = b.wifiHTModeList(ifName)
-	}
 	bandwidths := wifiSupportedBandwidths(htModes, wifiBandwidthFromConfig(config))
 	appendField(msg, base+"SupportedOperatingChannelBandwidths", wifiStringList(bandwidths))
 
@@ -3993,16 +4245,18 @@ func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *w
 
 // radioToIfname finds the first network interface belonging to a UCI radio section.
 func (b *OpenWrtBackend) radioToIfname(section string) string {
-	if data, err := b.ubusCaller("network.wireless", "status", b.ubusTimeout); err == nil {
-		var radios map[string]openWrtWirelessRadioStatus
-		if json.Unmarshal(data, &radios) == nil {
-			if radio, ok := radios[section]; ok && len(radio.Interfaces) > 0 {
-				return radio.Interfaces[0].IfName
+	// Resolve the UCI wifi-device section through the same local-ubus-first
+	// inventory used by collection. A configured ifname is accepted only after
+	// existingWiFiIfName proves that the runtime link exists.
+	if radio, ok := b.openWrtWirelessRadios()[strings.TrimSpace(section)]; ok {
+		for _, iface := range radio.Interfaces {
+			if ifName := b.existingWiFiIfName(iface.IfName); ifName != "" {
+				return ifName
 			}
 		}
 	}
-	// Fallback: scan sysfs for matching phy
-	targetPhy := strings.Replace(section, "radio", "phy", 1)
+	// Fallback: align a conventional radioN UCI section with phyN in sysfs.
+	targetPhy := strings.Replace(strings.TrimSpace(section), "radio", "phy", 1)
 	entries, _ := os.ReadDir(b.netClassDir)
 	for _, entry := range entries {
 		if data, err := os.ReadFile(b.netClassDir + "/" + entry.Name() + "/phy80211/name"); err == nil {
@@ -4028,12 +4282,16 @@ func bandwidthToHTMode(bw, section string, b *OpenWrtBackend, ctx context.Contex
 		return upper
 	}
 
-	// Get supported modes via netctl (reads sysfs or nl80211)
+	// Get supported modes from the same UCI-radio capability path used by the
+	// collector (libiwinfo, local rpcd iwinfo, CLI, then sysfs/netctl).
 	ifname := b.radioToIfname(section)
 	var supported []string
 	if ifname != "" {
-		if caps, err := netCtl.WiFiGetCapabilities(ifname); err == nil {
-			supported = caps.SupportedHTModes
+		_, supported = b.readOpenWrtWiFiCapabilities(ctx, ifname)
+		if len(supported) == 0 {
+			if caps, err := netCtl.WiFiGetCapabilities(ifname); err == nil {
+				supported = caps.SupportedHTModes
+			}
 		}
 	}
 

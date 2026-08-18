@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +56,71 @@ config wifi-iface 'default_radio0'
 	radios := backend.readWirelessRadioStatusFromUCI()
 	if got := radios["radio0"].Interfaces[0].IfName; got != "" {
 		t.Fatalf("UCI section was treated as runtime interface: %q", got)
+	}
+}
+
+func TestOpenWrtRadioInventoryKeepsUCIDeviceIdentity(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	if err := os.MkdirAll(filepath.Join(netClassDir, "phy0-ap0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wirelessPath := filepath.Join(configDir, "wireless")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wirelessPath, []byte(`config wifi-device 'qcawifi0'
+	option band '5g'
+	option channel '36'
+config wifi-iface 'main_ap'
+	option device 'qcawifi0'
+	option mode 'ap'
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "ubus" && len(args) == 3 && args[0] == "call" && args[1] == "network.wireless" && args[2] == "status" {
+				return []byte(`{"phy0":{"up":true,"config":{"band":"6g","channel":"149"},"interfaces":[{"section":"main_ap","ifname":"phy0-ap0","up":true,"config":{"mode":"ap"}}]}}`), nil
+			}
+			return nil, errors.New("unavailable")
+		},
+		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+			return nil, errors.New("HTTP ubus denied")
+		},
+	})
+
+	radios := backend.openWrtWirelessRadios()
+	if len(radios) != 1 {
+		t.Fatalf("radio inventory=%v want exactly one UCI-backed radio", radios)
+	}
+	radio, ok := radios["qcawifi0"]
+	if !ok {
+		t.Fatalf("UCI radio identity missing: %v", radios)
+	}
+	if _, exists := radios["phy0"]; exists {
+		t.Fatalf("runtime PHY leaked into OpenWrt radio identity: %v", radios)
+	}
+	if got := configString(radio.Config, "band"); got != "5g" {
+		t.Fatalf("radio band=%q want UCI value 5g", got)
+	}
+	if len(radio.Interfaces) != 1 || radio.Interfaces[0].IfName != "phy0-ap0" || !radio.Interfaces[0].Up {
+		t.Fatalf("runtime interface was not merged into UCI radio: %+v", radio.Interfaces)
+	}
+
+	if err := backend.Set(context.Background(), "Device.WiFi.Radio.1.Channel", wusp.Uint(44)); err != nil {
+		t.Fatalf("Set(Channel): %v", err)
+	}
+	updated, err := os.ReadFile(wirelessPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), "config wifi-device 'qcawifi0'\n\toption band '5g'\n\toption channel '44'") {
+		t.Fatalf("Set did not update UCI wifi-device section:\n%s", updated)
 	}
 }
 

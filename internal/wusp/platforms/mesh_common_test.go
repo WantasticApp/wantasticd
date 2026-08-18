@@ -74,10 +74,20 @@ func TestMeshBackhaulLinkTypeDoesNotConfuseLowBandWithLAN(t *testing.T) {
 
 func TestDedupeMeshForestDoesNotMergeReusedHostname(t *testing.T) {
 	roots := dedupeMeshForest([]*meshNode{
-		{name: "OpenWrt", mac: "02:00:00:00:00:11"},
-		{name: "OpenWrt", mac: "02:00:00:00:00:12"},
+		{name: "OpenWrt", mac: "02:00:00:00:00:11", ip: "208.125.216.78"},
+		{name: "OpenWrt", mac: "02:00:00:00:00:12", ip: "208.125.216.78"},
 	})
 	if len(roots) != 2 {
-		t.Fatalf("distinct MACs sharing a hostname collapsed to %d node(s)", len(roots))
+		t.Fatalf("distinct MACs sharing a hostname and public IP collapsed to %d node(s)", len(roots))
+	}
+}
+
+func TestDedupeMeshForestNeverUsesAddressAlone(t *testing.T) {
+	roots := dedupeMeshForest([]*meshNode{
+		{ip: "208.125.216.78"},
+		{ip: "208.125.216.78"},
+	})
+	if len(roots) != 2 {
+		t.Fatalf("shared address collapsed address-only observations to %d node(s)", len(roots))
 	}
 }

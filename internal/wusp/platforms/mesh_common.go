@@ -295,31 +295,39 @@ func meshDedupeIdentityKeys(node *meshNode) []string {
 	if node == nil {
 		return nil
 	}
-	keys := make([]string, 0, 4)
+	macKeys := make([]string, 0, 2)
 	addMAC := func(value string) bool {
 		if mac, ok := parseMeshMAC(value); ok {
-			keys = append(keys, "mac:"+mac.String())
+			key := "mac:" + mac.String()
+			for _, existing := range macKeys {
+				if existing == key {
+					return true
+				}
+			}
+			macKeys = append(macKeys, key)
 			return true
 		}
 		return false
 	}
 	addMAC(node.mac)
-	if !addMAC(node.id) {
-		if id := strings.ToLower(strings.TrimSpace(node.id)); id != "" {
-			keys = append(keys, "id:"+id)
+	addMAC(node.id)
+	if len(macKeys) > 0 {
+		return macKeys
+	}
+	if id := strings.ToLower(strings.TrimSpace(node.id)); id != "" {
+		return []string{"id:" + id}
+	}
+	name := strings.ToLower(strings.TrimSpace(node.name))
+	ip := strings.ToLower(strings.TrimSpace(node.ip))
+	if name != "" {
+		if ip != "" {
+			return []string{"name-address:" + name + "\x00" + ip}
 		}
+		return []string{"name:" + name}
 	}
-	if ip := strings.ToLower(strings.TrimSpace(node.ip)); ip != "" {
-		keys = append(keys, "ip:"+ip)
-	}
-	// A hostname alone is weaker than a MAC, node ID, or address and is often
-	// reused on factory-default devices. Use it only as the last available key.
-	if len(keys) == 0 {
-		if name := strings.ToLower(strings.TrimSpace(node.name)); name != "" {
-			keys = append(keys, "name:"+name)
-		}
-	}
-	return keys
+	// An address alone is not a device identity. Multiple devices commonly
+	// share one public/NAT address, and even private leases can be reused.
+	return nil
 }
 
 func isSyntheticMeshRoot(node *meshNode) bool {

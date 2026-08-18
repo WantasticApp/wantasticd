@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
+	"wantastic-agent/internal/linkdiscovery"
 	"wantastic-agent/internal/wusp"
 )
 
@@ -35,12 +36,154 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 	if topo.protocol == "" && topo.root != nil {
 		topo.protocol = "EasyMesh"
 	}
+	b.enrichOpenWrtMeshEvidence(topo.root, linkdiscovery.DefaultSnapshot())
 	appendMeshSnapshot(msg, meshSnapshot{
 		protocol:       topo.protocol,
 		implementation: "OpenWrt",
 		topology:       topo.root,
 		sampleTime:     b.now().UTC(),
 	})
+}
+
+func (b *OpenWrtBackend) enrichOpenWrtMeshEvidence(root *meshNode, discovery linkdiscovery.Snapshot) {
+	if root == nil {
+		return
+	}
+	nodes := flattenMeshForest(normalizedMeshRoots(root))
+	byMAC := make(map[string]*meshNode)
+	for _, node := range nodes {
+		if mac, ok := parseMeshMAC(firstNonEmpty(node.mac, node.id)); ok {
+			byMAC[strings.ToLower(mac.String())] = node
+		}
+	}
+	local := localMeshNode(nodes, b.readTextFile(b.hostnamePath))
+	if local == nil {
+		return
+	}
+
+	// A station-mode nl80211 dump returns the associated upstream AP/BSSID.
+	// This is direct kernel evidence for the local node's backhaul and fills the
+	// common CN -> T2 gap without treating ordinary AP clients as mesh nodes.
+	for _, radio := range b.openWrtWirelessRadios() {
+		for _, iface := range radio.Interfaces {
+			mode := strings.ToLower(configString(iface.Config, "mode"))
+			if mode != "sta" && mode != "station" && mode != "client" {
+				continue
+			}
+			ifName := strings.TrimSpace(iface.IfName)
+			if ifName == "" || b.wifiAssocList == nil {
+				continue
+			}
+			associations, err := b.wifiAssocList(ifName)
+			if err != nil {
+				continue
+			}
+			for _, association := range associations {
+				parent := byMAC[strings.ToLower(association.MAC.String())]
+				if parent == nil || parent == local {
+					continue
+				}
+				local.parentMAC = parent.mac
+				local.parentID = firstNonEmpty(parent.id, parent.mac)
+				local.linkType = "Wi-Fi"
+				local.linkIface = ifName
+				local.discovery = "nl80211"
+				break
+			}
+		}
+	}
+
+	// LLDP confirms the physical medium on a relationship already present in
+	// the vendor or station topology. It does not invent direction from a
+	// symmetric LLDP adjacency.
+	wifiInterfaces := b.openWrtWiFiInterfaceSet()
+	for _, neighbor := range discovery.LLDP {
+		remote := meshNodeForLLDPNeighbor(byMAC, neighbor)
+		if remote == nil || remote == local {
+			continue
+		}
+		linkType := "Ethernet"
+		if openWrtWiFiInterfaceMatch(neighbor.LocalInterface, wifiInterfaces) {
+			linkType = "Wi-Fi"
+		}
+		if meshNodeReferencesParent(local, remote) {
+			local.linkType, local.linkIface, local.discovery = linkType, neighbor.LocalInterface, "LLDP"
+		} else if meshNodeReferencesParent(remote, local) {
+			remote.linkType, remote.linkIface, remote.discovery = linkType, neighbor.LocalInterface, "LLDP"
+		}
+	}
+	for _, neighbor := range discovery.MNDP {
+		node := byMAC[strings.ToLower(neighbor.MAC.String())]
+		if node == nil {
+			continue
+		}
+		if node.name == "" {
+			node.name = strings.TrimSpace(neighbor.Identity)
+		}
+		if node.ip == "" && len(neighbor.IPv4) > 0 {
+			node.ip = neighbor.IPv4[0].String()
+		}
+	}
+}
+
+func localMeshNode(nodes []*meshNode, hostname string) *meshNode {
+	hostname = strings.TrimSpace(hostname)
+	localMACs := make(map[string]bool)
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if len(iface.HardwareAddr) == 6 {
+			localMACs[strings.ToLower(iface.HardwareAddr.String())] = true
+		}
+	}
+	for _, node := range nodes {
+		if mac, ok := parseMeshMAC(firstNonEmpty(node.mac, node.id)); ok && localMACs[strings.ToLower(mac.String())] {
+			return node
+		}
+	}
+	for _, node := range nodes {
+		if hostname != "" && strings.EqualFold(strings.TrimSpace(node.name), hostname) {
+			return node
+		}
+	}
+	return nil
+}
+
+func meshNodeForLLDPNeighbor(byMAC map[string]*meshNode, neighbor linkdiscovery.LLDPNeighbor) *meshNode {
+	for _, value := range []string{neighbor.ChassisID, neighbor.SourceMAC.String()} {
+		if mac, err := net.ParseMAC(value); err == nil {
+			if node := byMAC[strings.ToLower(mac.String())]; node != nil {
+				return node
+			}
+		}
+	}
+	return nil
+}
+
+func meshNodeReferencesParent(child, parent *meshNode) bool {
+	if child == nil || parent == nil {
+		return false
+	}
+	for _, childParent := range []string{child.parentMAC, child.parentID} {
+		for _, parentIdentity := range []string{parent.mac, parent.id} {
+			if meshIdentityValueEqual(childParent, parentIdentity) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func meshIdentityValueEqual(left, right string) bool {
+	left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	leftMAC, leftOK := parseMeshMAC(left)
+	rightMAC, rightOK := parseMeshMAC(right)
+	if leftOK && rightOK {
+		return strings.EqualFold(leftMAC.String(), rightMAC.String())
+	}
+	return strings.EqualFold(left, right)
 }
 
 func (b *OpenWrtBackend) appendOpenWrtMeshConfig(ctx context.Context, msg *wusp.Message) {
@@ -201,26 +344,15 @@ func (b *OpenWrtBackend) setOpenWrtBATMANAdvParam(ctx context.Context, path stri
 }
 
 func (b *OpenWrtBackend) readOpenWrtRealTopo(ctx context.Context) ([]byte, error) {
-	if b.ubusCaller != nil {
-		if data, err := b.ubusCaller("device", "getRealTopo", b.ubusTimeout); err == nil && len(bytes.TrimSpace(data)) > 0 {
-			return data, nil
-		}
-	}
-	if b.commandRunner == nil {
-		return nil, fmt.Errorf("openwrt mesh topology: no ubus caller or command runner")
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	timeout := b.ubusTimeout
-	if timeout <= 0 {
-		timeout = 3 * time.Second
-	}
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	data, err := b.commandRunner(callCtx, "ubus", "call", "device", "getRealTopo")
+	data, err := b.callUbus(ctx, "device", "getRealTopo", nil)
 	if err != nil {
 		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, fmt.Errorf("openwrt mesh topology: empty getRealTopo response")
 	}
 	return data, nil
 }

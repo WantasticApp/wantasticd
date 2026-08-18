@@ -1,6 +1,7 @@
 package platforms
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +70,21 @@ func TestMeshBackhaulLinkTypeDoesNotConfuseLowBandWithLAN(t *testing.T) {
 				t.Fatalf("meshBackhaulLinkType(%q) = %q, want %q", test.backhaul, got, test.want)
 			}
 		})
+	}
+}
+
+func TestMeshBackhaulUnknownIsNotInventedAndParentMACIsUpstream(t *testing.T) {
+	message := wusp.NewMessage()
+	appendMeshSnapshot(message, meshSnapshot{topology: &meshNode{
+		mac: "02:00:00:00:00:01", role: "controller",
+		children: []*meshNode{{mac: "02:00:00:00:00:02", role: "agent"}},
+	}})
+	if _, exists := message.Get("Device.WiFi.MultiAP.APDevice.2.BackhaulLinkType"); exists {
+		t.Fatal("unknown backhaul medium was emitted as a fabricated value")
+	}
+	assertMACField(t, message, "Device.WiFi.MultiAP.APDevice.2.BackhaulMACAddress", "02:00:00:00:00:01")
+	if value, _ := message.Get("Device.WiFi.MultiAP.APDevice.2.BackhaulMACAddress"); strings.EqualFold(value.AsString(), "02:00:00:00:00:02") {
+		t.Fatal("child MAC was incorrectly emitted as its own backhaul peer")
 	}
 }
 

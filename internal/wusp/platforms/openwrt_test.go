@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"wantastic-agent/internal/iwinfo"
+	"wantastic-agent/internal/linkdiscovery"
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 )
@@ -177,11 +178,8 @@ func TestOpenWrtBackendCollectRadioCapabilities(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UCIConfigDir: configDir,
 		NetClassDir:  netClassDir,
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "iwinfo" && strings.Join(args, " ") == "wlan0 txpowerlist" {
-				return []byte("  0 dBm (1 mW)\n 10 dBm (10 mW)\n* 20 dBm (100 mW)\n 30 dBm (1000 mW)\n"), nil
-			}
-			return nil, errors.New("disabled in test")
+		WiFiTxPowerLevels: func(context.Context, string) []int {
+			return []int{0, 10, 20, 30}
 		},
 		WiFiHWModeList: func(ifName string) (*iwinfo.HWModes, error) {
 			if ifName != "wlan0" {
@@ -213,12 +211,9 @@ func TestOpenWrtBackendCollectRadioCapabilities(t *testing.T) {
 func TestOpenWrtRadioCapabilitiesFromLocalRPCDIWInfo(t *testing.T) {
 	var capabilityCalls int
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "ubus" && len(args) == 4 && args[0] == "call" && args[1] == "iwinfo" && args[2] == "info" {
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "iwinfo" && method == "info" {
 				capabilityCalls++
-				if args[3] != `{"device":"wlan0"}` {
-					t.Fatalf("iwinfo payload=%q", args[3])
-				}
 				return []byte(`{"hwmodes":["a","n","ac","ax","be"],"htmodes":["HE80","EHT160","EHT320"]}`), nil
 			}
 			return nil, errors.New("unavailable")
@@ -260,11 +255,8 @@ func TestOpenWrtBackendSetRadioControls(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UCIConfigDir: configDir,
 		NetClassDir:  netClassDir,
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "iwinfo" && strings.Join(args, " ") == "wlan0 txpowerlist" {
-				return []byte("0 dBm (1 mW)\n10 dBm (10 mW)\n20 dBm (100 mW)\n30 dBm (1000 mW)\n"), nil
-			}
-			return nil, nil
+		WiFiTxPowerLevels: func(context.Context, string) []int {
+			return []int{0, 10, 20, 30}
 		},
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object == "network.wireless" && method == "status" {
@@ -547,12 +539,15 @@ func TestOpenWrtBackendCollectMeshTopologyFromRealTopo(t *testing.T) {
 
 func TestOpenWrtStockHostapdStationsPopulateTR181(t *testing.T) {
 	stationMAC, _ := net.ParseMAC("02:11:22:33:44:55")
+	arpPath := filepath.Join(t.TempDir(), "arp")
+	if err := os.WriteFile(arpPath, []byte("IP address       HW type     Flags       HW address            Mask     Device\n192.168.50.20 0x1 0x2 02:11:22:33:44:55 * br-lan\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		ARPPath: arpPath,
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "ip" && strings.Join(args, " ") == "neigh show" {
-				return []byte("192.168.50.20 dev br-lan lladdr 02:11:22:33:44:55 REACHABLE\nfe80::20 dev br-lan lladdr 02:11:22:33:44:55 STALE\n"), nil
-			}
-			return nil, errors.New("CLI disabled in test")
+			t.Fatalf("station collector invoked external command: %s %v", name, args)
+			return nil, errors.New("external commands disabled")
 		},
 		WiFiAssocList: func(ifName string) ([]iwinfo.AssocEntry, error) {
 			if ifName != "phy0-ap0" {
@@ -612,7 +607,7 @@ func TestOpenWrtStockHostapdStationsPopulateTR181(t *testing.T) {
 	assertStringField(t, msg, "Device.Hosts.Host.1.AssociatedDevice", "Device.WiFi.AccessPoint.1.AssociatedDevice.1.")
 	assertStringField(t, msg, "Device.Hosts.Host.1.IPAddress", "192.168.50.20")
 	assertUintField(t, msg, "Device.Hosts.Host.1.IPv4AddressNumberOfEntries", 1)
-	assertUintField(t, msg, "Device.Hosts.Host.1.IPv6AddressNumberOfEntries", 1)
+	assertUintField(t, msg, "Device.Hosts.Host.1.IPv6AddressNumberOfEntries", 0)
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(stock hostapd stations): %v", err)
 	}
@@ -654,50 +649,65 @@ func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testin
 	}
 }
 
-func TestOpenWrtBackendCollectMeshTopologyFallsBackToCLI(t *testing.T) {
-	var calls []string
+func TestOpenWrtStationModeAddsCNToUpstreamT2Backhaul(t *testing.T) {
+	rootDir := t.TempDir()
+	configDir := filepath.Join(rootDir, "etc", "config")
+	netClassDir := filepath.Join(rootDir, "sys", "class", "net")
+	hostnamePath := filepath.Join(rootDir, "hostname")
+	mustWriteFile(t, hostnamePath, "CN-device\n")
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), "config wifi-device 'wifi3'\nconfig wifi-iface 'backhaul'\n\toption device 'wifi3'\n\toption mode 'sta'\n\toption ifname 'ath31'\n")
+	if err := os.MkdirAll(filepath.Join(netClassDir, "ath31"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	upstreamMAC, _ := net.ParseMAC("02:00:00:00:30:01")
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		HostnamePath: hostnamePath,
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
+				return []byte(`{"wifi3":{"up":true,"interfaces":[{"section":"backhaul","ifname":"ath31","up":true,"config":{"mode":"sta"}}]}}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+		WiFiAssocList: func(ifName string) ([]iwinfo.AssocEntry, error) {
+			if ifName != "ath31" {
+				return nil, fmt.Errorf("unexpected interface %s", ifName)
+			}
+			return []iwinfo.AssocEntry{{MAC: upstreamMAC, Signal: -61, SignalKnown: true}}, nil
+		},
+	})
+	upstream := &meshNode{name: "T2-backhaul", mac: upstreamMAC.String(), role: "relay"}
+	local := &meshNode{name: "CN-device", mac: "02:00:00:00:30:02", role: "agent"}
+	topology := &meshNode{name: "Mesh Topology", children: []*meshNode{upstream, local}}
+	backend.enrichOpenWrtMeshEvidence(topology, linkdiscovery.Snapshot{})
+	if !strings.EqualFold(local.parentMAC, upstreamMAC.String()) || local.linkType != "Wi-Fi" || local.linkIface != "ath31" {
+		t.Fatalf("station backhaul evidence not applied: %+v", local)
+	}
+	msg := wusp.NewMessage()
+	appendMeshSnapshot(msg, meshSnapshot{protocol: "EasyMesh", topology: topology, sampleTime: time.Unix(1_700_000_000, 0)})
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.LinkType", "Wi-Fi")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.InterfaceName", "ath31")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.DiscoveryProtocol", "nl80211")
+	assertMACField(t, msg, "Device.WiFi.MultiAP.APDevice.2.BackhaulMACAddress", upstreamMAC.String())
+}
+
+func TestOpenWrtBackendMeshTopologyNeverFallsBackToCLI(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
 			return nil, errors.New("ubus rpc unavailable")
 		},
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			calls = append(calls, strings.TrimSpace(name+" "+strings.Join(args, " ")))
-			if name == "ubus" && strings.Join(args, " ") == "call device getRealTopo" {
-				return []byte(`{
-					"mesh_type":"openmesh",
-					"devices":{
-						"02:00:00:00:10:01":{"hostname":"root-node","role":"gateway"},
-						"02:00:00:00:10:02":{"hostname":"leaf-node","role":"agent","parent_mac":"02:00:00:00:10:01","rssi":-68}
-					}
-				}`), nil
-			}
-			return nil, errors.New("unexpected command")
-		},
-		Now: func() time.Time {
-			return time.Unix(1700000400, 0).UTC()
+			t.Fatalf("mesh collector invoked external command: %s %v", name, args)
+			return nil, errors.New("external commands disabled")
 		},
 	})
 
 	msg := &wusp.Message{}
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
-
-	if len(calls) != 1 || calls[0] != "ubus call device getRealTopo" {
-		t.Fatalf("cli calls=%v, want one getRealTopo fallback", calls)
-	}
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Protocol.1.Name", "OpenMesh")
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 2)
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 1)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.Hostname", "root-node")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.1.MACAddress", "02:00:00:00:10:01")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.Hostname", "leaf-node")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.MACAddress", "02:00:00:00:10:02")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentNode", "Device.WUSP_MeshTelemetry.Node.1.")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.ParentMACAddress", "02:00:00:00:10:01")
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.Node.2.HopCount", 1)
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.SourceMACAddress", "02:00:00:00:10:01")
-	assertMACField(t, msg, "Device.WUSP_MeshTelemetry.Link.1.TargetMACAddress", "02:00:00:00:10:02")
-	if err := wusp.ValidateMessageFast(msg); err != nil {
-		t.Fatalf("ValidateMessageFast(cli mesh topology): %v", err)
+	if len(msg.Fields) != 0 {
+		t.Fatalf("failed native topology should be non-authoritative, got %+v", msg.Fields)
 	}
 }
 

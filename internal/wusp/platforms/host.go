@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"wantastic-agent/internal/linkdiscovery"
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 )
@@ -44,6 +45,9 @@ type hostBackend struct {
 	commandRunner         CommandRunner
 	cellular              *cellularMonitor
 	now                   func() time.Time
+	linkSetUp             func(string) error
+	linkSetDown           func(string) error
+	linkSetMTU            func(string, int) error
 }
 
 type timeState struct {
@@ -57,6 +61,7 @@ var _ wusp.DataBackend = (*hostBackend)(nil)
 // agent to its controller. Subsequent snapshots remain cache-backed and never
 // block a USP Get on AT I/O.
 func (b *hostBackend) Warmup(ctx context.Context) error {
+	linkdiscovery.StartDefault()
 	if b == nil || b.cellular == nil {
 		return nil
 	}
@@ -83,6 +88,9 @@ func NewONUBackend(opts Options) wusp.DataBackend     { return newHostBackend(Ki
 func newHostBackend(kind Kind, opts Options) *hostBackend {
 	backend := &hostBackend{
 		kind:                  kind,
+		linkSetUp:             netCtl.LinkSetUp,
+		linkSetDown:           netCtl.LinkSetDown,
+		linkSetMTU:            netCtl.LinkSetMTU,
 		statePath:             coalesceString(opts.StatePath, defaultStatePath(kind)),
 		hostnamePath:          coalesceString(opts.HostnamePath, defaultHostnamePath(kind)),
 		uptimePath:            coalesceString(opts.UptimePath, defaultUptimePath(kind)),
@@ -204,25 +212,25 @@ func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, valu
 	name := filtered[int(index)-1].Name
 	switch leaf {
 	case "Enable":
-		state := "down"
 		if value.AsBool() {
-			state = "up"
+			return b.linkSetUp(name)
 		}
-		_, err = b.commandRunner(ctx, "ip", "link", "set", "dev", name, state)
-		return err
+		return b.linkSetDown(name)
 	case "MaxMTUSize":
 		mtu := value.AsUint()
 		if mtu < 68 || mtu > 65535 {
 			return fmt.Errorf("invalid MTU %d", mtu)
 		}
-		_, err = b.commandRunner(ctx, "ip", "link", "set", "dev", name, "mtu", strconv.FormatUint(mtu, 10))
-		return err
+		return b.linkSetMTU(name, int(mtu))
 	default:
 		return wusp.ErrUSPPathUnsupported
 	}
 }
 
 func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
+	if hostKindSupportsLinuxWiFi(b.kind) {
+		linkdiscovery.StartDefault()
+	}
 	state, stateErr := b.readState()
 	logCollectorError("host.state", stateErr)
 	now := b.now()
@@ -326,6 +334,12 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		})
 	}
 	_ = runCollector("mesh", func() error { collectMeshStatic(msg); return nil })
+	if hostKindSupportsLinuxWiFi(b.kind) {
+		_ = runCollector("linux.link.discovery", func() error {
+			appendLinkDiscoveryFields(msg, linkdiscovery.DefaultSnapshot(), runtimeWiFiInterfaceSet())
+			return nil
+		})
+	}
 	if hostKindSupportsLinuxWiFi(b.kind) {
 		_ = runCollector("linux.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 	}

@@ -28,6 +28,10 @@ func (c *darwinController) LinkSetDown(ifname string) error {
 	return exec.Command("ifconfig", ifname, "down").Run()
 }
 
+func (c *darwinController) LinkSetMTU(ifname string, mtu int) error {
+	return exec.Command("ifconfig", ifname, "mtu", fmt.Sprintf("%d", mtu)).Run()
+}
+
 func (c *darwinController) AddrAdd(ifname string, addr netip.Prefix) error {
 	ip := addr.Addr().String()
 	if addr.Addr().Is4() {

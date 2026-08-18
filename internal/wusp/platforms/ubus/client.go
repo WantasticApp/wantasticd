@@ -4,11 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	goubus "github.com/honeybbq/goubus"
+	goubuserr "github.com/honeybbq/goubus/errdefs"
+	goubustransport "github.com/honeybbq/goubus/transport"
 )
 
 const (
@@ -23,15 +30,25 @@ type Doer interface {
 }
 
 type Options struct {
-	URL       string
-	SessionID string
-	HTTPDoer  Doer
+	URL               string
+	SessionID         string
+	HTTPDoer          Doer
+	DisableNative     bool
+	NativeSocketPaths []string
 }
 
 type Client struct {
-	url       string
-	sessionID string
-	httpDoer  Doer
+	url               string
+	sessionID         string
+	httpDoer          Doer
+	disableNative     bool
+	nativeSocketPaths []string
+}
+
+var defaultNativeSocketPaths = []string{
+	"/var/run/ubus/ubus.sock",
+	"/run/ubus/ubus.sock",
+	"/tmp/run/ubus/ubus.sock",
 }
 
 type Error struct {
@@ -68,9 +85,11 @@ type rpcResponse struct {
 
 func NewClient(opts Options) *Client {
 	client := &Client{
-		url:       strings.TrimSpace(opts.URL),
-		sessionID: strings.TrimSpace(opts.SessionID),
-		httpDoer:  opts.HTTPDoer,
+		url:               strings.TrimSpace(opts.URL),
+		sessionID:         strings.TrimSpace(opts.SessionID),
+		httpDoer:          opts.HTTPDoer,
+		disableNative:     opts.DisableNative,
+		nativeSocketPaths: append([]string(nil), opts.NativeSocketPaths...),
 	}
 	if client.url == "" {
 		client.url = DefaultURL
@@ -80,6 +99,9 @@ func NewClient(opts Options) *Client {
 	}
 	if client.httpDoer == nil {
 		client.httpDoer = http.DefaultClient
+	}
+	if len(client.nativeSocketPaths) == 0 {
+		client.nativeSocketPaths = append([]string(nil), defaultNativeSocketPaths...)
 	}
 	return client
 }
@@ -92,6 +114,25 @@ func (c *Client) Call(ctx context.Context, object, method string, params map[str
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
+	}
+
+	// On-device collection must not depend on rpcd HTTP ACLs or a ubus CLI
+	// binary. Prefer ubusd's native Unix socket and retain JSON-RPC only as a
+	// compatibility fallback for remote/test clients.
+	var nativeErr error
+	if !c.disableNative && isLocalUbusURL(c.url) {
+		if data, err, attempted := c.callNative(ctx, object, method, params, timeout); err == nil {
+			return data, nil
+		} else {
+			nativeErr = err
+			// Once ubusd's local socket was reached, its result is authoritative.
+			// Do not repeat failed/unsupported calls through anonymous HTTP rpcd;
+			// that path adds seconds to every station refresh and is commonly ACL
+			// denied on stock OpenWrt.
+			if attempted {
+				return nil, err
+			}
+		}
 	}
 
 	body, err := json.Marshal(rpcRequest{
@@ -112,6 +153,9 @@ func (c *Client) Call(ctx context.Context, object, method string, params map[str
 
 	resp, err := c.httpDoer.Do(req)
 	if err != nil {
+		if nativeErr != nil {
+			return nil, fmt.Errorf("native ubus: %v; HTTP ubus %s.%s: %w", nativeErr, object, method, err)
+		}
 		return nil, fmt.Errorf("ubus %s.%s: %w", object, method, err)
 	}
 	defer resp.Body.Close()
@@ -155,6 +199,81 @@ func (c *Client) Call(ctx context.Context, object, method string, params map[str
 		return nil, nil
 	}
 	return append([]byte(nil), rpcResp.Result[1]...), nil
+}
+
+func (c *Client) callNative(ctx context.Context, object, method string, params map[string]any, timeout time.Duration) ([]byte, error, bool) {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	var lastErr error
+	attempted := false
+	for _, socketPath := range c.nativeSocketPaths {
+		socketPath = strings.TrimSpace(socketPath)
+		if socketPath == "" {
+			continue
+		}
+		info, err := os.Stat(socketPath)
+		if err != nil || info.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+		attempted = true
+		callCtx, cancel := context.WithTimeout(ctx, timeout)
+		type nativeResult struct {
+			data []byte
+			err  error
+		}
+		resultCh := make(chan nativeResult, 1)
+		go func() {
+			socketClient, err := goubustransport.NewSocketClient(socketPath)
+			if err != nil {
+				resultCh <- nativeResult{err: err}
+				return
+			}
+			client := goubus.NewClient(socketClient)
+			defer client.Close()
+			result, err := client.Caller().Call(object, method, cloneMap(params))
+			if err != nil {
+				resultCh <- nativeResult{err: err}
+				return
+			}
+			var payload map[string]any
+			err = result.Unmarshal(&payload)
+			if errors.Is(err, goubuserr.ErrNoData) {
+				err = nil
+				payload = map[string]any{}
+			}
+			if err != nil {
+				resultCh <- nativeResult{err: err}
+				return
+			}
+			data, err := json.Marshal(payload)
+			resultCh <- nativeResult{data: data, err: err}
+		}()
+		select {
+		case result := <-resultCh:
+			cancel()
+			if result.err == nil {
+				return result.data, nil, true
+			}
+			lastErr = result.err
+		case <-callCtx.Done():
+			lastErr = callCtx.Err()
+			cancel()
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no local ubus socket")
+	}
+	return nil, lastErr, attempted
+}
+
+func isLocalUbusURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 func (c *Client) CallJSON(ctx context.Context, object, method string, params map[string]any, timeout time.Duration, out any) error {

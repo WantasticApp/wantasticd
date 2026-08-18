@@ -11,29 +11,26 @@ import (
 	"time"
 
 	"wantastic-agent/internal/iwinfo"
+	"wantastic-agent/internal/linkdiscovery"
 	"wantastic-agent/internal/wusp"
 )
 
-func TestOpenWrtWirelessStatusPrefersLocalUbus(t *testing.T) {
-	httpCalls := 0
+func TestOpenWrtWirelessStatusUsesNativeUbusCaller(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "ubus" && len(args) == 3 && args[0] == "call" && args[1] == "network.wireless" && args[2] == "status" {
+			t.Fatalf("external command invoked: %s %v", name, args)
+			return nil, errors.New("external commands disabled")
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
 				return []byte(`{"radio0":{"up":true,"interfaces":[{"section":"default_radio0","ifname":"phy0-ap0","up":true,"config":{"mode":"ap"}}]}}`), nil
 			}
-			return nil, errors.New("unexpected command")
-		},
-		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
-			httpCalls++
-			return nil, errors.New("anonymous access denied")
+			return nil, errors.New("unexpected ubus call")
 		},
 	})
 	radios := backend.readWirelessRadioStatus()
 	if got := radios["radio0"].Interfaces[0].IfName; got != "phy0-ap0" {
 		t.Fatalf("runtime ifname=%q want phy0-ap0", got)
-	}
-	if httpCalls != 0 {
-		t.Fatalf("HTTP ubus called %d times after local success", httpCalls)
 	}
 }
 
@@ -57,6 +54,43 @@ config wifi-iface 'default_radio0'
 	if got := radios["radio0"].Interfaces[0].IfName; got != "" {
 		t.Fatalf("UCI section was treated as runtime interface: %q", got)
 	}
+}
+
+func TestOpenWrtUCIClassifiesQCAAPVLANDynamicLinkAsWiFi(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	if err := os.MkdirAll(filepath.Join(netClassDir, "ath2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "wireless"), []byte(`config wifi-device 'wifi2'
+config wifi-iface 'mesh_ap'
+	option device 'wifi2'
+	option mode 'ap'
+	option ifname 'ath2'
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
+			return nil, errors.New("runtime ubus unavailable")
+		},
+	})
+	msg := wusp.NewMessage()
+	appendLinkDiscoveryFields(msg, linkdiscovery.Snapshot{
+		LLDPReady: true,
+		LLDP: []linkdiscovery.LLDPNeighbor{{
+			LocalInterface: "ath2.sta1", ChassisIDSubtype: 4, ChassisID: "02:00:00:00:20:01",
+			PortIDSubtype: 5, PortID: "backhaul0", TTL: 120 * time.Second,
+			SourceMAC: net.HardwareAddr{0x02, 0, 0, 0, 0x20, 1}, LastUpdate: time.Unix(1_700_000_000, 0),
+		}},
+	}, backend.openWrtWiFiInterfaceSet())
+	assertUintField(t, msg, "Device.LLDP.Discovery.Device.1.Port.1.LinkInformation.InterfaceType", 71)
 }
 
 func TestOpenWrtRadioInventoryKeepsUCIDeviceIdentity(t *testing.T) {
@@ -83,14 +117,11 @@ config wifi-iface 'main_ap'
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UCIConfigDir: configDir,
 		NetClassDir:  netClassDir,
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "ubus" && len(args) == 3 && args[0] == "call" && args[1] == "network.wireless" && args[2] == "status" {
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
 				return []byte(`{"phy0":{"up":true,"config":{"band":"6g","channel":"149"},"interfaces":[{"section":"main_ap","ifname":"phy0-ap0","up":true,"config":{"mode":"ap"}}]}}`), nil
 			}
 			return nil, errors.New("unavailable")
-		},
-		UbusCaller: func(string, string, time.Duration) ([]byte, error) {
-			return nil, errors.New("HTTP ubus denied")
 		},
 	})
 
@@ -124,27 +155,27 @@ config wifi-iface 'main_ap'
 	}
 }
 
-func TestOpenWrtRuntimeDiscoversHostapdObject(t *testing.T) {
+func TestOpenWrtRuntimeDiscoversWiFiInterfaceFromSysfs(t *testing.T) {
 	root := t.TempDir()
 	netClass := filepath.Join(root, "sys", "class", "net")
 	if err := os.MkdirAll(filepath.Join(netClass, "phy0-ap0"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(netClass, "phy0-ap0", "phy80211"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(netClass, "phy0-ap0", "phy80211", "index"), []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		NetClassDir: netClass,
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "ubus" && len(args) >= 2 && args[0] == "list" {
-				return []byte("hostapd.phy0-ap0\n"), nil
-			}
-			return nil, errors.New("unavailable")
-		},
 		WiFiInfo: func(string) (*iwinfo.InterfaceInfo, error) {
 			return &iwinfo.InterfaceInfo{Mode: 1}, nil
 		},
 	})
 	radios := backend.enrichWirelessRuntime(nil)
 	if got := radios["phy0"].Interfaces; len(got) != 1 || got[0].IfName != "phy0-ap0" {
-		t.Fatalf("hostapd runtime discovery=%+v", got)
+		t.Fatalf("sysfs runtime discovery=%+v inventory=%+v discovered=%v", got, radios, backend.discoverWiFiInterfacesFromSysfs())
 	}
 }
 

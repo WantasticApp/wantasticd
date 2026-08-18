@@ -15,15 +15,15 @@ import "net/netip"
 
 // WiFiCapabilities describes a radio's hardware capabilities.
 type WiFiCapabilities struct {
-	PHYName       string   // e.g. "phy0"
+	PHYName          string   // e.g. "phy0"
 	SupportedHTModes []string // e.g. ["HT20","HT40","VHT20","VHT40","VHT80","VHT160"]
-	Bands         []string // e.g. ["2.4GHz","5GHz"]
-	MaxTxStreams  int
-	MaxRxStreams  int
-	HT            bool // 802.11n
-	VHT           bool // 802.11ac
-	HE            bool // 802.11ax (WiFi 6)
-	EHT           bool // 802.11be (WiFi 7)
+	Bands            []string // e.g. ["2.4GHz","5GHz"]
+	MaxTxStreams     int
+	MaxRxStreams     int
+	HT               bool // 802.11n
+	VHT              bool // 802.11ac
+	HE               bool // 802.11ax (WiFi 6)
+	EHT              bool // 802.11be (WiFi 7)
 }
 
 // WiFiStationInfo describes a connected WiFi client.
@@ -41,9 +41,9 @@ type WiFiStationInfo struct {
 
 // FirewallRule represents a NAT/filter rule.
 type FirewallRule struct {
-	Table   string // "nat", "filter", "mangle"
-	Chain   string // "POSTROUTING", "FORWARD", etc.
-	Args    []string
+	Table string // "nat", "filter", "mangle"
+	Chain string // "POSTROUTING", "FORWARD", etc.
+	Args  []string
 }
 
 // Controller is the unified network control interface.
@@ -52,6 +52,7 @@ type Controller interface {
 	// ── Link management ─────────────────────────────────────────────────
 	LinkSetUp(ifname string) error
 	LinkSetDown(ifname string) error
+	LinkSetMTU(ifname string, mtu int) error
 
 	// ── Address management ──────────────────────────────────────────────
 	AddrAdd(ifname string, addr netip.Prefix) error

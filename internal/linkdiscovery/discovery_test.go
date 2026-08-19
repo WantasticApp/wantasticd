@@ -2,7 +2,10 @@ package linkdiscovery
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math/rand"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,5 +73,109 @@ func TestParseMNDPPayload(t *testing.T) {
 	}
 	if len(neighbor.IPv4) != 1 || neighbor.IPv4[0].String() != "192.168.200.2" {
 		t.Fatalf("unexpected MNDP IPv4: %+v", neighbor.IPv4)
+	}
+}
+
+func TestDiscoveryParsersDoNotPanicOnMalformedTraffic(t *testing.T) {
+	random := rand.New(rand.NewSource(42))
+	for index := 0; index < 2000; index++ {
+		payload := make([]byte, random.Intn(2048))
+		if _, err := random.Read(payload); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = ParseLLDPPayload("eth0", nil, payload, time.Now())
+		_, _ = ParseMNDPPayload("eth0", nil, payload, time.Now())
+	}
+}
+
+func TestDiscoveryParsersRejectOversizedTraffic(t *testing.T) {
+	if _, err := ParseLLDPPayload("eth0", nil, make([]byte, maxLLDPPayloadBytes+1), time.Now()); err == nil {
+		t.Fatal("oversized LLDPDU was accepted")
+	}
+	if _, err := ParseMNDPPayload("eth0", nil, make([]byte, maxMNDPPayloadBytes+1), time.Now()); err == nil {
+		t.Fatal("oversized MNDP packet was accepted")
+	}
+}
+
+func TestZeroValueMonitorBoundsUntrustedNeighborCaches(t *testing.T) {
+	monitor := &Monitor{}
+	now := time.Now()
+	for index := 0; index < maxLLDPNeighbors+100; index++ {
+		monitor.observeLLDP(LLDPNeighbor{
+			LocalInterface: "eth0",
+			ChassisID:      fmt.Sprintf("chassis-%d", index),
+			PortID:         "port",
+			TTL:            time.Minute,
+			LastUpdate:     now.Add(time.Duration(index) * time.Nanosecond),
+		})
+	}
+	for index := 0; index < maxMNDPNeighbors+100; index++ {
+		monitor.observeMNDP(MNDPNeighbor{
+			MAC:        net.HardwareAddr{0x02, 0, 0, byte(index >> 16), byte(index >> 8), byte(index)},
+			LastUpdate: now.Add(time.Duration(index) * time.Nanosecond),
+		})
+	}
+
+	monitor.mu.Lock()
+	lldpCount, mndpCount := len(monitor.lldp), len(monitor.mndp)
+	monitor.mu.Unlock()
+	if lldpCount != maxLLDPNeighbors {
+		t.Fatalf("LLDP cache has %d entries, want cap %d", lldpCount, maxLLDPNeighbors)
+	}
+	if mndpCount != maxMNDPNeighbors {
+		t.Fatalf("MNDP cache has %d entries, want cap %d", mndpCount, maxMNDPNeighbors)
+	}
+}
+
+func TestSafelyRunListenerContainsPanic(t *testing.T) {
+	stopped := false
+	safelyRunListener("test", func() { stopped = true }, func() { panic("malformed packet") })
+	if !stopped {
+		t.Fatal("listener was not marked stopped after panic")
+	}
+}
+
+func TestMonitorConcurrentObserveAndSnapshot(t *testing.T) {
+	monitor := NewMonitor()
+	now := time.Now()
+	monitor.markLLDPStarted(now.Add(-time.Minute))
+	monitor.markMNDPStarted(now.Add(-2 * time.Minute))
+
+	var workers sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		worker := worker
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := 0; index < 500; index++ {
+				identity := worker*500 + index
+				monitor.observeLLDP(LLDPNeighbor{
+					LocalInterface: "eth0",
+					ChassisID:      fmt.Sprintf("chassis-%d", identity),
+					PortID:         "port",
+					TTL:            time.Minute,
+					LastUpdate:     now,
+				})
+				monitor.observeMNDP(MNDPNeighbor{
+					MAC:        net.HardwareAddr{0x02, byte(worker), 0, byte(index >> 16), byte(index >> 8), byte(index)},
+					LastUpdate: now,
+				})
+			}
+		}()
+	}
+	for worker := 0; worker < 4; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := 0; index < 500; index++ {
+				_ = monitor.Snapshot(now)
+			}
+		}()
+	}
+	workers.Wait()
+
+	snapshot := monitor.Snapshot(now)
+	if len(snapshot.LLDP) > maxLLDPNeighbors || len(snapshot.MNDP) > maxMNDPNeighbors {
+		t.Fatalf("concurrent cache exceeded limits: LLDP=%d MNDP=%d", len(snapshot.LLDP), len(snapshot.MNDP))
 	}
 }

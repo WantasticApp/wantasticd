@@ -3,16 +3,30 @@ package linkdiscovery
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/bgptools/mndp"
 	"github.com/mdlayher/lldp"
+)
+
+const (
+	maxLLDPPayloadBytes      = 9216
+	maxMNDPPayloadBytes      = 16 * 1024
+	maxLLDPNeighbors         = 1024
+	maxMNDPNeighbors         = 1024
+	maxManagementAddresses   = 32
+	maxOrganizationTLVs      = 64
+	maxOrganizationDataBytes = 124
+	maxMNDPAddresses         = 32
 )
 
 // OrganizationTLV preserves an LLDP organization-specific TLV. LLDP-MED is
@@ -148,15 +162,44 @@ func (m *Monitor) markMNDPStarted(started time.Time) {
 	m.mu.Unlock()
 }
 
+func (m *Monitor) markLLDPStopped() {
+	m.mu.Lock()
+	m.lldpUp = false
+	m.mu.Unlock()
+}
+
+func (m *Monitor) markMNDPStopped() {
+	m.mu.Lock()
+	m.mndpUp = false
+	m.mu.Unlock()
+}
+
+func safelyRunListener(protocol string, markStopped func(), receive func()) {
+	defer markStopped()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("[USP] %s passive listener recovered from a panic and was disabled", protocol)
+		}
+	}()
+	receive()
+}
+
 func (m *Monitor) observeLLDP(neighbor LLDPNeighbor) {
 	key := strings.ToLower(neighbor.LocalInterface + "\x00" + neighbor.ChassisID + "\x00" + neighbor.PortID)
 	if key == "\x00\x00" {
 		return
 	}
 	m.mu.Lock()
+	if m.lldp == nil {
+		m.lldp = make(map[string]LLDPNeighbor)
+	}
 	if neighbor.TTL <= 0 {
 		delete(m.lldp, key)
 	} else {
+		if _, exists := m.lldp[key]; !exists && len(m.lldp) >= maxLLDPNeighbors {
+			m.mu.Unlock()
+			return
+		}
 		m.lldp[key] = cloneLLDPNeighbor(neighbor)
 	}
 	m.mu.Unlock()
@@ -171,14 +214,30 @@ func (m *Monitor) observeMNDP(neighbor MNDPNeighbor) {
 		return
 	}
 	m.mu.Lock()
+	if m.mndp == nil {
+		m.mndp = make(map[string]MNDPNeighbor)
+	}
+	if _, exists := m.mndp[key]; !exists && len(m.mndp) >= maxMNDPNeighbors {
+		m.mu.Unlock()
+		return
+	}
 	m.mndp[key] = cloneMNDPNeighbor(neighbor)
 	m.mu.Unlock()
 }
 
 // ParseLLDPPayload decodes one LLDPDU using mdlayher/lldp and then maps the
 // common and organization-specific TLVs needed by TR-181 and LLDP-MED.
-func ParseLLDPPayload(localInterface string, sourceMAC net.HardwareAddr, payload []byte, receivedAt time.Time) (LLDPNeighbor, error) {
-	payload, err := trimLLDPDU(payload)
+func ParseLLDPPayload(localInterface string, sourceMAC net.HardwareAddr, payload []byte, receivedAt time.Time) (neighbor LLDPNeighbor, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			neighbor = LLDPNeighbor{}
+			err = errors.New("decode LLDPDU panic")
+		}
+	}()
+	if len(payload) > maxLLDPPayloadBytes {
+		return LLDPNeighbor{}, fmt.Errorf("LLDPDU exceeds %d bytes", maxLLDPPayloadBytes)
+	}
+	payload, err = trimLLDPDU(payload)
 	if err != nil {
 		return LLDPNeighbor{}, err
 	}
@@ -189,8 +248,8 @@ func ParseLLDPPayload(localInterface string, sourceMAC net.HardwareAddr, payload
 	if frame.ChassisID == nil || frame.PortID == nil {
 		return LLDPNeighbor{}, fmt.Errorf("LLDPDU missing chassis or port ID")
 	}
-	neighbor := LLDPNeighbor{
-		LocalInterface:   strings.TrimSpace(localInterface),
+	neighbor = LLDPNeighbor{
+		LocalInterface:   truncateUTF8Bytes(strings.ToValidUTF8(strings.TrimSpace(localInterface), ""), 64),
 		SourceMAC:        append(net.HardwareAddr(nil), sourceMAC...),
 		ChassisIDSubtype: uint8(frame.ChassisID.Subtype),
 		ChassisID:        discoveryID(uint8(frame.ChassisID.Subtype), frame.ChassisID.ID, true),
@@ -199,28 +258,37 @@ func ParseLLDPPayload(localInterface string, sourceMAC net.HardwareAddr, payload
 		TTL:              frame.TTL,
 		LastUpdate:       receivedAt.UTC(),
 	}
+	if neighbor.ChassisID == "" || neighbor.PortID == "" {
+		return LLDPNeighbor{}, fmt.Errorf("LLDPDU has an empty chassis or port ID")
+	}
 	for _, tlv := range frame.Optional {
 		if tlv == nil {
 			continue
 		}
 		switch tlv.Type {
 		case lldp.TLVTypePortDescription:
-			neighbor.PortDescription = cleanDiscoveryText(tlv.Value)
+			neighbor.PortDescription = truncateUTF8Bytes(cleanDiscoveryText(tlv.Value), 255)
 		case lldp.TLVTypeSystemName:
-			neighbor.SystemName = cleanDiscoveryText(tlv.Value)
+			neighbor.SystemName = truncateUTF8Bytes(cleanDiscoveryText(tlv.Value), 255)
 		case lldp.TLVTypeSystemDescription:
-			neighbor.SystemDescription = cleanDiscoveryText(tlv.Value)
+			neighbor.SystemDescription = truncateUTF8Bytes(cleanDiscoveryText(tlv.Value), 1024)
 		case lldp.TLVTypeManagementAddress:
-			if ip := parseLLDPManagementAddress(tlv.Value); ip != nil {
-				neighbor.ManagementAddresses = appendUniqueIP(neighbor.ManagementAddresses, ip)
+			if len(neighbor.ManagementAddresses) < maxManagementAddresses {
+				if ip := parseLLDPManagementAddress(tlv.Value); ip != nil {
+					neighbor.ManagementAddresses = appendUniqueIP(neighbor.ManagementAddresses, ip)
+				}
 			}
 		case lldp.TLVTypeOrganizationSpecific:
-			if len(tlv.Value) < 4 {
+			if len(tlv.Value) < 4 || len(neighbor.Organizations) >= maxOrganizationTLVs {
 				continue
 			}
 			oui := strings.ToLower(hex.EncodeToString(tlv.Value[:3]))
+			data := tlv.Value[4:]
+			if len(data) > maxOrganizationDataBytes {
+				data = data[:maxOrganizationDataBytes]
+			}
 			neighbor.Organizations = append(neighbor.Organizations, OrganizationTLV{
-				OUI: oui, Subtype: tlv.Value[3], Data: append([]byte(nil), tlv.Value[4:]...), LLDPMED: oui == "0012bb",
+				OUI: oui, Subtype: tlv.Value[3], Data: append([]byte(nil), data...), LLDPMED: oui == "0012bb",
 			})
 		}
 	}
@@ -271,9 +339,23 @@ func discoveryID(subtype uint8, raw []byte, chassis bool) string {
 		}
 	}
 	if text := cleanDiscoveryText(raw); text != "" {
-		return text
+		return truncateUTF8Bytes(text, 255)
 	}
-	return hex.EncodeToString(raw)
+	return truncateUTF8Bytes(hex.EncodeToString(raw), 255)
+}
+
+func truncateUTF8Bytes(value string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(value) <= maximum {
+		return value
+	}
+	value = value[:maximum]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
 }
 
 func cleanDiscoveryText(raw []byte) string {
@@ -319,12 +401,21 @@ func appendUniqueIP(values []net.IP, value net.IP) []net.IP {
 	return append(values, append(net.IP(nil), value...))
 }
 
-func ParseMNDPPayload(localInterface string, sourceAddress net.IP, payload []byte, receivedAt time.Time) (MNDPNeighbor, error) {
+func ParseMNDPPayload(localInterface string, sourceAddress net.IP, payload []byte, receivedAt time.Time) (neighbor MNDPNeighbor, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			neighbor = MNDPNeighbor{}
+			err = errors.New("decode MNDP panic")
+		}
+	}()
+	if len(payload) > maxMNDPPayloadBytes {
+		return MNDPNeighbor{}, fmt.Errorf("MNDP packet exceeds %d bytes", maxMNDPPayloadBytes)
+	}
 	packet, err := mndp.DecodePacket(payload)
 	if err != nil {
 		return MNDPNeighbor{}, fmt.Errorf("decode MNDP: %w", err)
 	}
-	neighbor := MNDPNeighbor{LocalInterface: localInterface, SourceAddress: append(net.IP(nil), sourceAddress...), LastUpdate: receivedAt.UTC()}
+	neighbor = MNDPNeighbor{LocalInterface: truncateUTF8Bytes(strings.ToValidUTF8(strings.TrimSpace(localInterface), ""), 64), SourceAddress: append(net.IP(nil), sourceAddress...), LastUpdate: receivedAt.UTC()}
 	for _, part := range packet.Parts {
 		switch part.Type {
 		case mndp.MMDPTypeMACAddress:
@@ -333,22 +424,28 @@ func ParseMNDPPayload(localInterface string, sourceAddress net.IP, payload []byt
 			}
 		case mndp.MMDPTypeIdentity:
 			neighbor.Identity, _ = part.Value.(string)
+			neighbor.Identity = truncateUTF8Bytes(strings.ToValidUTF8(neighbor.Identity, ""), 255)
 		case mndp.MMDPTypeVersion:
 			neighbor.Version, _ = part.Value.(string)
+			neighbor.Version = truncateUTF8Bytes(strings.ToValidUTF8(neighbor.Version, ""), 255)
 		case mndp.MMDPTypePlatform:
 			neighbor.Platform, _ = part.Value.(string)
+			neighbor.Platform = truncateUTF8Bytes(strings.ToValidUTF8(neighbor.Platform, ""), 255)
 		case mndp.MMDPTypeSoftwareID:
 			neighbor.SoftwareID, _ = part.Value.(string)
+			neighbor.SoftwareID = truncateUTF8Bytes(strings.ToValidUTF8(neighbor.SoftwareID, ""), 255)
 		case mndp.MMDPTypeBoard:
 			neighbor.Board, _ = part.Value.(string)
+			neighbor.Board = truncateUTF8Bytes(strings.ToValidUTF8(neighbor.Board, ""), 255)
 		case mndp.MMDPTypeInterfaceName:
 			neighbor.RemoteInterface, _ = part.Value.(string)
+			neighbor.RemoteInterface = truncateUTF8Bytes(strings.ToValidUTF8(neighbor.RemoteInterface, ""), 64)
 		case mndp.MMDPTypeIPv4Address:
-			if value, ok := part.Value.(net.IP); ok {
+			if value, ok := part.Value.(net.IP); ok && len(neighbor.IPv4) < maxMNDPAddresses {
 				neighbor.IPv4 = appendUniqueIP(neighbor.IPv4, value)
 			}
 		case mndp.MMDPTypeIPv6Address:
-			if value, ok := part.Value.(net.IP); ok {
+			if value, ok := part.Value.(net.IP); ok && len(neighbor.IPv6) < maxMNDPAddresses {
 				neighbor.IPv6 = appendUniqueIP(neighbor.IPv6, value)
 			}
 		}
@@ -374,5 +471,11 @@ func cloneMNDPNeighbor(value MNDPNeighbor) MNDPNeighbor {
 	value.MAC = append(net.HardwareAddr(nil), value.MAC...)
 	value.IPv4 = append([]net.IP(nil), value.IPv4...)
 	value.IPv6 = append([]net.IP(nil), value.IPv6...)
+	for index := range value.IPv4 {
+		value.IPv4[index] = append(net.IP(nil), value.IPv4[index]...)
+	}
+	for index := range value.IPv6 {
+		value.IPv6[index] = append(net.IP(nil), value.IPv6[index]...)
+	}
 	return value
 }

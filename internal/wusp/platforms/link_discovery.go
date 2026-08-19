@@ -6,6 +6,8 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"wantastic-agent/internal/iwinfo"
 	"wantastic-agent/internal/linkdiscovery"
@@ -54,7 +56,7 @@ func appendLinkDiscoveryFields(msg *wusp.Message, snapshot linkdiscovery.Snapsho
 		device := byChassis[key]
 		prefix := fmt.Sprintf("Device.LLDP.Discovery.Device.%d.", devicePosition+1)
 		appendField(msg, prefix+"ChassisIDSubtype", wusp.Uint(uint64(device.chassisSubtype)))
-		appendField(msg, prefix+"ChassisID", wusp.String(device.chassisID))
+		appendField(msg, prefix+"ChassisID", wusp.String(truncateUTF8Bytes(device.chassisID, 255)))
 		if len(device.ports) > 0 {
 			if path := interfacePaths[device.ports[0].LocalInterface]; path != "" {
 				appendField(msg, prefix+"Interface", wusp.String(path))
@@ -76,10 +78,16 @@ func appendLinkDiscoveryFields(msg *wusp.Message, snapshot linkdiscovery.Snapsho
 		for portPosition, port := range device.ports {
 			portPrefix := fmt.Sprintf("%sPort.%d.", prefix, portPosition+1)
 			appendField(msg, portPrefix+"PortIDSubtype", wusp.Uint(uint64(port.PortIDSubtype)))
-			appendField(msg, portPrefix+"PortID", wusp.String(port.PortID))
-			appendField(msg, portPrefix+"TTL", wusp.Uint(uint64(port.TTL.Seconds())))
+			appendField(msg, portPrefix+"PortID", wusp.String(truncateUTF8Bytes(port.PortID, 255)))
+			ttl := port.TTL / time.Second
+			if ttl < 0 {
+				ttl = 0
+			} else if ttl > 65535 {
+				ttl = 65535
+			}
+			appendField(msg, portPrefix+"TTL", wusp.Uint(uint64(ttl)))
 			if port.PortDescription != "" {
-				appendField(msg, portPrefix+"PortDescription", wusp.String(port.PortDescription))
+				appendField(msg, portPrefix+"PortDescription", wusp.String(truncateUTF8Bytes(port.PortDescription, 255)))
 			}
 			if len(port.SourceMAC) == 6 {
 				appendField(msg, portPrefix+"MACAddressList", wusp.List(wusp.String(port.SourceMAC.String())))
@@ -94,9 +102,27 @@ func appendLinkDiscoveryFields(msg *wusp.Message, snapshot linkdiscovery.Snapsho
 			orgPrefix := fmt.Sprintf("%sDeviceInformation.VendorSpecific.%d.", prefix, organizationPosition+1)
 			appendField(msg, orgPrefix+"OrganizationCode", wusp.String(strings.ToUpper(organization.OUI)))
 			appendField(msg, orgPrefix+"InformationType", wusp.Uint(uint64(organization.Subtype)))
-			appendField(msg, orgPrefix+"Information", wusp.String(hex.EncodeToString(organization.Data)))
+			data := organization.Data
+			if len(data) > 124 {
+				data = data[:124]
+			}
+			appendField(msg, orgPrefix+"Information", wusp.String(hex.EncodeToString(data)))
 		}
 	}
+}
+
+func truncateUTF8Bytes(value string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(value) <= maximum {
+		return value
+	}
+	value = value[:maximum]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
 }
 
 func containsOrganization(values []linkdiscovery.OrganizationTLV, candidate linkdiscovery.OrganizationTLV) bool {

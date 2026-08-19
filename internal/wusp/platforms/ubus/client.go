@@ -23,6 +23,8 @@ const (
 	AnonymousSessionID  = "00000000000000000000000000000000"
 	defaultContentType  = "application/json"
 	defaultReloadConfig = "reload_config"
+	maxHTTPResponseSize = 4 << 20
+	maxNativeCalls      = 4
 )
 
 type Doer interface {
@@ -44,6 +46,8 @@ type Client struct {
 	disableNative     bool
 	nativeSocketPaths []string
 }
+
+var nativeCallSlots = make(chan struct{}, maxNativeCalls)
 
 var defaultNativeSocketPaths = []string{
 	"/var/run/ubus/ubus.sock",
@@ -107,6 +111,9 @@ func NewClient(opts Options) *Client {
 }
 
 func (c *Client) Call(ctx context.Context, object, method string, params map[string]any, timeout time.Duration) ([]byte, error) {
+	if c == nil {
+		return nil, fmt.Errorf("nil ubus client")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -158,11 +165,17 @@ func (c *Client) Call(ctx context.Context, object, method string, params map[str
 		}
 		return nil, fmt.Errorf("ubus %s.%s: %w", object, method, err)
 	}
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("ubus %s.%s: HTTP client returned an empty response", object, method)
+	}
 	defer resp.Body.Close()
 
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPResponseSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("ubus %s.%s: read body: %w", object, method, err)
+	}
+	if len(payload) > maxHTTPResponseSize {
+		return nil, fmt.Errorf("ubus %s.%s: response exceeds %d bytes", object, method, maxHTTPResponseSize)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("ubus %s.%s: http status %s", object, method, resp.Status)
@@ -223,31 +236,46 @@ func (c *Client) callNative(ctx context.Context, object, method string, params m
 			err  error
 		}
 		resultCh := make(chan nativeResult, 1)
+		select {
+		case nativeCallSlots <- struct{}{}:
+		case <-callCtx.Done():
+			lastErr = callCtx.Err()
+			cancel()
+			continue
+		}
+		callParams := cloneMap(params)
 		go func() {
+			result := nativeResult{}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					result = nativeResult{err: errors.New("native ubus panic")}
+				}
+				<-nativeCallSlots
+				resultCh <- result
+			}()
 			socketClient, err := goubustransport.NewSocketClient(socketPath)
 			if err != nil {
-				resultCh <- nativeResult{err: err}
+				result.err = err
 				return
 			}
 			client := goubus.NewClient(socketClient)
 			defer client.Close()
-			result, err := client.Caller().Call(object, method, cloneMap(params))
+			callResult, err := client.Caller().Call(object, method, callParams)
 			if err != nil {
-				resultCh <- nativeResult{err: err}
+				result.err = err
 				return
 			}
 			var payload map[string]any
-			err = result.Unmarshal(&payload)
+			err = callResult.Unmarshal(&payload)
 			if errors.Is(err, goubuserr.ErrNoData) {
 				err = nil
 				payload = map[string]any{}
 			}
 			if err != nil {
-				resultCh <- nativeResult{err: err}
+				result.err = err
 				return
 			}
-			data, err := json.Marshal(payload)
-			resultCh <- nativeResult{data: data, err: err}
+			result.data, result.err = json.Marshal(payload)
 		}()
 		select {
 		case result := <-resultCh:

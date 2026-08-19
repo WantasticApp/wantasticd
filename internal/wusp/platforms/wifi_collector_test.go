@@ -91,6 +91,34 @@ config wifi-iface 'mesh_ap'
 		}},
 	}, backend.openWrtWiFiInterfaceSet())
 	assertUintField(t, msg, "Device.LLDP.Discovery.Device.1.Port.1.LinkInformation.InterfaceType", 71)
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("LLDP fields failed data-model validation: %v", err)
+	}
+}
+
+func TestLinkDiscoveryFieldsClampUntrustedValues(t *testing.T) {
+	msg := wusp.NewMessage()
+	appendLinkDiscoveryFields(msg, linkdiscovery.Snapshot{
+		LLDPReady: true,
+		LLDP: []linkdiscovery.LLDPNeighbor{{
+			LocalInterface:   "ath2",
+			ChassisIDSubtype: 4,
+			ChassisID:        strings.Repeat("c", 400),
+			PortIDSubtype:    5,
+			PortID:           strings.Repeat("p", 400),
+			PortDescription:  strings.Repeat("d", 400),
+			TTL:              -time.Second,
+			LastUpdate:       time.Unix(1_700_000_000, 0),
+			Organizations: []linkdiscovery.OrganizationTLV{{
+				OUI: "0012bb", Subtype: 1, Data: make([]byte, 1024),
+			}},
+		}},
+	}, map[string]bool{"ath2": true})
+
+	assertUintField(t, msg, "Device.LLDP.Discovery.Device.1.Port.1.TTL", 0)
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("bounded LLDP fields failed data-model validation: %v", err)
+	}
 }
 
 func TestOpenWrtRadioInventoryKeepsUCIDeviceIdentity(t *testing.T) {

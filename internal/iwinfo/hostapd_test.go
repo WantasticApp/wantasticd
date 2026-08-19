@@ -38,3 +38,13 @@ func TestParseHostapdStationsRejectsMulticastAndInvalidMAC(t *testing.T) {
 		t.Fatalf("got %+v, want no stations", entries)
 	}
 }
+
+func TestParseHostapdStationsRejectsNonFiniteRates(t *testing.T) {
+	entries := ParseHostapdStations("02:11:22:33:44:55\nrx_bitrate=NaN MBit/s\ntx_bitrate=+Inf MBit/s")
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(entries))
+	}
+	if entries[0].RxRateKnown || entries[0].TxRateKnown {
+		t.Fatalf("non-finite rate was marked measured: %+v", entries[0])
+	}
+}

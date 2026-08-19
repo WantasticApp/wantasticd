@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,5 +125,24 @@ func TestClientCallReturnsUbusError(t *testing.T) {
 	client := NewClient(Options{URL: server.URL})
 	if _, err := client.Call(context.Background(), "uci", "commit", nil, time.Second); err == nil {
 		t.Fatal("Call returned nil error, want ubus error")
+	}
+}
+
+func TestClientCallRejectsOversizedHTTPResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maxHTTPResponseSize+1)))
+	}))
+	defer server.Close()
+
+	client := NewClient(Options{URL: server.URL, DisableNative: true})
+	if _, err := client.Call(context.Background(), "system", "board", nil, time.Second); err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("Call error=%v, want bounded response error", err)
+	}
+}
+
+func TestNilClientCallFailsWithoutPanic(t *testing.T) {
+	var client *Client
+	if _, err := client.Call(context.Background(), "system", "board", nil, time.Second); err == nil {
+		t.Fatal("nil client call returned no error")
 	}
 }

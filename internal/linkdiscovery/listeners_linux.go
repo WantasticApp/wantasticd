@@ -22,11 +22,11 @@ const (
 func startPlatformListeners(m *Monitor) {
 	if fd, err := openLLDPSocket(); err == nil {
 		m.markLLDPStarted(time.Now())
-		go receiveLLDP(m, fd)
+		go safelyRunListener("LLDP", m.markLLDPStopped, func() { receiveLLDP(m, fd) })
 	}
 	if conn, packetConn, err := openMNDPSocket(); err == nil {
 		m.markMNDPStarted(time.Now())
-		go receiveMNDP(m, conn, packetConn)
+		go safelyRunListener("MNDP", m.markMNDPStopped, func() { receiveMNDP(m, conn, packetConn) })
 	}
 }
 

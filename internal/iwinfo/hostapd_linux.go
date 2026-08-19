@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+const (
+	maxHostapdStations      = 4096
+	maxHostapdResponseBytes = 64 * 1024
+	maxHostapdTotalBytes    = 8 * 1024 * 1024
+)
+
 func getHostapdAssocList(ifName string) ([]AssocEntry, error) {
 	paths := hostapdSocketPaths(ifName)
 	var lastErr error
@@ -71,19 +77,32 @@ func queryHostapdSocket(remotePath string) ([]AssocEntry, error) {
 	blocks := make([]string, 0)
 	command := "STA-FIRST"
 	seen := make(map[string]bool)
-	for len(blocks) < 4096 {
-		_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	buffer := make([]byte, maxHostapdResponseBytes)
+	totalBytes := 0
+	for {
+		if err := conn.SetDeadline(time.Now().Add(1500 * time.Millisecond)); err != nil {
+			return nil, err
+		}
 		if _, err := conn.WriteToUnix([]byte(command), remote); err != nil {
 			return nil, err
 		}
-		buffer := make([]byte, 64*1024)
 		length, _, err := conn.ReadFromUnix(buffer)
 		if err != nil {
 			return nil, err
 		}
+		if length == len(buffer) {
+			return nil, fmt.Errorf("hostapd station response reached the %d-byte safety limit", len(buffer))
+		}
+		totalBytes += length
+		if totalBytes > maxHostapdTotalBytes {
+			return nil, fmt.Errorf("hostapd station responses exceed the %d-byte safety limit", maxHostapdTotalBytes)
+		}
 		response := strings.TrimSpace(string(buffer[:length]))
 		if response == "" || strings.HasPrefix(response, "FAIL") {
 			break
+		}
+		if len(blocks) >= maxHostapdStations {
+			return nil, fmt.Errorf("hostapd station count exceeds the %d-entry safety limit", maxHostapdStations)
 		}
 		entry, ok := parseHostapdStation(response)
 		if !ok {

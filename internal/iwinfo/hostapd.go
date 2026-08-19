@@ -2,6 +2,7 @@ package iwinfo
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -123,7 +124,7 @@ func parseHostapdRate(value string) (uint32, bool) {
 		return 0, false
 	}
 	rate, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil || rate < 0 {
+	if err != nil || math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 {
 		return 0, false
 	}
 	if len(fields) > 1 {

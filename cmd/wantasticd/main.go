@@ -162,6 +162,9 @@ func loadOrCreateClaimKey(path, portalBaseURL string, force bool) (*claimKeyFile
 			}
 			existing.ServerURL = normalizeClaimServerURL(portalBaseURL)
 			existing.ClaimURL = buildClaimURL(portalBaseURL, existing.PublicKey)
+			if err := writeClaimKeyFile(path, &existing); err != nil {
+				return nil, false, fmt.Errorf("update existing key file: %w", err)
+			}
 			if err := auth.PersistPublicKey(existing.PublicKey); err != nil {
 				log.Printf("Warning: could not persist public key copy: %v", err)
 			}
@@ -245,6 +248,9 @@ func writeClaimKeyFile(path string, keyFile *claimKeyFile) error {
 	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("write key file: %w", err)
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("secure key file permissions: %w", err)
 	}
 	return nil
 }

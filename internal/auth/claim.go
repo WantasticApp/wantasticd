@@ -85,6 +85,10 @@ func WaitClaimConfig(ctx context.Context, portalURL, hashedDeviceID, publicKey s
 		return nil, fmt.Errorf("claim wait websocket failed: %w", err)
 	}
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopCancel()
 	conn.SetReadLimit(maxResponseBytes)
 	conn.SetPingHandler(func(appData string) error {
 		if err := conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {

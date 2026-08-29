@@ -150,21 +150,24 @@ func (d *Device) Start() error {
 		}
 	}
 
-	// Start P2P hole-punching subsystem after first handshake confirms connectivity
-	go func() {
-		// Wait for the first successful handshake before starting P2P
-		for i := 0; i < 30; i++ {
-			time.Sleep(1 * time.Second)
-			if d.HasActiveHandshake() {
-				logger.Verbosef("[P2P] Handshake detected, starting P2P client subsystem")
-				wd.StartP2P()
-				return
-			}
-		}
-		// Start anyway after 30s even without handshake (will retry registration)
-		logger.Verbosef("[P2P] Starting P2P client subsystem (no handshake yet)")
+	// P2P coordination is an authenticated side channel on the configured
+	// WireGuard UDP socket and does not need to wait for an encrypted data
+	// handshake. Starting it immediately removes up to 30 seconds of avoidable
+	// direct-path setup latency. Pass the exact coordinator key so dynamic peers
+	// can never be mistaken for the server.
+	if d.config.Server.PublicKey == "" {
 		wd.StartP2P()
-	}()
+	} else {
+		serverKeyHex, err := base64ToHex(d.config.Server.PublicKey)
+		if err != nil {
+			return fmt.Errorf("decode P2P coordinator key: %w", err)
+		}
+		var serverKey wgdevice.NoisePublicKey
+		if err := serverKey.FromHex(serverKeyHex); err != nil {
+			return fmt.Errorf("parse P2P coordinator key: %w", err)
+		}
+		wd.StartP2P(serverKey)
+	}
 
 	// Diagnostic: dump device state after Up() to verify configuration
 	if ipcState, err := wd.IpcGet(); err == nil {

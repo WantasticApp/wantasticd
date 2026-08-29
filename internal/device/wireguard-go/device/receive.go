@@ -213,10 +213,8 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				if len(p2pData) == 41 && p2pData[0] == P2PSubtypePunchPacket {
 					endpointStr := endpoints[i].DstToString()
 					srcAddr, err := net.ResolveUDPAddr("udp", endpointStr)
-					if err == nil && device.p2pClient != nil {
-						msgData := make([]byte, len(p2pData))
-						copy(msgData, p2pData)
-						go device.p2pClient.HandlePunch(msgData, srcAddr)
+					if client := device.GetP2PClient(); err == nil && client != nil {
+						client.EnqueuePunch(p2pData, srcAddr)
 					}
 
 					bufsArrs[i] = device.GetMessageBuffer()
@@ -230,8 +228,8 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					copy(msgData, p2pData)
 
 					msg := DecodeP2PMessage(msgData)
-					if msg != nil && device.p2pClient != nil {
-						go device.p2pClient.HandleMessage(msg)
+					if client := device.GetP2PClient(); msg != nil && client != nil {
+						client.EnqueueMessage(msg)
 					}
 
 					bufsArrs[i] = device.GetMessageBuffer()

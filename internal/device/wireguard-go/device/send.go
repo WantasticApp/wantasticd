@@ -378,6 +378,9 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+				if client := device.GetP2PClient(); client != nil {
+					client.ObserveDestination(dst)
+				}
 				peer = device.allowedips.Lookup(dst)
 
 			case 6:
@@ -385,6 +388,9 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
+				if client := device.GetP2PClient(); client != nil {
+					client.ObserveDestination(dst)
+				}
 				peer = device.allowedips.Lookup(dst)
 
 			default:

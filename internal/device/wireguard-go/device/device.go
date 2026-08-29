@@ -97,7 +97,8 @@ type Device struct {
 		nextID  atomic.Uint64
 		pending map[wuspFragmentKey]*wuspFragmentAssembly
 	}
-	p2pClient           *P2PClient
+	p2pMu               sync.Mutex
+	p2pClient           atomic.Pointer[P2PClient]
 	tunControlHandler   func(*Peer, []byte) // Handler for P2P TUN mode coordination (message type 7)
 	addPeerRouteHandler func(net.IP)        // Handler for dynamically adding P2P peer routes to TUN
 }
@@ -353,20 +354,24 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	return device
 }
 
-// StartP2P initializes and starts the P2P client subsystem.
-// Should be called after device.Up() and the first handshake completes.
-func (device *Device) StartP2P() {
-	if device.p2pClient != nil {
-		return // Already started
+// StartP2P initializes and starts the P2P client subsystem. Passing the
+// configured coordinator key avoids guessing the coordinator after direct
+// peers have been added to the WireGuard device.
+func (device *Device) StartP2P(serverKeys ...NoisePublicKey) {
+	device.p2pMu.Lock()
+	defer device.p2pMu.Unlock()
+	if device.p2pClient.Load() != nil || device.isClosed() {
+		return
 	}
-	device.p2pClient = NewP2PClient(device)
-	device.p2pClient.Start()
+	client := NewP2PClient(device, serverKeys...)
+	device.p2pClient.Store(client)
+	client.Start()
 	device.log.Verbosef("[P2P] Client subsystem started")
 }
 
 // GetP2PClient returns the P2P client instance if started
 func (device *Device) GetP2PClient() *P2PClient {
-	return device.p2pClient
+	return device.p2pClient.Load()
 }
 
 // BatchSize returns the BatchSize for the device as a whole which is the max of
@@ -435,13 +440,23 @@ func (device *Device) RemoveAllPeers() {
 func (device *Device) Close() {
 	device.state.Lock()
 	defer device.state.Unlock()
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
 		return
 	}
 	device.state.state.Store(uint32(deviceStateClosed))
 	device.log.Verbosef("Device closing")
+
+	// Stop P2P workers before taking ipcMutex. Promotion workers can be inside
+	// IpcSet, so the inverse order can deadlock shutdown.
+	device.p2pMu.Lock()
+	p2pClient := device.p2pClient.Swap(nil)
+	device.p2pMu.Unlock()
+	if p2pClient != nil {
+		p2pClient.Close()
+	}
+
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 
 	device.tun.device.Close()
 	device.downLocked()

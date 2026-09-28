@@ -43,6 +43,83 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 		topology:       topo.root,
 		sampleTime:     b.now().UTC(),
 	})
+	if topo.protocol == "EasyMesh" {
+		msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(0))
+		if b.openWrtDeviceIsCentralNode(ctx, topo.root) {
+			appendOpenWrtEasyMeshController(msg)
+		}
+	}
+}
+
+func appendOpenWrtEasyMeshController(msg *wusp.Message) {
+	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
+	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
+	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
+	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
+	msg.Set(protocolPath+"PrimaryObject", wusp.String(easyMeshPath))
+	msg.Set(protocolPath+"Writable", wusp.Bool(false))
+	msg.Set(easyMeshPath+"Alias", wusp.String("central-controller"))
+	msg.Set(easyMeshPath+"Status", wusp.String("Running"))
+	msg.Set(easyMeshPath+"ProtocolReference", wusp.String(protocolPath))
+	msg.Set(easyMeshPath+"Implementation", wusp.String("device.ubus"))
+	msg.Set(easyMeshPath+"Role", wusp.String("Controller"))
+}
+
+func (b *OpenWrtBackend) openWrtDeviceIsCentralNode(ctx context.Context, root *meshNode) bool {
+	if data, err := b.callUbus(ctx, "device", "getMode", nil); err == nil {
+		if central, known := parseOpenWrtCentralMode(data); known {
+			return central
+		}
+	}
+	nodes := flattenMeshForest(normalizedMeshRoots(root))
+	local := localMeshNode(nodes, b.readTextFile(b.hostnamePath))
+	return local != nil && local.hasHop && local.sourceHop == 0 &&
+		strings.TrimSpace(local.parentID) == "" && strings.TrimSpace(local.parentMAC) == ""
+}
+
+func parseOpenWrtCentralMode(data []byte) (bool, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var raw any
+	if err := decoder.Decode(&raw); err != nil {
+		return false, false
+	}
+	return centralModeFromAny(raw)
+}
+
+func centralModeFromAny(raw any) (bool, bool) {
+	switch value := raw.(type) {
+	case map[string]any:
+		if result, ok := lookupAnyCI(value, "result"); ok {
+			if list, ok := result.([]any); ok && len(list) >= 2 {
+				if central, known := centralModeFromAny(list[1]); known {
+					return central, true
+				}
+			}
+		}
+		for _, key := range []string{"mode", "device_mode", "deviceMode", "role", "device_role", "deviceRole"} {
+			if candidate, ok := lookupAnyCI(value, key); ok {
+				if central, known := centralModeFromAny(candidate); known {
+					return central, true
+				}
+			}
+		}
+	case []any:
+		for _, item := range value {
+			if central, known := centralModeFromAny(item); known {
+				return central, true
+			}
+		}
+	case string:
+		mode := strings.ToLower(strings.TrimSpace(value))
+		switch mode {
+		case "cn", "central", "central-node", "central_node", "controller", "root", "cap":
+			return true, true
+		case "agent", "re", "relay", "extender", "satellite", "leaf", "client":
+			return false, true
+		}
+	}
+	return false, false
 }
 
 func (b *OpenWrtBackend) enrichOpenWrtMeshEvidence(root *meshNode, discovery linkdiscovery.Snapshot) {
@@ -129,10 +206,18 @@ func (b *OpenWrtBackend) enrichOpenWrtMeshEvidence(root *meshNode, discovery lin
 func localMeshNode(nodes []*meshNode, hostname string) *meshNode {
 	hostname = strings.TrimSpace(hostname)
 	localMACs := make(map[string]bool)
+	localIPs := make(map[string]bool)
 	ifaces, _ := net.Interfaces()
 	for _, iface := range ifaces {
 		if len(iface.HardwareAddr) == 6 {
 			localMACs[strings.ToLower(iface.HardwareAddr.String())] = true
+		}
+		addresses, _ := iface.Addrs()
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
+			if err == nil && !ip.IsLoopback() {
+				localIPs[ip.String()] = true
+			}
 		}
 	}
 	for _, node := range nodes {
@@ -142,6 +227,11 @@ func localMeshNode(nodes []*meshNode, hostname string) *meshNode {
 	}
 	for _, node := range nodes {
 		if hostname != "" && strings.EqualFold(strings.TrimSpace(node.name), hostname) {
+			return node
+		}
+	}
+	for _, node := range nodes {
+		if localIPs[strings.TrimSpace(node.ip)] {
 			return node
 		}
 	}

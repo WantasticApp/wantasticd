@@ -616,15 +616,22 @@ func TestOpenWrtStockHostapdStationsPopulateTR181(t *testing.T) {
 func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
-			if object != "device" || method != "getRealTopo" {
+			if object != "device" {
 				return nil, wusp.ErrUSPPathUnsupported
 			}
-			return []byte(`{"topo":[
-				{"mac":"E0:5D:54:4B:E9:21","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":"G1TK7EY001160"},
-				{"mac":"E0:5D:54:4B:E9:2A","pMac":"E0:5D:54:4B:E9:21","hops":1,"ip":"192.168.200.109","backhaul":"L","name":"G1TK7EY001177"},
-				{"mac":"E0:5D:54:4B:E5:16","pMac":"E0:5D:54:4B:E9:2A","hops":2,"ip":"192.168.200.193","backhaul":"H","name":"G1TK7EY000012"},
-				{"mac":"E0:5D:54:4B:E7:3B","pMac":"E0:5D:54:4B:E5:16","hops":3,"ip":"192.168.200.178","backhaul":"L","name":"G1TK7EY000624"}
-			]}`), nil
+			switch method {
+			case "getMode":
+				return []byte(`{"mode":"CN"}`), nil
+			case "getRealTopo":
+				return []byte(`{"topo":[
+					{"mac":"E0:5D:54:4B:E9:21","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":"G1TK7EY001160"},
+					{"mac":"E0:5D:54:4B:E9:2A","pMac":"E0:5D:54:4B:E9:21","hops":1,"ip":"192.168.200.109","backhaul":"L","name":"G1TK7EY001177"},
+					{"mac":"E0:5D:54:4B:E5:16","pMac":"E0:5D:54:4B:E9:2A","hops":2,"ip":"192.168.200.193","backhaul":"H","name":"G1TK7EY000012"},
+					{"mac":"E0:5D:54:4B:E7:3B","pMac":"E0:5D:54:4B:E5:16","hops":3,"ip":"192.168.200.178","backhaul":"L","name":"G1TK7EY000624"}
+				]}`), nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
 		},
 		Now: time.Now,
 	})
@@ -644,8 +651,83 @@ func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testin
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.Node.4.Address", "192.168.200.178")
 	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.2.BackhaulLinkType", "Wi-Fi")
 	assertStringField(t, msg, "Device.WiFi.MultiAP.APDevice.3.BackhaulLinkType", "Wi-Fi")
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Implementation", "device.ubus")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Controller")
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(flat vendor topology): %v", err)
+	}
+}
+
+func TestOpenWrtBackendDoesNotExposeEasyMeshControllerForAgentMode(t *testing.T) {
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object != "device" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			switch method {
+			case "getMode":
+				return []byte(`{"mode":"RE"}`), nil
+			case "getRealTopo":
+				return []byte(`{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":""}]}`), nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+		Now: time.Now,
+	})
+
+	msg := wusp.NewMessage()
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 0)
+	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.Role"); ok {
+		t.Fatal("agent mode exposed the central EasyMesh controller row")
+	}
+}
+
+func TestOpenWrtBackendUsesLocalRootAsCentralFallback(t *testing.T) {
+	rootDir := t.TempDir()
+	hostnamePath := filepath.Join(rootDir, "hostname")
+	mustWriteFile(t, hostnamePath, "cn-device\n")
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		HostnamePath: hostnamePath,
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "device" && method == "getMode" {
+				return []byte(`{"mode":1}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+		Now: time.Now,
+	})
+
+	root := &meshNode{name: "cn-device", sourceHop: 0, hasHop: true}
+	if !backend.openWrtDeviceIsCentralNode(context.Background(), root) {
+		t.Fatal("local zero-hop parentless topology node was not accepted as CN fallback")
+	}
+	root.sourceHop = 1
+	if backend.openWrtDeviceIsCentralNode(context.Background(), root) {
+		t.Fatal("local non-root topology node was accepted as CN fallback")
+	}
+}
+
+func TestParseOpenWrtCentralMode(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload string
+		central bool
+		known   bool
+	}{
+		{name: "CN", payload: `{"mode":"CN"}`, central: true, known: true},
+		{name: "wrapped controller", payload: `{"result":[0,{"deviceMode":"controller"}]}`, central: true, known: true},
+		{name: "relay", payload: `{"role":"RE"}`, central: false, known: true},
+		{name: "unknown numeric", payload: `{"mode":1}`, central: false, known: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			central, known := parseOpenWrtCentralMode([]byte(test.payload))
+			if central != test.central || known != test.known {
+				t.Fatalf("parseOpenWrtCentralMode(%s)=(%v,%v), want (%v,%v)", test.payload, central, known, test.central, test.known)
+			}
+		})
 	}
 }
 

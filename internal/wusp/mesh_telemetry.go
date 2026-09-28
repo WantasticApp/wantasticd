@@ -45,6 +45,12 @@ var WUSPMeshTelemetryObjects = []Object{
 		Description:   "OpenWrt IEEE 802.11s mesh interface configuration and runtime state.",
 	},
 	{
+		Path:          WUSPMeshTelemetryPrefix + "EasyMesh.{i}.",
+		MultiInstance: true,
+		SinceVersion:  "1.0",
+		Description:   "Read-only marker for a vendor EasyMesh central controller and its topology source.",
+	},
+	{
 		Path:          WUSPMeshTelemetryPrefix + "IEEE80211s.{i}.Peer.{i}.",
 		MultiInstance: true,
 		SinceVersion:  "1.0",
@@ -146,6 +152,14 @@ var WUSPMeshTelemetryRootParams = []Param{
 		Limits:       Limits{Min: iptr(0)},
 	},
 	{
+		Path:         WUSPMeshTelemetryPrefix + "EasyMeshNumberOfEntries",
+		Type:         TypeUnsignedInt,
+		Access:       ReadOnly,
+		SinceVersion: "1.0",
+		Description:  "Number of entries in Device.WUSP_MeshTelemetry.EasyMesh.{i}.",
+		Limits:       Limits{Min: iptr(0)},
+	},
+	{
 		Path:         WUSPMeshTelemetryPrefix + "IEEE80211sNumberOfEntries",
 		Type:         TypeUnsignedInt,
 		Access:       ReadOnly,
@@ -161,6 +175,14 @@ var WUSPMeshTelemetryRootParams = []Param{
 		Description:  "Number of entries in Device.WUSP_MeshTelemetry.BATMANAdv.{i}.",
 		Limits:       Limits{Min: iptr(0)},
 	},
+}
+
+var WUSPMeshTelemetryEasyMeshParams = []Param{
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Alias", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Stable alias for the central EasyMesh controller row.", Limits: Limits{MaxLength: 64}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Status", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Current central-controller topology status.", Limits: Limits{Enums: []string{"Running", "Degraded", "Error", "Unknown"}}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.ProtocolReference", Type: TypePathRef, Access: ReadOnly, SinceVersion: "1.0", Description: "Reference to the EasyMesh protocol row."},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Implementation", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Vendor abstraction that supplied the EasyMesh topology.", Limits: Limits{Enums: []string{"device.ubus"}}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Role", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "EasyMesh role confirmed for this local device.", Limits: Limits{Enums: []string{"Controller"}}},
 }
 
 var WUSPMeshTelemetryNodeParams = []Param{
@@ -570,6 +592,7 @@ var AllWUSPMeshTelemetryParams = concat(
 	WUSPMeshTelemetryLinkParams,
 	WUSPMeshTelemetryRouteParams,
 	WUSPMeshTelemetryProtocolParams,
+	WUSPMeshTelemetryEasyMeshParams,
 	WUSPMeshTelemetryIEEE80211sParams,
 	WUSPMeshTelemetryIEEE80211sPeerParams,
 	WUSPMeshTelemetryBATMANAdvParams,

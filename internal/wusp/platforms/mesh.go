@@ -9,7 +9,7 @@ import (
 	"wantastic-agent/internal/wusp"
 )
 
-// collectMeshStatic detects mesh topology (EasyMesh, batman-adv, 802.11s)
+// collectMeshStatic detects non-vendor mesh topology (batman-adv, 802.11s)
 // and populates TR-181 Device.WiFi.MultiAP.* and Device.WiFi.DataElements.* params.
 //
 // This uses the mesh detection from internal/stats (already pure Go — sysfs,
@@ -57,36 +57,19 @@ func collectMeshStatic(msg *wusp.Message) {
 	})
 }
 
-// detectMeshTopology checks sysfs/procfs for mesh indicators.
+// detectMeshTopology checks sysfs/procfs for non-vendor mesh indicators.
 // Returns protocol name, role, and root topology node.
 func detectMeshTopology() (protocol, role string, root *meshNode) {
-	// 1. EasyMesh — check for map-agent/controller presence
-	for _, p := range []string{
-		"/usr/sbin/map-agent",
-		"/usr/sbin/map-controller",
-		"/etc/config/multiap",
-		"/var/run/ezmesh-agent-cmd.fifo",
-		"/var/run/wsplcd.lock",
-	} {
-		if fileExists(p) {
-			protocol = "easymesh"
-			if strings.Contains(p, "controller") {
-				role = "controller"
-			} else {
-				role = "agent"
-			}
-			return
-		}
-	}
+	// Vendor EasyMesh is intentionally collected only through device.getRealTopo.
 
-	// 2. batman-adv — check sysfs
+	// 1. batman-adv — check sysfs
 	if fileExists("/sys/class/net/bat0/mesh") {
 		protocol = "batman-adv"
 		root = collectBatmanTopologyFromSysfs()
 		return
 	}
 
-	// 3. 802.11s — check for mesh point interfaces
+	// 2. 802.11s — check for mesh point interfaces
 	if ifaces := find80211sMeshInterfaces(); len(ifaces) > 0 {
 		protocol = "802.11s"
 		return

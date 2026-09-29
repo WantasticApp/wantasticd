@@ -621,6 +621,21 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		}()
 		return nil, nil
 	case "Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()":
+		if controller, ok := r.rawBackend.(interface {
+			StartApplyEasyMeshTopology(context.Context, string) error
+		}); ok {
+			topologyJSON := cellularInputString(input, "TopologyJSON")
+			if topologyJSON == "" {
+				return nil, fmt.Errorf("EasyMesh TopologyJSON is required")
+			}
+			if err := controller.StartApplyEasyMeshTopology(ctx, topologyJSON); err != nil {
+				return nil, err
+			}
+			output := wusp.NewMessage()
+			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Pending"))
+			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology accepted; waiting for the saved policy and live mesh to converge"))
+			return output, nil
+		}
 		controller, ok := r.rawBackend.(interface {
 			ApplyEasyMeshTopology(context.Context, string) error
 		})

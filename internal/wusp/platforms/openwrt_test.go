@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -169,15 +170,25 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T) {
 	var gotObject, gotMethod string
 	var gotParams map[string]any
+	var savedPolicy string
+	liveTopology := `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","name":"Controller"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"Relay"}]}`
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		EasyMeshVerifyInterval: time.Millisecond,
+		EasyMeshStableDuration: 2 * time.Millisecond,
 		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
 			switch method {
 			case "getRealTopo":
-				return []byte(`{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","name":"Controller"}]}`), nil
+				return []byte(liveTopology), nil
 			case "getMode":
 				return []byte(`{"mode":"CN"}`), nil
+			case "getTopo":
+				if savedPolicy == "" {
+					return []byte(`{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-72,"apName":"Relay"}]}`), nil
+				}
+				return []byte(savedPolicy), nil
 			case "setTopo":
 				gotObject, gotMethod, gotParams = object, method, params
+				savedPolicy, _ = params["data"].(string)
 				return []byte(`{}`), nil
 			default:
 				return nil, wusp.ErrUSPPathUnsupported
@@ -185,7 +196,7 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 		},
 	})
 	raw := `{
-		"topOptPolicy":"manual",
+		"topOptPolicy":"strict",
 		"convTimeout":120,
 		"deviceArray":[
 			{"alId":"00:03:7f:ba:db:ad","parentAlId":"NULL","bStaLinkBand":"6ghl","depth":0,"rssiThresh":-70,"apName":"Controller"},
@@ -208,11 +219,12 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 func TestApplyEasyMeshTopologyRejectsUnsafeOrInconsistentPlans(t *testing.T) {
 	validRoot := `{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"}`
 	tests := map[string]string{
-		"unknown field":     `{"topOptPolicy":"manual","convTimeout":120,"extra":true,"deviceArray":[` + validRoot + `]}`,
-		"missing root":      `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`,
-		"unknown parent":    `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[` + validRoot + `,{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"E0:5D:54:4B:E6:AA","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`,
-		"invalid band":      `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"auto","depth":0,"rssiThresh":-70,"apName":"Controller"}]}`,
-		"control character": `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"bad\u000a name"}]}`,
+		"unknown field":     `{"topOptPolicy":"strict","convTimeout":120,"extra":true,"deviceArray":[` + validRoot + `]}`,
+		"invalid policy":    `{"topOptPolicy":"automatic","convTimeout":120,"deviceArray":[` + validRoot + `]}`,
+		"missing root":      `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`,
+		"unknown parent":    `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[` + validRoot + `,{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"E0:5D:54:4B:E6:AA","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`,
+		"invalid band":      `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"auto","depth":0,"rssiThresh":-70,"apName":"Controller"}]}`,
+		"control character": `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"bad\u000a name"}]}`,
 	}
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusParamCaller: func(context.Context, string, string, map[string]any) ([]byte, error) {
@@ -229,6 +241,17 @@ func TestApplyEasyMeshTopologyRejectsUnsafeOrInconsistentPlans(t *testing.T) {
 	}
 }
 
+func TestValidateEasyMeshTopologyMigratesLegacyManualPolicyToStrict(t *testing.T) {
+	raw := `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"}]}`
+	normalized, err := validateEasyMeshTopology(raw)
+	if err != nil {
+		t.Fatalf("validateEasyMeshTopology: %v", err)
+	}
+	if !strings.Contains(normalized, `"topOptPolicy":"strict"`) {
+		t.Fatalf("legacy policy was not migrated: %s", normalized)
+	}
+}
+
 func TestApplyEasyMeshTopologyRejectsAgentRole(t *testing.T) {
 	setTopoCalled := false
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
@@ -241,6 +264,8 @@ func TestApplyEasyMeshTopologyRejectsAgentRole(t *testing.T) {
 				return []byte(`{"topo":[{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"Relay"}]}`), nil
 			case "getMode":
 				return []byte(`{"mode":"RE"}`), nil
+			case "getTopo":
+				return []byte(`{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Relay"}]}`), nil
 			case "setTopo":
 				setTopoCalled = true
 				return []byte(`{}`), nil
@@ -249,7 +274,7 @@ func TestApplyEasyMeshTopologyRejectsAgentRole(t *testing.T) {
 			}
 		},
 	})
-	raw := `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Relay"}]}`
+	raw := `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Relay"}]}`
 
 	err := backend.ApplyEasyMeshTopology(context.Background(), raw)
 	if err == nil || !strings.Contains(err.Error(), "not the active controller") {
@@ -258,6 +283,93 @@ func TestApplyEasyMeshTopologyRejectsAgentRole(t *testing.T) {
 	if setTopoCalled {
 		t.Fatal("agent role reached device.setTopo")
 	}
+}
+
+func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testing.T) {
+	const currentPolicy = `{"topOptPolicy":"strict","convTimeout":1,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay A"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay B"}]}`
+	const requestedPolicy = `{"topOptPolicy":"strict","convTimeout":1,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay A"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"E0:5D:54:4B:E5:DC","bStaLinkBand":"6GH","depth":2,"rssiThresh":-70,"apName":"Relay B"}]}`
+	const starTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay B"}]}`
+	const chainTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"E0:5D:54:4B:E5:DC","hops":2,"name":"Relay B"}]}`
+
+	var mu sync.RWMutex
+	savedPolicy := currentPolicy
+	liveTopology := starTopology
+	started := make(chan struct{})
+	release := make(chan struct{})
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		EasyMeshVerifyInterval: 10 * time.Millisecond,
+		EasyMeshStableDuration: 60 * time.Millisecond,
+		UbusParamCaller: func(ctx context.Context, object, method string, params map[string]any) ([]byte, error) {
+			if object != "device" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			switch method {
+			case "getMode":
+				return []byte(`{"mode":"CN"}`), nil
+			case "getTopo":
+				mu.RLock()
+				defer mu.RUnlock()
+				return []byte(savedPolicy), nil
+			case "getRealTopo":
+				mu.RLock()
+				defer mu.RUnlock()
+				return []byte(liveTopology), nil
+			case "setTopo":
+				close(started)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				mu.Lock()
+				savedPolicy, _ = params["data"].(string)
+				liveTopology = chainTopology
+				mu.Unlock()
+				return []byte(`{}`), nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+	})
+
+	if err := backend.StartApplyEasyMeshTopology(context.Background(), requestedPolicy); err != nil {
+		t.Fatalf("StartApplyEasyMeshTopology: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("device.setTopo did not start")
+	}
+	status, _ := backend.easyMeshOperationResult()
+	if status != "Pending" {
+		t.Fatalf("operation status=%q want Pending", status)
+	}
+	close(release)
+	time.Sleep(25 * time.Millisecond)
+	mu.Lock()
+	liveTopology = starTopology
+	mu.Unlock()
+	time.Sleep(70 * time.Millisecond)
+	status, _ = backend.easyMeshOperationResult()
+	if status != "Pending" {
+		t.Fatalf("brief topology match was accepted as final: status=%q", status)
+	}
+	mu.Lock()
+	liveTopology = chainTopology
+	mu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status, message := backend.easyMeshOperationResult()
+		if status == "Success" {
+			if !strings.Contains(message, "converged") {
+				t.Fatalf("success message=%q", message)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	status, message := backend.easyMeshOperationResult()
+	t.Fatalf("operation did not complete: status=%q message=%q", status, message)
 }
 
 func TestRemoveEasyMeshStationValidatesAndUsesVendorPolicy(t *testing.T) {
@@ -889,7 +1001,7 @@ func TestOpenWrtBackendExposesEasyMeshAgentWithoutControllerTopology(t *testing.
 	}
 }
 
-func TestOpenWrtBackendAdvertisesVerifiedControllerWriteWithoutSavedPolicy(t *testing.T) {
+func TestOpenWrtBackendDoesNotAdvertiseControllerWriteWithoutSavedPolicy(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object != "device" {
@@ -910,7 +1022,7 @@ func TestOpenWrtBackendAdvertisesVerifiedControllerWriteWithoutSavedPolicy(t *te
 	msg := wusp.NewMessage()
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
 	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation")
 	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
 		t.Fatal("missing vendor policy must not be represented as a current topology policy")
 	}
@@ -918,7 +1030,7 @@ func TestOpenWrtBackendAdvertisesVerifiedControllerWriteWithoutSavedPolicy(t *te
 
 func TestOpenWrtBackendUsesVendorGetTopoPolicyForControllerControl(t *testing.T) {
 	policy := `{
-		"topOptPolicy":"manual",
+		"topOptPolicy":"strict",
 		"convTimeout":120,
 		"deviceArray":[
 			{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},
@@ -959,7 +1071,7 @@ func TestOpenWrtBackendUsesVendorGetTopoPolicyForControllerControl(t *testing.T)
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
 	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-72,"apName":"Relay"}]}`)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-72,"apName":"Relay"}]}`)
 }
 
 func TestExtractEasyMeshTopologyPolicyRejectsTrailingJSON(t *testing.T) {

@@ -220,6 +220,98 @@ func TestApplyEasyMeshTopologyRejectsUnsafeOrInconsistentPlans(t *testing.T) {
 	}
 }
 
+func TestRemoveEasyMeshStationValidatesAndUsesVendorPolicy(t *testing.T) {
+	var gotMethod string
+	var gotParams map[string]any
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name != "ubus" || !slices.Equal(args, []string{"-S", "-v", "list", "device"}) {
+				t.Fatalf("command=%s %v", name, args)
+			}
+			return []byte("device\n\trmStation: { station:String, user:String }"), nil
+		},
+		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
+			if object != "device" {
+				t.Fatalf("object=%q", object)
+			}
+			gotMethod, gotParams = method, params
+			return []byte(`{}`), nil
+		},
+	})
+
+	if err := backend.RemoveEasyMeshStation(context.Background(), "ath01", "02:11:22:33:44:55"); err != nil {
+		t.Fatalf("RemoveEasyMeshStation: %v", err)
+	}
+	if gotMethod != "rmStation" || gotParams["station"] != "ath01" || gotParams["user"] != "02:11:22:33:44:55" {
+		t.Fatalf("rmStation params=%#v method=%q", gotParams, gotMethod)
+	}
+	if err := backend.RemoveEasyMeshStation(context.Background(), "ath01;reboot", "bad"); err == nil {
+		t.Fatal("unsafe station removal input was accepted")
+	}
+}
+
+func TestSetEasyMeshModeRejectsSecondController(t *testing.T) {
+	root := t.TempDir()
+	hostnamePath := filepath.Join(root, "hostname")
+	mustWriteFile(t, hostnamePath, "relay-1\n")
+	called := false
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		HostnamePath: hostnamePath,
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte("device\n\tsetMode: { mode:Int32 }"), nil
+		},
+		UbusParamCaller: func(_ context.Context, object, method string, _ map[string]any) ([]byte, error) {
+			if object == "device" && method == "getRealTopo" {
+				return []byte(`{"topo":[
+					{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","name":"controller"},
+					{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"relay-1"}
+				]}`), nil
+			}
+			called = true
+			return nil, nil
+		},
+	})
+
+	err := backend.SetEasyMeshMode(context.Background(), "controller")
+	if err == nil || !strings.Contains(err.Error(), "another EasyMesh controller") {
+		t.Fatalf("expected second-controller rejection, got %v", err)
+	}
+	if called {
+		t.Fatal("setMode reached ubus while another controller was active")
+	}
+}
+
+func TestSetEasyMeshModePromotesOrphanAgent(t *testing.T) {
+	root := t.TempDir()
+	hostnamePath := filepath.Join(root, "hostname")
+	mustWriteFile(t, hostnamePath, "relay-1\n")
+	var gotMethod string
+	var gotParams map[string]any
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		HostnamePath: hostnamePath,
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte("device\n\tsetMode: { mode:Int32 }"), nil
+		},
+		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
+			if object != "device" {
+				t.Fatalf("object=%q", object)
+			}
+			if method == "getRealTopo" {
+				return []byte(`{"topo":[{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"relay-1"}]}`), nil
+			}
+			gotMethod, gotParams = method, params
+			return []byte(`{}`), nil
+		},
+	})
+
+	if err := backend.SetEasyMeshMode(context.Background(), "controller"); err != nil {
+		t.Fatalf("SetEasyMeshMode: %v", err)
+	}
+	if gotMethod != "setMode" || gotParams["mode"] != 1 {
+		t.Fatalf("setMode params=%#v method=%q", gotParams, gotMethod)
+	}
+}
+
 func TestOpenWrtBackendCollectRadioCapabilities(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")
@@ -713,8 +805,11 @@ func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testin
 	}
 }
 
-func TestOpenWrtBackendDoesNotExposeEasyMeshControllerForAgentMode(t *testing.T) {
+func TestOpenWrtBackendExposesEasyMeshAgentCapabilitiesForAgentMode(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte("device\n\trmStation: { station:String, user:String }\n\tsetMode: { mode:Int32 }"), nil
+		},
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object != "device" {
 				return nil, wusp.ErrUSPPathUnsupported
@@ -733,10 +828,9 @@ func TestOpenWrtBackendDoesNotExposeEasyMeshControllerForAgentMode(t *testing.T)
 
 	msg := wusp.NewMessage()
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
-	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 0)
-	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.Role"); ok {
-		t.Fatal("agent mode exposed the central EasyMesh controller row")
-	}
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Agent")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation,SetMode")
 }
 
 func TestOpenWrtBackendUsesLocalRootAsCentralFallback(t *testing.T) {

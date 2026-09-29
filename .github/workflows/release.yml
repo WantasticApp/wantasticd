@@ -56,7 +56,7 @@ jobs:
     - uses: actions/checkout@v4
     - uses: actions/setup-go@v5
       with:
-        go-version: '1.24.5'
+        go-version: '1.25.12'
 
     - name: Install dependencies (Linux only)
       if: matrix.goos == 'linux'
@@ -174,5 +174,4 @@ jobs:
         r2-bucket: ${{ secrets.R2_BUCKET }}
         source-dir: root_upload
         destination-dir: ./
-
 

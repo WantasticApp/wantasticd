@@ -638,6 +638,37 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Success"))
 		output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology applied"))
 		return output, nil
+	case "Device.WUSP_MeshTelemetry.EasyMesh.1.RemoveStation()":
+		controller, ok := r.rawBackend.(interface {
+			RemoveEasyMeshStation(context.Context, string, string) error
+		})
+		if !ok {
+			return nil, wusp.ErrUSPPathUnsupported
+		}
+		station := cellularInputString(input, "Station", "InterfaceName")
+		user := cellularInputString(input, "User", "MACAddress")
+		if station == "" || user == "" {
+			return nil, fmt.Errorf("EasyMesh station and user MAC address are required")
+		}
+		if err := controller.RemoveEasyMeshStation(ctx, station, user); err != nil {
+			return nil, err
+		}
+		return easyMeshOperationStatus("Station removed"), nil
+	case "Device.WUSP_MeshTelemetry.EasyMesh.1.SetMode()":
+		controller, ok := r.rawBackend.(interface {
+			SetEasyMeshMode(context.Context, string) error
+		})
+		if !ok {
+			return nil, wusp.ErrUSPPathUnsupported
+		}
+		mode := cellularInputString(input, "Mode")
+		if mode == "" {
+			return nil, fmt.Errorf("EasyMesh mode is required")
+		}
+		if err := controller.SetEasyMeshMode(ctx, mode); err != nil {
+			return nil, err
+		}
+		return easyMeshOperationStatus("Mode updated"), nil
 	default:
 		if strings.HasPrefix(cmd, "Device.WUSP_CellularControl.Interface.") {
 			if strings.HasSuffix(cmd, ".") {
@@ -652,6 +683,13 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		}
 		return nil, wusp.ErrUSPPathUnsupported
 	}
+}
+
+func easyMeshOperationStatus(message string) *wusp.Message {
+	output := wusp.NewMessage()
+	output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Success"))
+	output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String(message))
+	return output
 }
 
 func cellularOperateCommandFallback(objectPath string, input *wusp.Message) string {

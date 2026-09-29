@@ -47,31 +47,32 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 	})
 	if topo.protocol == "EasyMesh" {
 		msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(0))
-		if b.openWrtDeviceIsCentralNode(ctx, topo.root) {
-			b.appendOpenWrtEasyMeshController(ctx, msg)
+		if role, known := b.openWrtDeviceRole(ctx, topo.root); known {
+			b.appendOpenWrtEasyMeshDevice(ctx, msg, role)
 		}
 	}
 }
 
-func (b *OpenWrtBackend) appendOpenWrtEasyMeshController(ctx context.Context, msg *wusp.Message) {
+func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(ctx context.Context, msg *wusp.Message, role string) {
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	topologyJSON := strings.TrimSpace(b.readTextFile(b.easyMeshTopologyPath))
-	writable := b.easyMeshControlSupported(ctx, topologyJSON)
+	operations := b.easyMeshSupportedOperations(ctx, role, topologyJSON)
+	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
 	msg.Set(protocolPath+"PrimaryObject", wusp.String(easyMeshPath))
 	msg.Set(protocolPath+"Writable", wusp.Bool(writable))
-	msg.Set(easyMeshPath+"Alias", wusp.String("central-controller"))
+	msg.Set(easyMeshPath+"Alias", wusp.String(strings.ToLower(role)))
 	msg.Set(easyMeshPath+"Status", wusp.String("Running"))
 	msg.Set(easyMeshPath+"ProtocolReference", wusp.String(protocolPath))
 	msg.Set(easyMeshPath+"Implementation", wusp.String("device.ubus"))
-	msg.Set(easyMeshPath+"Role", wusp.String("Controller"))
+	msg.Set(easyMeshPath+"Role", wusp.String(role))
 	msg.Set(easyMeshPath+"Writable", wusp.Bool(writable))
 	if writable {
-		msg.Set(easyMeshPath+"SupportedOperations", wusp.String("ApplyTopology"))
+		msg.Set(easyMeshPath+"SupportedOperations", wusp.String(strings.Join(operations, ",")))
 	}
-	if topologyJSON != "" && len(topologyJSON) <= maxEasyMeshTopologyBytes {
+	if role == "Controller" && topologyJSON != "" && len(topologyJSON) <= maxEasyMeshTopologyBytes {
 		if normalized, err := validateEasyMeshTopology(topologyJSON); err == nil {
 			msg.Set(easyMeshPath+"TopologyJSON", wusp.String(normalized))
 		}
@@ -113,12 +114,107 @@ func (b *OpenWrtBackend) ApplyEasyMeshTopology(ctx context.Context, raw string) 
 	return nil
 }
 
-func (b *OpenWrtBackend) easyMeshControlSupported(ctx context.Context, topologyJSON string) bool {
+// RemoveEasyMeshStation disconnects one associated user from a named hostapd
+// station. The vendor RPC policy accepts exactly the strings "station" and
+// "user"; both are allow-listed here before crossing the privileged boundary.
+func (b *OpenWrtBackend) RemoveEasyMeshStation(ctx context.Context, station, user string) error {
+	station = strings.TrimSpace(station)
+	if !validEasyMeshStationName(station) {
+		return fmt.Errorf("EasyMesh station must be a valid interface name")
+	}
+	mac, err := normalizeEasyMeshMAC(user)
+	if err != nil {
+		return fmt.Errorf("EasyMesh user: %w", err)
+	}
+	if !b.easyMeshMethodSupported(ctx, "rmStation") {
+		return fmt.Errorf("EasyMesh station removal is not supported by this firmware")
+	}
+	if _, err := b.callUbus(ctx, "device", "rmStation", map[string]any{
+		"station": station,
+		"user":    mac,
+	}); err != nil {
+		return fmt.Errorf("remove EasyMesh station: %w", err)
+	}
+	return nil
+}
+
+// SetEasyMeshMode promotes this device to the controller role only when the
+// reported topology proves that no different controller is active. SPF 12.2
+// exposes no symmetric demotion operation, so a live controller must never be
+// bypassed or guessed away.
+func (b *OpenWrtBackend) SetEasyMeshMode(ctx context.Context, mode string) error {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	if normalized != "controller" && normalized != "cn" {
+		return fmt.Errorf("SPF 12.2 only supports controller promotion through device.setMode")
+	}
+	if !b.easyMeshMethodSupported(ctx, "setMode") {
+		return fmt.Errorf("EasyMesh mode control is not supported by this firmware")
+	}
+	data, err := b.readOpenWrtRealTopo(ctx)
+	if err != nil {
+		return fmt.Errorf("verify EasyMesh controller before promotion: %w", err)
+	}
+	topo, ok := parseOpenWrtRealTopo(data)
+	if !ok || topo.root == nil {
+		return fmt.Errorf("verify EasyMesh controller before promotion: topology is unavailable")
+	}
+	nodes := flattenMeshForest(normalizedMeshRoots(topo.root))
+	local := localMeshNode(nodes, b.readTextFile(b.hostnamePath))
+	if local == nil {
+		return fmt.Errorf("verify EasyMesh controller before promotion: local node is not identifiable")
+	}
+	if meshNodeIsController(local) {
+		return nil
+	}
+	for _, node := range nodes {
+		if node != local && meshNodeIsController(node) {
+			return fmt.Errorf("promotion blocked: another EasyMesh controller is active; SPF 12.2 has no safe controller handover RPC")
+		}
+	}
+	if _, err := b.callUbus(ctx, "device", "setMode", map[string]any{"mode": 1}); err != nil {
+		return fmt.Errorf("promote EasyMesh controller: %w", err)
+	}
+	return nil
+}
+
+func meshNodeIsController(node *meshNode) bool {
+	return node != nil && node.hasHop && node.sourceHop == 0 &&
+		strings.TrimSpace(node.parentID) == "" && strings.TrimSpace(node.parentMAC) == ""
+}
+
+func validEasyMeshStationName(value string) bool {
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for _, char := range value {
+		valid := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.'
+		if !valid {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *OpenWrtBackend) easyMeshSupportedOperations(ctx context.Context, role, topologyJSON string) []string {
+	operations := make([]string, 0, 3)
+	if role == "Controller" && b.easyMeshTopologyControlSupported(ctx, topologyJSON) {
+		operations = append(operations, "ApplyTopology")
+	}
+	if b.easyMeshMethodSupported(ctx, "rmStation") {
+		operations = append(operations, "RemoveStation")
+	}
+	if role == "Agent" && b.easyMeshMethodSupported(ctx, "setMode") {
+		operations = append(operations, "SetMode")
+	}
+	return operations
+}
+
+func (b *OpenWrtBackend) easyMeshTopologyControlSupported(ctx context.Context, topologyJSON string) bool {
 	if b == nil || b.commandRunner == nil {
 		return false
 	}
-	output, err := b.commandRunner(ctx, "ubus", "-S", "list", "device")
-	if err == nil && strings.Contains(string(output), "setTopo") {
+	if b.easyMeshMethodSupported(ctx, "setTopo") {
 		return true
 	}
 	// This file is owned by the same firmware module that implements setTopo.
@@ -126,8 +222,27 @@ func (b *OpenWrtBackend) easyMeshControlSupported(ctx context.Context, topologyJ
 	if topologyJSON == "" {
 		return false
 	}
-	_, err = validateEasyMeshTopology(topologyJSON)
+	_, err := validateEasyMeshTopology(topologyJSON)
 	return err == nil
+}
+
+func (b *OpenWrtBackend) easyMeshMethodSupported(ctx context.Context, method string) bool {
+	if b == nil || b.commandRunner == nil || method == "" {
+		return false
+	}
+	output, err := b.commandRunner(ctx, "ubus", "-S", "-v", "list", "device")
+	if err != nil {
+		return false
+	}
+	for _, field := range strings.FieldsFunc(string(output), func(char rune) bool {
+		return !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || char == '_')
+	}) {
+		if field == method {
+			return true
+		}
+	}
+	return false
 }
 
 func validateEasyMeshTopology(raw string) (string, error) {
@@ -263,15 +378,30 @@ func validateEasyMeshText(field, value string, max int, allowEmpty bool) error {
 }
 
 func (b *OpenWrtBackend) openWrtDeviceIsCentralNode(ctx context.Context, root *meshNode) bool {
+	role, known := b.openWrtDeviceRole(ctx, root)
+	return known && role == "Controller"
+}
+
+func (b *OpenWrtBackend) openWrtDeviceRole(ctx context.Context, root *meshNode) (string, bool) {
 	if data, err := b.callUbus(ctx, "device", "getMode", nil); err == nil {
 		if central, known := parseOpenWrtCentralMode(data); known {
-			return central
+			if central {
+				return "Controller", true
+			}
+			return "Agent", true
 		}
 	}
 	nodes := flattenMeshForest(normalizedMeshRoots(root))
 	local := localMeshNode(nodes, b.readTextFile(b.hostnamePath))
-	return local != nil && local.hasHop && local.sourceHop == 0 &&
-		strings.TrimSpace(local.parentID) == "" && strings.TrimSpace(local.parentMAC) == ""
+	if local == nil || !local.hasHop {
+		return "", false
+	}
+	central := local.sourceHop == 0 && strings.TrimSpace(local.parentID) == "" &&
+		strings.TrimSpace(local.parentMAC) == ""
+	if central {
+		return "Controller", true
+	}
+	return "Agent", true
 }
 
 func parseOpenWrtCentralMode(data []byte) (bool, bool) {

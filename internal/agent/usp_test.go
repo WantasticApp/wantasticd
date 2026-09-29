@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -703,4 +704,17 @@ func newTestUSPRuntime(tb testing.TB) *uspRuntime {
 		tb.Fatal("newUSPRuntime returned nil")
 	}
 	return runtime
+}
+
+func TestNewUSPRuntimeRequiresControllerIdentity(t *testing.T) {
+	cfg := &config.Config{DeviceID: "test-device"}
+	transport := &fakeUSPTransport{sendCh: make(chan []byte, 1)}
+
+	runtime, err := newUSPRuntime(cfg, transport, "test-0.0.0")
+	if err == nil || !strings.Contains(err.Error(), "controller public key is required") {
+		t.Fatalf("newUSPRuntime() error = %v, want controller identity error", err)
+	}
+	if runtime != nil {
+		t.Fatal("newUSPRuntime() returned a runtime without a controller identity")
+	}
 }

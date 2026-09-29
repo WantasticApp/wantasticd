@@ -27,12 +27,19 @@ type openWrtMeshLinkHint struct {
 }
 
 func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wusp.Message) {
+	role, roleKnown := b.openWrtDeviceRole(ctx, nil)
 	data, err := b.readOpenWrtRealTopo(ctx)
 	if err != nil || len(bytes.TrimSpace(data)) == 0 {
+		if roleKnown {
+			b.appendOpenWrtRoleOnlyEasyMesh(ctx, msg, role)
+		}
 		return
 	}
 	topo, ok := parseOpenWrtRealTopo(data)
 	if !ok {
+		if roleKnown {
+			b.appendOpenWrtRoleOnlyEasyMesh(ctx, msg, role)
+		}
 		return
 	}
 	if topo.protocol == "" && topo.root != nil {
@@ -47,17 +54,30 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 	})
 	if topo.protocol == "EasyMesh" {
 		msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(0))
-		if role, known := b.openWrtDeviceRole(ctx, topo.root); known {
+		if !roleKnown {
+			role, roleKnown = b.openWrtDeviceRole(ctx, topo.root)
+		}
+		if roleKnown {
 			b.appendOpenWrtEasyMeshDevice(ctx, msg, role)
 		}
 	}
+}
+
+func (b *OpenWrtBackend) appendOpenWrtRoleOnlyEasyMesh(ctx context.Context, msg *wusp.Message, role string) {
+	appendMeshSnapshot(msg, meshSnapshot{
+		protocol:       "EasyMesh",
+		implementation: "OpenWrt",
+		sampleTime:     b.now().UTC(),
+	})
+	msg.Set("Device.WUSP_MeshTelemetry.Status", wusp.String("Partial"))
+	b.appendOpenWrtEasyMeshDevice(ctx, msg, role)
 }
 
 func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(ctx context.Context, msg *wusp.Message, role string) {
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	topologyJSON := b.readEasyMeshTopologyPolicy(ctx)
-	operations := easyMeshSupportedOperations(role, topologyJSON)
+	operations := easyMeshSupportedOperations(role)
 	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
@@ -202,9 +222,9 @@ func validEasyMeshStationName(value string) bool {
 	return true
 }
 
-func easyMeshSupportedOperations(role, topologyJSON string) []string {
+func easyMeshSupportedOperations(role string) []string {
 	operations := make([]string, 0, 3)
-	if role == "Controller" && topologyJSON != "" {
+	if role == "Controller" {
 		operations = append(operations, "ApplyTopology")
 	}
 	operations = append(operations, "RemoveStation")
@@ -481,7 +501,7 @@ func centralModeFromAny(raw any) (bool, bool) {
 		switch mode {
 		case "cn", "central", "central-node", "central_node", "controller", "root", "cap":
 			return true, true
-		case "agent", "re", "relay", "extender", "satellite", "leaf", "client":
+		case "agent", "rn", "re", "relay", "extender", "satellite", "leaf", "client":
 			return false, true
 		}
 	}

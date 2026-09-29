@@ -866,7 +866,7 @@ func TestOpenWrtBackendExposesEasyMeshAgentWithoutControllerTopology(t *testing.
 			}
 			switch method {
 			case "getMode":
-				return []byte(`{"mode":"RN"}`), nil
+				return []byte(`{"mode":2}`), nil
 			case "getRealTopo":
 				return nil, wusp.ErrUSPPathUnsupported
 			default:
@@ -977,7 +977,7 @@ func TestOpenWrtBackendUsesLocalRootAsCentralFallback(t *testing.T) {
 		HostnamePath: hostnamePath,
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object == "device" && method == "getMode" {
-				return []byte(`{"mode":1}`), nil
+				return []byte(`{"mode":3}`), nil
 			}
 			return nil, wusp.ErrUSPPathUnsupported
 		},
@@ -1005,7 +1005,9 @@ func TestParseOpenWrtCentralMode(t *testing.T) {
 		{name: "wrapped controller", payload: `{"result":[0,{"deviceMode":"controller"}]}`, central: true, known: true},
 		{name: "relay", payload: `{"role":"RE"}`, central: false, known: true},
 		{name: "RN", payload: `{"role":"RN"}`, central: false, known: true},
-		{name: "unknown numeric", payload: `{"mode":1}`, central: false, known: false},
+		{name: "numeric CN", payload: `{"mode":1}`, central: true, known: true},
+		{name: "numeric RN", payload: `{"mode":2}`, central: false, known: true},
+		{name: "unknown numeric", payload: `{"mode":3}`, central: false, known: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			central, known := parseOpenWrtCentralMode([]byte(test.payload))

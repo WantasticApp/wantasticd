@@ -504,6 +504,16 @@ func centralModeFromAny(raw any) (bool, bool) {
 		case "agent", "rn", "re", "relay", "extender", "satellite", "leaf", "client":
 			return false, true
 		}
+	case json.Number:
+		// SPF 12.2's device.getMode emits a blobmsg u32 rather than a role
+		// string. The matching device.setMode handler accepts 1 only when the
+		// current mode is 2: 1 is the central node and 2 is a relay node.
+		switch value.String() {
+		case "1":
+			return true, true
+		case "2":
+			return false, true
+		}
 	}
 	return false, false
 }

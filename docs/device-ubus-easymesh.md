@@ -7,10 +7,13 @@ link to Qualcomm libraries, write daemon FIFOs, or reload the EasyMesh service.
 ## Telemetry integration
 
 - `device.getMode` identifies whether the local device is the CN central node.
-- `device.getRealTopo` returns the controller topology.
+- `device.getRealTopo` returns the live controller topology.
+- `device.getTopo` returns the exact editable topology policy currently used by
+  the controller. The agent validates this response before advertising writes.
 - The EasyMesh-specific WUSP row is emitted for confirmed CN and RN roles.
-- CN rows expose validated topology policy control. RN rows expose only the
-  capabilities proven by the local `device` ubus method list.
+- CN rows expose validated topology policy control. RN rows expose the
+  `rmStation` and controller-promotion contracts verified in this vendor RPC
+  service; the RPC call itself remains authoritative if firmware rejects one.
 
 The known topology response is:
 
@@ -65,10 +68,10 @@ is a JSON document that the firmware validates, stores at
 }
 ```
 
-Wantastic exposes `ApplyTopology()` only when the device is the CN and either
-the ubus method list contains `setTopo` or the current topology policy file is
-present and passes strict validation. The existing validated document is the
-base for every UI edit; the console does not invent missing policies or links.
+Wantastic exposes `ApplyTopology()` only when the device is the CN and the
+current policy returned by `getTopo` (or the on-device policy file fallback)
+passes strict validation. The existing validated document is the base for
+every UI edit; the console does not invent missing policies or links.
 
 Before calling ubus, the agent limits the payload to 64 KiB and 128 nodes,
 rejects unknown JSON fields, validates all MAC addresses and radio-band enums,

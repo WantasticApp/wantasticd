@@ -56,8 +56,8 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(ctx context.Context, msg *wusp.Message, role string) {
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
-	topologyJSON := strings.TrimSpace(b.readTextFile(b.easyMeshTopologyPath))
-	operations := b.easyMeshSupportedOperations(ctx, role, topologyJSON)
+	topologyJSON := b.readEasyMeshTopologyPolicy(ctx)
+	operations := easyMeshSupportedOperations(role, topologyJSON)
 	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
@@ -108,6 +108,18 @@ func (b *OpenWrtBackend) ApplyEasyMeshTopology(ctx context.Context, raw string) 
 	if err != nil {
 		return err
 	}
+	topologyData, err := b.readOpenWrtRealTopo(ctx)
+	if err != nil {
+		return fmt.Errorf("verify EasyMesh controller role: %w", err)
+	}
+	topology, ok := parseOpenWrtRealTopo(topologyData)
+	if !ok || topology.root == nil {
+		return fmt.Errorf("verify EasyMesh controller role: topology is unavailable")
+	}
+	role, known := b.openWrtDeviceRole(ctx, topology.root)
+	if !known || role != "Controller" {
+		return fmt.Errorf("apply EasyMesh topology: device is not the active controller")
+	}
 	if _, err := b.callUbus(ctx, "device", "setTopo", map[string]any{"data": normalized}); err != nil {
 		return fmt.Errorf("apply EasyMesh topology: %w", err)
 	}
@@ -126,9 +138,6 @@ func (b *OpenWrtBackend) RemoveEasyMeshStation(ctx context.Context, station, use
 	if err != nil {
 		return fmt.Errorf("EasyMesh user: %w", err)
 	}
-	if !b.easyMeshMethodSupported(ctx, "rmStation") {
-		return fmt.Errorf("EasyMesh station removal is not supported by this firmware")
-	}
 	if _, err := b.callUbus(ctx, "device", "rmStation", map[string]any{
 		"station": station,
 		"user":    mac,
@@ -146,9 +155,6 @@ func (b *OpenWrtBackend) SetEasyMeshMode(ctx context.Context, mode string) error
 	normalized := strings.ToLower(strings.TrimSpace(mode))
 	if normalized != "controller" && normalized != "cn" {
 		return fmt.Errorf("SPF 12.2 only supports controller promotion through device.setMode")
-	}
-	if !b.easyMeshMethodSupported(ctx, "setMode") {
-		return fmt.Errorf("EasyMesh mode control is not supported by this firmware")
 	}
 	data, err := b.readOpenWrtRealTopo(ctx)
 	if err != nil {
@@ -196,53 +202,86 @@ func validEasyMeshStationName(value string) bool {
 	return true
 }
 
-func (b *OpenWrtBackend) easyMeshSupportedOperations(ctx context.Context, role, topologyJSON string) []string {
+func easyMeshSupportedOperations(role, topologyJSON string) []string {
 	operations := make([]string, 0, 3)
-	if role == "Controller" && b.easyMeshTopologyControlSupported(ctx, topologyJSON) {
+	if role == "Controller" && topologyJSON != "" {
 		operations = append(operations, "ApplyTopology")
 	}
-	if b.easyMeshMethodSupported(ctx, "rmStation") {
-		operations = append(operations, "RemoveStation")
-	}
-	if role == "Agent" && b.easyMeshMethodSupported(ctx, "setMode") {
+	operations = append(operations, "RemoveStation")
+	if role == "Agent" {
 		operations = append(operations, "SetMode")
 	}
 	return operations
 }
 
-func (b *OpenWrtBackend) easyMeshTopologyControlSupported(ctx context.Context, topologyJSON string) bool {
-	if b == nil || b.commandRunner == nil {
-		return false
+func (b *OpenWrtBackend) readEasyMeshTopologyPolicy(ctx context.Context) string {
+	if b == nil {
+		return ""
 	}
-	if b.easyMeshMethodSupported(ctx, "setTopo") {
-		return true
-	}
-	// This file is owned by the same firmware module that implements setTopo.
-	// It is a conservative fallback for images without the ubus CLI installed.
-	if topologyJSON == "" {
-		return false
-	}
-	_, err := validateEasyMeshTopology(topologyJSON)
-	return err == nil
-}
-
-func (b *OpenWrtBackend) easyMeshMethodSupported(ctx context.Context, method string) bool {
-	if b == nil || b.commandRunner == nil || method == "" {
-		return false
-	}
-	output, err := b.commandRunner(ctx, "ubus", "-S", "-v", "list", "device")
-	if err != nil {
-		return false
-	}
-	for _, field := range strings.FieldsFunc(string(output), func(char rune) bool {
-		return !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
-			char >= '0' && char <= '9' || char == '_')
-	}) {
-		if field == method {
-			return true
+	if data, err := b.callUbus(ctx, "device", "getTopo", nil); err == nil {
+		if normalized, err := extractEasyMeshTopologyPolicy(data); err == nil {
+			return normalized
 		}
 	}
-	return false
+	raw := strings.TrimSpace(b.readTextFile(b.easyMeshTopologyPath))
+	if raw == "" {
+		return ""
+	}
+	normalized, err := validateEasyMeshTopology(raw)
+	if err != nil {
+		return ""
+	}
+	return normalized
+}
+
+func extractEasyMeshTopologyPolicy(data []byte) (string, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return "", fmt.Errorf("empty EasyMesh topology policy")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var payload any
+	if err := decoder.Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode EasyMesh topology policy: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return "", fmt.Errorf("decode EasyMesh topology policy: %w", err)
+	}
+	return extractEasyMeshTopologyValue(payload)
+}
+
+func extractEasyMeshTopologyValue(value any) (string, error) {
+	switch typed := value.(type) {
+	case string:
+		return validateEasyMeshTopology(strings.TrimSpace(typed))
+	case map[string]any:
+		_, hasPolicy := typed["topOptPolicy"]
+		_, hasTimeout := typed["convTimeout"]
+		_, hasDevices := typed["deviceArray"]
+		if hasPolicy && hasTimeout && hasDevices {
+			encoded, err := json.Marshal(typed)
+			if err != nil {
+				return "", fmt.Errorf("encode EasyMesh topology policy: %w", err)
+			}
+			return validateEasyMeshTopology(string(encoded))
+		}
+		for _, key := range []string{"data", "topology", "topo", "response", "result"} {
+			nested, ok := typed[key]
+			if !ok {
+				continue
+			}
+			if normalized, err := extractEasyMeshTopologyValue(nested); err == nil {
+				return normalized, nil
+			}
+		}
+	case []any:
+		for index := len(typed) - 1; index >= 0; index-- {
+			if normalized, err := extractEasyMeshTopologyValue(typed[index]); err == nil {
+				return normalized, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("EasyMesh topology policy is missing from vendor response")
 }
 
 func validateEasyMeshTopology(raw string) (string, error) {

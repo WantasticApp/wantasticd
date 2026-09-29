@@ -171,8 +171,17 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 	var gotParams map[string]any
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
-			gotObject, gotMethod, gotParams = object, method, params
-			return []byte(`{}`), nil
+			switch method {
+			case "getRealTopo":
+				return []byte(`{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","name":"Controller"}]}`), nil
+			case "getMode":
+				return []byte(`{"mode":"CN"}`), nil
+			case "setTopo":
+				gotObject, gotMethod, gotParams = object, method, params
+				return []byte(`{}`), nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
 		},
 	})
 	raw := `{
@@ -220,16 +229,41 @@ func TestApplyEasyMeshTopologyRejectsUnsafeOrInconsistentPlans(t *testing.T) {
 	}
 }
 
+func TestApplyEasyMeshTopologyRejectsAgentRole(t *testing.T) {
+	setTopoCalled := false
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusParamCaller: func(_ context.Context, object, method string, _ map[string]any) ([]byte, error) {
+			if object != "device" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			switch method {
+			case "getRealTopo":
+				return []byte(`{"topo":[{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"Relay"}]}`), nil
+			case "getMode":
+				return []byte(`{"mode":"RE"}`), nil
+			case "setTopo":
+				setTopoCalled = true
+				return []byte(`{}`), nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+	})
+	raw := `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Relay"}]}`
+
+	err := backend.ApplyEasyMeshTopology(context.Background(), raw)
+	if err == nil || !strings.Contains(err.Error(), "not the active controller") {
+		t.Fatalf("expected agent role rejection, got %v", err)
+	}
+	if setTopoCalled {
+		t.Fatal("agent role reached device.setTopo")
+	}
+}
+
 func TestRemoveEasyMeshStationValidatesAndUsesVendorPolicy(t *testing.T) {
 	var gotMethod string
 	var gotParams map[string]any
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name != "ubus" || !slices.Equal(args, []string{"-S", "-v", "list", "device"}) {
-				t.Fatalf("command=%s %v", name, args)
-			}
-			return []byte("device\n\trmStation: { station:String, user:String }"), nil
-		},
 		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
 			if object != "device" {
 				t.Fatalf("object=%q", object)
@@ -257,9 +291,6 @@ func TestSetEasyMeshModeRejectsSecondController(t *testing.T) {
 	called := false
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		HostnamePath: hostnamePath,
-		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
-			return []byte("device\n\tsetMode: { mode:Int32 }"), nil
-		},
 		UbusParamCaller: func(_ context.Context, object, method string, _ map[string]any) ([]byte, error) {
 			if object == "device" && method == "getRealTopo" {
 				return []byte(`{"topo":[
@@ -289,9 +320,6 @@ func TestSetEasyMeshModePromotesOrphanAgent(t *testing.T) {
 	var gotParams map[string]any
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		HostnamePath: hostnamePath,
-		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
-			return []byte("device\n\tsetMode: { mode:Int32 }"), nil
-		},
 		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
 			if object != "device" {
 				t.Fatalf("object=%q", object)
@@ -807,9 +835,6 @@ func TestOpenWrtBackendCollectFlatVendorRealTopoPreservesParentAndHops(t *testin
 
 func TestOpenWrtBackendExposesEasyMeshAgentCapabilitiesForAgentMode(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
-			return []byte("device\n\trmStation: { station:String, user:String }\n\tsetMode: { mode:Int32 }"), nil
-		},
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object != "device" {
 				return nil, wusp.ErrUSPPathUnsupported
@@ -831,6 +856,59 @@ func TestOpenWrtBackendExposesEasyMeshAgentCapabilitiesForAgentMode(t *testing.T
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 1)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Agent")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation,SetMode")
+}
+
+func TestOpenWrtBackendUsesVendorGetTopoPolicyForControllerControl(t *testing.T) {
+	policy := `{
+		"topOptPolicy":"manual",
+		"convTimeout":120,
+		"deviceArray":[
+			{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},
+			{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-72,"apName":"Relay"}
+		]
+	}`
+	var policyValue any
+	if err := json.Unmarshal([]byte(policy), &policyValue); err != nil {
+		t.Fatalf("decode policy fixture: %v", err)
+	}
+	response, err := json.Marshal(map[string]any{"data": policyValue})
+	if err != nil {
+		t.Fatalf("encode getTopo fixture: %v", err)
+	}
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object != "device" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			switch method {
+			case "getMode":
+				return []byte(`{"mode":"CN"}`), nil
+			case "getRealTopo":
+				return []byte(`{"topo":[
+					{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":"Controller"},
+					{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","backhaul":"H","name":"Relay"}
+				]}`), nil
+			case "getTopo":
+				return response, nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+		Now: time.Now,
+	})
+
+	msg := wusp.NewMessage()
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-72,"apName":"Relay"}]}`)
+}
+
+func TestExtractEasyMeshTopologyPolicyRejectsTrailingJSON(t *testing.T) {
+	_, err := extractEasyMeshTopologyPolicy([]byte(`{"data":{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[]}} {}`))
+	if err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
+		t.Fatalf("expected trailing JSON rejection, got %v", err)
+	}
 }
 
 func TestOpenWrtBackendUsesLocalRootAsCentralFallback(t *testing.T) {

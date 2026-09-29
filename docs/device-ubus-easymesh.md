@@ -8,9 +8,9 @@ link to Qualcomm libraries, write daemon FIFOs, or reload the EasyMesh service.
 
 - `device.getMode` identifies whether the local device is the CN central node.
 - `device.getRealTopo` returns the controller topology.
-- The EasyMesh-specific WUSP row is emitted only when the local mode is CN.
-- Agent and relay devices may still report generic mesh telemetry, but they do
-  not expose the EasyMesh console tab.
+- The EasyMesh-specific WUSP row is emitted for confirmed CN and RN roles.
+- CN rows expose validated topology policy control. RN rows expose only the
+  capabilities proven by the local `device` ubus method list.
 
 The known topology response is:
 
@@ -76,8 +76,19 @@ requires exactly one root, and rejects missing parents, inconsistent depths,
 self-parenting, cycles, control characters, and out-of-range timeout/RSSI
 values. The ubus call uses a structured parameter map rather than shell text.
 
-`device.setMode` and `device.rmStation` remain unavailable in the topology UI.
-The former changes the device's controller role and boot environment; the
-latter disassociates a client station. Neither operation is topology
-reparenting, so exposing them under the mesh diagram would be unsafe and
-misleading.
+## Verified RN control contracts
+
+The same SPF 12.2 `/usr/lib/rpcd/uai.so` binary defines these policies:
+
+- `device.rmStation` accepts string parameters `station` and `user`. The first
+  selects the hostapd station/interface and the second is the client MAC. The
+  agent validates both before making the structured ubus call.
+- `device.setMode` accepts one integer parameter named `mode`. This firmware
+  accepts only `1`, which promotes the device to root/controller and changes
+  its boot environment. It does not expose a symmetric demotion or handover.
+
+The console therefore blocks controller promotion while another controller is
+visible. This single-controller invariant is also enforced by the agent, so a
+forged browser request cannot create two CNs. SPF 12.2 exposes no
+`device.addStation` method; new clients join using valid mesh Wi-Fi credentials
+and the console must not simulate an unsupported RPC.

@@ -23,6 +23,9 @@ type fakeUSPTransport struct {
 
 type easyMeshOperateBackend struct {
 	topology string
+	station  string
+	user     string
+	mode     string
 }
 
 func (b *easyMeshOperateBackend) Collect(context.Context, ...string) (*wusp.Message, error) {
@@ -39,6 +42,17 @@ func (b *easyMeshOperateBackend) Delete(context.Context, ...string) error {
 
 func (b *easyMeshOperateBackend) ApplyEasyMeshTopology(_ context.Context, topology string) error {
 	b.topology = topology
+	return nil
+}
+
+func (b *easyMeshOperateBackend) RemoveEasyMeshStation(_ context.Context, station, user string) error {
+	b.station = station
+	b.user = user
+	return nil
+}
+
+func (b *easyMeshOperateBackend) SetEasyMeshMode(_ context.Context, mode string) error {
+	b.mode = mode
 	return nil
 }
 
@@ -167,6 +181,53 @@ func TestUSPRuntimeAppliesEasyMeshTopologyThroughCapableBackend(t *testing.T) {
 	status, ok := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus")
 	if !ok || status.AsString() != "Success" {
 		t.Fatalf("operation status=%v, present=%v", status, ok)
+	}
+}
+
+func TestUSPRuntimeRoutesEasyMeshStationRemoval(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	backend := &easyMeshOperateBackend{}
+	runtime.rawBackend = backend
+	input := wusp.NewMessage()
+	input.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.Station", wusp.String("ath01"))
+	input.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.User", wusp.String("02:11:22:33:44:55"))
+
+	output, err := runtime.handleOperate(
+		context.Background(),
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.RemoveStation()",
+		input,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("handleOperate: %v", err)
+	}
+	if backend.station != "ath01" || backend.user != "02:11:22:33:44:55" {
+		t.Fatalf("station removal=(%q,%q)", backend.station, backend.user)
+	}
+	status, _ := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus")
+	if status.AsString() != "Success" {
+		t.Fatalf("operation status=%q", status.AsString())
+	}
+}
+
+func TestUSPRuntimeRoutesEasyMeshModeChange(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	backend := &easyMeshOperateBackend{}
+	runtime.rawBackend = backend
+	input := wusp.NewMessage()
+	input.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.Mode", wusp.String("Controller"))
+
+	_, err := runtime.handleOperate(
+		context.Background(),
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.SetMode()",
+		input,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("handleOperate: %v", err)
+	}
+	if backend.mode != "Controller" {
+		t.Fatalf("mode=%q", backend.mode)
 	}
 }
 

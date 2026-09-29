@@ -197,8 +197,10 @@ func (a *Agent) runUpdateChecker(ctx context.Context) {
 	initial := time.NewTimer(1 * time.Minute)
 	defer initial.Stop()
 
-	// Daily check
-	ticker := time.NewTicker(24 * time.Hour)
+	// Keep the fleet current without requiring a service restart. Release
+	// artifacts are immutable, so an hourly version-marker request is cheap and
+	// avoids leaving long-running routers one day behind a control-plane fix.
+	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 
 	check := func() {

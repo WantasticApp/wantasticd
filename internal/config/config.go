@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -397,6 +398,13 @@ func registerAndDecryptConfig(ctx context.Context, portalURL, accessToken string
 func (c *Config) Validate() error {
 	if c.PrivateKey == "" {
 		return fmt.Errorf("private key required")
+	}
+	if strings.TrimSpace(c.Server.PublicKey) == "" {
+		return fmt.Errorf("server public key required")
+	}
+	serverPublicKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(c.Server.PublicKey))
+	if err != nil || len(serverPublicKey) != 32 {
+		return fmt.Errorf("server public key must be a base64-encoded 32-byte WireGuard key")
 	}
 	if c.Server.Endpoint == "" {
 		return fmt.Errorf("server endpoint required")

@@ -216,6 +216,9 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	if err != nil {
 		return nil, err
 	}
+	if controllerPublicKeyHex == "" {
+		return nil, fmt.Errorf("controller public key is required for WUSP")
+	}
 
 	wuspSerial := cfg.DeviceID
 	if serial, serialErr := auth.PersistentSerialNumber(); serialErr == nil && strings.TrimSpace(serial) != "" {
@@ -224,11 +227,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		log.Printf("[USP] persistent serial unavailable, using config device ID: %v", serialErr)
 	}
 
-	if controllerPublicKeyHex == "" {
-		log.Printf("[USP] WARNING: Server.PublicKey not configured — WUSP accepts any WireGuard peer (open mode)")
-	} else {
-		log.Printf("[USP] Runtime initializing: deviceID=%q serial=%q controllerKey=%q", cfg.DeviceID, wuspSerial, controllerPublicKeyHex)
-	}
+	log.Printf("[USP] Runtime initializing: deviceID=%q serial=%q controllerKey=%q", cfg.DeviceID, wuspSerial, controllerPublicKeyHex)
 
 	backend := platforms.NewBackend(platforms.Options{})
 	networkSpeed := newNetworkSpeedManager(auth.PersistentFilePath("network-speed.json"))
@@ -580,10 +579,7 @@ func (r *uspRuntime) dispatchResponse(resp wusp.USPAgentResponse) bool {
 
 func (r *uspRuntime) isControllerPeer(peerPublicKeyHex string) bool {
 	if r.controllerPublicKeyHex == "" {
-		// No controller key configured — accept requests from any WireGuard peer.
-		// WireGuard already authenticates peers at the cryptographic layer, so any
-		// packet that reaches this point came from a peer listed in our config.
-		return true
+		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(peerPublicKeyHex), r.controllerPublicKeyHex)
 }

@@ -97,7 +97,18 @@ main() {
   echo "Target version: $VERSION"
   echo "Platform:       $OS-$ARCH"
 
-  DOWNLOAD_URL="${BASE_URL}/latest/wantasticd-${OS}-${ARCH}.tar.gz"
+  # The version endpoint includes build metadata (for example
+  # v1.0.5+abcdef0), while immutable release objects use the tag directory.
+  # Never download binaries through /latest: that path can remain cached at
+  # an edge after the small version marker has already changed.
+  RELEASE_TAG="${VERSION%%+*}"
+  case "$RELEASE_TAG" in
+    ""|*[!A-Za-z0-9._-]*)
+      echo "Error: invalid release version: $VERSION"
+      exit 1
+      ;;
+  esac
+  DOWNLOAD_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz"
   echo "Downloading $DOWNLOAD_URL…"
 
   TMP_DIR=$(mktemp -d)

@@ -48,7 +48,7 @@ var WUSPMeshTelemetryObjects = []Object{
 		Path:          WUSPMeshTelemetryPrefix + "EasyMesh.{i}.",
 		MultiInstance: true,
 		SinceVersion:  "1.0",
-		Description:   "Read-only marker for a vendor EasyMesh central controller and its topology source.",
+		Description:   "Vendor EasyMesh central controller telemetry and capability-gated topology control.",
 	},
 	{
 		Path:          WUSPMeshTelemetryPrefix + "IEEE80211s.{i}.Peer.{i}.",
@@ -183,7 +183,14 @@ var WUSPMeshTelemetryEasyMeshParams = []Param{
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.ProtocolReference", Type: TypePathRef, Access: ReadOnly, SinceVersion: "1.0", Description: "Reference to the EasyMesh protocol row."},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Implementation", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Vendor abstraction that supplied the EasyMesh topology.", Limits: Limits{Enums: []string{"device.ubus"}}},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Role", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "EasyMesh role confirmed for this local device.", Limits: Limits{Enums: []string{"Controller"}}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Writable", Type: TypeBoolean, Access: ReadOnly, SinceVersion: "1.0", Description: "Whether the agent verified the vendor topology control contract on this controller."},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.SupportedOperations", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Comma-separated EasyMesh operations supported by this controller.", Limits: Limits{MaxLength: 128}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.TopologyJSON", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Validated current vendor topology policy used as the base for controlled edits.", Limits: Limits{MaxLength: maxEasyMeshTopologyJSONLength}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LastOperationStatus", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Result of the latest EasyMesh control operation.", Limits: Limits{Enums: []string{"Success", "Error"}}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LastOperationMessage", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Short result detail from the latest EasyMesh control operation.", Limits: Limits{MaxLength: 256}},
 }
+
+const maxEasyMeshTopologyJSONLength = 64 << 10
 
 var WUSPMeshTelemetryNodeParams = []Param{
 	{

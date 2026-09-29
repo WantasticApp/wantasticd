@@ -166,6 +166,60 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	}
 }
 
+func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T) {
+	var gotObject, gotMethod string
+	var gotParams map[string]any
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
+			gotObject, gotMethod, gotParams = object, method, params
+			return []byte(`{}`), nil
+		},
+	})
+	raw := `{
+		"topOptPolicy":"manual",
+		"convTimeout":120,
+		"deviceArray":[
+			{"alId":"00:03:7f:ba:db:ad","parentAlId":"NULL","bStaLinkBand":"6ghl","depth":0,"rssiThresh":-70,"apName":"Controller"},
+			{"alId":"e0:5d:54:4b:e6:cf","parentAlId":"00:03:7f:ba:db:ad","bStaLinkBand":"6gh","depth":1,"rssiThresh":-72,"apName":"Relay"}
+		]
+	}`
+
+	if err := backend.ApplyEasyMeshTopology(context.Background(), raw); err != nil {
+		t.Fatalf("ApplyEasyMeshTopology: %v", err)
+	}
+	if gotObject != "device" || gotMethod != "setTopo" {
+		t.Fatalf("ubus target=%s.%s, want device.setTopo", gotObject, gotMethod)
+	}
+	payload, ok := gotParams["data"].(string)
+	if !ok || !strings.Contains(payload, `"alId":"00:03:7F:BA:DB:AD"`) || !strings.Contains(payload, `"bStaLinkBand":"6GH"`) {
+		t.Fatalf("normalized data param=%#v", gotParams["data"])
+	}
+}
+
+func TestApplyEasyMeshTopologyRejectsUnsafeOrInconsistentPlans(t *testing.T) {
+	validRoot := `{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"}`
+	tests := map[string]string{
+		"unknown field":     `{"topOptPolicy":"manual","convTimeout":120,"extra":true,"deviceArray":[` + validRoot + `]}`,
+		"missing root":      `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`,
+		"unknown parent":    `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[` + validRoot + `,{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"E0:5D:54:4B:E6:AA","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`,
+		"invalid band":      `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"auto","depth":0,"rssiThresh":-70,"apName":"Controller"}]}`,
+		"control character": `{"topOptPolicy":"manual","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"bad\u000a name"}]}`,
+	}
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusParamCaller: func(context.Context, string, string, map[string]any) ([]byte, error) {
+			t.Fatal("invalid topology reached ubus")
+			return nil, nil
+		},
+	})
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := backend.ApplyEasyMeshTopology(context.Background(), raw); err == nil {
+				t.Fatal("ApplyEasyMeshTopology succeeded for invalid input")
+			}
+		})
+	}
+}
+
 func TestOpenWrtBackendCollectRadioCapabilities(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "etc", "config")

@@ -20,6 +20,27 @@ type fakeUSPTransport struct {
 	sendCh chan []byte
 }
 
+type easyMeshOperateBackend struct {
+	topology string
+}
+
+func (b *easyMeshOperateBackend) Collect(context.Context, ...string) (*wusp.Message, error) {
+	return wusp.NewMessage(), nil
+}
+
+func (b *easyMeshOperateBackend) Set(context.Context, string, wusp.Value) error {
+	return wusp.ErrUSPPathUnsupported
+}
+
+func (b *easyMeshOperateBackend) Delete(context.Context, ...string) error {
+	return wusp.ErrUSPPathUnsupported
+}
+
+func (b *easyMeshOperateBackend) ApplyEasyMeshTopology(_ context.Context, topology string) error {
+	b.topology = topology
+	return nil
+}
+
 func (t *fakeUSPTransport) SendWUSPToServer(data []byte) error {
 	if t.sendCh == nil {
 		return errors.New("send channel not configured")
@@ -120,6 +141,31 @@ func TestUSPRuntimeCellularOperateRequiresCommandPath(t *testing.T) {
 	)
 	if !errors.Is(err, wusp.ErrUSPPathUnsupported) {
 		t.Fatalf("cellular operate error=%v, want unsupported path", err)
+	}
+}
+
+func TestUSPRuntimeAppliesEasyMeshTopologyThroughCapableBackend(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	backend := &easyMeshOperateBackend{}
+	runtime.rawBackend = backend
+	input := wusp.NewMessage()
+	input.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", wusp.String(`{"topOptPolicy":"manual"}`))
+
+	output, err := runtime.handleOperate(
+		context.Background(),
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()",
+		input,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("handleOperate: %v", err)
+	}
+	if backend.topology != `{"topOptPolicy":"manual"}` {
+		t.Fatalf("backend topology=%q", backend.topology)
+	}
+	status, ok := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus")
+	if !ok || status.AsString() != "Success" {
+		t.Fatalf("operation status=%v, present=%v", status, ok)
 	}
 }
 

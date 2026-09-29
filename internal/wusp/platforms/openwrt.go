@@ -44,7 +44,9 @@ type OpenWrtBackendOptions struct {
 	UbusSessionID         string
 	UbusTimeout           time.Duration
 	UbusCaller            func(string, string, time.Duration) ([]byte, error)
+	UbusParamCaller       func(context.Context, string, string, map[string]any) ([]byte, error)
 	UbusClient            *ubus.Client
+	EasyMeshTopologyPath  string
 	CommandRunner         func(context.Context, string, ...string) ([]byte, error)
 	WiFiAssocList         func(string) ([]iwinfo.AssocEntry, error)
 	WiFiInfo              func(string) (*iwinfo.InterfaceInfo, error)
@@ -74,7 +76,9 @@ type OpenWrtBackend struct {
 	ubusClient            *ubus.Client
 	ubusTimeout           time.Duration
 	ubusCaller            func(string, string, time.Duration) ([]byte, error)
+	ubusParamCaller       func(context.Context, string, string, map[string]any) ([]byte, error)
 	ubusCallerInjected    bool
+	easyMeshTopologyPath  string
 	commandRunner         func(context.Context, string, ...string) ([]byte, error)
 	wifiAssocList         func(string) ([]iwinfo.AssocEntry, error)
 	wifiInfo              func(string) (*iwinfo.InterfaceInfo, error)
@@ -107,6 +111,9 @@ func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
 func (b *OpenWrtBackend) callUbus(ctx context.Context, object, method string, params map[string]any) ([]byte, error) {
 	if b == nil {
 		return nil, fmt.Errorf("nil OpenWrt backend")
+	}
+	if b.ubusParamCaller != nil {
+		return b.ubusParamCaller(ctx, object, method, params)
 	}
 	if b.ubusCaller != nil && (len(params) == 0 || b.ubusCallerInjected) {
 		return b.ubusCaller(object, method, b.ubusTimeout)
@@ -278,7 +285,9 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		ubusClient:            opts.UbusClient,
 		ubusTimeout:           opts.UbusTimeout,
 		ubusCaller:            opts.UbusCaller,
+		ubusParamCaller:       opts.UbusParamCaller,
 		ubusCallerInjected:    opts.UbusCaller != nil,
+		easyMeshTopologyPath:  coalesceString(opts.EasyMeshTopologyPath, "/etc/topo-ezmesh.json"),
 		commandRunner:         opts.CommandRunner,
 		wifiAssocList:         opts.WiFiAssocList,
 		wifiInfo:              opts.WiFiInfo,

@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"wantastic-agent/internal/linkdiscovery"
 	"wantastic-agent/internal/wusp"
@@ -46,23 +48,218 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 	if topo.protocol == "EasyMesh" {
 		msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(0))
 		if b.openWrtDeviceIsCentralNode(ctx, topo.root) {
-			appendOpenWrtEasyMeshController(msg)
+			b.appendOpenWrtEasyMeshController(ctx, msg)
 		}
 	}
 }
 
-func appendOpenWrtEasyMeshController(msg *wusp.Message) {
+func (b *OpenWrtBackend) appendOpenWrtEasyMeshController(ctx context.Context, msg *wusp.Message) {
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
+	topologyJSON := strings.TrimSpace(b.readTextFile(b.easyMeshTopologyPath))
+	writable := b.easyMeshControlSupported(ctx, topologyJSON)
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
 	msg.Set(protocolPath+"PrimaryObject", wusp.String(easyMeshPath))
-	msg.Set(protocolPath+"Writable", wusp.Bool(false))
+	msg.Set(protocolPath+"Writable", wusp.Bool(writable))
 	msg.Set(easyMeshPath+"Alias", wusp.String("central-controller"))
 	msg.Set(easyMeshPath+"Status", wusp.String("Running"))
 	msg.Set(easyMeshPath+"ProtocolReference", wusp.String(protocolPath))
 	msg.Set(easyMeshPath+"Implementation", wusp.String("device.ubus"))
 	msg.Set(easyMeshPath+"Role", wusp.String("Controller"))
+	msg.Set(easyMeshPath+"Writable", wusp.Bool(writable))
+	if writable {
+		msg.Set(easyMeshPath+"SupportedOperations", wusp.String("ApplyTopology"))
+	}
+	if topologyJSON != "" && len(topologyJSON) <= maxEasyMeshTopologyBytes {
+		if normalized, err := validateEasyMeshTopology(topologyJSON); err == nil {
+			msg.Set(easyMeshPath+"TopologyJSON", wusp.String(normalized))
+		}
+	}
+}
+
+const (
+	maxEasyMeshTopologyBytes = 64 << 10
+	maxEasyMeshNodes         = 128
+)
+
+type easyMeshTopology struct {
+	TopOptPolicy string                 `json:"topOptPolicy"`
+	ConvTimeout  int                    `json:"convTimeout"`
+	DeviceArray  []easyMeshTopologyNode `json:"deviceArray"`
+}
+
+type easyMeshTopologyNode struct {
+	ALID          string `json:"alId"`
+	ParentALID    string `json:"parentAlId"`
+	BStaLinkBand  string `json:"bStaLinkBand"`
+	Depth         int    `json:"depth"`
+	RSSIThreshold int    `json:"rssiThresh"`
+	APName        string `json:"apName"`
+}
+
+// ApplyEasyMeshTopology validates the complete vendor topology document before
+// crossing the privileged ubus boundary. The firmware persists this document
+// and immediately reconfigures the mesh, so partial or guessed input must fail
+// closed.
+func (b *OpenWrtBackend) ApplyEasyMeshTopology(ctx context.Context, raw string) error {
+	normalized, err := validateEasyMeshTopology(raw)
+	if err != nil {
+		return err
+	}
+	if _, err := b.callUbus(ctx, "device", "setTopo", map[string]any{"data": normalized}); err != nil {
+		return fmt.Errorf("apply EasyMesh topology: %w", err)
+	}
+	return nil
+}
+
+func (b *OpenWrtBackend) easyMeshControlSupported(ctx context.Context, topologyJSON string) bool {
+	if b == nil || b.commandRunner == nil {
+		return false
+	}
+	output, err := b.commandRunner(ctx, "ubus", "-S", "list", "device")
+	if err == nil && strings.Contains(string(output), "setTopo") {
+		return true
+	}
+	// This file is owned by the same firmware module that implements setTopo.
+	// It is a conservative fallback for images without the ubus CLI installed.
+	if topologyJSON == "" {
+		return false
+	}
+	_, err = validateEasyMeshTopology(topologyJSON)
+	return err == nil
+}
+
+func validateEasyMeshTopology(raw string) (string, error) {
+	if len(raw) == 0 || len(raw) > maxEasyMeshTopologyBytes {
+		return "", fmt.Errorf("EasyMesh topology must be between 1 and %d bytes", maxEasyMeshTopologyBytes)
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var topology easyMeshTopology
+	if err := decoder.Decode(&topology); err != nil {
+		return "", fmt.Errorf("decode EasyMesh topology: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return "", err
+	}
+	if err := validateEasyMeshText("topOptPolicy", topology.TopOptPolicy, 64, false); err != nil {
+		return "", err
+	}
+	if topology.ConvTimeout < 1 || topology.ConvTimeout > 3600 {
+		return "", fmt.Errorf("convTimeout must be between 1 and 3600 seconds")
+	}
+	if len(topology.DeviceArray) == 0 || len(topology.DeviceArray) > maxEasyMeshNodes {
+		return "", fmt.Errorf("deviceArray must contain between 1 and %d nodes", maxEasyMeshNodes)
+	}
+
+	byMAC := make(map[string]*easyMeshTopologyNode, len(topology.DeviceArray))
+	rootCount := 0
+	for i := range topology.DeviceArray {
+		node := &topology.DeviceArray[i]
+		mac, err := normalizeEasyMeshMAC(node.ALID)
+		if err != nil {
+			return "", fmt.Errorf("deviceArray[%d].alId: %w", i, err)
+		}
+		if _, exists := byMAC[mac]; exists {
+			return "", fmt.Errorf("deviceArray[%d].alId duplicates %s", i, mac)
+		}
+		node.ALID = mac
+		if strings.EqualFold(strings.TrimSpace(node.ParentALID), "NULL") {
+			node.ParentALID = "NULL"
+			rootCount++
+		} else {
+			parent, err := normalizeEasyMeshMAC(node.ParentALID)
+			if err != nil {
+				return "", fmt.Errorf("deviceArray[%d].parentAlId: %w", i, err)
+			}
+			if parent == mac {
+				return "", fmt.Errorf("deviceArray[%d] cannot parent itself", i)
+			}
+			node.ParentALID = parent
+		}
+		node.BStaLinkBand = strings.ToUpper(strings.TrimSpace(node.BStaLinkBand))
+		switch node.BStaLinkBand {
+		case "6GL", "6GH", "6GHL":
+		default:
+			return "", fmt.Errorf("deviceArray[%d].bStaLinkBand must be 6GL, 6GH, or 6GHL", i)
+		}
+		if node.Depth < 0 || node.Depth >= maxEasyMeshNodes {
+			return "", fmt.Errorf("deviceArray[%d].depth is out of range", i)
+		}
+		if node.RSSIThreshold < -120 || node.RSSIThreshold > 0 {
+			return "", fmt.Errorf("deviceArray[%d].rssiThresh must be between -120 and 0", i)
+		}
+		if err := validateEasyMeshText(fmt.Sprintf("deviceArray[%d].apName", i), node.APName, 64, true); err != nil {
+			return "", err
+		}
+		byMAC[mac] = node
+	}
+	if rootCount != 1 {
+		return "", fmt.Errorf("deviceArray must contain exactly one root node")
+	}
+	for _, node := range topology.DeviceArray {
+		if node.ParentALID == "NULL" {
+			if node.Depth != 0 {
+				return "", fmt.Errorf("root node %s must have depth 0", node.ALID)
+			}
+			continue
+		}
+		parent := byMAC[node.ParentALID]
+		if parent == nil {
+			return "", fmt.Errorf("node %s references unknown parent %s", node.ALID, node.ParentALID)
+		}
+		if node.Depth != parent.Depth+1 {
+			return "", fmt.Errorf("node %s depth must be its parent depth plus one", node.ALID)
+		}
+		seen := map[string]bool{node.ALID: true}
+		for cursor := parent; cursor != nil && cursor.ParentALID != "NULL"; cursor = byMAC[cursor.ParentALID] {
+			if seen[cursor.ALID] {
+				return "", fmt.Errorf("topology contains a parent cycle at %s", cursor.ALID)
+			}
+			seen[cursor.ALID] = true
+		}
+	}
+	encoded, err := json.Marshal(topology)
+	if err != nil {
+		return "", fmt.Errorf("encode EasyMesh topology: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("EasyMesh topology contains multiple JSON values")
+		}
+		return fmt.Errorf("decode EasyMesh topology: %w", err)
+	}
+	return nil
+}
+
+func normalizeEasyMeshMAC(value string) (string, error) {
+	mac, err := net.ParseMAC(strings.TrimSpace(value))
+	if err != nil || len(mac) != 6 {
+		return "", fmt.Errorf("must be a 48-bit MAC address")
+	}
+	return strings.ToUpper(mac.String()), nil
+}
+
+func validateEasyMeshText(field, value string, max int, allowEmpty bool) error {
+	value = strings.TrimSpace(value)
+	if !allowEmpty && value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > max {
+		return fmt.Errorf("%s must be valid UTF-8 with at most %d characters", field, max)
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s contains control characters", field)
+		}
+	}
+	return nil
 }
 
 func (b *OpenWrtBackend) openWrtDeviceIsCentralNode(ctx context.Context, root *meshNode) bool {

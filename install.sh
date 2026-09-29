@@ -168,7 +168,14 @@ echo "Version: $VERSION"
 
 TMP_DIR=$(mktemp -d 2>/dev/null || { mkdir -p /tmp/wantastic_install; printf '/tmp/wantastic_install'; })
 
-ARCHIVE_URL="${BASE_URL}/latest/wantasticd-${OS}-${ARCH}.tar.gz"
+RELEASE_TAG="${VERSION%%+*}"
+case "$RELEASE_TAG" in
+  ""|*[!A-Za-z0-9._-]*)
+    echo "Error: invalid release version: $VERSION"
+    exit 1
+    ;;
+esac
+ARCHIVE_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz"
 echo "Downloading $ARCHIVE_URL…"
 http_get "$ARCHIVE_URL" "$TMP_DIR/pkg.tar.gz"
 tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"

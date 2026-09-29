@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"wantastic-agent/internal/linkdiscovery"
@@ -24,6 +25,12 @@ type openWrtRealTopo struct {
 type openWrtMeshLinkHint struct {
 	source string
 	target string
+}
+
+type easyMeshOperationState struct {
+	status       string
+	message      string
+	topologyJSON string
 }
 
 func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wusp.Message) {
@@ -77,7 +84,7 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(ctx context.Context, msg *w
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	topologyJSON := b.readEasyMeshTopologyPolicy(ctx)
-	operations := easyMeshSupportedOperations(role)
+	operations := easyMeshSupportedOperations(role, topologyJSON != "")
 	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
@@ -96,6 +103,11 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(ctx context.Context, msg *w
 		if normalized, err := validateEasyMeshTopology(topologyJSON); err == nil {
 			msg.Set(easyMeshPath+"TopologyJSON", wusp.String(normalized))
 		}
+	}
+	status, message := b.easyMeshOperationResult()
+	if status != "" {
+		msg.Set(easyMeshPath+"LastOperationStatus", wusp.String(status))
+		msg.Set(easyMeshPath+"LastOperationMessage", wusp.String(message))
 	}
 }
 
@@ -119,31 +131,155 @@ type easyMeshTopologyNode struct {
 	APName        string `json:"apName"`
 }
 
-// ApplyEasyMeshTopology validates the complete vendor topology document before
-// crossing the privileged ubus boundary. The firmware persists this document
-// and immediately reconfigures the mesh, so partial or guessed input must fail
-// closed.
-func (b *OpenWrtBackend) ApplyEasyMeshTopology(ctx context.Context, raw string) error {
-	normalized, err := validateEasyMeshTopology(raw)
+// StartApplyEasyMeshTopology validates the complete vendor topology document
+// before acknowledging the operation. device.setTopo blocks while the mesh
+// converges, so the actual vendor call runs in the background and its result is
+// published through LastOperationStatus. This prevents the controller's normal
+// request deadline from turning a still-running topology change into a false
+// rejection.
+func (b *OpenWrtBackend) StartApplyEasyMeshTopology(ctx context.Context, raw string) error {
+	normalized, topology, err := b.prepareEasyMeshTopology(ctx, raw)
 	if err != nil {
 		return err
 	}
+
+	b.easyMeshOperationMu.Lock()
+	if b.easyMeshOperation.status == "Pending" {
+		b.easyMeshOperationMu.Unlock()
+		return fmt.Errorf("an EasyMesh topology operation is already converging")
+	}
+	b.easyMeshOperation = easyMeshOperationState{
+		status:       "Pending",
+		message:      "Topology accepted; waiting for the saved policy and live mesh to converge",
+		topologyJSON: normalized,
+	}
+	b.easyMeshOperationMu.Unlock()
+
+	go b.runEasyMeshTopologyOperation(normalized, topology)
+	return nil
+}
+
+// ApplyEasyMeshTopology is the blocking form used by direct callers and tests.
+// The USP runtime uses StartApplyEasyMeshTopology so it can acknowledge the
+// accepted plan without waiting for the vendor convergence command.
+func (b *OpenWrtBackend) ApplyEasyMeshTopology(ctx context.Context, raw string) error {
+	normalized, topology, err := b.prepareEasyMeshTopology(ctx, raw)
+	if err != nil {
+		return err
+	}
+	return b.applyAndVerifyEasyMeshTopology(ctx, normalized, topology)
+}
+
+func (b *OpenWrtBackend) prepareEasyMeshTopology(ctx context.Context, raw string) (string, easyMeshTopology, error) {
+	normalized, err := validateEasyMeshTopology(raw)
+	if err != nil {
+		return "", easyMeshTopology{}, err
+	}
+	var requested easyMeshTopology
+	if err := json.Unmarshal([]byte(normalized), &requested); err != nil {
+		return "", easyMeshTopology{}, fmt.Errorf("decode normalized EasyMesh topology: %w", err)
+	}
+	if b.readEasyMeshTopologyPolicy(ctx) == "" {
+		return "", easyMeshTopology{}, fmt.Errorf("apply EasyMesh topology: the controller did not provide a validated saved topology policy")
+	}
 	topologyData, err := b.readOpenWrtRealTopo(ctx)
 	if err != nil {
-		return fmt.Errorf("verify EasyMesh controller role: %w", err)
+		return "", easyMeshTopology{}, fmt.Errorf("verify EasyMesh controller role: %w", err)
 	}
-	topology, ok := parseOpenWrtRealTopo(topologyData)
-	if !ok || topology.root == nil {
-		return fmt.Errorf("verify EasyMesh controller role: topology is unavailable")
+	liveTopology, ok := parseOpenWrtRealTopo(topologyData)
+	if !ok || liveTopology.root == nil {
+		return "", easyMeshTopology{}, fmt.Errorf("verify EasyMesh controller role: topology is unavailable")
 	}
-	role, known := b.openWrtDeviceRole(ctx, topology.root)
+	role, known := b.openWrtDeviceRole(ctx, liveTopology.root)
 	if !known || role != "Controller" {
-		return fmt.Errorf("apply EasyMesh topology: device is not the active controller")
+		return "", easyMeshTopology{}, fmt.Errorf("apply EasyMesh topology: device is not the active controller")
 	}
-	if _, err := b.callUbus(ctx, "device", "setTopo", map[string]any{"data": normalized}); err != nil {
-		return fmt.Errorf("apply EasyMesh topology: %w", err)
+	if err := validateEasyMeshTopologyInventory(requested, liveTopology.root); err != nil {
+		return "", easyMeshTopology{}, err
 	}
-	return nil
+	return normalized, requested, nil
+}
+
+func (b *OpenWrtBackend) runEasyMeshTopologyOperation(normalized string, topology easyMeshTopology) {
+	err := b.applyAndVerifyEasyMeshTopology(context.Background(), normalized, topology)
+	if err != nil {
+		b.setEasyMeshOperationResult("Error", err.Error(), normalized)
+		return
+	}
+	b.setEasyMeshOperationResult("Success", "Topology persisted and the live mesh converged", normalized)
+}
+
+func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, normalized string, topology easyMeshTopology) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	convergenceTimeout := time.Duration(topology.ConvTimeout) * time.Second
+	commandTimeout := convergenceTimeout + 15*time.Second
+	overallDeadline := time.Now().Add(convergenceTimeout + 45*time.Second)
+	_, commandErr := b.callUbusWithTimeout(ctx, "device", "setTopo", map[string]any{"data": normalized}, commandTimeout)
+
+	verifyTimeout := time.Until(overallDeadline)
+	if verifyTimeout < 15*time.Second {
+		verifyTimeout = 15 * time.Second
+	}
+	verifyCtx, cancel := context.WithTimeout(context.Background(), verifyTimeout)
+	defer cancel()
+
+	policyPersisted := false
+	liveConverged := false
+	var stableSince time.Time
+	ticker := time.NewTicker(b.easyMeshVerifyInterval)
+	defer ticker.Stop()
+	for {
+		policyPersisted = b.readEasyMeshTopologyPolicy(verifyCtx) == normalized
+		liveConverged = false
+		if data, err := b.readOpenWrtRealTopo(verifyCtx); err == nil {
+			if live, ok := parseOpenWrtRealTopo(data); ok && easyMeshTopologyMatchesLive(topology, live.root) {
+				liveConverged = true
+			}
+		}
+		if policyPersisted && liveConverged {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
+			}
+			if time.Since(stableSince) >= b.easyMeshStableDuration {
+				return nil
+			}
+		} else {
+			stableSince = time.Time{}
+		}
+
+		select {
+		case <-verifyCtx.Done():
+			if policyPersisted {
+				return fmt.Errorf("topology policy was saved, but the live mesh did not converge before %d seconds", topology.ConvTimeout)
+			}
+			if commandErr != nil {
+				return fmt.Errorf("topology policy was not saved: %w", commandErr)
+			}
+			return fmt.Errorf("the vendor command completed, but the topology policy was not saved")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *OpenWrtBackend) easyMeshOperationResult() (string, string) {
+	if b == nil {
+		return "", ""
+	}
+	b.easyMeshOperationMu.RLock()
+	defer b.easyMeshOperationMu.RUnlock()
+	return b.easyMeshOperation.status, b.easyMeshOperation.message
+}
+
+func (b *OpenWrtBackend) setEasyMeshOperationResult(status, message, topologyJSON string) {
+	message = strings.TrimSpace(message)
+	if len(message) > 256 {
+		message = message[:256]
+	}
+	b.easyMeshOperationMu.Lock()
+	b.easyMeshOperation = easyMeshOperationState{status: status, message: message, topologyJSON: topologyJSON}
+	b.easyMeshOperationMu.Unlock()
 }
 
 // RemoveEasyMeshStation disconnects one associated user from a named hostapd
@@ -222,9 +358,9 @@ func validEasyMeshStationName(value string) bool {
 	return true
 }
 
-func easyMeshSupportedOperations(role string) []string {
+func easyMeshSupportedOperations(role string, hasValidatedPolicy bool) []string {
 	operations := make([]string, 0, 3)
-	if role == "Controller" {
+	if role == "Controller" && hasValidatedPolicy {
 		operations = append(operations, "ApplyTopology")
 	}
 	operations = append(operations, "RemoveStation")
@@ -232,6 +368,57 @@ func easyMeshSupportedOperations(role string) []string {
 		operations = append(operations, "SetMode")
 	}
 	return operations
+}
+
+func validateEasyMeshTopologyInventory(topology easyMeshTopology, root *meshNode) error {
+	live := make(map[string]bool)
+	for _, node := range flattenMeshForest(normalizedMeshRoots(root)) {
+		mac, err := normalizeEasyMeshMAC(firstNonEmpty(node.mac, node.id))
+		if err == nil {
+			live[mac] = true
+		}
+	}
+	if len(live) == 0 {
+		return fmt.Errorf("apply EasyMesh topology: live node inventory is unavailable")
+	}
+	if len(live) != len(topology.DeviceArray) {
+		return fmt.Errorf("apply EasyMesh topology: requested %d nodes, but the live controller reports %d", len(topology.DeviceArray), len(live))
+	}
+	for _, node := range topology.DeviceArray {
+		if !live[node.ALID] {
+			return fmt.Errorf("apply EasyMesh topology: node %s is not present in the live mesh", node.ALID)
+		}
+	}
+	return nil
+}
+
+func easyMeshTopologyMatchesLive(topology easyMeshTopology, root *meshNode) bool {
+	if root == nil {
+		return false
+	}
+	liveParents := make(map[string]string)
+	for _, node := range flattenMeshForest(normalizedMeshRoots(root)) {
+		mac, err := normalizeEasyMeshMAC(firstNonEmpty(node.mac, node.id))
+		if err != nil {
+			continue
+		}
+		parent := "NULL"
+		if rawParent := firstNonEmpty(node.parentMAC, node.parentID); strings.TrimSpace(rawParent) != "" {
+			if normalizedParent, err := normalizeEasyMeshMAC(rawParent); err == nil {
+				parent = normalizedParent
+			}
+		}
+		liveParents[mac] = parent
+	}
+	if len(liveParents) != len(topology.DeviceArray) {
+		return false
+	}
+	for _, node := range topology.DeviceArray {
+		if liveParents[node.ALID] != node.ParentALID {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *OpenWrtBackend) readEasyMeshTopologyPolicy(ctx context.Context) string {
@@ -319,6 +506,19 @@ func validateEasyMeshTopology(raw string) (string, error) {
 	}
 	if err := validateEasyMeshText("topOptPolicy", topology.TopOptPolicy, 64, false); err != nil {
 		return "", err
+	}
+	switch strings.ToLower(strings.TrimSpace(topology.TopOptPolicy)) {
+	case "strict":
+		topology.TopOptPolicy = "strict"
+	case "permissive":
+		topology.TopOptPolicy = "permissive"
+	case "manual":
+		// Early Wantastic builds exposed a made-up "manual" value. Migrate
+		// those saved policies to the vendor's strict mode before sending
+		// them back to SPF 12.2.
+		topology.TopOptPolicy = "strict"
+	default:
+		return "", fmt.Errorf("topOptPolicy must be strict or permissive")
 	}
 	if topology.ConvTimeout < 1 || topology.ConvTimeout > 3600 {
 		return "", fmt.Errorf("convTimeout must be between 1 and 3600 seconds")

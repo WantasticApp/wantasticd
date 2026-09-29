@@ -53,7 +53,7 @@ is a JSON document that the firmware validates, stores at
 
 ```json
 {
-  "topOptPolicy": "manual",
+  "topOptPolicy": "strict",
   "convTimeout": 120,
   "deviceArray": [
     {
@@ -72,6 +72,18 @@ Wantastic exposes `ApplyTopology()` only when the device is the CN and the
 current policy returned by `getTopo` (or the on-device policy file fallback)
 passes strict validation. The existing validated document is the base for
 every UI edit; the console does not invent missing policies or links.
+
+The vendor controller accepts only `strict` and `permissive` for
+`topOptPolicy`. `strict` keeps the requested parent graph authoritative;
+`permissive` allows the controller to choose another viable path. Wantastic
+migrates the invalid `manual` value emitted by early console builds to
+`strict` before applying the policy.
+
+`device.setTopo` blocks while the mesh converges, so the USP operation is
+acknowledged as `Pending` and completed asynchronously. Success is published
+only after both `/etc/topo-ezmesh.json` and `device.getRealTopo` match the
+requested graph continuously for the stability window. A brief match followed
+by a rollback remains pending and then reports an exact convergence failure.
 
 Before calling ubus, the agent limits the payload to 64 KiB and 128 nodes,
 rejects unknown JSON fields, validates all MAC addresses and radio-band enums,

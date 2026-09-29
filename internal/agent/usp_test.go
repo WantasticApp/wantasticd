@@ -28,6 +28,16 @@ type easyMeshOperateBackend struct {
 	mode     string
 }
 
+type asyncEasyMeshOperateBackend struct {
+	easyMeshOperateBackend
+	started string
+}
+
+func (b *asyncEasyMeshOperateBackend) StartApplyEasyMeshTopology(_ context.Context, topology string) error {
+	b.started = topology
+	return nil
+}
+
 func (b *easyMeshOperateBackend) Collect(context.Context, ...string) (*wusp.Message, error) {
 	return wusp.NewMessage(), nil
 }
@@ -180,6 +190,31 @@ func TestUSPRuntimeAppliesEasyMeshTopologyThroughCapableBackend(t *testing.T) {
 	}
 	status, ok := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus")
 	if !ok || status.AsString() != "Success" {
+		t.Fatalf("operation status=%v, present=%v", status, ok)
+	}
+}
+
+func TestUSPRuntimeAcknowledgesAsyncEasyMeshTopologyAsPending(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	backend := &asyncEasyMeshOperateBackend{}
+	runtime.rawBackend = backend
+	input := wusp.NewMessage()
+	input.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", wusp.String(`{"topOptPolicy":"manual"}`))
+
+	output, err := runtime.handleOperate(
+		context.Background(),
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()",
+		input,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("handleOperate: %v", err)
+	}
+	if backend.started != `{"topOptPolicy":"manual"}` {
+		t.Fatalf("backend topology=%q", backend.started)
+	}
+	status, ok := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus")
+	if !ok || status.AsString() != "Pending" {
 		t.Fatalf("operation status=%v, present=%v", status, ok)
 	}
 }

@@ -84,7 +84,7 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(ctx context.Context, msg *w
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	topologyJSON := b.readEasyMeshTopologyPolicy(ctx)
-	operations := easyMeshSupportedOperations(role, topologyJSON != "")
+	operations := easyMeshSupportedOperations(role)
 	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
@@ -178,9 +178,6 @@ func (b *OpenWrtBackend) prepareEasyMeshTopology(ctx context.Context, raw string
 	var requested easyMeshTopology
 	if err := json.Unmarshal([]byte(normalized), &requested); err != nil {
 		return "", easyMeshTopology{}, fmt.Errorf("decode normalized EasyMesh topology: %w", err)
-	}
-	if b.readEasyMeshTopologyPolicy(ctx) == "" {
-		return "", easyMeshTopology{}, fmt.Errorf("apply EasyMesh topology: the controller did not provide a validated saved topology policy")
 	}
 	topologyData, err := b.readOpenWrtRealTopo(ctx)
 	if err != nil {
@@ -358,9 +355,9 @@ func validEasyMeshStationName(value string) bool {
 	return true
 }
 
-func easyMeshSupportedOperations(role string, hasValidatedPolicy bool) []string {
+func easyMeshSupportedOperations(role string) []string {
 	operations := make([]string, 0, 3)
-	if role == "Controller" && hasValidatedPolicy {
+	if role == "Controller" {
 		operations = append(operations, "ApplyTopology")
 	}
 	operations = append(operations, "RemoveStation")

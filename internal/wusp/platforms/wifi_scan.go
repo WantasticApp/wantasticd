@@ -260,6 +260,10 @@ func appendWiFiScanFields(msg *wusp.Message) error {
 		return err
 	}
 	snapshots := defaultWiFiScanCoordinator.snapshotsAndTrigger(interfaces)
+	return appendWiFiScanSnapshotFields(msg, interfaces, snapshots)
+}
+
+func appendWiFiScanSnapshotFields(msg *wusp.Message, interfaces []iwinfo.WirelessInterface, snapshots []wifiPHYScanSnapshot) error {
 	available := snapshots[:0]
 	for _, snapshot := range snapshots {
 		age := time.Duration(0)
@@ -286,7 +290,11 @@ func appendWiFiScanFields(msg *wusp.Message) error {
 		if !validRuntimeMAC(radioMAC) {
 			radioMAC = localMAC
 		}
-		appendField(msg, radioPath+"ID", wusp.MAC(radioMAC))
+		// BBF Device:2 models a DataElements Device ID as MACAddress, but a
+		// Radio ID as a six-byte base64 value. Keeping these two identifiers in
+		// their distinct USP types prevents one radio from invalidating and
+		// dropping the complete value-change notification batch.
+		appendField(msg, radioPath+"ID", wusp.Bytes(append([]byte(nil), radioMAC...)))
 		appendField(msg, radioPath+"ScanResultNumberOfEntries", wusp.Uint(1))
 		appendScanResultFields(msg, radioPath+"ScanResult.1.", snapshot)
 	}

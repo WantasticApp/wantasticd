@@ -1,6 +1,7 @@
 package platforms
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -10,6 +11,39 @@ import (
 	"wantastic-agent/internal/iwinfo"
 	"wantastic-agent/internal/wusp"
 )
+
+func TestAppendWiFiScanSnapshotFieldsUsesBBFRadioIDType(t *testing.T) {
+	local, _ := net.ParseMAC("02:00:00:00:10:01")
+	msg := wusp.NewMessage()
+	err := appendWiFiScanSnapshotFields(
+		msg,
+		[]iwinfo.WirelessInterface{{Name: "phy0-ap0", PHY: 0, Mode: "ap", HardwareAddr: local}},
+		[]wifiPHYScanSnapshot{{
+			PHY:       0,
+			Interface: "phy0-ap0",
+			RadioMAC:  local,
+			Timestamp: time.Unix(1700000000, 0).UTC(),
+		}},
+	)
+	if err != nil {
+		t.Fatalf("appendWiFiScanSnapshotFields: %v", err)
+	}
+
+	deviceID, ok := msg.Get("Device.WiFi.DataElements.Network.Device.1.ID")
+	if !ok || deviceID.Tag != wusp.TagMAC {
+		t.Fatalf("device ID tag=%v found=%t want TagMAC", deviceID.Tag, ok)
+	}
+	radioID, ok := msg.Get("Device.WiFi.DataElements.Network.Device.1.Radio.1.ID")
+	if !ok || radioID.Tag != wusp.TagBytes {
+		t.Fatalf("radio ID tag=%v found=%t want TagBytes", radioID.Tag, ok)
+	}
+	if !bytes.Equal(radioID.AsBytes(), local) {
+		t.Fatalf("radio ID=%x want %x", radioID.AsBytes(), []byte(local))
+	}
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast: %v", err)
+	}
+}
 
 func TestWiFiScanCoordinatorDeduplicatesCapsAndExcludesOwnBSSID(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()

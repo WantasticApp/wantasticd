@@ -144,7 +144,7 @@ func ApplyTunnel(ctx context.Context, servers []string) Result {
 	if result.Changed {
 		log.Printf("DNS: applied %s via %s: %v", result.Reason, result.Method, result.Servers)
 	} else if result.Skipped {
-		log.Printf("DNS: skipped %s (%s)", result.Reason, result.Reason)
+		log.Printf("DNS: skipped (%s)", result.Reason)
 	}
 	return result
 }

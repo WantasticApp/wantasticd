@@ -3,7 +3,6 @@ package platforms
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -187,8 +186,7 @@ func collectLinuxStations(ctx context.Context, ifName string, commandRunner Comm
 	stations, err = iwinfo.GetAssocList(ifName)
 	mergeSuccess("nl80211", stations, err)
 
-	log.Printf("[USP] wifi_collection_summary interface=%q sources_attempted=%q successful=%t selected_station_count=%d errors=%q",
-		ifName, strings.Join(collection.Attempted, ","), collection.Succeeded, len(collection.Stations), strings.Join(collection.Errors, "; "))
+	logWiFiCollectionSummary(ifName, strings.Join(collection.Attempted, ","), collection.Succeeded, len(collection.Stations), collection.Errors)
 	return collection
 }
 

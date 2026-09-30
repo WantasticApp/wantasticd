@@ -23,6 +23,7 @@ import (
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
+	"wantastic-agent/internal/diaglog"
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
 	"wantastic-agent/internal/wusp/platforms"
@@ -319,9 +320,9 @@ func (r *uspRuntime) HandlePeerPacket(peer *wgdevice.Peer, data []byte) {
 		return
 	}
 	peerHex := peer.PublicKeyHex()
-	log.Printf("[USP] HandlePeerPacket: peer=%s bytes=%d", peerHex, len(data))
+	diaglog.Printf("[USP] HandlePeerPacket: peer=%s bytes=%d", peerHex, len(data))
 	if err := r.handleFrameFromPeer(peerHex, data, func(frame []byte) error {
-		log.Printf("[USP] Sending WUSP response: peer=%s bytes=%d", peerHex, len(frame))
+		diaglog.Printf("[USP] Sending WUSP response: peer=%s bytes=%d", peerHex, len(frame))
 		return peer.SendWUSPDatagram(frame)
 	}); err != nil {
 		log.Printf("[USP] WUSP frame handling failed: peer=%s err=%v", peerHex, err)
@@ -338,13 +339,13 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	if streamFrame, err := wusp.DecodeUSPTransferStreamFrame(data); err == nil {
 		r.stats.transferFramesReceived.Add(1)
 		r.stats.transferFrameBytesReceived.Add(uint64(len(data)))
-		log.Printf("[USP] handleFrameFromPeer: stream frame from peer=%s phase=%d", peerPublicKeyHex, streamFrame.Phase)
+		diaglog.Printf("[USP] handleFrameFromPeer: stream frame from peer=%s phase=%d", peerPublicKeyHex, streamFrame.Phase)
 		return r.handleTransferStreamFrame(peerPublicKeyHex, streamFrame)
 	}
 
 	if resp, err := wusp.DecodeUSPAgentResponse(data); err == nil {
 		r.stats.inboundResponses.Add(1)
-		log.Printf("[USP] handleFrameFromPeer: response id=%d method=%d from peer=%s", resp.ID, resp.Method, peerPublicKeyHex)
+		diaglog.Printf("[USP] handleFrameFromPeer: response id=%d method=%d from peer=%s", resp.ID, resp.Method, peerPublicKeyHex)
 		if !r.isControllerPeer(peerPublicKeyHex) {
 			return nil
 		}
@@ -373,7 +374,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 	r.stats.inboundRequests.Add(1)
 
-	log.Printf("[USP] handleFrameFromPeer: request id=%d method=%d from peer=%s isController=%v",
+	diaglog.Printf("[USP] handleFrameFromPeer: request id=%d method=%d from peer=%s isController=%v",
 		req.ID, req.Method, peerPublicKeyHex, r.isControllerPeer(peerPublicKeyHex))
 	if req.Method == wusp.USPAgentMethodOperate {
 		commandPath, commandErr := wusp.OperationCommandPath(req.ObjectPath, req.Metadata)
@@ -416,7 +417,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 
 	if req.Method == wusp.USPAgentMethodGetSupportedProtocol {
-		log.Printf("[USP] Replying GetSupportedProtocol directly: id=%d", req.ID)
+		diaglog.Printf("[USP] Replying GetSupportedProtocol directly: id=%d", req.ID)
 		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
@@ -424,7 +425,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		})
 	}
 
-	log.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)
+	diaglog.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)
 	type requestResult struct {
 		resp wusp.USPAgentResponse
 		err  error
@@ -448,11 +449,11 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 	if resp.Message != nil {
 		objects, values := dataModelMessageCounts(resp.Message)
-		log.Printf("[USP] DataModel message collected: method=%s objects=%d values=%d requested_paths=%d",
+		diaglog.Printf("[USP] DataModel message collected: method=%s objects=%d values=%d requested_paths=%d",
 			req.Method, objects, values, len(req.Paths))
 	}
 	if resp.SupportedDataModel != nil {
-		log.Printf("[USP] DataModel schema: models=%d objects=%d parameters=%d",
+		diaglog.Printf("[USP] DataModel schema: models=%d objects=%d parameters=%d",
 			len(resp.SupportedDataModel.Models), len(resp.SupportedDataModel.Objects), len(resp.SupportedDataModel.Params))
 	}
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
@@ -472,7 +473,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 			return encErr
 		}
 	}
-	log.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
+	diaglog.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
 	return r.replyControlPayload(reply, req, frame)
 }
 
@@ -1322,7 +1323,7 @@ func (r *uspRuntime) emitDataModelChanges(previous, current *wusp.Message) {
 			return
 		}
 	}
-	log.Printf("[USP] DataModel changes pushed: fields=%d", len(params))
+	diaglog.Printf("[USP] DataModel changes pushed: fields=%d", len(params))
 }
 
 func changedDataModelParams(previous, current *wusp.Message) map[string]string {
@@ -1432,7 +1433,7 @@ func (r *uspRuntime) runInit(ctx context.Context) {
 				close(r.initReady)
 				log.Printf("[USP] WUSP ready (attempt %d)", attempt+1)
 			} else {
-				log.Printf("[USP] WUSP re-announced OnBoardRequest to controller")
+				diaglog.Printf("[USP] WUSP re-announced OnBoardRequest to controller")
 			}
 			// Re-announce periodically. Reset backoff counter so the next
 			// failure (e.g. controller restart) uses fast initial retries again.
@@ -1471,7 +1472,7 @@ func (r *uspRuntime) runInit(ctx context.Context) {
 // success immediately and never retry even though the packet was discarded.
 func (r *uspRuntime) initializeOnce(ctx context.Context) error {
 	connected := r.transport.IsServerConnected()
-	log.Printf("[USP] initializeOnce: server_connected=%v deviceID=%q", connected, r.deviceID)
+	diaglog.Printf("[USP] initializeOnce: server_connected=%v deviceID=%q", connected, r.deviceID)
 	if !connected {
 		return fmt.Errorf("wusp: server tunnel not up (no active WireGuard handshake)")
 	}
@@ -1484,7 +1485,7 @@ func (r *uspRuntime) initializeOnce(ctx context.Context) error {
 			return fmt.Errorf("wusp: data model warmup: %w", ctx.Err())
 		}
 	}
-	log.Printf("[USP] Sending OnBoardRequest to controller")
+	diaglog.Printf("[USP] Sending OnBoardRequest to controller")
 	err := r.emitOnBoardRequest(ctx)
 	if err != nil {
 		log.Printf("[USP] OnBoardRequest emit failed: %v", err)

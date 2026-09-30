@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"wantastic-agent/internal/diaglog"
 	"wantastic-agent/internal/iwinfo"
 	"wantastic-agent/internal/linkdiscovery"
 	"wantastic-agent/internal/netctl"
@@ -747,27 +748,33 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				// Stock OpenWrt exposes clients through hostapd.<ifname>.get_clients.
 				// Merge it with the optional vendor call and the direct nl80211/
 				// libiwinfo collector so each source fills the fields it knows.
-				stations := append([]iwinfo.AssocEntry(nil), ubusStations[ifName]...)
-				succeeded := ubusStationsErr == nil
+				stations := make([]iwinfo.AssocEntry, 0)
+				succeeded := false
 				errorsBySource := make([]string, 0, 4)
-				if ubusStationsErr != nil {
-					errorsBySource = append(errorsBySource, "device.getStaList: "+ubusStationsErr.Error())
-				}
-				for _, source := range []struct {
-					name string
-					read func(string) ([]iwinfo.AssocEntry, error)
-				}{
-					{name: "hostapd", read: b.readHostapdAssociations},
-					{name: "iwinfo-ubus", read: b.readIWInfoUBusAssociations},
-					{name: "nl80211", read: b.readIWInfoAssociations},
-				} {
-					observed, err := source.read(ifName)
-					if err != nil {
-						errorsBySource = append(errorsBySource, source.name+": "+err.Error())
-						continue
+				attempted := "none"
+				if ifName != "" {
+					attempted = "device.getStaList,hostapd,iwinfo-ubus,nl80211"
+					stations = append(stations, ubusStations[ifName]...)
+					succeeded = ubusStationsErr == nil
+					if ubusStationsErr != nil {
+						errorsBySource = append(errorsBySource, "device.getStaList: "+ubusStationsErr.Error())
 					}
-					succeeded = true
-					stations = mergeWiFiAssociations(stations, observed)
+					for _, source := range []struct {
+						name string
+						read func(string) ([]iwinfo.AssocEntry, error)
+					}{
+						{name: "hostapd", read: b.readHostapdAssociations},
+						{name: "iwinfo-ubus", read: b.readIWInfoUBusAssociations},
+						{name: "nl80211", read: b.readIWInfoAssociations},
+					} {
+						observed, err := source.read(ifName)
+						if err != nil {
+							errorsBySource = append(errorsBySource, source.name+": "+err.Error())
+							continue
+						}
+						succeeded = true
+						stations = mergeWiFiAssociations(stations, observed)
+					}
 				}
 				if succeeded {
 					appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(len(stations))))
@@ -777,8 +784,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 						wifiHosts[strings.ToLower(station.MAC.String())] = stationPath
 					}
 				}
-				log.Printf("[USP] wifi_collection_summary interface=%q sources_attempted=%q successful=%t selected_station_count=%d errors=%q",
-					ifName, "device.getStaList,hostapd,iwinfo-ubus,nl80211", succeeded, len(stations), strings.Join(errorsBySource, "; "))
+				logWiFiCollectionSummary(ifName, attempted, succeeded, len(stations), errorsBySource)
 			} else if wifiInterfaceModeIsEndpoint(mode) {
 				endPointCount++
 			}
@@ -790,6 +796,16 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 	appendField(msg, "Device.WiFi.AccessPointNumberOfEntries", wusp.Uint(uint64(apCount)))
 	appendField(msg, "Device.WiFi.EndPointNumberOfEntries", wusp.Uint(uint64(endPointCount)))
 	b.appendHostFields(msg, wifiHosts)
+}
+
+func logWiFiCollectionSummary(ifName, attempted string, succeeded bool, stationCount int, errorsBySource []string) {
+	format := "[USP] wifi_collection_summary interface=%q sources_attempted=%q successful=%t selected_station_count=%d errors=%q"
+	args := []any{ifName, attempted, succeeded, stationCount, strings.Join(errorsBySource, "; ")}
+	if succeeded || ifName == "" {
+		diaglog.Printf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func (b *OpenWrtBackend) readIWInfoAssociations(ifName string) ([]iwinfo.AssocEntry, error) {

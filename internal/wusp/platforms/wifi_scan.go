@@ -3,13 +3,13 @@ package platforms
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"wantastic-agent/internal/diaglog"
 	"wantastic-agent/internal/iwinfo"
 	"wantastic-agent/internal/wusp"
 )
@@ -267,7 +267,7 @@ func appendWiFiScanFields(msg *wusp.Message) error {
 			age = time.Since(snapshot.Timestamp)
 			available = append(available, snapshot)
 		}
-		log.Printf("[USP] wifi_scan_summary phy=%d interface=%q successful=%t neighbor_count=%d scan_age=%q last_error=%q",
+		diaglog.Printf("[USP] wifi_scan_summary phy=%d interface=%q successful=%t neighbor_count=%d scan_age=%q last_error=%q",
 			snapshot.PHY, snapshot.Interface, !snapshot.Timestamp.IsZero(), len(snapshot.Entries), age.Round(time.Second), snapshot.LastError)
 	}
 	if len(available) == 0 {

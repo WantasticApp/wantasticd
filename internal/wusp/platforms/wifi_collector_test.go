@@ -96,6 +96,51 @@ config wifi-iface 'mesh_ap'
 	}
 }
 
+func TestOpenWrtWiFiSkipsStationSourcesWithoutRuntimeInterface(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "wireless"), []byte(`config wifi-device 'wifi0'
+config wifi-iface 'configured_only'
+	option device 'wifi0'
+	option mode 'ap'
+	option ssid 'Configured only'
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	associationCalls := 0
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  filepath.Join(root, "sys", "class", "net"),
+		WiFiAssocList: func(string) ([]iwinfo.AssocEntry, error) {
+			associationCalls++
+			return nil, nil
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			switch {
+			case object == "network.wireless" && method == "status":
+				return []byte(`{"wifi0":{"up":false,"interfaces":[{"section":"configured_only","up":false,"config":{"mode":"ap"}}]}}`), nil
+			case object == "device" && method == "getStaList":
+				return []byte(`{"station":[]}`), nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+	})
+
+	msg := wusp.NewMessage()
+	backend.appendWiFiFields(context.Background(), msg)
+	if associationCalls != 0 {
+		t.Fatalf("station source called %d times without a runtime interface", associationCalls)
+	}
+	if _, found := msg.Get("Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries"); found {
+		t.Fatal("configured-only AP emitted an authoritative station count")
+	}
+}
+
 func TestLinkDiscoveryFieldsClampUntrustedValues(t *testing.T) {
 	msg := wusp.NewMessage()
 	appendLinkDiscoveryFields(msg, linkdiscovery.Snapshot{

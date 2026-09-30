@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"wantastic-agent/internal/diaglog"
 	"wantastic-agent/internal/wusp"
 )
 
@@ -249,7 +250,7 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	observer := c.changeObserver
 	c.mu.Unlock()
 	objects, values := dataModelMessageCounts(msg)
-	log.Printf("[USP] DataModel cache refreshed: objects=%d values=%d file=%s", objects, values, c.path)
+	diaglog.Printf("[USP] DataModel cache refreshed: objects=%d values=%d file=%s", objects, values, c.path)
 	if observer != nil && previous != nil && len(previous.Fields) > 0 {
 		observer(previous, cloneCachedMessage(msg))
 	}

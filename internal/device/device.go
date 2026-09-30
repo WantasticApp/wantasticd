@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"wantastic-agent/internal/config"
+	"wantastic-agent/internal/diaglog"
 
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
 
@@ -489,7 +490,7 @@ func (d *Device) HasActiveHandshake() bool {
 				ts, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
 				age := time.Since(time.Unix(ts, 0))
 				if ts > 0 && age < activeHandshakeWindow {
-					log.Printf("[WG] HasActiveHandshake: active (last handshake %s ago)", age.Round(time.Second))
+					diaglog.Printf("[WG] HasActiveHandshake: active (last handshake %s ago)", age.Round(time.Second))
 					return true
 				}
 				log.Printf("[WG] HasActiveHandshake: peer handshake ts=%d age=%s (window=%s)",

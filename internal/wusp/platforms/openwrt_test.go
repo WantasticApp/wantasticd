@@ -1011,7 +1011,11 @@ func TestOpenWrtBackendAdvertisesControllerBootstrapWithoutSavedPolicy(t *testin
 			case "getMode":
 				return []byte(`{"mode":"CN"}`), nil
 			case "getRealTopo":
-				return []byte(`{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"}]}`), nil
+				return []byte(`{"topo":[
+					{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":"G1TK7EY00044B"},
+					{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","backhaul":"N","name":"G1TK7EY000506"},
+					{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.141","backhaul":"H","name":"G1TK7EY00023A"}
+				]}`), nil
 			default:
 				return nil, wusp.ErrUSPPathUnsupported
 			}
@@ -1021,10 +1025,17 @@ func TestOpenWrtBackendAdvertisesControllerBootstrapWithoutSavedPolicy(t *testin
 
 	msg := wusp.NewMessage()
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.NodeNumberOfEntries", 3)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Controller")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Implementation", "device.ubus")
 	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
 	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
 		t.Fatal("missing vendor policy must not be represented as a current topology policy")
+	}
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(controller bootstrap): %v", err)
 	}
 }
 

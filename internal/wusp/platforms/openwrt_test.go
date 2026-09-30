@@ -183,7 +183,7 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 				return []byte(`{"mode":"CN"}`), nil
 			case "getTopo":
 				if savedPolicy == "" {
-					return []byte(`{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-72,"apName":"Relay"}]}`), nil
+					return nil, wusp.ErrUSPPathUnsupported
 				}
 				return []byte(savedPolicy), nil
 			case "setTopo":
@@ -1001,7 +1001,7 @@ func TestOpenWrtBackendExposesEasyMeshAgentWithoutControllerTopology(t *testing.
 	}
 }
 
-func TestOpenWrtBackendDoesNotAdvertiseControllerWriteWithoutSavedPolicy(t *testing.T) {
+func TestOpenWrtBackendAdvertisesControllerBootstrapWithoutSavedPolicy(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object != "device" {
@@ -1022,7 +1022,7 @@ func TestOpenWrtBackendDoesNotAdvertiseControllerWriteWithoutSavedPolicy(t *test
 	msg := wusp.NewMessage()
 	backend.appendOpenWrtMeshTopology(context.Background(), msg)
 	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
 	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
 		t.Fatal("missing vendor policy must not be represented as a current topology policy")
 	}

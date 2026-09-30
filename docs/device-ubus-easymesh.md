@@ -68,10 +68,13 @@ is a JSON document that the firmware validates, stores at
 }
 ```
 
-Wantastic exposes `ApplyTopology()` only when the device is the CN and the
-current policy returned by `getTopo` (or the on-device policy file fallback)
-passes strict validation. The existing validated document is the base for
-every UI edit; the console does not invent missing policies or links.
+Wantastic exposes `ApplyTopology()` when the device is the confirmed CN. When
+`getTopo` (or the on-device policy file fallback) returns a valid policy, that
+document is the base for every UI edit. If no policy exists yet, the console
+builds a first reviewable policy from the authoritative `getRealTopo` nodes and
+links, uses the vendor's strict policy with bounded defaults, and requires user
+confirmation before `setTopo` persists it. Missing nodes or ambiguous links
+remain read-only rather than being guessed.
 
 The vendor controller accepts only `strict` and `permissive` for
 `topOptPolicy`. `strict` keeps the requested parent graph authoritative;

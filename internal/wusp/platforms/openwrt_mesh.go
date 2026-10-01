@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -210,10 +211,26 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := b.setEasyMeshTopologyRequestGate(ctx, true); err != nil {
+		enableErr := fmt.Errorf("enable EasyMesh topology requests: %w", err)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), easyMeshConsoleTimeout)
+		cleanupErr := b.setEasyMeshTopologyRequestGate(cleanupCtx, false)
+		cleanupCancel()
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("restore EasyMesh topology request gate: %w", cleanupErr)
+		}
+		return errors.Join(enableErr, cleanupErr)
+	}
 	convergenceTimeout := time.Duration(topology.ConvTimeout) * time.Second
 	commandTimeout := convergenceTimeout + 15*time.Second
 	overallDeadline := time.Now().Add(convergenceTimeout + 45*time.Second)
 	_, commandErr := b.callUbusWithTimeout(ctx, "device", "setTopo", map[string]any{"data": normalized}, commandTimeout)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), easyMeshConsoleTimeout)
+	cleanupErr := b.setEasyMeshTopologyRequestGate(cleanupCtx, false)
+	cleanupCancel()
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("disable EasyMesh topology requests: %w", cleanupErr)
+	}
 
 	verifyTimeout := time.Until(overallDeadline)
 	if verifyTimeout < 15*time.Second {
@@ -240,7 +257,7 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 				stableSince = time.Now()
 			}
 			if time.Since(stableSince) >= b.easyMeshStableDuration {
-				return nil
+				return cleanupErr
 			}
 		} else {
 			stableSince = time.Time{}
@@ -249,15 +266,44 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 		select {
 		case <-verifyCtx.Done():
 			if policyPersisted {
-				return fmt.Errorf("topology policy was saved, but the live mesh did not converge before %d seconds", topology.ConvTimeout)
+				return errors.Join(
+					fmt.Errorf(
+						"topology policy was saved, but the live mesh did not converge before %d seconds",
+						topology.ConvTimeout,
+					),
+					cleanupErr,
+				)
 			}
 			if commandErr != nil {
-				return fmt.Errorf("topology policy was not saved: %w", commandErr)
+				return errors.Join(fmt.Errorf("topology policy was not saved: %w", commandErr), cleanupErr)
 			}
-			return fmt.Errorf("the vendor command completed, but the topology policy was not saved")
+			return errors.Join(
+				fmt.Errorf("the vendor command completed, but the topology policy was not saved"),
+				cleanupErr,
+			)
 		case <-ticker.C:
 		}
 	}
+}
+
+func (b *OpenWrtBackend) setEasyMeshTopologyRequestGate(ctx context.Context, enabled bool) error {
+	if b == nil || b.easyMeshConsole == nil {
+		return fmt.Errorf("local EasyMesh console is unavailable")
+	}
+	command := easyMeshConsoleDisableTopologyRequests
+	expected := "ToptReq:Off"
+	if enabled {
+		command = easyMeshConsoleEnableTopologyRequests
+		expected = "ToptReq:ON"
+	}
+	output, err := b.easyMeshConsole.Run(ctx, command)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(output, expected) {
+		return fmt.Errorf("console did not confirm %s", expected)
+	}
+	return nil
 }
 
 func (b *OpenWrtBackend) easyMeshOperationResult() (string, string) {

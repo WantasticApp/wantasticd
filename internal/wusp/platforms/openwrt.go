@@ -85,6 +85,7 @@ type OpenWrtBackend struct {
 	easyMeshTopologyPath   string
 	easyMeshVerifyInterval time.Duration
 	easyMeshStableDuration time.Duration
+	easyMeshConsole        easyMeshConsole
 	commandRunner          func(context.Context, string, ...string) ([]byte, error)
 	wifiAssocList          func(string) ([]iwinfo.AssocEntry, error)
 	wifiInfo               func(string) (*iwinfo.InterfaceInfo, error)
@@ -310,6 +311,7 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		easyMeshTopologyPath:   coalesceString(opts.EasyMeshTopologyPath, "/etc/topo-ezmesh.json"),
 		easyMeshVerifyInterval: opts.EasyMeshVerifyInterval,
 		easyMeshStableDuration: opts.EasyMeshStableDuration,
+		easyMeshConsole:        newEasyMeshConsoleClient(),
 		commandRunner:          opts.CommandRunner,
 		wifiAssocList:          opts.WiFiAssocList,
 		wifiInfo:               opts.WiFiInfo,

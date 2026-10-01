@@ -1,8 +1,10 @@
 # EasyMesh through the vendor `device` ubus API
 
 The SPF 12.2 device service is the authoritative abstraction for mesh state.
-Wantastic does not infer EasyMesh from files or processes, read `ezmesh` UCI,
-link to Qualcomm libraries, write daemon FIFOs, or reload the EasyMesh service.
+Wantastic does not infer EasyMesh from files or processes, link to Qualcomm
+libraries, write daemon FIFOs, or reload the EasyMesh service. Topology writes
+also use the daemon's loopback-only command console to enable its otherwise
+disabled backhaul-request gate for the duration of the vendor call.
 
 ## Telemetry integration
 
@@ -49,7 +51,7 @@ zero-hop parentless node to match a local interface MAC, IP address, or hostname
 The target firmware's `/usr/lib/rpcd/uai.so` contract has been verified. The
 `device.setTopo` method accepts one string parameter named `data`. The string
 is a JSON document that the firmware validates, stores at
-`/etc/topo-ezmesh.json`, and applies through its EasyMesh controller.
+`/etc/topo-ezmesh.json`, and passes to `ezcmd td topt`.
 
 ```json
 {
@@ -82,11 +84,20 @@ The vendor controller accepts only `strict` and `permissive` for
 migrates the invalid `manual` value emitted by early console builds to
 `strict` before applying the policy.
 
-`device.setTopo` blocks while the mesh converges, so the USP operation is
-acknowledged as `Pending` and completed asynchronously. Success is published
-only after both `/etc/topo-ezmesh.json` and `device.getRealTopo` match the
-requested graph continuously for the stability window. A brief match followed
-by a rollback remains pending and then reports an exact convergence failure.
+SPF 12.2 keeps a separate process-local `g_TopOptRequestSendFlag` disabled by
+default. Without enabling it, `td topt` accepts and prints the requested graph
+but reports `Do not Send TopOpt Request!!`. Wantastic connects only to
+`127.0.0.1:7777`, sends the fixed command `td test on`, calls
+`device.setTopo`, and immediately restores the gate with the fixed command
+`td test off`. No arbitrary console command is accepted from WUSP input.
+
+The USP operation is acknowledged as `Pending` and completed asynchronously
+because the controller can schedule per-node steering after the RPC returns.
+Success is published only after both `/etc/topo-ezmesh.json` and
+`device.getRealTopo` match the requested graph continuously for the stability
+window. A brief match followed by a rollback remains pending and then reports
+an exact convergence failure. Failure to enable or restore the daemon gate is
+reported as an operation error.
 
 Before calling ubus, the agent limits the payload to 64 KiB and 128 nodes,
 rejects unknown JSON fields, validates all MAC addresses and radio-band enums,

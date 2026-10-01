@@ -133,11 +133,9 @@ type easyMeshTopologyNode struct {
 }
 
 // StartApplyEasyMeshTopology validates the complete vendor topology document
-// before acknowledging the operation. device.setTopo blocks while the mesh
-// converges, so the actual vendor call runs in the background and its result is
-// published through LastOperationStatus. This prevents the controller's normal
-// request deadline from turning a still-running topology change into a false
-// rejection.
+// before acknowledging the operation. The vendor can schedule steering after
+// device.setTopo returns, so the apply and read-back checks run in the
+// background and publish their result through LastOperationStatus.
 func (b *OpenWrtBackend) StartApplyEasyMeshTopology(ctx context.Context, raw string) error {
 	normalized, topology, err := b.prepareEasyMeshTopology(ctx, raw)
 	if err != nil {
@@ -207,7 +205,11 @@ func (b *OpenWrtBackend) runEasyMeshTopologyOperation(normalized string, topolog
 	b.setEasyMeshOperationResult("Success", "Topology persisted and the live mesh converged", normalized)
 }
 
-func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, normalized string, topology easyMeshTopology) error {
+func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(
+	ctx context.Context,
+	normalized string,
+	topology easyMeshTopology,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -225,11 +227,30 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 	commandTimeout := convergenceTimeout + 15*time.Second
 	overallDeadline := time.Now().Add(convergenceTimeout + 45*time.Second)
 	_, commandErr := b.callUbusWithTimeout(ctx, "device", "setTopo", map[string]any{"data": normalized}, commandTimeout)
+	// uai.so invokes `ezcmd td topt` synchronously. The gate is needed while
+	// that command emits the vendor steering requests, but leaving it enabled
+	// during the whole convergence window would unnecessarily allow unrelated
+	// topology requests.
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), easyMeshConsoleTimeout)
 	cleanupErr := b.setEasyMeshTopologyRequestGate(cleanupCtx, false)
 	cleanupCancel()
 	if cleanupErr != nil {
 		cleanupErr = fmt.Errorf("disable EasyMesh topology requests: %w", cleanupErr)
+	}
+	if commandErr != nil {
+		return errors.Join(fmt.Errorf("device.setTopo failed: %w", commandErr), cleanupErr)
+	}
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+
+	// uai.so writes /etc/topo-ezmesh.json before it invokes `ezcmd td topt`.
+	// Therefore an exact getTopo read-back is a prerequisite for claiming that
+	// the plan was accepted. In particular, do not let a requested timeout of
+	// 120 appear successful when the device still reports 60.
+	savedPolicy := b.readEasyMeshTopologyPolicy(ctx)
+	if savedPolicy != normalized {
+		return easyMeshTopologyReadbackError(topology, savedPolicy)
 	}
 
 	verifyTimeout := time.Until(overallDeadline)
@@ -245,7 +266,8 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 	ticker := time.NewTicker(b.easyMeshVerifyInterval)
 	defer ticker.Stop()
 	for {
-		policyPersisted = b.readEasyMeshTopologyPolicy(verifyCtx) == normalized
+		savedPolicy = b.readEasyMeshTopologyPolicy(verifyCtx)
+		policyPersisted = savedPolicy == normalized
 		liveConverged = false
 		if data, err := b.readOpenWrtRealTopo(verifyCtx); err == nil {
 			if live, ok := parseOpenWrtRealTopo(data); ok && easyMeshTopologyMatchesLive(topology, live.root) {
@@ -257,7 +279,7 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 				stableSince = time.Now()
 			}
 			if time.Since(stableSince) >= b.easyMeshStableDuration {
-				return cleanupErr
+				return nil
 			}
 		} else {
 			stableSince = time.Time{}
@@ -266,24 +288,33 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(ctx context.Context, nor
 		select {
 		case <-verifyCtx.Done():
 			if policyPersisted {
-				return errors.Join(
-					fmt.Errorf(
-						"topology policy was saved, but the live mesh did not converge before %d seconds",
-						topology.ConvTimeout,
-					),
-					cleanupErr,
+				return fmt.Errorf(
+					"topology policy was saved, but the live mesh did not converge before %d seconds",
+					topology.ConvTimeout,
 				)
 			}
-			if commandErr != nil {
-				return errors.Join(fmt.Errorf("topology policy was not saved: %w", commandErr), cleanupErr)
-			}
-			return errors.Join(
-				fmt.Errorf("the vendor command completed, but the topology policy was not saved"),
-				cleanupErr,
-			)
+			return easyMeshTopologyReadbackError(topology, savedPolicy)
 		case <-ticker.C:
 		}
 	}
+}
+
+func easyMeshTopologyReadbackError(requested easyMeshTopology, savedPolicy string) error {
+	if savedPolicy == "" {
+		return fmt.Errorf("device.setTopo returned, but device.getTopo did not return a saved policy")
+	}
+	var saved easyMeshTopology
+	if err := json.Unmarshal([]byte(savedPolicy), &saved); err == nil {
+		if saved.ConvTimeout != requested.ConvTimeout {
+			return fmt.Errorf(
+				"device.setTopo did not persist the requested policy: requested convTimeout=%d, device.getTopo reports convTimeout=%d",
+				requested.ConvTimeout,
+				saved.ConvTimeout,
+			)
+		}
+		return fmt.Errorf("device.setTopo returned, but device.getTopo reports a different topology graph")
+	}
+	return fmt.Errorf("device.setTopo returned, but device.getTopo did not match the requested policy")
 }
 
 func (b *OpenWrtBackend) setEasyMeshTopologyRequestGate(ctx context.Context, enabled bool) error {

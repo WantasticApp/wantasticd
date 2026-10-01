@@ -56,7 +56,7 @@ is a JSON document that the firmware validates, stores at
 ```json
 {
   "topOptPolicy": "strict",
-  "convTimeout": 120,
+  "convTimeout": 60,
   "deviceArray": [
     {
       "alId": "00:03:7F:BA:DB:AD",
@@ -88,12 +88,20 @@ SPF 12.2 keeps a separate process-local `g_TopOptRequestSendFlag` disabled by
 default. Without enabling it, `td topt` accepts and prints the requested graph
 but reports `Do not Send TopOpt Request!!`. Wantastic connects only to
 `127.0.0.1:7777`, sends the fixed command `td test on`, calls
-`device.setTopo`, and immediately restores the gate with the fixed command
-`td test off`. No arbitrary console command is accepted from WUSP input.
+`device.setTopo`, and restores the gate with the fixed command `td test off`
+after that RPC returns. The extracted `uai.so` invokes `ezcmd td topt`
+synchronously, and `libtdService.so` checks the flag while that command emits
+each vendor steering request. The `time1`/`time2` values printed by the command
+are carried as request timeouts; they do not require the send gate to remain
+open during the whole convergence interval. No arbitrary console command is
+accepted from WUSP input.
 
 The USP operation is acknowledged as `Pending` and completed asynchronously
 because the controller can schedule per-node steering after the RPC returns.
-Success is published only after both `/etc/topo-ezmesh.json` and
+The synchronous `device.getTopo` read-back must exactly match the requested
+document before Wantastic waits for live convergence. This prevents a staged
+timeout or graph from being presented as saved when the device retained a
+different value. Success is published only after both the saved policy and
 `device.getRealTopo` match the requested graph continuously for the stability
 window. A brief match followed by a rollback remains pending and then reports
 an exact convergence failure. Failure to enable or restore the daemon gate is
@@ -104,6 +112,33 @@ rejects unknown JSON fields, validates all MAC addresses and radio-band enums,
 requires exactly one root, and rejects missing parents, inconsistent depths,
 self-parenting, cycles, control characters, and out-of-range timeout/RSSI
 values. The ubus call uses a structured parameter map rather than shell text.
+
+## SPF 12.2 firmware evidence
+
+The extracted `qca-ezmesh_gdc773b1-1` and `qca-ezmesh-cmn_gdc773b1-1`
+packages provide two different topology mechanisms. They must not be treated as
+interchangeable:
+
+- `/usr/sbin/ezmesh-cmd topopt` writes the fixed `topopt` command to
+  `/var/run/ezmesh-ctrl-cmd.fifo`. The vendor init script installs that same
+  command as the periodic `EnableTopologyOpt` cron job. Its handler is
+  `mapCtrlAlgTopologyOptHandler`, which starts the controller's automatic
+  capacity-based optimizer; it does not accept a requested parent graph.
+- `libmapServiceCtrl.so` exports
+  `mapServiceCtrlSendBackhaulSteeringRequest`. Its request contains a BSTA MAC,
+  target BSSID, operating class, and channel. Calling this library from a new
+  process is not valid because the library expects the EasyMesh controller's
+  in-process topology, message buffers, event loop, and IEEE 1905 state.
+- The saved `device.setTopo` graph is handled by `libtdService.so`. Its sender
+  checks `g_TopOptRequestSendFlag` before emitting each request. This is why a
+  graph can be saved while no live parent changes: the observed trace printed
+  `Do not Send TopOpt Request!!` for both requested relay changes.
+
+Wantastic therefore does not use the automatic `ezmesh-cmd topopt` FIFO as a
+substitute for an operator-selected graph and does not load the native shared
+objects into its own process. The existing typed `device.setTopo` request plus
+bounded local gate and authoritative read-back is the only recovered path that
+preserves the requested parent relationships on this firmware.
 
 ## Verified RN control contracts
 

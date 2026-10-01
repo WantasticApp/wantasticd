@@ -171,6 +171,7 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 	var gotObject, gotMethod string
 	var gotParams map[string]any
 	var savedPolicy string
+	events := []string{}
 	liveTopology := `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","name":"Controller"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"Relay"}]}`
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		EasyMeshVerifyInterval: time.Millisecond,
@@ -187,6 +188,7 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 				}
 				return []byte(savedPolicy), nil
 			case "setTopo":
+				events = append(events, "setTopo")
 				gotObject, gotMethod, gotParams = object, method, params
 				savedPolicy, _ = params["data"].(string)
 				return []byte(`{}`), nil
@@ -194,6 +196,21 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 				return nil, wusp.ErrUSPPathUnsupported
 			}
 		},
+	})
+	backend.easyMeshConsole = easyMeshConsoleFunc(func(
+		_ context.Context,
+		command easyMeshConsoleCommand,
+	) (string, error) {
+		switch command {
+		case easyMeshConsoleEnableTopologyRequests:
+			events = append(events, "enable")
+			return "ToptReq:ON", nil
+		case easyMeshConsoleDisableTopologyRequests:
+			events = append(events, "disable")
+			return "ToptReq:Off", nil
+		default:
+			return "", fmt.Errorf("unexpected command %d", command)
+		}
 	})
 	raw := `{
 		"topOptPolicy":"strict",
@@ -213,6 +230,9 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 	payload, ok := gotParams["data"].(string)
 	if !ok || !strings.Contains(payload, `"alId":"00:03:7F:BA:DB:AD"`) || !strings.Contains(payload, `"bStaLinkBand":"6GH"`) {
 		t.Fatalf("normalized data param=%#v", gotParams["data"])
+	}
+	if !slices.Equal(events, []string{"enable", "setTopo", "disable"}) {
+		t.Fatalf("EasyMesh control events=%v", events)
 	}
 }
 
@@ -330,6 +350,15 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 				return nil, wusp.ErrUSPPathUnsupported
 			}
 		},
+	})
+	backend.easyMeshConsole = easyMeshConsoleFunc(func(
+		_ context.Context,
+		command easyMeshConsoleCommand,
+	) (string, error) {
+		if command == easyMeshConsoleEnableTopologyRequests {
+			return "ToptReq:ON", nil
+		}
+		return "ToptReq:Off", nil
 	})
 
 	if err := backend.StartApplyEasyMeshTopology(context.Background(), requestedPolicy); err != nil {

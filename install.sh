@@ -187,6 +187,16 @@ else
 fi
 [ -n "$EXTRACTED" ] || { echo "Error: binary not found in archive"; ls -la "$TMP_DIR"; exit 1; }
 
+EXTRACTED_VERSION=$("$EXTRACTED" version 2>/dev/null || true)
+case "$EXTRACTED_VERSION" in
+  *"$VERSION"*) ;;
+  *)
+    echo "Error: downloaded binary does not report target version $VERSION"
+    [ -n "$EXTRACTED_VERSION" ] && echo "Reported: $EXTRACTED_VERSION"
+    exit 1
+    ;;
+esac
+
 # ── install binary (atomic) ───────────────────────────────────────────────────
 if   [ -d "/usr/local/bin" ] && echo "$PATH" | grep -q "/usr/local/bin"; then
   INSTALL_DIR="/usr/local/bin"
@@ -334,6 +344,8 @@ start_service() {
   procd_open_instance
   procd_set_param command ${INSTALL_PATH_Q} connect --config ${CONFIG_FILE_Q}
   procd_set_param respawn 3600 5 0
+  procd_set_param term_timeout 15
+  procd_set_param file ${CONFIG_FILE_Q}
   procd_set_param stdout 1
   procd_set_param stderr 1
   procd_close_instance
@@ -347,7 +359,25 @@ EOF
     echo "Error: procd service script was not installed"
     return 1
   }
+  _sleep_count=0
+  while ! procd_service_is_running; do
+    _sleep_count=$((_sleep_count + 1))
+    [ "$_sleep_count" -lt 15 ] || {
+      echo "Error: procd service did not become healthy"
+      return 1
+    }
+    sleep 1
+  done
   echo "Service registered with procd and started."
+}
+
+procd_service_is_running() {
+  if command -v ubus >/dev/null 2>&1; then
+    _service_state=$(ubus call service list '{"name":"wantasticd"}' 2>/dev/null || true)
+    echo "$_service_state" | grep -q '"running"[[:space:]]*:[[:space:]]*true'
+    return
+  fi
+  pidof wantasticd >/dev/null 2>&1
 }
 
 install_service_openrc() {

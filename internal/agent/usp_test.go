@@ -219,6 +219,38 @@ func TestUSPRuntimeAcknowledgesAsyncEasyMeshTopologyAsPending(t *testing.T) {
 	}
 }
 
+func TestUSPRuntimePushesEasyMeshOperationUpdateImmediately(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	defer runtime.Close()
+
+	patch := wusp.NewMessage()
+	patch.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Pending"))
+	patch.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase", wusp.String("Converging"))
+	patch.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology policy saved"))
+	runtime.handleEasyMeshUpdate(patch)
+
+	_, event := readMatchingOutboundEvent(
+		t,
+		runtime.transport.(*fakeUSPTransport),
+		time.Second,
+		wusp.USPEventTypeEvent,
+	)
+	if event.EventName != dataModelChangeEventName {
+		t.Fatalf("event name=%q", event.EventName)
+	}
+	if got := event.Params["Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase"]; got != "Converging" {
+		t.Fatalf("operation phase=%q", got)
+	}
+	cached, err := runtime.dataModelCache.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("collect patched cache: %v", err)
+	}
+	phase, ok := cached.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase")
+	if !ok || phase.AsString() != "Converging" {
+		t.Fatalf("cached operation phase=%q present=%v", phase.AsString(), ok)
+	}
+}
+
 func TestUSPRuntimeRoutesEasyMeshStationRemoval(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	backend := &easyMeshOperateBackend{}

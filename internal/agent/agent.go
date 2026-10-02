@@ -22,10 +22,11 @@ type Agent struct {
 	updater *update.Manager
 	usp     *uspRuntime
 
-	mu      sync.RWMutex
-	running bool
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	mu           sync.RWMutex
+	running      bool
+	stopCh       chan struct{}
+	workerCancel context.CancelFunc
+	wg           sync.WaitGroup
 
 	apiServer *APIServer
 }
@@ -66,15 +67,26 @@ func New(cfg *config.Config) (*Agent, error) {
 
 // Start starts the agent and its components.
 func (a *Agent) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
 		return fmt.Errorf("agent already running")
 	}
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	a.workerCancel = workerCancel
+	a.stopCh = make(chan struct{})
 	a.running = true
 	a.mu.Unlock()
 
 	if err := a.device.Start(); err != nil {
+		workerCancel()
+		a.mu.Lock()
+		a.running = false
+		a.workerCancel = nil
+		a.mu.Unlock()
 		return fmt.Errorf("start device: %w", err)
 	}
 
@@ -87,17 +99,17 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 	a.wg.Add(workerCount)
 
-	go a.runHealthCheck(ctx)
-	go a.runDNSCheck(ctx)
+	go a.runHealthCheck(workerCtx)
+	go a.runDNSCheck(workerCtx)
 
 	if a.usp != nil {
-		go a.runWUSPInit(ctx)
-		go a.runNetworkSpeedMonitor(ctx)
+		go a.runWUSPInit(workerCtx)
+		go a.runNetworkSpeedMonitor(workerCtx)
 	}
 
 	if a.config.AutoUpdate {
 		log.Println("Auto-update enabled")
-		go a.runUpdateChecker(ctx)
+		go a.runUpdateChecker(workerCtx)
 	} else {
 		log.Println("Auto-update disabled")
 	}
@@ -117,6 +129,8 @@ func (a *Agent) Stop() error {
 		return nil
 	}
 	a.running = false
+	workerCancel := a.workerCancel
+	a.workerCancel = nil
 
 	select {
 	case <-a.stopCh:
@@ -125,6 +139,12 @@ func (a *Agent) Stop() error {
 	}
 	a.mu.Unlock()
 
+	if workerCancel != nil {
+		workerCancel()
+	}
+	if a.usp != nil {
+		a.usp.Close()
+	}
 	a.wg.Wait()
 
 	if err := a.device.Stop(); err != nil {

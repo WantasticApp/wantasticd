@@ -157,14 +157,19 @@ func TestCellularMonitorClearsRememberedModemAfterConfirmedEmptyDiscoveries(t *t
 		if got := monitor.refresh(); len(got) != 1 {
 			t.Fatalf("attempt %d prematurely cleared cached modem", attempt)
 		}
-		if state := monitor.snapshotWithState().state; state != cellularDiscoveryStale {
+		monitor.mu.RLock()
+		state := monitor.snapshotLocked().state
+		monitor.mu.RUnlock()
+		if state != cellularDiscoveryStale {
 			t.Fatalf("attempt %d state=%q want Stale", attempt, state)
 		}
 	}
 	if got := monitor.refresh(); len(got) != 0 {
 		t.Fatalf("confirmed absence retained %d modem(s)", len(got))
 	}
-	state := monitor.snapshotWithState()
+	monitor.mu.RLock()
+	state := monitor.snapshotLocked()
+	monitor.mu.RUnlock()
 	if state.state != cellularDiscoveryAbsent || state.consecutiveEmpties != 3 {
 		t.Fatalf("confirmed empty state=%+v", state)
 	}

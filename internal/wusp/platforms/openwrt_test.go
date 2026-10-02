@@ -351,6 +351,7 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 			}
 		},
 	})
+	defer backend.Close()
 	backend.easyMeshConsole = easyMeshConsoleFunc(func(
 		_ context.Context,
 		command easyMeshConsoleCommand,
@@ -399,6 +400,75 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 	}
 	status, message := backend.easyMeshOperationResult()
 	t.Fatalf("operation did not complete: status=%q message=%q", status, message)
+}
+
+func TestEasyMeshTopologyOperationCloseCancelsVendorCallAndRestoresGate(t *testing.T) {
+	const requestedPolicy = `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`
+	const liveTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay"}]}`
+
+	started := make(chan struct{})
+	gateDisabled := make(chan struct{}, 1)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusParamCaller: func(ctx context.Context, object, method string, _ map[string]any) ([]byte, error) {
+			if object != "device" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			switch method {
+			case "getMode":
+				return []byte(`{"mode":"CN"}`), nil
+			case "getRealTopo":
+				return []byte(liveTopology), nil
+			case "setTopo":
+				close(started)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+	})
+	backend.easyMeshConsole = easyMeshConsoleFunc(func(
+		_ context.Context,
+		command easyMeshConsoleCommand,
+	) (string, error) {
+		if command == easyMeshConsoleEnableTopologyRequests {
+			return "ToptReq:ON", nil
+		}
+		select {
+		case gateDisabled <- struct{}{}:
+		default:
+		}
+		return "ToptReq:Off", nil
+	})
+
+	if err := backend.StartApplyEasyMeshTopology(context.Background(), requestedPolicy); err != nil {
+		t.Fatalf("StartApplyEasyMeshTopology: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("device.setTopo did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		_ = backend.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("backend Close did not cancel and join device.setTopo")
+	}
+	select {
+	case <-gateDisabled:
+	default:
+		t.Fatal("topology request gate was not restored during cancellation")
+	}
+	status, message := backend.easyMeshOperationResult()
+	if status != "Error" || !strings.Contains(message, "context canceled") {
+		t.Fatalf("operation after Close: status=%q message=%q", status, message)
+	}
 }
 
 func TestRemoveEasyMeshStationValidatesAndUsesVendorPolicy(t *testing.T) {
@@ -1030,7 +1100,7 @@ func TestOpenWrtBackendExposesEasyMeshAgentWithoutControllerTopology(t *testing.
 	}
 }
 
-func TestOpenWrtBackendAdvertisesControllerBootstrapWithoutSavedPolicy(t *testing.T) {
+func TestOpenWrtBackendKeepsControllerReadOnlyWithoutSavedPolicy(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object != "device" {
@@ -1058,13 +1128,64 @@ func TestOpenWrtBackendAdvertisesControllerBootstrapWithoutSavedPolicy(t *testin
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Controller")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Implementation", "device.ubus")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Status", "Degraded")
 	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation")
 	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
 		t.Fatal("missing vendor policy must not be represented as a current topology policy")
 	}
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(controller bootstrap): %v", err)
+	}
+}
+
+func TestOpenWrtBackendKeepsControllerTopologyReadOnlyWhenPolicyInventoryIsStale(t *testing.T) {
+	policy := map[string]any{
+		"topOptPolicy": "strict",
+		"convTimeout":  60,
+		"deviceArray": []map[string]any{
+			{"alId": "00:03:7F:BA:DB:AD", "parentAlId": "NULL", "bStaLinkBand": "6GHL", "depth": 0, "rssiThresh": -70, "apName": "Controller"},
+			{"alId": "E0:5D:54:4B:E6:CF", "parentAlId": "00:03:7F:BA:DB:AD", "bStaLinkBand": "6GHL", "depth": 1, "rssiThresh": -70, "apName": "Missing"},
+			{"alId": "E0:5D:54:4B:E5:DC", "parentAlId": "E0:5D:54:4B:E6:CF", "bStaLinkBand": "6GHL", "depth": 2, "rssiThresh": -70, "apName": "Relay"},
+		},
+	}
+	response, err := json.Marshal(map[string]any{"data": policy})
+	if err != nil {
+		t.Fatalf("encode getTopo fixture: %v", err)
+	}
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object != "device" {
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+			switch method {
+			case "getMode":
+				return []byte(`{"mode":1}`), nil
+			case "getRealTopo":
+				return []byte(`{"topo":[
+					{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","backhaul":"B","name":"Controller"},
+					{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.141","backhaul":"H","name":"Relay"}
+				]}`), nil
+			case "getTopo":
+				return response, nil
+			default:
+				return nil, wusp.ErrUSPPathUnsupported
+			}
+		},
+		Now: time.Now,
+	})
+
+	msg := wusp.NewMessage()
+	backend.appendOpenWrtMeshTopology(context.Background(), msg)
+	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Controller")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Status", "Degraded")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation")
+	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
+		t.Fatal("stale saved policy must not be exposed as an editable topology")
+	}
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("ValidateMessageFast(stale controller policy): %v", err)
 	}
 }
 

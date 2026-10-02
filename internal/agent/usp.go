@@ -51,6 +51,8 @@ const (
 )
 
 type uspRuntime struct {
+	ctx                    context.Context
+	cancel                 context.CancelFunc
 	transport              uspTransport
 	agent                  *wusp.USPAgent
 	dataModelCache         *persistentDataModelCache
@@ -234,7 +236,10 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	networkSpeed := newNetworkSpeedManager(auth.PersistentFilePath("network-speed.json"))
 	telemetryBackend := &networkTelemetryBackend{backend: backend, speed: networkSpeed}
 	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	runtime := &uspRuntime{
+		ctx:                    runtimeCtx,
+		cancel:                 runtimeCancel,
 		transport:              transport,
 		dataModelCache:         cachedBackend,
 		rawBackend:             backend,
@@ -257,6 +262,11 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		OperateHandler:  runtime.handleOperate,
 		EventSender:     runtime, // uspRuntime implements wusp.USPEventSender
 	})
+	if controller, ok := backend.(interface {
+		SetEasyMeshObserver(func(*wusp.Message))
+	}); ok {
+		controller.SetEasyMeshObserver(runtime.handleEasyMeshUpdate)
+	}
 	cachedBackend.SetChangeObserver(func(previous, current *wusp.Message) {
 		go runtime.emitDataModelChanges(previous, current)
 	})
@@ -266,16 +276,17 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		Timestamp: time.Now().UTC(),
 		Overwrite: true,
 	}); err != nil {
+		runtime.Close()
 		return nil, err
 	}
 	go func() {
 		defer close(runtime.warmupDone)
-		defer cachedBackend.Start(context.Background())
+		defer cachedBackend.Start(runtime.ctx)
 		started := time.Now()
 		// The RM520N-GL native AT bridge serializes a broad telemetry sweep and
 		// can legitimately need more than 45 seconds. Do not announce WUSP with
 		// an empty cellular cache merely because the modem is still collecting.
-		warmCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		warmCtx, cancel := context.WithTimeout(runtime.ctx, 2*time.Minute)
 		defer cancel()
 		log.Printf("[USP] DataModel warmup: starting live cellular collection")
 		if err := cachedBackend.Warmup(warmCtx); err != nil {
@@ -634,7 +645,8 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 			}
 			output := wusp.NewMessage()
 			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Pending"))
-			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology accepted; waiting for the saved policy and live mesh to converge"))
+			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase", wusp.String("Accepted"))
+			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology accepted; applying the saved policy on the controller"))
 			return output, nil
 		}
 		controller, ok := r.rawBackend.(interface {
@@ -1264,6 +1276,55 @@ func (r *uspRuntime) SendUSPNotify(ctx context.Context, data []byte) error {
 }
 
 const dataModelChangeEventName = "DataModelChange!"
+
+// handleEasyMeshUpdate persists asynchronous operation phases and live parent
+// graph changes, then emits them immediately. This is deliberately independent
+// of the 60-second collector so cloud and portal state cannot lag the device.
+func (r *uspRuntime) handleEasyMeshUpdate(patch *wusp.Message) {
+	if r == nil || r.agent == nil || patch == nil || len(patch.Fields) == 0 {
+		return
+	}
+	if r.dataModelCache != nil {
+		if err := r.dataModelCache.Patch(patch); err != nil {
+			log.Printf("[USP] EasyMesh live cache patch warning: continue_on_error=true err=%v", err)
+		}
+	}
+
+	params := make(map[string]string, len(patch.Fields))
+	for _, field := range patch.Fields {
+		params[field.Path] = wusp.ValueToString(field.Val)
+	}
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	notifyCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := r.agent.Emit(notifyCtx, wusp.USPEvent{
+		Type:         wusp.USPEventTypeEvent,
+		EventName:    dataModelChangeEventName,
+		ObjPath:      "Device.WUSP_MeshTelemetry.EasyMesh.1.",
+		Params:       params,
+		ParamMessage: patch,
+	}); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("[USP] EasyMesh live notify warning: continue_on_error=true err=%v", err)
+	}
+}
+
+// Close stops runtime-owned background collection and joins backend operations.
+func (r *uspRuntime) Close() {
+	if r == nil {
+		return
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if closer, ok := r.rawBackend.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			log.Printf("[USP] backend shutdown warning: %v", err)
+		}
+	}
+}
 
 // emitDataModelChanges turns each successful periodic platform collection into
 // compact push updates. The transport fragments large events, while bounded

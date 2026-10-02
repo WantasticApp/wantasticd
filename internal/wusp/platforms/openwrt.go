@@ -51,6 +51,8 @@ type OpenWrtBackendOptions struct {
 	EasyMeshTopologyPath   string
 	EasyMeshVerifyInterval time.Duration
 	EasyMeshStableDuration time.Duration
+	EasyMeshCommandTimeout time.Duration
+	EasyMeshObserver       func(*wusp.Message)
 	CommandRunner          func(context.Context, string, ...string) ([]byte, error)
 	WiFiAssocList          func(string) ([]iwinfo.AssocEntry, error)
 	WiFiInfo               func(string) (*iwinfo.InterfaceInfo, error)
@@ -61,41 +63,47 @@ type OpenWrtBackendOptions struct {
 }
 
 type OpenWrtBackend struct {
-	uciConfigDir           string
-	statePath              string
-	hostnamePath           string
-	etcHostnamePath        string
-	tzPath                 string
-	zoneInfoDir            string
-	uptimePath             string
-	memInfoPath            string
-	ipv6DisablePath        string
-	tcpImplementationPath  string
-	openWrtReleasePath     string
-	osReleasePath          string
-	serialNumberPath       string
-	netClassDir            string
-	dhcpLeasesPath         string
-	arpPath                string
-	ubusClient             *ubus.Client
-	ubusTimeout            time.Duration
-	ubusCaller             func(string, string, time.Duration) ([]byte, error)
-	ubusParamCaller        func(context.Context, string, string, map[string]any) ([]byte, error)
-	ubusCallerInjected     bool
-	easyMeshTopologyPath   string
-	easyMeshVerifyInterval time.Duration
-	easyMeshStableDuration time.Duration
-	easyMeshConsole        easyMeshConsole
-	commandRunner          func(context.Context, string, ...string) ([]byte, error)
-	wifiAssocList          func(string) ([]iwinfo.AssocEntry, error)
-	wifiInfo               func(string) (*iwinfo.InterfaceInfo, error)
-	wifiHWModeList         func(string) (*iwinfo.HWModes, error)
-	wifiHTModeList         func(string) ([]string, error)
-	wifiTxPowerLevels      func(context.Context, string) []int
-	cellular               *cellularMonitor
-	now                    func() time.Time
-	easyMeshOperationMu    sync.RWMutex
-	easyMeshOperation      easyMeshOperationState
+	uciConfigDir            string
+	statePath               string
+	hostnamePath            string
+	etcHostnamePath         string
+	tzPath                  string
+	zoneInfoDir             string
+	uptimePath              string
+	memInfoPath             string
+	ipv6DisablePath         string
+	tcpImplementationPath   string
+	openWrtReleasePath      string
+	osReleasePath           string
+	serialNumberPath        string
+	netClassDir             string
+	dhcpLeasesPath          string
+	arpPath                 string
+	ubusClient              *ubus.Client
+	ubusTimeout             time.Duration
+	ubusCaller              func(string, string, time.Duration) ([]byte, error)
+	ubusParamCaller         func(context.Context, string, string, map[string]any) ([]byte, error)
+	ubusCallerInjected      bool
+	easyMeshTopologyPath    string
+	easyMeshVerifyInterval  time.Duration
+	easyMeshStableDuration  time.Duration
+	easyMeshCommandTimeout  time.Duration
+	easyMeshConsole         easyMeshConsole
+	commandRunner           func(context.Context, string, ...string) ([]byte, error)
+	wifiAssocList           func(string) ([]iwinfo.AssocEntry, error)
+	wifiInfo                func(string) (*iwinfo.InterfaceInfo, error)
+	wifiHWModeList          func(string) (*iwinfo.HWModes, error)
+	wifiHTModeList          func(string) ([]string, error)
+	wifiTxPowerLevels       func(context.Context, string) []int
+	cellular                *cellularMonitor
+	now                     func() time.Time
+	easyMeshOperationMu     sync.RWMutex
+	easyMeshOperation       easyMeshOperationState
+	easyMeshObserver        func(*wusp.Message)
+	easyMeshOperationCtx    context.Context
+	easyMeshOperationCancel context.CancelFunc
+	easyMeshOperationWG     sync.WaitGroup
+	easyMeshCloseOnce       sync.Once
 }
 
 func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
@@ -286,40 +294,45 @@ type openWrtHostapdClients struct {
 var _ wusp.DataBackend = (*OpenWrtBackend)(nil)
 
 func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
+	operationCtx, operationCancel := context.WithCancel(context.Background())
 	backend := &OpenWrtBackend{
-		uciConfigDir:           coalesceString(opts.UCIConfigDir, "/etc/config"),
-		statePath:              coalesceString(opts.StatePath, defaultWantasticStatePath("usp-openwrt.json")),
-		hostnamePath:           coalesceString(opts.HostnamePath, "/proc/sys/kernel/hostname"),
-		etcHostnamePath:        coalesceString(opts.EtcHostnamePath, "/etc/hostname"),
-		tzPath:                 coalesceString(opts.TZPath, "/etc/TZ"),
-		zoneInfoDir:            coalesceString(opts.ZoneInfoDir, "/usr/share/zoneinfo"),
-		uptimePath:             coalesceString(opts.UptimePath, "/proc/uptime"),
-		memInfoPath:            coalesceString(opts.MemInfoPath, "/proc/meminfo"),
-		ipv6DisablePath:        coalesceString(opts.IPv6DisablePath, "/proc/sys/net/ipv6/conf/all/disable_ipv6"),
-		tcpImplementationPath:  coalesceString(opts.TCPImplementationPath, "/proc/sys/net/ipv4/tcp_congestion_control"),
-		openWrtReleasePath:     coalesceString(opts.OpenWrtReleasePath, "/etc/openwrt_release"),
-		osReleasePath:          coalesceString(opts.OSReleasePath, "/etc/os-release"),
-		serialNumberPath:       coalesceString(opts.SerialNumberPath, "/proc/device-tree/serial-number"),
-		netClassDir:            coalesceString(opts.NetClassDir, "/sys/class/net"),
-		dhcpLeasesPath:         coalesceString(opts.DHCPLeasesPath, "/tmp/dhcp.leases"),
-		arpPath:                coalesceString(opts.ARPPath, "/proc/net/arp"),
-		ubusClient:             opts.UbusClient,
-		ubusTimeout:            opts.UbusTimeout,
-		ubusCaller:             opts.UbusCaller,
-		ubusParamCaller:        opts.UbusParamCaller,
-		ubusCallerInjected:     opts.UbusCaller != nil,
-		easyMeshTopologyPath:   coalesceString(opts.EasyMeshTopologyPath, "/etc/topo-ezmesh.json"),
-		easyMeshVerifyInterval: opts.EasyMeshVerifyInterval,
-		easyMeshStableDuration: opts.EasyMeshStableDuration,
-		easyMeshConsole:        newEasyMeshConsoleClient(),
-		commandRunner:          opts.CommandRunner,
-		wifiAssocList:          opts.WiFiAssocList,
-		wifiInfo:               opts.WiFiInfo,
-		wifiHWModeList:         opts.WiFiHWModeList,
-		wifiHTModeList:         opts.WiFiHTModeList,
-		wifiTxPowerLevels:      opts.WiFiTxPowerLevels,
-		cellular:               newCellularMonitor(),
-		now:                    opts.Now,
+		uciConfigDir:            coalesceString(opts.UCIConfigDir, "/etc/config"),
+		statePath:               coalesceString(opts.StatePath, defaultWantasticStatePath("usp-openwrt.json")),
+		hostnamePath:            coalesceString(opts.HostnamePath, "/proc/sys/kernel/hostname"),
+		etcHostnamePath:         coalesceString(opts.EtcHostnamePath, "/etc/hostname"),
+		tzPath:                  coalesceString(opts.TZPath, "/etc/TZ"),
+		zoneInfoDir:             coalesceString(opts.ZoneInfoDir, "/usr/share/zoneinfo"),
+		uptimePath:              coalesceString(opts.UptimePath, "/proc/uptime"),
+		memInfoPath:             coalesceString(opts.MemInfoPath, "/proc/meminfo"),
+		ipv6DisablePath:         coalesceString(opts.IPv6DisablePath, "/proc/sys/net/ipv6/conf/all/disable_ipv6"),
+		tcpImplementationPath:   coalesceString(opts.TCPImplementationPath, "/proc/sys/net/ipv4/tcp_congestion_control"),
+		openWrtReleasePath:      coalesceString(opts.OpenWrtReleasePath, "/etc/openwrt_release"),
+		osReleasePath:           coalesceString(opts.OSReleasePath, "/etc/os-release"),
+		serialNumberPath:        coalesceString(opts.SerialNumberPath, "/proc/device-tree/serial-number"),
+		netClassDir:             coalesceString(opts.NetClassDir, "/sys/class/net"),
+		dhcpLeasesPath:          coalesceString(opts.DHCPLeasesPath, "/tmp/dhcp.leases"),
+		arpPath:                 coalesceString(opts.ARPPath, "/proc/net/arp"),
+		ubusClient:              opts.UbusClient,
+		ubusTimeout:             opts.UbusTimeout,
+		ubusCaller:              opts.UbusCaller,
+		ubusParamCaller:         opts.UbusParamCaller,
+		ubusCallerInjected:      opts.UbusCaller != nil,
+		easyMeshTopologyPath:    coalesceString(opts.EasyMeshTopologyPath, "/etc/topo-ezmesh.json"),
+		easyMeshVerifyInterval:  opts.EasyMeshVerifyInterval,
+		easyMeshStableDuration:  opts.EasyMeshStableDuration,
+		easyMeshCommandTimeout:  opts.EasyMeshCommandTimeout,
+		easyMeshObserver:        opts.EasyMeshObserver,
+		easyMeshOperationCtx:    operationCtx,
+		easyMeshOperationCancel: operationCancel,
+		easyMeshConsole:         newEasyMeshConsoleClient(),
+		commandRunner:           opts.CommandRunner,
+		wifiAssocList:           opts.WiFiAssocList,
+		wifiInfo:                opts.WiFiInfo,
+		wifiHWModeList:          opts.WiFiHWModeList,
+		wifiHTModeList:          opts.WiFiHTModeList,
+		wifiTxPowerLevels:       opts.WiFiTxPowerLevels,
+		cellular:                newCellularMonitor(),
+		now:                     opts.Now,
 	}
 	if backend.ubusTimeout <= 0 {
 		backend.ubusTimeout = 3 * time.Second
@@ -329,6 +342,9 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	}
 	if backend.easyMeshStableDuration <= 0 {
 		backend.easyMeshStableDuration = 10 * time.Second
+	}
+	if backend.easyMeshCommandTimeout <= 0 {
+		backend.easyMeshCommandTimeout = 30 * time.Second
 	}
 	if backend.ubusClient == nil {
 		backend.ubusClient = ubus.NewClient(ubus.Options{

@@ -7,6 +7,8 @@ set -e
 BASE_URL="https://get.wantastic.app"
 CONNECT_TIMEOUT="${WANTASTIC_UPDATE_CONNECT_TIMEOUT:-15}"
 DOWNLOAD_TIMEOUT="${WANTASTIC_UPDATE_DOWNLOAD_TIMEOUT:-300}"
+VERIFY_TIMEOUT="${WANTASTIC_UPDATE_VERIFY_TIMEOUT:-20}"
+SERVICE_MANAGER=""
 
 # ── platform ─────────────────────────────────────────────────────────────────
 UNAME_S="$(uname -s)"
@@ -38,24 +40,28 @@ restart_service() {
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wantasticd 2>/dev/null; then
     echo "Restarting via systemd…"
     systemctl restart wantasticd
+    SERVICE_MANAGER="systemd"
     return 0
   fi
   # procd (OpenWrt)
   if [ -x /etc/init.d/wantasticd ] && command -v procd >/dev/null 2>&1; then
     echo "Restarting via procd…"
     /etc/init.d/wantasticd restart
+    SERVICE_MANAGER="procd"
     return 0
   fi
   # OpenRC
   if command -v rc-service >/dev/null 2>&1; then
     echo "Restarting via OpenRC…"
     rc-service wantasticd restart
+    SERVICE_MANAGER="openrc"
     return 0
   fi
   # generic init.d
   if [ -x /etc/init.d/wantasticd ]; then
     echo "Restarting via init.d…"
     /etc/init.d/wantasticd restart
+    SERVICE_MANAGER="initd"
     return 0
   fi
   # launchd (macOS)
@@ -63,11 +69,50 @@ restart_service() {
     echo "Restarting via launchctl…"
     launchctl stop  com.wantastic.wantasticd 2>/dev/null || true
     launchctl start com.wantastic.wantasticd
+    SERVICE_MANAGER="launchd"
     return 0
   fi
-  # Fallback: exec new binary directly (replaces running process)
-  echo "No service manager found — exec'ing new binary directly…"
-  exec "$TARGET_BIN" "$@"
+  echo "Error: no supported service manager found; refusing an unverifiable update"
+  return 1
+}
+
+service_is_running() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl is-active --quiet wantasticd ;;
+    procd)
+      if command -v ubus >/dev/null 2>&1; then
+        _service_state=$(ubus call service list '{"name":"wantasticd"}' 2>/dev/null || true)
+        echo "$_service_state" | grep -q '"running"[[:space:]]*:[[:space:]]*true'
+      else
+        pidof wantasticd >/dev/null 2>&1
+      fi
+      ;;
+    initd) /etc/init.d/wantasticd status >/dev/null 2>&1 ;;
+    openrc) rc-service wantasticd status >/dev/null 2>&1 ;;
+    launchd) launchctl list com.wantastic.wantasticd >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+binary_reports_version() {
+  _expected="$1"
+  _output=$("$TARGET_BIN" version 2>/dev/null || true)
+  case "$_output" in
+    *"$_expected"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_update() {
+  _elapsed=0
+  while [ "$_elapsed" -lt "$VERIFY_TIMEOUT" ]; do
+    if service_is_running && binary_reports_version "$VERSION"; then
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+  return 1
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -136,20 +181,44 @@ main() {
 
   chmod +x "$NEW_BIN"
 
+  # Refuse a corrupt archive, wrong architecture, or incorrectly-versioned
+  # build before touching the running installation.
+  NEW_VERSION_OUTPUT=$("$NEW_BIN" version 2>/dev/null || true)
+  case "$NEW_VERSION_OUTPUT" in
+    *"$VERSION"*) ;;
+    *)
+      echo "Error: downloaded binary does not report target version $VERSION"
+      [ -n "$NEW_VERSION_OUTPUT" ] && echo "Reported: $NEW_VERSION_OUTPUT"
+      exit 1
+      ;;
+  esac
+
   # ── atomic replacement ────────────────────────────────────────────────────
   # Stage in the same directory so mv is rename(2) — atomic on same filesystem.
   # The running process keeps its old inode open; the new inode is exec'd by
   # the service manager on restart.
   DEST_DIR="$(dirname "$TARGET_BIN")"
   STAGING="${DEST_DIR}/.wantasticd.update.$$"
+  BACKUP="$TMP_DIR/wantasticd.previous"
 
+  [ ! -f "$TARGET_BIN" ] || cp -p "$TARGET_BIN" "$BACKUP"
   cp "$NEW_BIN" "$STAGING" || { echo "Error: cannot write to $DEST_DIR (check permissions)"; exit 1; }
   chmod +x "$STAGING"
   mv -f "$STAGING" "$TARGET_BIN"
   echo "Binary updated: $TARGET_BIN"
 
   # ── trigger service restart ───────────────────────────────────────────────
-  restart_service
+  if ! restart_service || ! verify_update; then
+    echo "Error: updated service failed health verification; restoring previous binary"
+    if [ -f "$BACKUP" ]; then
+      ROLLBACK_STAGING="${DEST_DIR}/.wantasticd.rollback.$$"
+      cp -p "$BACKUP" "$ROLLBACK_STAGING"
+      chmod +x "$ROLLBACK_STAGING"
+      mv -f "$ROLLBACK_STAGING" "$TARGET_BIN"
+      restart_service || true
+    fi
+    exit 1
+  fi
   echo "Update complete — running version: $VERSION"
 }
 

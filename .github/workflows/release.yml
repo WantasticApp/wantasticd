@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: wantasticd-release
+  cancel-in-progress: false
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -148,6 +152,18 @@ jobs:
         fi
         cp latest r2_upload/
 
+    - name: Check tag is still newest
+      id: newest-tag
+      run: |
+        git fetch --tags --force
+        NEWEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
+        if [ "$NEWEST_TAG" = "${{ github.ref_name }}" ]; then
+          echo "is_newest=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "is_newest=false" >> "$GITHUB_OUTPUT"
+          echo "Skipping latest-channel upload because $NEWEST_TAG supersedes ${{ github.ref_name }}"
+        fi
+
     - name: Upload to R2 (Versioned)
       uses: ryand56/r2-upload-action@latest
       with:
@@ -159,6 +175,7 @@ jobs:
         destination-dir: ${{ github.ref_name }}
 
     - name: Upload to R2 (Latest)
+      if: steps.newest-tag.outputs.is_newest == 'true'
       uses: ryand56/r2-upload-action@latest
       with:
         r2-account-id: ${{ secrets.R2_ACCOUNT }}
@@ -179,7 +196,20 @@ jobs:
         cp install.sh root_upload/
         echo "${{ github.ref_name }}+$(git rev-parse --short HEAD)" > root_upload/latest
 
+    - name: Check tag is still newest
+      id: newest-tag
+      run: |
+        git fetch --tags --force
+        NEWEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
+        if [ "$NEWEST_TAG" = "${{ github.ref_name }}" ]; then
+          echo "is_newest=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "is_newest=false" >> "$GITHUB_OUTPUT"
+          echo "Skipping root latest marker because $NEWEST_TAG supersedes ${{ github.ref_name }}"
+        fi
+
     - name: Upload Root Artifacts to R2
+      if: steps.newest-tag.outputs.is_newest == 'true'
       uses: ryand56/r2-upload-action@latest
       with:
         r2-account-id: ${{ secrets.R2_ACCOUNT }}

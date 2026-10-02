@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -109,14 +110,118 @@ func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath
 	return nil
 }
 
-func (m *Manager) shouldUpdate(targetVersion string) bool {
-	return m.currentVersion != targetVersion
+type releaseVersion struct {
+	major      uint64
+	minor      uint64
+	patch      uint64
+	prerelease string
+}
+
+func parseReleaseVersion(raw string) (releaseVersion, error) {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimPrefix(value, "v")
+	value, _, _ = strings.Cut(value, "+")
+	core, prerelease, _ := strings.Cut(value, "-")
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return releaseVersion{}, fmt.Errorf("version %q is not major.minor.patch", raw)
+	}
+	numbers := make([]uint64, len(parts))
+	for i, part := range parts {
+		if part == "" || len(part) > 1 && part[0] == '0' {
+			return releaseVersion{}, fmt.Errorf("version %q has an invalid numeric component", raw)
+		}
+		number, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return releaseVersion{}, fmt.Errorf("version %q has an invalid numeric component: %w", raw, err)
+		}
+		numbers[i] = number
+	}
+	return releaseVersion{
+		major:      numbers[0],
+		minor:      numbers[1],
+		patch:      numbers[2],
+		prerelease: prerelease,
+	}, nil
+}
+
+func compareReleaseVersions(left, right releaseVersion) int {
+	for _, pair := range [][2]uint64{
+		{left.major, right.major},
+		{left.minor, right.minor},
+		{left.patch, right.patch},
+	} {
+		if pair[0] < pair[1] {
+			return -1
+		}
+		if pair[0] > pair[1] {
+			return 1
+		}
+	}
+	if left.prerelease == right.prerelease {
+		return 0
+	}
+	if left.prerelease == "" {
+		return 1
+	}
+	if right.prerelease == "" {
+		return -1
+	}
+	return comparePrerelease(left.prerelease, right.prerelease)
+}
+
+func comparePrerelease(left, right string) int {
+	leftParts := strings.Split(left, ".")
+	rightParts := strings.Split(right, ".")
+	for i := 0; i < len(leftParts) && i < len(rightParts); i++ {
+		if leftParts[i] == rightParts[i] {
+			continue
+		}
+		leftNumber, leftErr := strconv.ParseUint(leftParts[i], 10, 64)
+		rightNumber, rightErr := strconv.ParseUint(rightParts[i], 10, 64)
+		switch {
+		case leftErr == nil && rightErr == nil:
+			if leftNumber < rightNumber {
+				return -1
+			}
+			return 1
+		case leftErr == nil:
+			return -1
+		case rightErr == nil:
+			return 1
+		default:
+			return strings.Compare(leftParts[i], rightParts[i])
+		}
+	}
+	if len(leftParts) < len(rightParts) {
+		return -1
+	}
+	return 1
+}
+
+// ShouldUpdate returns true only when targetVersion is strictly newer. Build
+// metadata is intentionally ignored, so a stale release channel can never
+// downgrade a newer agent or restart one for a different build of the same tag.
+func (m *Manager) ShouldUpdate(targetVersion string) (bool, error) {
+	current, err := parseReleaseVersion(m.currentVersion)
+	if err != nil {
+		return false, fmt.Errorf("parse current version: %w", err)
+	}
+	target, err := parseReleaseVersion(targetVersion)
+	if err != nil {
+		return false, fmt.Errorf("parse target version: %w", err)
+	}
+	return compareReleaseVersions(current, target) < 0, nil
 }
 
 // CheckAndUpdate checks for updates and applies them. Returns true if updated.
 func (m *Manager) CheckAndUpdate(ctx context.Context, targetVersion string) (bool, error) {
-	if !m.shouldUpdate(targetVersion) {
-		log.Printf("Already running latest version: %s", m.currentVersion)
+	shouldUpdate, err := m.ShouldUpdate(targetVersion)
+	if err != nil {
+		return false, err
+	}
+	if !shouldUpdate {
+		log.Printf("No newer release available: current=%s offered=%s", m.currentVersion, targetVersion)
 		return false, nil
 	}
 

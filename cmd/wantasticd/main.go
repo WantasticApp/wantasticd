@@ -647,8 +647,12 @@ func handleUpdate() {
 		log.Fatalf("Failed to fetch latest version: %v", err)
 	}
 
-	if latest == version.Version {
-		fmt.Printf("Already running latest version: %s\n", version.Version)
+	shouldUpdate, err := mgr.ShouldUpdate(latest)
+	if err != nil {
+		log.Fatalf("Invalid update version: %v", err)
+	}
+	if !shouldUpdate {
+		fmt.Printf("No newer release available: current=%s offered=%s\n", version.Version, latest)
 		return
 	}
 

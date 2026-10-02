@@ -9,7 +9,22 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.12'
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Validate installers
+        run: sh -n install.sh scripts/install.sh internal/update/self-update.sh
+
   create-release:
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +37,6 @@ jobs:
   release:
     needs: create-release
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       matrix:
         goos: [linux, darwin, windows]
@@ -174,4 +188,3 @@ jobs:
         r2-bucket: ${{ secrets.R2_BUCKET }}
         source-dir: root_upload
         destination-dir: ./
-

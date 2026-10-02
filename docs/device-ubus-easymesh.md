@@ -70,13 +70,13 @@ is a JSON document that the firmware validates, stores at
 }
 ```
 
-Wantastic exposes `ApplyTopology()` when the device is the confirmed CN. When
-`getTopo` (or the on-device policy file fallback) returns a valid policy, that
-document is the base for every UI edit. If no policy exists yet, the console
-builds a first reviewable policy from the authoritative `getRealTopo` nodes and
-links, uses the vendor's strict policy with bounded defaults, and requires user
-confirmation before `setTopo` persists it. Missing nodes or ambiguous links
-remain read-only rather than being guessed.
+Wantastic exposes `ApplyTopology()` only when the device is the confirmed CN
+and `getTopo` (or the on-device policy file fallback) returns a valid policy
+whose node inventory exactly matches `getRealTopo`. That document is the base
+for every UI edit. A missing, malformed, or stale policy keeps the EasyMesh row
+visible for diagnostics but omits `ApplyTopology` and `TopologyJSON`. The
+controller must first publish a consistent vendor policy before cloud topology
+editing is enabled.
 
 The vendor controller accepts only `strict` and `permissive` for
 `topOptPolicy`. `strict` keeps the requested parent graph authoritative;
@@ -98,6 +98,16 @@ accepted from WUSP input.
 
 The USP operation is acknowledged as `Pending` and completed asynchronously
 because the controller can schedule per-node steering after the RPC returns.
+The agent publishes `Accepted`, `Applying`, `Converging`, and terminal
+`Complete`/`Failed` phases immediately through WUSP `DataModelChange!`
+notifications. The portal consumes those pushes and does not run a second
+polling loop. While convergence is active, each changed `getRealTopo` parent
+graph is also converted to WUSP node/link rows and pushed immediately;
+unchanged samples are suppressed by a stable graph fingerprint. The vendor RPC
+has its own fixed 30-second safety deadline; the
+user-facing cloud request never waits for either that deadline or radio
+convergence. The `convTimeout` field applies only to live parent-graph
+convergence after the saved policy has been confirmed.
 The synchronous `device.getTopo` read-back must exactly match the requested
 document before Wantastic waits for live convergence. This prevents a staged
 timeout or graph from being presented as saved when the device retained a
@@ -139,6 +149,43 @@ substitute for an operator-selected graph and does not load the native shared
 objects into its own process. The existing typed `device.setTopo` request plus
 bounded local gate and authoritative read-back is the only recovered path that
 preserves the requested parent relationships on this firmware.
+
+## SkyNet Bigo reference agent
+
+The extracted SkyNet Bigo agent is a useful reference for reporting behavior,
+but it is not evidence of a second topology-write API. The analyzed artifact
+was `bigo_agent.xz` from the extracted AI_QCA_0004 firmware:
+
+- compressed SHA-256:
+  `f0ea5f527ac562199e1f7ea155a96574229b2a4124882d6e0ff4fbdd51a3fcad`;
+- decompressed SHA-256:
+  `bc100e39454918ace42be5634386e07d841e8fb8697f0de8e946384be2ad677f`;
+- static ARM64 Go 1.20.14 binary, built with the `SC7161,CN` tags;
+- module `agent`, revision `ed9d0c462a9b7aa424dc69ebe12dcc037ef40a85`.
+
+Recovered Go function metadata and disassembly show that its topology reporter
+runs every 60 seconds, skips non-root APs, calls `device.getRealTopo`, and
+publishes the resulting `TopologyInfos` asynchronously. Its cloud command
+registry contains `setMode` and `rmStation`, but no `setTopo` handler. Wantastic
+therefore adopts the confirmed root gate and asynchronous reporting pattern;
+manual graph mutation continues to use the separately verified `uai.so`
+`device.setTopo` contract.
+
+## Recovery lesson and mutation boundary
+
+A saved policy is not proof that radios moved. `device.getTopo` proves only the
+persisted controller plan; `device.getRealTopo` is the live result. On the test
+firmware a requested chain was stored while both relays remained attached to
+the CN, so the operation must stay in `Converging` and eventually report the
+precise failure instead of claiming success.
+
+Topology control must never write wireless UCI channel or HT-mode settings,
+invoke `wifi reload`, or restart EasyMesh. During device investigation,
+changing `wifi2`/`wifi3` from the vendor's `EHT0` state caused the `ath2`,
+`ath21`, `ath3`, and `ath31` hotplug retry loop. Explicit `EHT320` restored
+hostapd generation on that image, but this is a firmware recovery detail, not
+part of topology apply. Wantastic's mutation boundary remains the console gate
+and structured `device.setTopo` call only.
 
 ## Verified RN control contracts
 

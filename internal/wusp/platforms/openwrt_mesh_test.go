@@ -120,3 +120,49 @@ func TestApplyEasyMeshTopologyRejectsMismatchedDeviceReadback(t *testing.T) {
 		t.Fatalf("EasyMesh control events=%v", events)
 	}
 }
+
+func TestEasyMeshLiveTopologyChangeIsPushedThroughObserver(t *testing.T) {
+	const starTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay B"}]}`
+	const chainTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"E0:5D:54:4B:E5:DC","hops":2,"name":"Relay B"}]}`
+
+	star, ok := parseOpenWrtRealTopo([]byte(starTopology))
+	if !ok {
+		t.Fatal("parse star topology")
+	}
+	chain, ok := parseOpenWrtRealTopo([]byte(chainTopology))
+	if !ok {
+		t.Fatal("parse chain topology")
+	}
+	if easyMeshLiveFingerprint(star.root) == easyMeshLiveFingerprint(chain.root) {
+		t.Fatal("parent graph change did not change live fingerprint")
+	}
+
+	updates := make(chan *wusp.Message, 1)
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		EasyMeshObserver: func(msg *wusp.Message) { updates <- msg },
+	})
+	defer backend.Close()
+	backend.notifyEasyMeshLiveTopology(chain.root)
+	update := <-updates
+
+	values := make(map[string]string, len(update.Fields))
+	for _, field := range update.Fields {
+		values[field.Path] = wusp.ValueToString(field.Val)
+	}
+	foundRelayParent := false
+	for path, value := range values {
+		if !strings.HasPrefix(path, "Device.WUSP_MeshTelemetry.Node.") ||
+			!strings.HasSuffix(path, ".MACAddress") ||
+			!strings.EqualFold(value, "E0:5D:54:4B:E6:CF") {
+			continue
+		}
+		prefix := strings.TrimSuffix(path, "MACAddress")
+		foundRelayParent = strings.EqualFold(values[prefix+"ParentMACAddress"], "E0:5D:54:4B:E5:DC")
+		if foundRelayParent {
+			break
+		}
+	}
+	if !foundRelayParent {
+		t.Fatal("live topology push did not include Relay B's new parent")
+	}
+}

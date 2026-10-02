@@ -777,7 +777,10 @@ func isSMSBodyField(field string) bool {
 }
 
 func normalizeSMSBody(value string) string {
-	value = strings.TrimSpace(value)
+	// Remove bidi and other unsafe format controls before inspecting an
+	// explicit encoding marker. Otherwise a trailing control character makes a
+	// valid UCS-2 payload fail its length and hex checks.
+	value = strings.TrimSpace(sanitizeSMSText(value))
 	if decoded, ok := decodeExplicitUCS2(value); ok {
 		value = decoded
 	} else if decoded, ok := decodeLikelyUCS2Body(value); ok {
@@ -2276,7 +2279,14 @@ func parseQuectelMetricAverages(lines []string, metric string, dst *int) {
 	for _, value := range values {
 		sum += value
 	}
-	*dst = sum / len(values)
+	average := sum / len(values)
+	remainder := sum % len(values)
+	if remainder > 0 && remainder*2 >= len(values) {
+		average++
+	} else if remainder < 0 && -remainder*2 > len(values) {
+		average--
+	}
+	*dst = average
 }
 
 func parseQuectelMetricValue(value, metric string) (int, bool) {

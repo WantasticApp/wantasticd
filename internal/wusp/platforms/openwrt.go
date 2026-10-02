@@ -53,6 +53,7 @@ type OpenWrtBackendOptions struct {
 	EasyMeshStableDuration time.Duration
 	EasyMeshCommandTimeout time.Duration
 	EasyMeshObserver       func(*wusp.Message)
+	RouteNeighbors         func() ([]linuxNeighborObservation, error)
 	CommandRunner          func(context.Context, string, ...string) ([]byte, error)
 	WiFiAssocList          func(string) ([]iwinfo.AssocEntry, error)
 	WiFiInfo               func(string) (*iwinfo.InterfaceInfo, error)
@@ -104,6 +105,7 @@ type OpenWrtBackend struct {
 	easyMeshOperationCancel context.CancelFunc
 	easyMeshOperationWG     sync.WaitGroup
 	easyMeshCloseOnce       sync.Once
+	routeNeighbors          func() ([]linuxNeighborObservation, error)
 }
 
 func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
@@ -324,6 +326,7 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		easyMeshObserver:        opts.EasyMeshObserver,
 		easyMeshOperationCtx:    operationCtx,
 		easyMeshOperationCancel: operationCancel,
+		routeNeighbors:          opts.RouteNeighbors,
 		easyMeshConsole:         newEasyMeshConsoleClient(),
 		commandRunner:           opts.CommandRunner,
 		wifiAssocList:           opts.WiFiAssocList,
@@ -345,6 +348,9 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	}
 	if backend.easyMeshCommandTimeout <= 0 {
 		backend.easyMeshCommandTimeout = 30 * time.Second
+	}
+	if backend.routeNeighbors == nil {
+		backend.routeNeighbors = readRouteNeighbors
 	}
 	if backend.ubusClient == nil {
 		backend.ubusClient = ubus.NewClient(ubus.Options{
@@ -1379,7 +1385,7 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 	}
 
 	interfacePaths := ipInterfacePathByName()
-	if neighbors, err := readRouteNeighbors(); err == nil {
+	if neighbors, err := b.routeNeighbors(); err == nil {
 		for _, neighbor := range neighbors {
 			host := ensure(neighbor.MAC.String())
 			if host == nil {

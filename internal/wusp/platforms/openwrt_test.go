@@ -69,6 +69,9 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 		NetClassDir:           filepath.Join(root, "sys", "class", "net"),
 		DHCPLeasesPath:        filepath.Join(root, "dhcp.leases"),
 		ARPPath:               filepath.Join(root, "arp"),
+		RouteNeighbors: func() ([]linuxNeighborObservation, error) {
+			return nil, nil
+		},
 		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
 			return nil, errors.New("disabled in test")
 		},
@@ -930,6 +933,9 @@ func TestOpenWrtStockHostapdStationsPopulateTR181(t *testing.T) {
 	}
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		ARPPath: arpPath,
+		RouteNeighbors: func() ([]linuxNeighborObservation, error) {
+			return nil, nil
+		},
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			t.Fatalf("station collector invoked external command: %s %v", name, args)
 			return nil, errors.New("external commands disabled")

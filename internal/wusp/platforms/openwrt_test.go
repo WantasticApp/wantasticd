@@ -173,9 +173,10 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 	var gotObject, gotMethod string
 	var gotParams map[string]any
 	var savedPolicy string
-	events := []string{}
+	updates := make(chan *wusp.Message, 1)
 	liveTopology := `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"ip":"192.168.200.1","name":"Controller"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"ip":"192.168.200.227","name":"Relay"}]}`
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		EasyMeshObserver:       func(msg *wusp.Message) { updates <- msg },
 		EasyMeshVerifyInterval: time.Millisecond,
 		EasyMeshStableDuration: 2 * time.Millisecond,
 		UbusParamCaller: func(_ context.Context, object, method string, params map[string]any) ([]byte, error) {
@@ -190,7 +191,6 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 				}
 				return []byte(savedPolicy), nil
 			case "setTopo":
-				events = append(events, "setTopo")
 				gotObject, gotMethod, gotParams = object, method, params
 				savedPolicy, _ = params["data"].(string)
 				return []byte(`{}`), nil
@@ -198,21 +198,6 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 				return nil, wusp.ErrUSPPathUnsupported
 			}
 		},
-	})
-	backend.easyMeshConsole = easyMeshConsoleFunc(func(
-		_ context.Context,
-		command easyMeshConsoleCommand,
-	) (string, error) {
-		switch command {
-		case easyMeshConsoleEnableTopologyRequests:
-			events = append(events, "enable")
-			return "ToptReq:ON", nil
-		case easyMeshConsoleDisableTopologyRequests:
-			events = append(events, "disable")
-			return "ToptReq:Off", nil
-		default:
-			return "", fmt.Errorf("unexpected command %d", command)
-		}
 	})
 	raw := `{
 		"topOptPolicy":"strict",
@@ -233,9 +218,8 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 	if !ok || !strings.Contains(payload, `"alId":"00:03:7F:BA:DB:AD"`) || !strings.Contains(payload, `"bStaLinkBand":"6GHL"`) {
 		t.Fatalf("normalized data param=%#v", gotParams["data"])
 	}
-	if !slices.Equal(events, []string{"disable", "setTopo", "disable"}) {
-		t.Fatalf("EasyMesh control events=%v", events)
-	}
+	update := <-updates
+	assertStringField(t, update, "Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", payload)
 }
 
 func TestApplyEasyMeshTopologyRejectsUnsafeOrInconsistentPlans(t *testing.T) {
@@ -307,37 +291,14 @@ func TestApplyEasyMeshTopologyRejectsAgentRole(t *testing.T) {
 	}
 }
 
-func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testing.T) {
-	const currentPolicy = `{"topOptPolicy":"strict","convTimeout":1,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay A"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay B"}]}`
+func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorReadback(t *testing.T) {
 	const requestedPolicy = `{"topOptPolicy":"strict","convTimeout":1,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay A"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"E0:5D:54:4B:E5:DC","bStaLinkBand":"6GH","depth":2,"rssiThresh":-70,"apName":"Relay B"}]}`
 	const starTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay B"}]}`
-	const chainTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"E0:5D:54:4B:E5:DC","hops":2,"name":"Relay B"}]}`
 
-	savedPolicy := currentPolicy
-	liveTopology := starTopology
+	savedPolicy := ""
 	started := make(chan struct{})
 	release := make(chan struct{})
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		EasyMeshVerifyInterval: time.Millisecond,
-		CommandRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			if name != easyMeshCommandPath {
-				return nil, fmt.Errorf("unexpected command %q", name)
-			}
-			if slices.Equal(args, []string{"td", "s2"}) {
-				return []byte(easyMeshNativeSteerFixture), nil
-			}
-			if len(args) >= 2 && args[0] == "map" && args[1] == "bhs" {
-				close(started)
-				select {
-				case <-release:
-					liveTopology = chainTopology
-					return nil, nil
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-			return nil, fmt.Errorf("unexpected ezcmd args %v", args)
-		},
 		UbusParamCaller: func(ctx context.Context, object, method string, params map[string]any) ([]byte, error) {
 			if object != "device" {
 				return nil, wusp.ErrUSPPathUnsupported
@@ -348,25 +309,22 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 			case "getTopo":
 				return []byte(savedPolicy), nil
 			case "getRealTopo":
-				return []byte(liveTopology), nil
+				return []byte(starTopology), nil
 			case "setTopo":
-				savedPolicy, _ = params["data"].(string)
-				return []byte(`{}`), nil
+				close(started)
+				select {
+				case <-release:
+					savedPolicy, _ = params["data"].(string)
+					return []byte(`{}`), nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			default:
 				return nil, wusp.ErrUSPPathUnsupported
 			}
 		},
 	})
 	defer backend.Close()
-	backend.easyMeshConsole = easyMeshConsoleFunc(func(
-		_ context.Context,
-		command easyMeshConsoleCommand,
-	) (string, error) {
-		if command == easyMeshConsoleEnableTopologyRequests {
-			return "ToptReq:ON", nil
-		}
-		return "ToptReq:Off", nil
-	})
 
 	if err := backend.StartApplyEasyMeshTopology(context.Background(), requestedPolicy); err != nil {
 		t.Fatalf("StartApplyEasyMeshTopology: %v", err)
@@ -396,12 +354,11 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 	t.Fatalf("operation did not complete: status=%q message=%q", status, message)
 }
 
-func TestEasyMeshTopologyOperationCloseCancelsVendorCallAndRestoresGate(t *testing.T) {
+func TestEasyMeshTopologyOperationCloseCancelsVendorCall(t *testing.T) {
 	const requestedPolicy = `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GH","depth":1,"rssiThresh":-70,"apName":"Relay"}]}`
 	const liveTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay"}]}`
 
 	started := make(chan struct{})
-	gateDisabled := make(chan struct{}, 1)
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusParamCaller: func(ctx context.Context, object, method string, _ map[string]any) ([]byte, error) {
 			if object != "device" {
@@ -420,19 +377,6 @@ func TestEasyMeshTopologyOperationCloseCancelsVendorCallAndRestoresGate(t *testi
 				return nil, wusp.ErrUSPPathUnsupported
 			}
 		},
-	})
-	backend.easyMeshConsole = easyMeshConsoleFunc(func(
-		_ context.Context,
-		command easyMeshConsoleCommand,
-	) (string, error) {
-		if command == easyMeshConsoleEnableTopologyRequests {
-			return "ToptReq:ON", nil
-		}
-		select {
-		case gateDisabled <- struct{}{}:
-		default:
-		}
-		return "ToptReq:Off", nil
 	})
 
 	if err := backend.StartApplyEasyMeshTopology(context.Background(), requestedPolicy); err != nil {
@@ -453,11 +397,6 @@ func TestEasyMeshTopologyOperationCloseCancelsVendorCallAndRestoresGate(t *testi
 	case <-closed:
 	case <-time.After(time.Second):
 		t.Fatal("backend Close did not cancel and join device.setTopo")
-	}
-	select {
-	case <-gateDisabled:
-	default:
-		t.Fatal("topology request gate was not restored during cancellation")
 	}
 	status, message := backend.easyMeshOperationResult()
 	if status != "Error" || !strings.Contains(message, "context canceled") {
@@ -1097,7 +1036,7 @@ func TestOpenWrtBackendExposesEasyMeshAgentWithoutControllerTopology(t *testing.
 	}
 }
 
-func TestOpenWrtBackendKeepsControllerReadOnlyWithoutSavedPolicy(t *testing.T) {
+func TestOpenWrtBackendUsesLiveTopologyWhenSavedPolicyIsAbsent(t *testing.T) {
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
 		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
 			if object != "device" {
@@ -1125,9 +1064,9 @@ func TestOpenWrtBackendKeepsControllerReadOnlyWithoutSavedPolicy(t *testing.T) {
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.LinkNumberOfEntries", 2)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Controller")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Implementation", "device.ubus")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Status", "Degraded")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Status", "Running")
 	assertBoolField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Writable", true)
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
 	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
 		t.Fatal("missing vendor policy must not be represented as a current topology policy")
 	}
@@ -1136,7 +1075,7 @@ func TestOpenWrtBackendKeepsControllerReadOnlyWithoutSavedPolicy(t *testing.T) {
 	}
 }
 
-func TestOpenWrtBackendKeepsControllerTopologyReadOnlyWhenPolicyInventoryIsStale(t *testing.T) {
+func TestOpenWrtBackendPublishesSavedTopologyWhenPolicyInventoryIsStale(t *testing.T) {
 	policy := map[string]any{
 		"topOptPolicy": "strict",
 		"convTimeout":  60,
@@ -1177,10 +1116,8 @@ func TestOpenWrtBackendKeepsControllerTopologyReadOnlyWhenPolicyInventoryIsStale
 	assertUintField(t, msg, "Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", 1)
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Role", "Controller")
 	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.Status", "Degraded")
-	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "RemoveStation")
-	if _, ok := msg.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON"); ok {
-		t.Fatal("stale saved policy must not be exposed as an editable topology")
-	}
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.SupportedOperations", "ApplyTopology,RemoveStation")
+	assertStringField(t, msg, "Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", `{"topOptPolicy":"strict","convTimeout":60,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GHL","depth":1,"rssiThresh":-70,"apName":"Missing"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"E0:5D:54:4B:E6:CF","bStaLinkBand":"6GHL","depth":2,"rssiThresh":-70,"apName":"Relay"}]}`)
 	if err := wusp.ValidateMessageFast(msg); err != nil {
 		t.Fatalf("ValidateMessageFast(stale controller policy): %v", err)
 	}
@@ -2077,86 +2014,6 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	}
 	if len(ubusCalls) != 0 {
 		t.Fatalf("unexpected ubus calls %v (file write should win)", ubusCalls)
-	}
-}
-
-func TestOpenWrtBackendSetBatchCoalescesWirelessReload(t *testing.T) {
-	root := t.TempDir()
-	configDir := filepath.Join(root, "etc", "config")
-	mustWriteFile(t, filepath.Join(configDir, "network"), "config globals 'globals'\n")
-	mustWriteFile(t, filepath.Join(configDir, "firewall"), "config defaults\n\toption disabled '0'\n")
-	mustWriteFile(t, filepath.Join(configDir, "wireless"), "config wifi-device 'wifi0'\n\toption band '5g'\n\toption channel '36'\nconfig wifi-iface 'main_ap'\n\toption device 'wifi0'\n\toption mode 'ap'\n\toption ssid 'Old'\n")
-
-	var commands []string
-	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		UCIConfigDir: configDir,
-		StatePath:    filepath.Join(root, "state.json"),
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			commands = append(commands, strings.TrimSpace(name+" "+strings.Join(args, " ")))
-			return nil, nil
-		},
-		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
-			if object == "network.wireless" && method == "status" {
-				return []byte(`{"wifi0":{"up":true,"interfaces":[{"section":"main_ap","ifname":"ath0","up":true,"config":{"mode":"ap"}}]}}`), nil
-			}
-			return nil, wusp.ErrUSPPathUnsupported
-		},
-	})
-	fields := []wusp.Field{
-		{Path: "Device.WiFi.Radio.1.Channel", Val: wusp.Uint(44)},
-		{Path: "Device.WiFi.SSID.1.SSID", Val: wusp.String("Mesh Live")},
-		{Path: "Device.Firewall.Enable", Val: wusp.Bool(false)},
-	}
-	if err := backend.SetBatch(context.Background(), fields); err != nil {
-		t.Fatalf("SetBatch: %v", err)
-	}
-
-	wirelessData, err := os.ReadFile(filepath.Join(configDir, "wireless"))
-	if err != nil {
-		t.Fatalf("read wireless: %v", err)
-	}
-	wireless := string(wirelessData)
-	if !strings.Contains(wireless, "option channel '44'") || !strings.Contains(wireless, "option ssid 'Mesh Live'") {
-		t.Fatalf("wireless batch was not persisted:\n%s", wireless)
-	}
-	reloadCount := 0
-	for _, command := range commands {
-		if command == "ubus call network reload" {
-			reloadCount++
-		}
-	}
-	if reloadCount != 1 {
-		t.Fatalf("wireless reload count=%d commands=%v", reloadCount, commands)
-	}
-}
-
-func TestOpenWrtBackendSetBatchAppliesInterfaceChangesWithoutReload(t *testing.T) {
-	var commands []string
-	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			commands = append(commands, strings.TrimSpace(name+" "+strings.Join(args, " ")))
-			return nil, nil
-		},
-	})
-	backend.networkInterfaces = func() ([]net.Interface, error) {
-		return []net.Interface{
-			{Name: "lo", Flags: net.FlagLoopback},
-			{Name: "br-test", HardwareAddr: net.HardwareAddr{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}},
-		}, nil
-	}
-	fields := []wusp.Field{
-		{Path: "Device.IP.Interface.1.Enable", Val: wusp.Bool(true)},
-		{Path: "Device.IP.Interface.1.MaxMTUSize", Val: wusp.Uint(1492)},
-	}
-	if err := backend.SetBatch(context.Background(), fields); err != nil {
-		t.Fatalf("SetBatch: %v", err)
-	}
-	want := []string{
-		"ip link set dev br-test up",
-		"ip link set dev br-test mtu 1492",
-	}
-	if !slices.Equal(commands, want) {
-		t.Fatalf("commands=%v want %v", commands, want)
 	}
 }
 

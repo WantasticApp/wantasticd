@@ -30,13 +30,6 @@ type DataSetter interface {
 	Delete(context.Context, ...string) error
 }
 
-// DataBatchSetter applies one validated WUSP Set request as a unit. Platform
-// backends can use it to coalesce commits/reloads while preserving the order of
-// fields in the request. DataSetter remains the compatibility fallback.
-type DataBatchSetter interface {
-	SetBatch(context.Context, []Field) error
-}
-
 // DataAdder materializes a USP Add in the underlying device before the agent
 // stores any local representation. Backends may return ErrUSPPathUnsupported
 // to retain the normal in-memory behavior.
@@ -298,12 +291,12 @@ func (a *USPAgent) GetByCode(codes ...uint64) (*Message, error) {
 // Set validates and stores one parameter value.
 func (a *USPAgent) Set(path string, value Value) error {
 	path = strings.TrimSpace(path)
-	return a.storeFieldsContext(context.Background(), []Field{{Path: path, Val: value}}, false)
+	return a.storeFields([]Field{{Path: path, Val: value}}, false)
 }
 
 // SetBatch validates and stores a full field batch in one pass.
 func (a *USPAgent) SetBatch(fields ...Field) error {
-	return a.storeFieldsContext(context.Background(), fields, false)
+	return a.storeFields(fields, false)
 }
 
 // Delete removes stored params or object subtrees from the agent state.
@@ -793,15 +786,8 @@ func sortedStoredFields(values map[string]Field) []Field {
 }
 
 func (a *USPAgent) storeFields(fields []Field, alreadyValidated bool) error {
-	return a.storeFieldsContext(context.Background(), fields, alreadyValidated)
-}
-
-func (a *USPAgent) storeFieldsContext(ctx context.Context, fields []Field, alreadyValidated bool) error {
 	if len(fields) == 0 {
 		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 
 	if !alreadyValidated {
@@ -816,25 +802,11 @@ func (a *USPAgent) storeFieldsContext(ctx context.Context, fields []Field, alrea
 		}
 		fields = normalized
 	}
-	for index := range fields {
-		fields[index].Path = strings.TrimSpace(fields[index].Path)
-	}
 
-	batchHandled := false
-	if batchSetter, ok := a.setter.(DataBatchSetter); ok {
-		err := batchSetter.SetBatch(ctx, cloneFields(fields))
-		switch {
-		case err == nil:
-			batchHandled = true
-		case errors.Is(err, ErrUSPPathUnsupported):
-		default:
-			return err
-		}
-	}
-	if a.setter != nil && !batchHandled {
+	if a.setter != nil {
 		for _, field := range fields {
 			field.Path = strings.TrimSpace(field.Path)
-			if err := a.setter.Set(ctx, field.Path, cloneValue(field.Val)); err != nil && !errors.Is(err, ErrUSPPathUnsupported) {
+			if err := a.setter.Set(context.Background(), field.Path, cloneValue(field.Val)); err != nil && !errors.Is(err, ErrUSPPathUnsupported) {
 				return err
 			}
 		}
@@ -875,14 +847,6 @@ func (a *USPAgent) storeFieldsContext(ctx context.Context, fields []Field, alrea
 		}
 	}
 	return nil
-}
-
-func cloneFields(fields []Field) []Field {
-	cloned := make([]Field, len(fields))
-	for index, field := range fields {
-		cloned[index] = cloneField(field)
-	}
-	return cloned
 }
 
 func cloneField(field Field) Field {

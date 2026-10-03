@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"wantastic-agent/internal/linkdiscovery"
@@ -92,7 +91,7 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	topologyJSON := b.readEasyMeshTopologyPolicy(ctx)
 	topologyReady := role == "Controller" && easyMeshPolicyMatchesLiveInventory(topologyJSON, liveRoot)
-	operations := easyMeshSupportedOperations(role, topologyReady)
+	operations := easyMeshSupportedOperations(role, liveRoot != nil)
 	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
@@ -100,7 +99,7 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
 	msg.Set(protocolPath+"Writable", wusp.Bool(writable))
 	msg.Set(easyMeshPath+"Alias", wusp.String(strings.ToLower(role)))
 	status := "Running"
-	if role == "Controller" && !topologyReady {
+	if role == "Controller" && (liveRoot == nil || topologyJSON != "" && !topologyReady) {
 		status = "Degraded"
 	}
 	msg.Set(easyMeshPath+"Status", wusp.String(status))
@@ -111,7 +110,9 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
 	if writable {
 		msg.Set(easyMeshPath+"SupportedOperations", wusp.String(strings.Join(operations, ",")))
 	}
-	if topologyReady {
+	// getTopo is the vendor's saved control-plane view. Publish it whenever it
+	// exists; the Node/Link graph above is the getRealTopo fallback.
+	if topologyJSON != "" {
 		msg.Set(easyMeshPath+"TopologyJSON", wusp.String(topologyJSON))
 	}
 	status, phase, message := b.easyMeshOperationSnapshot()
@@ -150,8 +151,8 @@ type easyMeshTopologyNode struct {
 }
 
 // StartApplyEasyMeshTopology validates the complete vendor topology document
-// before acknowledging the operation. Native steering and live-parent
-// verification run in the background and publish through LastOperationStatus.
+// before acknowledging the operation. device.setTopo and its device.getTopo
+// read-back run in the background and publish through LastOperationStatus.
 func (b *OpenWrtBackend) StartApplyEasyMeshTopology(ctx context.Context, raw string) error {
 	normalized, topology, err := b.prepareEasyMeshTopology(ctx, raw)
 	if err != nil {
@@ -169,7 +170,7 @@ func (b *OpenWrtBackend) StartApplyEasyMeshTopology(ctx context.Context, raw str
 		return fmt.Errorf("EasyMesh topology controller is shutting down")
 	default:
 	}
-	const acceptedMessage = "Topology accepted; validating the native backhaul path"
+	const acceptedMessage = "Topology accepted; applying the vendor topology policy"
 	b.easyMeshOperation = easyMeshOperationState{
 		status:       "Pending",
 		phase:        "Accepted",
@@ -190,7 +191,7 @@ func (b *OpenWrtBackend) StartApplyEasyMeshTopology(ctx context.Context, raw str
 
 // ApplyEasyMeshTopology is the blocking form used by direct callers and tests.
 // The USP runtime uses StartApplyEasyMeshTopology so it can acknowledge the
-// accepted plan without waiting for the native steering response.
+// accepted plan without waiting for the vendor ubus response.
 func (b *OpenWrtBackend) ApplyEasyMeshTopology(ctx context.Context, raw string) error {
 	normalized, topology, err := b.prepareEasyMeshTopology(ctx, raw)
 	if err != nil {
@@ -271,7 +272,7 @@ func (b *OpenWrtBackend) runEasyMeshTopologyOperation(normalized string, topolog
 	b.setEasyMeshOperationResult(
 		"Success",
 		"Complete",
-		"Native backhaul steering completed and the live parent was verified",
+		"Topology was saved and verified by device.getTopo",
 		normalized,
 	)
 }
@@ -285,57 +286,18 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	liveData, err := b.readOpenWrtRealTopo(ctx)
-	if err != nil {
-		return fmt.Errorf("read live EasyMesh topology: %w", err)
-	}
-	live, ok := parseOpenWrtRealTopo(liveData)
-	if !ok || live.root == nil {
-		return fmt.Errorf("read live EasyMesh topology: topology is unavailable")
-	}
-	steer, rollback, err := b.prepareEasyMeshBackhaulSteer(ctx, topology, live.root)
-	if err != nil {
-		return err
-	}
-	if steer != nil {
-		if progress != nil {
-			progress("Applying", "The controller is sending a native EasyMesh backhaul steering request")
-		}
-		if err := b.executeEasyMeshBackhaulSteer(ctx, *steer); err != nil {
-			return err
-		}
-	}
 	if progress != nil {
-		progress("Converging", "The requested parent is live; saving the confirmed topology policy")
+		progress("Applying", "The controller is saving the topology through device.setTopo")
 	}
-	if err := b.persistEasyMeshTopologyPolicy(ctx, normalized, topology); err != nil {
-		if steer == nil || rollback == nil {
-			return err
-		}
-		rollbackErr := b.executeEasyMeshBackhaulSteer(context.Background(), *rollback)
-		if rollbackErr != nil {
-			return errors.Join(err, fmt.Errorf("restore previous EasyMesh parent: %w", rollbackErr))
-		}
-		return fmt.Errorf("%w; previous EasyMesh parent was restored", err)
-	}
-	return nil
+	return b.persistEasyMeshTopologyPolicy(ctx, normalized, topology, progress)
 }
 
 func (b *OpenWrtBackend) persistEasyMeshTopologyPolicy(
 	ctx context.Context,
 	normalized string,
 	topology easyMeshTopology,
+	progress func(phase, message string),
 ) error {
-	// setTopo remains the vendor-owned persistence API, but its optimizer is
-	// intentionally gated off. Native BHS already moved and verified the one
-	// requested node; allowing the delayed optimizer to run would duplicate the
-	// request and can undo a confirmed live parent.
-	if err := b.setEasyMeshTopologyRequestGate(ctx, false); err != nil {
-		enableErr := fmt.Errorf("disable delayed EasyMesh topology optimizer: %w", err)
-		cleanupErr := b.restoreEasyMeshTopologyRequestGate()
-		return errors.Join(enableErr, cleanupErr)
-	}
-
 	_, commandErr := b.callUbusWithTimeout(
 		ctx,
 		"device",
@@ -343,46 +305,27 @@ func (b *OpenWrtBackend) persistEasyMeshTopologyPolicy(
 		map[string]any{"data": normalized},
 		b.easyMeshCommandTimeout,
 	)
-	// uai.so writes /etc/topo-ezmesh.json before it invokes `ezcmd td topt`.
-	// An exact read-back is therefore authoritative even when the vendor
-	// console restarts while the ubus call is returning.
-	savedPolicy := b.readEasyMeshTopologyPolicy(ctx)
-	cleanupErr := b.restoreEasyMeshTopologyRequestGate()
+	if progress != nil {
+		progress("Converging", "The controller is verifying the saved policy through device.getTopo")
+	}
+	// The exact vendor read-back is authoritative even if setTopo returns an
+	// error while the mesh service is applying the accepted policy.
+	savedPolicy, readbackCallErr := b.readEasyMeshTopologyPolicyFromUbus(ctx)
 	if savedPolicy != normalized {
 		readbackErr := easyMeshTopologyReadbackError(topology, savedPolicy)
+		if readbackCallErr != nil {
+			readbackErr = errors.Join(
+				fmt.Errorf("device.getTopo failed: %w", readbackCallErr),
+				readbackErr,
+			)
+		}
 		if commandErr != nil {
-			readbackErr = errors.Join(fmt.Errorf("device.setTopo failed: %w", commandErr), readbackErr)
+			return errors.Join(fmt.Errorf("device.setTopo failed: %w", commandErr), readbackErr)
 		}
-		return errors.Join(readbackErr, cleanupErr)
+		return readbackErr
 	}
-	if cleanupErr != nil {
-		return cleanupErr
-	}
+	b.notifyEasyMeshSavedTopology(savedPolicy)
 	return nil
-}
-
-func (b *OpenWrtBackend) restoreEasyMeshTopologyRequestGate() error {
-	const (
-		restoreTimeout  = 12 * time.Second
-		restoreInterval = 500 * time.Millisecond
-	)
-	ctx, cancel := context.WithTimeout(context.Background(), restoreTimeout)
-	defer cancel()
-
-	var lastErr error
-	for {
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, easyMeshConsoleTimeout)
-		lastErr = b.setEasyMeshTopologyRequestGate(attemptCtx, false)
-		attemptCancel()
-		if lastErr == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("restore EasyMesh topology request gate: %w", lastErr)
-		case <-time.After(restoreInterval):
-		}
-	}
 }
 
 func easyMeshTopologyReadbackError(requested easyMeshTopology, savedPolicy string) error {
@@ -504,6 +447,21 @@ func (b *OpenWrtBackend) notifyEasyMeshLiveTopology(root *meshNode) {
 	observer(patch)
 }
 
+func (b *OpenWrtBackend) notifyEasyMeshSavedTopology(topologyJSON string) {
+	if b == nil || topologyJSON == "" {
+		return
+	}
+	b.easyMeshOperationMu.RLock()
+	observer := b.easyMeshObserver
+	b.easyMeshOperationMu.RUnlock()
+	if observer == nil {
+		return
+	}
+	patch := wusp.NewMessage()
+	patch.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.TopologyJSON", wusp.String(topologyJSON))
+	observer(patch)
+}
+
 // Close cancels and joins the one in-flight topology operation. This prevents
 // a service restart from leaving an unowned vendor RPC or convergence poller.
 func (b *OpenWrtBackend) Close() error {
@@ -595,9 +553,9 @@ func validEasyMeshStationName(value string) bool {
 	return true
 }
 
-func easyMeshSupportedOperations(role string, topologyReady bool) []string {
+func easyMeshSupportedOperations(role string, liveTopologyAvailable bool) []string {
 	operations := make([]string, 0, 3)
-	if role == "Controller" && topologyReady {
+	if role == "Controller" && liveTopologyAvailable {
 		operations = append(operations, "ApplyTopology")
 	}
 	operations = append(operations, "RemoveStation")
@@ -668,23 +626,23 @@ func easyMeshLiveFingerprint(root *meshNode) string {
 }
 
 func (b *OpenWrtBackend) readEasyMeshTopologyPolicy(ctx context.Context) string {
+	policy, _ := b.readEasyMeshTopologyPolicyFromUbus(ctx)
+	return policy
+}
+
+func (b *OpenWrtBackend) readEasyMeshTopologyPolicyFromUbus(ctx context.Context) (string, error) {
 	if b == nil {
-		return ""
+		return "", fmt.Errorf("nil OpenWrt backend")
 	}
-	if data, err := b.callUbus(ctx, "device", "getTopo", nil); err == nil {
-		if normalized, err := extractEasyMeshTopologyPolicy(data); err == nil {
-			return normalized
-		}
-	}
-	raw := strings.TrimSpace(b.readTextFile(b.easyMeshTopologyPath))
-	if raw == "" {
-		return ""
-	}
-	normalized, err := validateEasyMeshTopology(raw)
+	data, err := b.callUbus(ctx, "device", "getTopo", nil)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return normalized
+	normalized, err := extractEasyMeshTopologyPolicy(data)
+	if err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 
 func extractEasyMeshTopologyPolicy(data []byte) (string, error) {

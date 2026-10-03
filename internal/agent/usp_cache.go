@@ -89,32 +89,6 @@ func (c *persistentDataModelCache) Set(ctx context.Context, path string, value w
 	return nil
 }
 
-func (c *persistentDataModelCache) SetBatch(ctx context.Context, fields []wusp.Field) error {
-	if len(fields) == 0 {
-		return nil
-	}
-	if batchSetter, ok := c.backend.(wusp.DataBatchSetter); ok {
-		if err := batchSetter.SetBatch(ctx, fields); err != nil {
-			return err
-		}
-	} else {
-		for _, field := range fields {
-			if err := c.backend.Set(ctx, field.Path, field.Val); err != nil {
-				return err
-			}
-		}
-	}
-	patch := wusp.NewMessage()
-	for _, field := range fields {
-		patch.Set(field.Path, field.Val)
-	}
-	if err := c.Patch(patch); err != nil {
-		log.Printf("[USP] DataModel cache batch mutation patch warning: continue_on_error=true err=%v", err)
-	}
-	c.refreshAfterMutation()
-	return nil
-}
-
 func (c *persistentDataModelCache) Delete(ctx context.Context, paths ...string) error {
 	if err := c.backend.Delete(ctx, paths...); err != nil {
 		return err

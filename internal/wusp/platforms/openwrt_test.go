@@ -2080,6 +2080,86 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	}
 }
 
+func TestOpenWrtBackendSetBatchCoalescesWirelessReload(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	mustWriteFile(t, filepath.Join(configDir, "network"), "config globals 'globals'\n")
+	mustWriteFile(t, filepath.Join(configDir, "firewall"), "config defaults\n\toption disabled '0'\n")
+	mustWriteFile(t, filepath.Join(configDir, "wireless"), "config wifi-device 'wifi0'\n\toption band '5g'\n\toption channel '36'\nconfig wifi-iface 'main_ap'\n\toption device 'wifi0'\n\toption mode 'ap'\n\toption ssid 'Old'\n")
+
+	var commands []string
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		StatePath:    filepath.Join(root, "state.json"),
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			commands = append(commands, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+			return nil, nil
+		},
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
+				return []byte(`{"wifi0":{"up":true,"interfaces":[{"section":"main_ap","ifname":"ath0","up":true,"config":{"mode":"ap"}}]}}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+	})
+	fields := []wusp.Field{
+		{Path: "Device.WiFi.Radio.1.Channel", Val: wusp.Uint(44)},
+		{Path: "Device.WiFi.SSID.1.SSID", Val: wusp.String("Mesh Live")},
+		{Path: "Device.Firewall.Enable", Val: wusp.Bool(false)},
+	}
+	if err := backend.SetBatch(context.Background(), fields); err != nil {
+		t.Fatalf("SetBatch: %v", err)
+	}
+
+	wirelessData, err := os.ReadFile(filepath.Join(configDir, "wireless"))
+	if err != nil {
+		t.Fatalf("read wireless: %v", err)
+	}
+	wireless := string(wirelessData)
+	if !strings.Contains(wireless, "option channel '44'") || !strings.Contains(wireless, "option ssid 'Mesh Live'") {
+		t.Fatalf("wireless batch was not persisted:\n%s", wireless)
+	}
+	reloadCount := 0
+	for _, command := range commands {
+		if command == "ubus call network reload" {
+			reloadCount++
+		}
+	}
+	if reloadCount != 1 {
+		t.Fatalf("wireless reload count=%d commands=%v", reloadCount, commands)
+	}
+}
+
+func TestOpenWrtBackendSetBatchAppliesInterfaceChangesWithoutReload(t *testing.T) {
+	var commands []string
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			commands = append(commands, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+			return nil, nil
+		},
+	})
+	backend.networkInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Name: "lo", Flags: net.FlagLoopback},
+			{Name: "br-test", HardwareAddr: net.HardwareAddr{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}},
+		}, nil
+	}
+	fields := []wusp.Field{
+		{Path: "Device.IP.Interface.1.Enable", Val: wusp.Bool(true)},
+		{Path: "Device.IP.Interface.1.MaxMTUSize", Val: wusp.Uint(1492)},
+	}
+	if err := backend.SetBatch(context.Background(), fields); err != nil {
+		t.Fatalf("SetBatch: %v", err)
+	}
+	want := []string{
+		"ip link set dev br-test up",
+		"ip link set dev br-test mtu 1492",
+	}
+	if !slices.Equal(commands, want) {
+		t.Fatalf("commands=%v want %v", commands, want)
+	}
+}
+
 // TestOpenWrtHostnameDirectWrite locks the contract that hostname persistence
 // uses a direct os.WriteFile path instead of tmp+rename. This matters for
 // container runtimes (Docker, Podman, LXC) where /etc/hostname is a bind mount

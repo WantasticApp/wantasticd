@@ -219,6 +219,54 @@ func TestUSPRuntimeAcknowledgesAsyncEasyMeshTopologyAsPending(t *testing.T) {
 	}
 }
 
+func TestUSPRuntimeReceivesEasyMeshApplyOverWUSPOperate(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	backend := &asyncEasyMeshOperateBackend{}
+	runtime.rawBackend = backend
+	const (
+		commandPath = "Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()"
+		objectPath  = "Device.WUSP_MeshTelemetry.EasyMesh.1."
+		topology    = `{"topOptPolicy":"strict","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"}]}`
+	)
+	input := wusp.NewMessage()
+	input.Set(objectPath+"TopologyJSON", wusp.String(topology))
+	frame, err := wusp.EncodeUSPAgentRequest(wusp.USPAgentRequest{
+		ID:         902,
+		Method:     wusp.USPAgentMethodOperate,
+		ObjectPath: objectPath,
+		Message:    input,
+		Metadata: map[string]string{
+			wusp.MetadataKeyOperationCommandPath: commandPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest: %v", err)
+	}
+
+	var responseFrame []byte
+	if err := runtime.handleFrameFromPeer(runtime.controllerPublicKeyHex, frame, func(frame []byte) error {
+		responseFrame = append([]byte(nil), frame...)
+		return nil
+	}); err != nil {
+		t.Fatalf("handleFrameFromPeer: %v", err)
+	}
+	response := decodeControlResponseDatagram(t, responseFrame)
+	if response.Error != "" {
+		t.Fatalf("response error=%q", response.Error)
+	}
+	if backend.started != topology {
+		t.Fatalf("backend topology=%q want %q", backend.started, topology)
+	}
+	status, ok := response.Message.Get(objectPath + "LastOperationStatus")
+	if !ok || status.AsString() != "Pending" {
+		t.Fatalf("status=%q present=%t want Pending", status.AsString(), ok)
+	}
+	phase, ok := response.Message.Get(objectPath + "LastOperationPhase")
+	if !ok || phase.AsString() != "Accepted" {
+		t.Fatalf("phase=%q present=%t want Accepted", phase.AsString(), ok)
+	}
+}
+
 func TestUSPRuntimePushesEasyMeshOperationUpdateImmediately(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	defer runtime.Close()

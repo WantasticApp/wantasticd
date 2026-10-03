@@ -96,8 +96,10 @@ type OpenWrtBackend struct {
 	wifiHWModeList          func(string) (*iwinfo.HWModes, error)
 	wifiHTModeList          func(string) ([]string, error)
 	wifiTxPowerLevels       func(context.Context, string) []int
+	networkInterfaces       func() ([]net.Interface, error)
 	cellular                *cellularMonitor
 	now                     func() time.Time
+	configMutationMu        sync.Mutex
 	easyMeshOperationMu     sync.RWMutex
 	easyMeshOperation       easyMeshOperationState
 	easyMeshObserver        func(*wusp.Message)
@@ -334,6 +336,7 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		wifiHWModeList:          opts.WiFiHWModeList,
 		wifiHTModeList:          opts.WiFiHTModeList,
 		wifiTxPowerLevels:       opts.WiFiTxPowerLevels,
+		networkInterfaces:       net.Interfaces,
 		cellular:                newCellularMonitor(),
 		now:                     opts.Now,
 	}
@@ -419,7 +422,16 @@ func (b *OpenWrtBackend) Collect(ctx context.Context, paths ...string) (*wusp.Me
 }
 
 func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value) error {
+	b.configMutationMu.Lock()
+	defer b.configMutationMu.Unlock()
+	return b.set(ctx, path, value)
+}
+
+func (b *OpenWrtBackend) set(ctx context.Context, path string, value wusp.Value) error {
 	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, "Device.IP.Interface.") {
+		return b.setOpenWrtIPInterfaceParam(ctx, path, value)
+	}
 	switch path {
 	case "Device.DeviceInfo.HostName":
 		return b.setHostname(ctx, value.AsString())
@@ -462,7 +474,91 @@ func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value)
 	}
 }
 
+// setOpenWrtIPInterfaceParam applies runtime-only link properties directly.
+// These operations do not reload netifd and do not guess a UCI network section
+// from a Linux device name. The latter mapping is not one-to-one on OpenWrt
+// (for example br-lan may aggregate several UCI devices), so guessing it could
+// persist a change to the wrong interface.
+func (b *OpenWrtBackend) setOpenWrtIPInterfaceParam(ctx context.Context, path string, value wusp.Value) error {
+	index, leaf, ok := parseIndexedPath(path, "Device.IP.Interface.")
+	if !ok {
+		return wusp.ErrUSPPathUnsupported
+	}
+	listInterfaces := b.networkInterfaces
+	if listInterfaces == nil {
+		listInterfaces = net.Interfaces
+	}
+	interfaces, err := listInterfaces()
+	if err != nil {
+		return fmt.Errorf("list network interfaces: %w", err)
+	}
+	writable := make([]net.Interface, 0, len(interfaces))
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if len(iface.HardwareAddr) == 0 && !isCellularNetdev(iface.Name) {
+			continue
+		}
+		writable = append(writable, iface)
+	}
+	if index == 0 || index > uint64(len(writable)) {
+		return wusp.ErrUSPPathNotFound
+	}
+	name := writable[int(index)-1].Name
+	args := []string{"link", "set", "dev", name}
+	switch leaf {
+	case "Enable":
+		state := "down"
+		if value.AsBool() {
+			state = "up"
+		}
+		args = append(args, state)
+	case "MaxMTUSize":
+		mtu := value.AsUint()
+		if mtu < 68 || mtu > 65535 {
+			return fmt.Errorf("invalid MTU %d", mtu)
+		}
+		args = append(args, "mtu", strconv.FormatUint(mtu, 10))
+	default:
+		return wusp.ErrUSPPathUnsupported
+	}
+	if _, err := b.commandRunner(ctx, "ip", args...); err != nil {
+		return fmt.Errorf("set network interface %s %s: %w", name, leaf, err)
+	}
+	return nil
+}
+
+// SetBatch applies one WUSP Set request while coalescing live service actions.
+// Each owning service is reloaded at most once, after every field has been
+// persisted successfully. This avoids repeatedly bouncing netifd, hostapd, or
+// the firewall when the controller edits several related parameters together.
+func (b *OpenWrtBackend) SetBatch(ctx context.Context, fields []wusp.Field) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.configMutationMu.Lock()
+	defer b.configMutationMu.Unlock()
+
+	batch := &openWrtReloadBatch{scripts: make(map[string]struct{})}
+	batchCtx := context.WithValue(ctx, openWrtReloadBatchContextKey{}, batch)
+	for _, field := range fields {
+		if err := b.set(batchCtx, field.Path, field.Val); err != nil {
+			if errors.Is(err, wusp.ErrUSPPathUnsupported) {
+				return fmt.Errorf("apply WUSP field %s: path is not writable on OpenWrt", field.Path)
+			}
+			return fmt.Errorf("apply WUSP field %s: %w", field.Path, err)
+		}
+	}
+	return batch.apply(ctx, b)
+}
+
 func (b *OpenWrtBackend) Delete(ctx context.Context, paths ...string) error {
+	b.configMutationMu.Lock()
+	defer b.configMutationMu.Unlock()
 	for _, path := range paths {
 		path = strings.TrimSpace(path)
 		switch path {
@@ -1815,11 +1911,57 @@ func (b *OpenWrtBackend) deleteUCIOption(ctx context.Context, config, section, o
 func (b *OpenWrtBackend) applyUCIChange(ctx context.Context, config, section, option, value, reloadScript string) {
 	switch {
 	case config == "system" && option == "hostname":
-		_ = b.writeProcSysHostname(value)
+		if err := b.writeProcSysHostname(value); err == nil {
+			return
+		}
 	case config == "system" && option == "timezone":
-		_ = b.writeEtcTZ(value)
+		if err := b.writeEtcTZ(value); err == nil {
+			return
+		}
+	}
+	if ctx != nil {
+		if batch, ok := ctx.Value(openWrtReloadBatchContextKey{}).(*openWrtReloadBatch); ok && batch != nil {
+			batch.add(reloadScript)
+			return
+		}
 	}
 	_ = b.reloadScript(ctx, reloadScript)
+}
+
+type openWrtReloadBatchContextKey struct{}
+
+type openWrtReloadBatch struct {
+	scripts map[string]struct{}
+}
+
+func (batch *openWrtReloadBatch) add(script string) {
+	if batch == nil || strings.TrimSpace(script) == "" {
+		return
+	}
+	batch.scripts[script] = struct{}{}
+}
+
+func (batch *openWrtReloadBatch) apply(ctx context.Context, backend *OpenWrtBackend) error {
+	if batch == nil || backend == nil || len(batch.scripts) == 0 {
+		return nil
+	}
+	order := []string{systemReloadScript, networkReloadScript, firewallReloadScript, wirelessReloadScript}
+	var errs []error
+	for _, script := range order {
+		if _, ok := batch.scripts[script]; !ok {
+			continue
+		}
+		if err := backend.reloadScript(ctx, script); err != nil {
+			errs = append(errs, fmt.Errorf("reload %s: %w", script, err))
+		}
+		delete(batch.scripts, script)
+	}
+	for script := range batch.scripts {
+		if err := backend.reloadScript(ctx, script); err != nil {
+			errs = append(errs, fmt.Errorf("reload %s: %w", script, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // writeUCIOptionViaFile rewrites /etc/config/<config> in place, setting

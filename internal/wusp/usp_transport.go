@@ -358,7 +358,7 @@ func (a *USPAgent) HandleRequest(ctx context.Context, req USPAgentRequest) (USPA
 			resp.Error = "set request missing fields"
 			return resp, nil
 		}
-		if err := a.storeFields(req.Message.Fields, true); err != nil {
+		if err := a.storeFieldsContext(ctx, req.Message.Fields, true); err != nil {
 			resp.Error = err.Error()
 			return resp, nil
 		}

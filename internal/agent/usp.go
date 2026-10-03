@@ -646,7 +646,7 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 			output := wusp.NewMessage()
 			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Pending"))
 			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase", wusp.String("Accepted"))
-			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology accepted; applying the saved policy on the controller"))
+			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology accepted; validating the native backhaul path"))
 			return output, nil
 		}
 		controller, ok := r.rawBackend.(interface {

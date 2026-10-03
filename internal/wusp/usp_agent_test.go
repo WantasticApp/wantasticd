@@ -30,6 +30,20 @@ type mockSetter struct {
 	deleteErr   error
 }
 
+type mockBatchSetter struct {
+	mockSetter
+	batchCalls int
+	fields     []Field
+	ctx        context.Context
+}
+
+func (m *mockBatchSetter) SetBatch(ctx context.Context, fields []Field) error {
+	m.batchCalls++
+	m.ctx = ctx
+	m.fields = append([]Field(nil), fields...)
+	return nil
+}
+
 func (m *mockSetter) Set(_ context.Context, path string, _ Value) error {
 	m.setCalls = append(m.setCalls, path)
 	return m.setErr
@@ -190,6 +204,38 @@ func TestUSPAgentCollectorAndSetterDelegation(t *testing.T) {
 	}
 	if got := len(setter.deleteCalls); got != 1 || setter.deleteCalls[0] != "Device.DeviceInfo.FriendlyName" {
 		t.Fatalf("setter delete calls=%v want Device.DeviceInfo.FriendlyName", setter.deleteCalls)
+	}
+}
+
+func TestUSPAgentHandleRequestUsesBackendBatchSetterAndRequestContext(t *testing.T) {
+	setter := &mockBatchSetter{}
+	agent := NewUSPAgent(USPAgentOptions{Setter: setter})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := USPAgentRequest{
+		ID:     73,
+		Method: USPAgentMethodSet,
+		Message: &Message{Fields: []Field{
+			{Path: "Device.DeviceInfo.FriendlyName", Val: String("Node A")},
+			{Path: "Device.Firewall.Enable", Val: Bool(true)},
+		}},
+	}
+
+	response, err := agent.HandleRequest(ctx, request)
+	if err != nil {
+		t.Fatalf("HandleRequest: %v", err)
+	}
+	if response.Error != "" {
+		t.Fatalf("response error=%q", response.Error)
+	}
+	if setter.batchCalls != 1 || len(setter.fields) != 2 {
+		t.Fatalf("batch calls=%d fields=%d", setter.batchCalls, len(setter.fields))
+	}
+	if setter.ctx == nil || !errors.Is(setter.ctx.Err(), context.Canceled) {
+		t.Fatalf("backend did not receive canceled request context: %v", setter.ctx)
+	}
+	if len(setter.setCalls) != 0 {
+		t.Fatalf("individual Set calls=%v want none", setter.setCalls)
 	}
 }
 

@@ -299,14 +299,14 @@ func (b *OpenWrtBackend) applyAndVerifyEasyMeshTopology(
 	}
 	if steer != nil {
 		if progress != nil {
-			progress("Steering", "The controller is sending a native EasyMesh backhaul steering request")
+			progress("Applying", "The controller is sending a native EasyMesh backhaul steering request")
 		}
 		if err := b.executeEasyMeshBackhaulSteer(ctx, *steer); err != nil {
 			return err
 		}
 	}
 	if progress != nil {
-		progress("Saving", "The requested parent is live; saving the confirmed topology policy")
+		progress("Converging", "The requested parent is live; saving the confirmed topology policy")
 	}
 	if err := b.persistEasyMeshTopologyPolicy(ctx, normalized, topology); err != nil {
 		if steer == nil || rollback == nil {

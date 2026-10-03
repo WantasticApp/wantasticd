@@ -85,6 +85,17 @@ func TestWUSPMeshTelemetryValuesValidate(t *testing.T) {
 	}
 }
 
+func TestWUSPEasyMeshOperationPhasesValidate(t *testing.T) {
+	const path = "Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase"
+	for _, phase := range []string{"Accepted", "Applying", "Converging", "Complete", "Failed"} {
+		t.Run(phase, func(t *testing.T) {
+			if err := ValidateFieldFast(Field{Path: path, Val: String(phase)}); err != nil {
+				t.Fatalf("ValidateFieldFast(%s): %v", phase, err)
+			}
+		})
+	}
+}
+
 func TestWUSPMeshTelemetrySupportedDM(t *testing.T) {
 	agent := NewUSPAgent(USPAgentOptions{})
 	model := agent.GetSupportedDM("Device.WUSP_MeshTelemetry.")

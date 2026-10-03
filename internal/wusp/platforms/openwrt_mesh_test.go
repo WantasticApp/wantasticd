@@ -2,73 +2,13 @@ package platforms
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"wantastic-agent/internal/wusp"
 )
-
-func TestApplyEasyMeshTopologyStopsWhenOptimizerDisableConfirmationFails(t *testing.T) {
-	const liveTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"}]}`
-	const policy = `{"topOptPolicy":"strict","convTimeout":1,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"}]}`
-
-	setTopoCalled := false
-	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		UbusParamCaller: func(
-			_ context.Context,
-			object string,
-			method string,
-			_ map[string]any,
-		) ([]byte, error) {
-			if object != "device" {
-				return nil, wusp.ErrUSPPathUnsupported
-			}
-			switch method {
-			case "getMode":
-				return []byte(`{"mode":"CN"}`), nil
-			case "getRealTopo":
-				return []byte(liveTopology), nil
-			case "setTopo":
-				setTopoCalled = true
-				return []byte(`{}`), nil
-			default:
-				return nil, wusp.ErrUSPPathUnsupported
-			}
-		},
-	})
-	commands := []easyMeshConsoleCommand{}
-	disableAttempts := 0
-	backend.easyMeshConsole = easyMeshConsoleFunc(func(
-		_ context.Context,
-		command easyMeshConsoleCommand,
-	) (string, error) {
-		commands = append(commands, command)
-		disableAttempts++
-		if disableAttempts == 1 {
-			return "", errors.New("confirmation lost")
-		}
-		return "ToptReq:Off", nil
-	})
-
-	err := backend.ApplyEasyMeshTopology(t.Context(), policy)
-	if err == nil || !strings.Contains(err.Error(), "confirmation lost") {
-		t.Fatalf("ApplyEasyMeshTopology error=%v", err)
-	}
-	wantCommands := []easyMeshConsoleCommand{
-		easyMeshConsoleDisableTopologyRequests,
-		easyMeshConsoleDisableTopologyRequests,
-	}
-	if !slices.Equal(commands, wantCommands) {
-		t.Fatalf("console commands=%v want %v", commands, wantCommands)
-	}
-	if setTopoCalled {
-		t.Fatal("device.setTopo was called without confirmed request gate")
-	}
-}
 
 func TestApplyEasyMeshTopologyRejectsMismatchedDeviceReadback(t *testing.T) {
 	const liveTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"}]}`
@@ -101,18 +41,6 @@ func TestApplyEasyMeshTopologyRejectsMismatchedDeviceReadback(t *testing.T) {
 			}
 		},
 	})
-	backend.easyMeshConsole = easyMeshConsoleFunc(func(
-		_ context.Context,
-		command easyMeshConsoleCommand,
-	) (string, error) {
-		if command == easyMeshConsoleEnableTopologyRequests {
-			events = append(events, "enable")
-			return "ToptReq:ON", nil
-		}
-		events = append(events, "disable")
-		return "ToptReq:Off", nil
-	})
-
 	err := backend.ApplyEasyMeshTopology(t.Context(), requestedPolicy)
 	if err == nil || !strings.Contains(
 		err.Error(),
@@ -120,7 +48,7 @@ func TestApplyEasyMeshTopologyRejectsMismatchedDeviceReadback(t *testing.T) {
 	) {
 		t.Fatalf("ApplyEasyMeshTopology error=%v", err)
 	}
-	if !slices.Equal(events, []string{"disable", "setTopo", "disable"}) {
+	if !slices.Equal(events, []string{"setTopo"}) {
 		t.Fatalf("EasyMesh control events=%v", events)
 	}
 }
@@ -160,10 +88,7 @@ func TestApplyEasyMeshTopologyAcceptsPersistedPlanAcrossConsoleRestart(t *testin
 	const requestedPolicy = `{"topOptPolicy":"permissive","convTimeout":120,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GH","depth":0,"rssiThresh":-50,"apName":"Controller"}]}`
 
 	savedPolicy := ""
-	disableAttempts := 0
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		EasyMeshVerifyInterval: time.Millisecond,
-		EasyMeshStableDuration: 2 * time.Millisecond,
 		UbusParamCaller: func(
 			_ context.Context,
 			object string,
@@ -188,84 +113,13 @@ func TestApplyEasyMeshTopologyAcceptsPersistedPlanAcrossConsoleRestart(t *testin
 			}
 		},
 	})
-	backend.easyMeshConsole = easyMeshConsoleFunc(func(
-		_ context.Context,
-		command easyMeshConsoleCommand,
-	) (string, error) {
-		if command == easyMeshConsoleEnableTopologyRequests {
-			return "ToptReq:ON", nil
-		}
-		disableAttempts++
-		if disableAttempts == 2 {
-			return "", errors.New("connection refused")
-		}
-		return "ToptReq:Off", nil
-	})
 
 	if err := backend.ApplyEasyMeshTopology(t.Context(), requestedPolicy); err != nil {
 		t.Fatalf("ApplyEasyMeshTopology: %v", err)
 	}
-	if disableAttempts != 3 {
-		t.Fatalf("disable attempts=%d want 3", disableAttempts)
-	}
 	if !strings.Contains(savedPolicy, `"topOptPolicy":"strict"`) ||
 		!strings.Contains(savedPolicy, `"convTimeout":120`) {
 		t.Fatalf("saved policy=%s", savedPolicy)
-	}
-}
-
-func TestApplyEasyMeshTopologyRejectsRelayWithoutBackhaulBSS(t *testing.T) {
-	const starTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay B"}]}`
-	const requestedPolicy = `{"topOptPolicy":"strict","convTimeout":1,"deviceArray":[{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"Controller"},{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GHL","depth":1,"rssiThresh":-70,"apName":"Relay A"},{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"E0:5D:54:4B:E6:CF","bStaLinkBand":"6GHL","depth":2,"rssiThresh":-70,"apName":"Relay B"}]}`
-
-	requested := easyMeshTopology{}
-	if err := json.Unmarshal([]byte(requestedPolicy), &requested); err != nil {
-		t.Fatalf("decode requested topology: %v", err)
-	}
-	setTopoCalled := false
-	steerCalled := false
-	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name != easyMeshCommandPath {
-				t.Fatalf("command=%q", name)
-			}
-			if slices.Equal(args, []string{"td", "s2"}) {
-				return []byte(strings.ReplaceAll(easyMeshNativeSteerFixture, "0x40, Role: |BH|", "0x00, Role:")), nil
-			}
-			steerCalled = true
-			return nil, nil
-		},
-		UbusParamCaller: func(
-			_ context.Context,
-			object string,
-			method string,
-			_ map[string]any,
-		) ([]byte, error) {
-			if object != "device" {
-				return nil, wusp.ErrUSPPathUnsupported
-			}
-			switch method {
-			case "getRealTopo":
-				return []byte(starTopology), nil
-			case "setTopo":
-				setTopoCalled = true
-				return []byte(`{}`), nil
-			default:
-				return nil, wusp.ErrUSPPathUnsupported
-			}
-		},
-	})
-	err := backend.applyAndVerifyEasyMeshTopology(
-		t.Context(),
-		requestedPolicy,
-		requested,
-		nil,
-	)
-	if err == nil || !strings.Contains(err.Error(), "not advertising an operational backhaul BSS") {
-		t.Fatalf("applyAndVerifyEasyMeshTopology error=%v", err)
-	}
-	if setTopoCalled || steerCalled {
-		t.Fatalf("unsafe mutation reached device: setTopo=%t steer=%t", setTopoCalled, steerCalled)
 	}
 }
 

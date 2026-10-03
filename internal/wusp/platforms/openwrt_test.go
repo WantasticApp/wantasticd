@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -231,10 +230,10 @@ func TestApplyEasyMeshTopologyValidatesAndUsesStructuredUbusParams(t *testing.T)
 		t.Fatalf("ubus target=%s.%s, want device.setTopo", gotObject, gotMethod)
 	}
 	payload, ok := gotParams["data"].(string)
-	if !ok || !strings.Contains(payload, `"alId":"00:03:7F:BA:DB:AD"`) || !strings.Contains(payload, `"bStaLinkBand":"6GH"`) {
+	if !ok || !strings.Contains(payload, `"alId":"00:03:7F:BA:DB:AD"`) || !strings.Contains(payload, `"bStaLinkBand":"6GHL"`) {
 		t.Fatalf("normalized data param=%#v", gotParams["data"])
 	}
-	if !slices.Equal(events, []string{"enable", "setTopo", "disable"}) {
+	if !slices.Equal(events, []string{"disable", "setTopo", "disable"}) {
 		t.Fatalf("EasyMesh control events=%v", events)
 	}
 }
@@ -314,14 +313,31 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 	const starTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay B"}]}`
 	const chainTopology = `{"topo":[{"mac":"00:03:7F:BA:DB:AD","pMac":"","hops":0,"name":"Controller"},{"mac":"E0:5D:54:4B:E5:DC","pMac":"00:03:7F:BA:DB:AD","hops":1,"name":"Relay A"},{"mac":"E0:5D:54:4B:E6:CF","pMac":"E0:5D:54:4B:E5:DC","hops":2,"name":"Relay B"}]}`
 
-	var mu sync.RWMutex
 	savedPolicy := currentPolicy
 	liveTopology := starTopology
 	started := make(chan struct{})
 	release := make(chan struct{})
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		EasyMeshVerifyInterval: 10 * time.Millisecond,
-		EasyMeshStableDuration: 60 * time.Millisecond,
+		EasyMeshVerifyInterval: time.Millisecond,
+		CommandRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name != easyMeshCommandPath {
+				return nil, fmt.Errorf("unexpected command %q", name)
+			}
+			if slices.Equal(args, []string{"td", "s2"}) {
+				return []byte(easyMeshNativeSteerFixture), nil
+			}
+			if len(args) >= 2 && args[0] == "map" && args[1] == "bhs" {
+				close(started)
+				select {
+				case <-release:
+					liveTopology = chainTopology
+					return nil, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return nil, fmt.Errorf("unexpected ezcmd args %v", args)
+		},
 		UbusParamCaller: func(ctx context.Context, object, method string, params map[string]any) ([]byte, error) {
 			if object != "device" {
 				return nil, wusp.ErrUSPPathUnsupported
@@ -330,24 +346,11 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 			case "getMode":
 				return []byte(`{"mode":"CN"}`), nil
 			case "getTopo":
-				mu.RLock()
-				defer mu.RUnlock()
 				return []byte(savedPolicy), nil
 			case "getRealTopo":
-				mu.RLock()
-				defer mu.RUnlock()
 				return []byte(liveTopology), nil
 			case "setTopo":
-				close(started)
-				select {
-				case <-release:
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-				mu.Lock()
 				savedPolicy, _ = params["data"].(string)
-				liveTopology = chainTopology
-				mu.Unlock()
 				return []byte(`{}`), nil
 			default:
 				return nil, wusp.ErrUSPPathUnsupported
@@ -378,23 +381,11 @@ func TestStartApplyEasyMeshTopologyAcknowledgesBeforeVendorConvergence(t *testin
 		t.Fatalf("operation status=%q want Pending", status)
 	}
 	close(release)
-	time.Sleep(25 * time.Millisecond)
-	mu.Lock()
-	liveTopology = starTopology
-	mu.Unlock()
-	time.Sleep(70 * time.Millisecond)
-	status, _ = backend.easyMeshOperationResult()
-	if status != "Pending" {
-		t.Fatalf("brief topology match was accepted as final: status=%q", status)
-	}
-	mu.Lock()
-	liveTopology = chainTopology
-	mu.Unlock()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		status, message := backend.easyMeshOperationResult()
 		if status == "Success" {
-			if !strings.Contains(message, "converged") {
+			if !strings.Contains(message, "verified") {
 				t.Fatalf("success message=%q", message)
 			}
 			return

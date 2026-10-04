@@ -13,6 +13,12 @@ import (
 
 const uspTransportVersion = 1
 
+// WUSPControlTransportReliable identifies agents that deduplicate action
+// requests and replay their original response when the controller retries the
+// same request identity. Older controllers safely treat this as display-only
+// protocol metadata.
+const WUSPControlTransportReliable = "wireguard-noise-fragmented-datagram+request-replay-v1"
+
 const (
 	uspTransportKindRequest  = 1
 	uspTransportKindResponse = 2

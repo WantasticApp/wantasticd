@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -48,7 +49,27 @@ const (
 	uspDataModelCacheRefresh     = 60 * time.Second
 	wuspControlFragmentPaceEvery = 16
 	wuspControlFragmentPaceDelay = time.Millisecond
+	wuspControlReplayTTL         = 2 * time.Minute
+	wuspControlReplayMaxEntries  = 256
 )
+
+type uspControlReplayKey struct {
+	peer     string
+	request  uint64
+	sequence uint64
+}
+
+type uspControlReplayEntry struct {
+	fingerprint [sha256.Size]byte
+	payload     []byte
+	ready       chan struct{}
+	expiresAt   time.Time
+}
+
+type uspControlReplayTicket struct {
+	key         uspControlReplayKey
+	fingerprint [sha256.Size]byte
+}
 
 type uspRuntime struct {
 	ctx                    context.Context
@@ -69,6 +90,9 @@ type uspRuntime struct {
 	pending sync.Map // map[uint64]chan wusp.USPAgentResponse
 	streams sync.Map // map[uint64]*uspTransferSession
 
+	controlReplayMu sync.Mutex
+	controlReplay   map[uspControlReplayKey]*uspControlReplayEntry
+
 	// Initialization state machine.
 	initState  atomic.Int32
 	initReady  chan struct{} // closed once initState == uspInitReady
@@ -82,6 +106,7 @@ type USPRuntimeStats struct {
 	InboundResponses           uint64
 	UnauthorizedRequests       uint64
 	OutboundResponses          uint64
+	ControlResponseReplays     uint64
 	ResponseFragmentsSent      uint64
 	FragmentedResponses        uint64
 	TransferFramesSent         uint64
@@ -106,6 +131,7 @@ type uspRuntimeStats struct {
 	inboundResponses           atomic.Uint64
 	unauthorizedRequests       atomic.Uint64
 	outboundResponses          atomic.Uint64
+	controlResponseReplays     atomic.Uint64
 	responseFragmentsSent      atomic.Uint64
 	fragmentedResponses        atomic.Uint64
 	transferFramesSent         atomic.Uint64
@@ -134,6 +160,7 @@ func (r *uspRuntime) StatsSnapshot() USPRuntimeStats {
 		InboundResponses:           r.stats.inboundResponses.Load(),
 		UnauthorizedRequests:       r.stats.unauthorizedRequests.Load(),
 		OutboundResponses:          r.stats.outboundResponses.Load(),
+		ControlResponseReplays:     r.stats.controlResponseReplays.Load(),
 		ResponseFragmentsSent:      r.stats.responseFragmentsSent.Load(),
 		FragmentedResponses:        r.stats.fragmentedResponses.Load(),
 		TransferFramesSent:         r.stats.transferFramesSent.Load(),
@@ -250,9 +277,10 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		httpClient: &http.Client{
 			Timeout: 2 * time.Minute,
 		},
-		transferDir: filepath.Join(os.TempDir(), "wantastic-usp"),
-		initReady:   make(chan struct{}),
-		warmupDone:  make(chan struct{}),
+		transferDir:   filepath.Join(os.TempDir(), "wantastic-usp"),
+		controlReplay: make(map[uspControlReplayKey]*uspControlReplayEntry),
+		initReady:     make(chan struct{}),
+		warmupDone:    make(chan struct{}),
 	}
 	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
 		Collector:       cachedBackend,
@@ -314,7 +342,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		"Device.WUSP.ProtocolVersion":     wusp.String(wusp.WUSPModelVersion),
 		"Device.WUSP.MaxControlPayload":   wusp.Uint(uint64(wusp.WUSPMaxDatagramPayload)),
 		"Device.WUSP.TunnelOnly":          wusp.Bool(true),
-		"Device.WUSP.ReliableControl":     wusp.Bool(false),
+		"Device.WUSP.ReliableControl":     wusp.Bool(true),
 		"Device.WUSP.ControlCompression":  wusp.List(wusp.String("nested-message-lz4")),
 		"Device.WUSP.TransferCompression": wusp.List(wusp.String("stream-chunk-lz4")),
 	}
@@ -338,6 +366,135 @@ func (r *uspRuntime) HandlePeerPacket(peer *wgdevice.Peer, data []byte) {
 	}); err != nil {
 		log.Printf("[USP] WUSP frame handling failed: peer=%s err=%v", peerHex, err)
 	}
+}
+
+func replayableWUSPControlMethod(method wusp.USPAgentMethod) bool {
+	switch method {
+	case wusp.USPAgentMethodSet,
+		wusp.USPAgentMethodAdd,
+		wusp.USPAgentMethodDelete,
+		wusp.USPAgentMethodOperate,
+		wusp.USPAgentMethodNotify:
+		return true
+	default:
+		return false
+	}
+}
+
+func wuspControlRequestFingerprint(req wusp.USPAgentRequest) ([sha256.Size]byte, error) {
+	semantic := req
+	semantic.Metadata = wusp.CloneMetadata(req.Metadata)
+	delete(semantic.Metadata, wusp.MetadataKeyResponseMaxControlPayload)
+	payload, err := wusp.EncodeUSPAgentRequest(semantic)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return sha256.Sum256(payload), nil
+}
+
+func (r *uspRuntime) beginControlReplay(
+	ctx context.Context,
+	peerPublicKeyHex string,
+	req wusp.USPAgentRequest,
+) (*uspControlReplayTicket, []byte, error) {
+	if r == nil || !replayableWUSPControlMethod(req.Method) {
+		return nil, nil, nil
+	}
+	fingerprint, err := wuspControlRequestFingerprint(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fingerprint WUSP request: %w", err)
+	}
+	sequence, _ := wusp.RequestSequence(req.Metadata)
+	key := uspControlReplayKey{peer: peerPublicKeyHex, request: req.ID, sequence: sequence}
+
+	r.controlReplayMu.Lock()
+	if r.controlReplay == nil {
+		r.controlReplay = make(map[uspControlReplayKey]*uspControlReplayEntry)
+	}
+	now := time.Now()
+	for replayKey, entry := range r.controlReplay {
+		if now.After(entry.expiresAt) {
+			delete(r.controlReplay, replayKey)
+		}
+	}
+	if entry := r.controlReplay[key]; entry != nil {
+		if entry.fingerprint != fingerprint {
+			r.controlReplayMu.Unlock()
+			return nil, nil, fmt.Errorf("request identity %d/%d was reused with different action data", req.ID, sequence)
+		}
+		ready := entry.ready
+		r.controlReplayMu.Unlock()
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return nil, nil, fmt.Errorf("wait for original request %d: %w", req.ID, ctx.Err())
+		}
+		r.controlReplayMu.Lock()
+		entry = r.controlReplay[key]
+		if entry == nil || len(entry.payload) == 0 {
+			r.controlReplayMu.Unlock()
+			return nil, nil, fmt.Errorf("original request %d completed without a replayable response", req.ID)
+		}
+		payload := append([]byte(nil), entry.payload...)
+		r.controlReplayMu.Unlock()
+		return nil, payload, nil
+	}
+	if len(r.controlReplay) >= wuspControlReplayMaxEntries {
+		var oldestKey uspControlReplayKey
+		var oldestExpiry time.Time
+		found := false
+		for replayKey, entry := range r.controlReplay {
+			if len(entry.payload) == 0 {
+				continue
+			}
+			if !found || entry.expiresAt.Before(oldestExpiry) {
+				oldestKey = replayKey
+				oldestExpiry = entry.expiresAt
+				found = true
+			}
+		}
+		if !found {
+			r.controlReplayMu.Unlock()
+			return nil, nil, fmt.Errorf("reliable control queue is full")
+		}
+		delete(r.controlReplay, oldestKey)
+	}
+	r.controlReplay[key] = &uspControlReplayEntry{
+		fingerprint: fingerprint,
+		ready:       make(chan struct{}),
+		expiresAt:   now.Add(wuspControlReplayTTL),
+	}
+	r.controlReplayMu.Unlock()
+	return &uspControlReplayTicket{key: key, fingerprint: fingerprint}, nil, nil
+}
+
+func (r *uspRuntime) completeControlReplay(ticket *uspControlReplayTicket, payload []byte) {
+	if r == nil || ticket == nil || len(payload) == 0 {
+		return
+	}
+	r.controlReplayMu.Lock()
+	defer r.controlReplayMu.Unlock()
+	entry := r.controlReplay[ticket.key]
+	if entry == nil || entry.fingerprint != ticket.fingerprint || len(entry.payload) != 0 {
+		return
+	}
+	entry.payload = append([]byte(nil), payload...)
+	entry.expiresAt = time.Now().Add(wuspControlReplayTTL)
+	close(entry.ready)
+}
+
+func (r *uspRuntime) abortControlReplay(ticket *uspControlReplayTicket) {
+	if r == nil || ticket == nil {
+		return
+	}
+	r.controlReplayMu.Lock()
+	defer r.controlReplayMu.Unlock()
+	entry := r.controlReplay[ticket.key]
+	if entry == nil || entry.fingerprint != ticket.fingerprint || len(entry.payload) != 0 {
+		return
+	}
+	delete(r.controlReplay, ticket.key)
+	close(entry.ready)
 }
 
 func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, reply func([]byte) error) error {
@@ -429,12 +586,35 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 
 	if req.Method == wusp.USPAgentMethodGetSupportedProtocol {
 		diaglog.Printf("[USP] Replying GetSupportedProtocol directly: id=%d", req.ID)
+		protocol := r.agent.GetSupportedProtocol()
+		protocol.ControlTransport = wusp.WUSPControlTransportReliable
 		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
-			Protocol: r.agent.GetSupportedProtocol(),
+			Protocol: protocol,
 		})
 	}
+
+	replayTicket, replayPayload, replayErr := r.beginControlReplay(ctx, peerPublicKeyHex, req)
+	if replayErr != nil {
+		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{
+			ID:       req.ID,
+			Method:   req.Method,
+			Metadata: wusp.ResponseMetadataForRequest(req),
+			Error:    replayErr.Error(),
+		})
+	}
+	if len(replayPayload) != 0 {
+		r.stats.controlResponseReplays.Add(1)
+		log.Printf("[USP] replaying cached control response: method=%s id=%d", req.Method, req.ID)
+		return r.replyControlPayload(reply, req, replayPayload)
+	}
+	replayCompleted := false
+	defer func() {
+		if !replayCompleted {
+			r.abortControlReplay(replayTicket)
+		}
+	}()
 
 	diaglog.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)
 	type requestResult struct {
@@ -456,7 +636,12 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 	}
 	if err != nil {
 		log.Printf("[USP] agent.HandleRequest failed: method=%d id=%d err=%v", req.Method, req.ID, err)
-		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{ID: req.ID, Method: req.Method, Error: err.Error()})
+		resp = wusp.USPAgentResponse{
+			ID:       req.ID,
+			Method:   req.Method,
+			Metadata: wusp.ResponseMetadataForRequest(req),
+			Error:    err.Error(),
+		}
 	}
 	if resp.Message != nil {
 		objects, values := dataModelMessageCounts(resp.Message)
@@ -474,16 +659,18 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		// list).  Send an error response so the controller gets an immediate
 		// reply rather than waiting for a round-trip timeout.
 		log.Printf("[USP] EncodeUSPAgentResponse failed: method=%d id=%d err=%v — sending error response", req.Method, req.ID, err)
-		if encErr := r.replyControlResponse(reply, req, wusp.USPAgentResponse{
-			ID:     req.ID,
-			Method: req.Method,
-			Error:  err.Error(),
-		}); encErr == nil {
-			return nil
-		} else {
-			return encErr
+		frame, err = wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+			ID:       req.ID,
+			Method:   req.Method,
+			Metadata: wusp.ResponseMetadataForRequest(req),
+			Error:    err.Error(),
+		})
+		if err != nil {
+			return err
 		}
 	}
+	r.completeControlReplay(replayTicket, frame)
+	replayCompleted = true
 	diaglog.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
 	return r.replyControlPayload(reply, req, frame)
 }

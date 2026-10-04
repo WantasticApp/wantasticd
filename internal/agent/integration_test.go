@@ -116,6 +116,9 @@ func TestIntegration_GetSupportedProtocol(t *testing.T) {
 	if len(resp.Protocol.Methods) == 0 {
 		t.Error("Protocol.Methods is empty — expected supported method list")
 	}
+	if resp.Protocol.ControlTransport != wusp.WUSPControlTransportReliable {
+		t.Errorf("Protocol.ControlTransport=%q want %q", resp.Protocol.ControlTransport, wusp.WUSPControlTransportReliable)
+	}
 	// Every well-known method must be advertised.
 	want := map[string]bool{
 		"Get": false, "Set": false, "GetSupportedProtocol": false, "GetSupportedDM": false,

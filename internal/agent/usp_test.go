@@ -155,6 +155,71 @@ func TestUSPRuntimeHandlesControllerRequest(t *testing.T) {
 	}
 }
 
+func TestUSPRuntimeReplaysDuplicateOperateWithoutExecutingTwice(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	const (
+		requestID = uint64(1028)
+		sequence  = uint64(77)
+		object    = "Device.WUSP_MeshTelemetry.EasyMesh.1."
+		command   = object + "ApplyTopology()"
+	)
+
+	executions := 0
+	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
+		OperateHandler: func(_ context.Context, path string, _ *wusp.Message, _ map[string]string) (*wusp.Message, error) {
+			executions++
+			if path != command {
+				t.Fatalf("operate path=%q want %q", path, command)
+			}
+			output := wusp.NewMessage()
+			output.Set(object+"LastOperationStatus", wusp.String("Pending"))
+			return output, nil
+		},
+	})
+	request := wusp.USPAgentRequest{
+		ID:         requestID,
+		Method:     wusp.USPAgentMethodOperate,
+		ObjectPath: object,
+		Metadata: wusp.WithRequestSequence(
+			wusp.WithOperationCommandPath(nil, command),
+			sequence,
+		),
+	}
+	requestFrame, err := wusp.EncodeUSPAgentRequest(request)
+	if err != nil {
+		t.Fatalf("EncodeUSPAgentRequest: %v", err)
+	}
+
+	var responses [][]byte
+	for attempt := 0; attempt < 2; attempt++ {
+		var responseFrame []byte
+		if err := runtime.handleFrameFromPeer(runtime.controllerPublicKeyHex, requestFrame, func(frame []byte) error {
+			responseFrame = append(responseFrame, frame...)
+			return nil
+		}); err != nil {
+			t.Fatalf("handleFrameFromPeer(attempt=%d): %v", attempt+1, err)
+		}
+		responses = append(responses, responseFrame)
+	}
+
+	if executions != 1 {
+		t.Fatalf("operate executions=%d want 1", executions)
+	}
+	if !bytes.Equal(responses[0], responses[1]) {
+		t.Fatal("replayed response differs from original response")
+	}
+	response := decodeControlResponseDatagram(t, responses[1])
+	if response.Error != "" {
+		t.Fatalf("replayed response error=%q", response.Error)
+	}
+	if got, ok := wusp.ResponseSequence(response.Metadata); !ok || got != sequence {
+		t.Fatalf("response sequence=%d ok=%v want %d/true", got, ok, sequence)
+	}
+	if got := runtime.StatsSnapshot().ControlResponseReplays; got != 1 {
+		t.Fatalf("ControlResponseReplays=%d want 1", got)
+	}
+}
+
 func TestUSPRuntimeCellularOperateRequiresCommandPath(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 

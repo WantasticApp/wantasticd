@@ -118,6 +118,7 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
 	status, phase, message := b.easyMeshOperationSnapshot()
 	if status != "" {
 		msg.Set(easyMeshPath+"LastOperationStatus", wusp.String(status))
+		msg.Set(easyMeshPath+"LastOperationCode", wusp.String(easyMeshOperationCode(status)))
 		msg.Set(easyMeshPath+"LastOperationPhase", wusp.String(phase))
 		msg.Set(easyMeshPath+"LastOperationMessage", wusp.String(message))
 	}
@@ -410,9 +411,23 @@ func (b *OpenWrtBackend) notifyEasyMeshOperationObserver(
 	const prefix = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	patch := wusp.NewMessage()
 	patch.Set(prefix+"LastOperationStatus", wusp.String(status))
+	patch.Set(prefix+"LastOperationCode", wusp.String(easyMeshOperationCode(status)))
 	patch.Set(prefix+"LastOperationPhase", wusp.String(phase))
 	patch.Set(prefix+"LastOperationMessage", wusp.String(message))
 	observer(patch)
+}
+
+func easyMeshOperationCode(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "pending":
+		return wusp.ControlCodeOperationPending
+	case "success":
+		return wusp.ControlCodeOperationSuccess
+	case "error":
+		return wusp.ControlCodeDeviceRejected
+	default:
+		return wusp.ControlCodeAgentError
+	}
 }
 
 // SetEasyMeshObserver connects asynchronous vendor progress and live topology

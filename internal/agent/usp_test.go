@@ -215,6 +215,10 @@ func TestUSPRuntimeReplaysDuplicateOperateWithoutExecutingTwice(t *testing.T) {
 	if got, ok := wusp.ResponseSequence(response.Metadata); !ok || got != sequence {
 		t.Fatalf("response sequence=%d ok=%v want %d/true", got, ok, sequence)
 	}
+	result, ok := wusp.ControlResultFromMetadata(response.Metadata)
+	if !ok || result.State != wusp.ControlResultPending || result.Code != wusp.ControlCodeOperationAccepted || result.RequestID != requestID {
+		t.Fatalf("control result=%+v present=%t", result, ok)
+	}
 	if got := runtime.StatsSnapshot().ControlResponseReplays; got != 1 {
 		t.Fatalf("ControlResponseReplays=%d want 1", got)
 	}
@@ -282,6 +286,10 @@ func TestUSPRuntimeAcknowledgesAsyncEasyMeshTopologyAsPending(t *testing.T) {
 	if !ok || status.AsString() != "Pending" {
 		t.Fatalf("operation status=%v, present=%v", status, ok)
 	}
+	code, ok := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationCode")
+	if !ok || code.AsString() != wusp.ControlCodeOperationAccepted {
+		t.Fatalf("operation code=%v, present=%v", code, ok)
+	}
 }
 
 func TestUSPRuntimeReceivesEasyMeshApplyOverWUSPOperate(t *testing.T) {
@@ -329,6 +337,10 @@ func TestUSPRuntimeReceivesEasyMeshApplyOverWUSPOperate(t *testing.T) {
 	phase, ok := response.Message.Get(objectPath + "LastOperationPhase")
 	if !ok || phase.AsString() != "Accepted" {
 		t.Fatalf("phase=%q present=%t want Accepted", phase.AsString(), ok)
+	}
+	result, ok := wusp.ControlResultFromMetadata(response.Metadata)
+	if !ok || result.State != wusp.ControlResultPending || result.Code != wusp.ControlCodeOperationAccepted || result.RequestID != 902 {
+		t.Fatalf("control result=%+v present=%t", result, ok)
 	}
 }
 

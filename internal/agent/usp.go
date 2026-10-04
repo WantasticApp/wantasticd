@@ -652,6 +652,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		diaglog.Printf("[USP] DataModel schema: models=%d objects=%d parameters=%d",
 			len(resp.SupportedDataModel.Models), len(resp.SupportedDataModel.Objects), len(resp.SupportedDataModel.Params))
 	}
+	resp = wusp.FinalizeAgentResponse(req, resp)
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
 		// Encoding can fail if the platform backend returned a value whose
@@ -659,19 +660,22 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		// list).  Send an error response so the controller gets an immediate
 		// reply rather than waiting for a round-trip timeout.
 		log.Printf("[USP] EncodeUSPAgentResponse failed: method=%d id=%d err=%v — sending error response", req.Method, req.ID, err)
-		frame, err = wusp.EncodeUSPAgentResponse(wusp.USPAgentResponse{
+		fallback := wusp.FinalizeAgentResponse(req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
 			Metadata: wusp.ResponseMetadataForRequest(req),
 			Error:    err.Error(),
 		})
+		resp = fallback
+		frame, err = wusp.EncodeUSPAgentResponse(fallback)
 		if err != nil {
 			return err
 		}
 	}
 	r.completeControlReplay(replayTicket, frame)
 	replayCompleted = true
-	diaglog.Printf("[USP] HandleRequest done: method=%d id=%d response_bytes=%d", req.Method, req.ID, len(frame))
+	controlResult, _ := wusp.ControlResultFromMetadata(resp.Metadata)
+	diaglog.Printf("[USP] HandleRequest done: method=%d id=%d state=%s code=%s response_bytes=%d", req.Method, req.ID, controlResult.State, controlResult.Code, len(frame))
 	return r.replyControlPayload(reply, req, frame)
 }
 
@@ -694,6 +698,7 @@ func dataModelMessageCounts(msg *wusp.Message) (objects, values int) {
 }
 
 func (r *uspRuntime) replyControlResponse(reply func([]byte) error, req wusp.USPAgentRequest, resp wusp.USPAgentResponse) error {
+	resp = wusp.FinalizeAgentResponse(req, resp)
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
 		return err
@@ -832,6 +837,7 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 			}
 			output := wusp.NewMessage()
 			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Pending"))
+			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationCode", wusp.String(wusp.ControlCodeOperationAccepted))
 			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase", wusp.String("Accepted"))
 			output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology accepted; applying the vendor topology policy"))
 			return output, nil
@@ -851,6 +857,7 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		}
 		output := wusp.NewMessage()
 		output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Success"))
+		output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationCode", wusp.String(wusp.ControlCodeOperationSuccess))
 		output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology applied"))
 		return output, nil
 	case "Device.WUSP_MeshTelemetry.EasyMesh.1.RemoveStation()":
@@ -903,6 +910,7 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 func easyMeshOperationStatus(message string) *wusp.Message {
 	output := wusp.NewMessage()
 	output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationStatus", wusp.String("Success"))
+	output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationCode", wusp.String(wusp.ControlCodeOperationSuccess))
 	output.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String(message))
 	return output
 }

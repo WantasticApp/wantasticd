@@ -891,6 +891,25 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 			return nil, err
 		}
 		return easyMeshOperationStatus("Mode updated"), nil
+	case "Device.WUSP_MeshTelemetry.EasyMesh.1.RefreshTopology()",
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.DiscoverNeighbors()",
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.AnnounceTopology()",
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.RefreshRadioCapabilities()":
+		controller, ok := r.rawBackend.(interface {
+			RunEasyMeshConsoleAction(context.Context, string) (string, error)
+		})
+		if !ok {
+			return nil, wusp.ErrUSPPathUnsupported
+		}
+		action := strings.TrimSuffix(strings.TrimPrefix(
+			cmd,
+			"Device.WUSP_MeshTelemetry.EasyMesh.1.",
+		), "()")
+		message, err := controller.RunEasyMeshConsoleAction(ctx, action)
+		if err != nil {
+			return nil, err
+		}
+		return easyMeshOperationStatus(message), nil
 	default:
 		if strings.HasPrefix(cmd, "Device.WUSP_CellularControl.Interface.") {
 			if strings.HasSuffix(cmd, ".") {

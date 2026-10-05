@@ -186,6 +186,14 @@ var WUSPMeshTelemetryEasyMeshParams = []Param{
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.Writable", Type: TypeBoolean, Access: ReadOnly, SinceVersion: "1.0", Description: "Whether the agent verified at least one vendor EasyMesh control contract."},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.SupportedOperations", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Comma-separated EasyMesh operations verified for this device.", Limits: Limits{MaxLength: 128}},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.TopologyJSON", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Validated current vendor topology policy used as the base for controlled edits.", Limits: Limits{MaxLength: maxEasyMeshTopologyJSONLength}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.TopologySource", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Local vendor source used to collect the current EasyMesh view.", Limits: Limits{Enums: []string{"device.getRealTopo", "ezcmd.td.s1"}}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.MAPAgentVersion", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "MAP agent protocol version reported by the vendor service.", Limits: Limits{MaxLength: 32}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.PackageVersion", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Vendor EasyMesh package version.", Limits: Limits{MaxLength: 128}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.CountryCode", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Regulatory country code reported by the local EasyMesh service.", Limits: Limits{MaxLength: 8}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LocalMACAddress", Type: TypeMACAddress, Access: ReadOnly, SinceVersion: "1.0", Description: "Local IEEE 1905 AL MAC address."},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LocalIPAddress", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Local management IPv4 address reported by EasyMesh.", Limits: Limits{MaxLength: 64}},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.UpstreamMACAddress", Type: TypeMACAddress, Access: ReadOnly, SinceVersion: "1.0", Description: "Upstream EasyMesh device MAC address for a relay node."},
+	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LocalInterfacesJSON", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Validated local EasyMesh radio and interface summary encoded as JSON.", Limits: Limits{MaxLength: maxEasyMeshInterfacesJSONLength}},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LastOperationStatus", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Result of the latest EasyMesh control operation.", Limits: Limits{Enums: []string{"Pending", "Success", "Error"}}},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LastOperationCode", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Stable machine-readable code for the latest EasyMesh control operation.", Limits: Limits{MaxLength: 64}},
 	{Path: WUSPMeshTelemetryPrefix + "EasyMesh.{i}.LastOperationPhase", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Current phase of the latest asynchronous topology operation.", Limits: Limits{Enums: []string{"Accepted", "Applying", "Converging", "Complete", "Failed"}}},
@@ -193,6 +201,7 @@ var WUSPMeshTelemetryEasyMeshParams = []Param{
 }
 
 const maxEasyMeshTopologyJSONLength = 64 << 10
+const maxEasyMeshInterfacesJSONLength = 32 << 10
 
 var WUSPMeshTelemetryNodeParams = []Param{
 	{

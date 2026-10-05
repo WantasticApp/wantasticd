@@ -141,6 +141,62 @@ config wifi-iface 'configured_only'
 	}
 }
 
+func TestOpenWrtWiFiReportsConfiguredNetworksNotDriverArtifacts(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "wireless"), []byte(`config wifi-device 'wifi0'
+	option band '5g'
+config wifi-iface 'main'
+	option device 'wifi0'
+	option mode 'ap'
+	option ssid '  Cyber  Access  '
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  filepath.Join(root, "sys", "class", "net"),
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
+				return []byte(`{"wifi0":{"up":true,"interfaces":[
+					{"section":"main","ifname":"ath0","up":true,"config":{"mode":"ap"}},
+					{"section":"mld-wifi0","ifname":"mld-wifi0","up":true,"config":{"mode":"ap"}},
+					{"section":"ath0.sta1","ifname":"ath0.sta1","up":true,"config":{"mode":"ap-vlan"}},
+					{"section":"wifi0","ifname":"wifi0","up":true,"config":{"mode":"unknown"}}
+				]}}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+		WiFiInfo: func(ifName string) (*iwinfo.InterfaceInfo, error) {
+			if ifName == "ath0" {
+				return &iwinfo.InterfaceInfo{SSID: "  Cyber  Access  ", BSSID: "02:00:00:00:00:01"}, nil
+			}
+			return &iwinfo.InterfaceInfo{}, nil
+		},
+	})
+
+	msg := wusp.NewMessage()
+	backend.appendWiFiFields(context.Background(), msg)
+	assertUintField(t, msg, "Device.WiFi.RadioNumberOfEntries", 1)
+	assertUintField(t, msg, "Device.WiFi.SSIDNumberOfEntries", 1)
+	assertUintField(t, msg, "Device.WiFi.AccessPointNumberOfEntries", 1)
+	assertStringField(t, msg, "Device.WiFi.SSID.1.Name", "ath0")
+	assertStringField(t, msg, "Device.WiFi.SSID.1.SSID", "  Cyber  Access  ")
+	if _, found := msg.Get("Device.WiFi.SSID.2.Name"); found {
+		t.Fatal("driver-created wireless link leaked into the logical SSID inventory")
+	}
+	if got := backend.resolveWiFiIfaceSection(1); got != "main" {
+		t.Fatalf("SSID.1 section=%q want main", got)
+	}
+	if got := backend.resolveWiFiIfaceSection(2); got != "" {
+		t.Fatalf("nonexistent SSID.2 resolved to %q", got)
+	}
+}
+
 func TestLinkDiscoveryFieldsClampUntrustedValues(t *testing.T) {
 	msg := wusp.NewMessage()
 	appendLinkDiscoveryFields(msg, linkdiscovery.Snapshot{

@@ -236,10 +236,11 @@ type openWrtWirelessRadioStatus struct {
 }
 
 type openWrtWirelessIfaceStatus struct {
-	Section string         `json:"section"`
-	IfName  string         `json:"ifname"`
-	Up      bool           `json:"up"`
-	Config  map[string]any `json:"config"`
+	Section    string         `json:"section"`
+	IfName     string         `json:"ifname"`
+	Up         bool           `json:"up"`
+	Config     map[string]any `json:"config"`
+	Configured bool           `json:"-"`
 }
 
 type openWrtWiFiStation struct {
@@ -458,6 +459,9 @@ func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value)
 		if err := b.setOpenWrtMeshParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
 			return err
 		}
+		if err := b.setOpenWrtServiceParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
+			return err
+		}
 		return wusp.ErrUSPPathUnsupported
 	}
 }
@@ -562,6 +566,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 
 	// Network interface details via getifaddrs (pure Go)
 	_ = runCollector("openwrt.network.interfaces", func() error { collectNetworkInterfacesStatic(msg, b.netClassDir); return nil })
+	_ = runCollector("openwrt.network.services", func() error { b.appendOpenWrtServiceFields(msg); return nil })
 	_ = runCollector("openwrt.cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("openwrt.cellular.runtime", func() error {
 		if b.cellular != nil {
@@ -721,12 +726,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 		}
 		b.appendWiFiRadioCapabilities(ctx, msg, key, radioIfName, radioIndex, radio.Config)
 
-		interfaces := append([]openWrtWirelessIfaceStatus(nil), radio.Interfaces...)
-		sort.SliceStable(interfaces, func(i, j int) bool {
-			left := firstNonEmpty(interfaces[i].Section, interfaces[i].IfName)
-			right := firstNonEmpty(interfaces[j].Section, interfaces[j].IfName)
-			return left < right
-		})
+		interfaces := b.reportableWiFiInterfaces(radio)
 
 		for _, iface := range interfaces {
 			ssidCount++
@@ -735,13 +735,13 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 			ifName := firstNonEmpty(iface.IfName, b.existingWiFiIfName(configString(iface.Config, "ifname")))
 			mode := strings.ToLower(firstNonEmpty(configString(iface.Config, "mode"), "ap"))
 			ssidEnabled := !parseOpenWrtBool(configString(iface.Config, "disabled"), false)
-			ssidValue := configString(iface.Config, "ssid")
+			ssidValue := configExactString(iface.Config, "ssid")
 			bssidValue := ""
 
 			if ifName != "" && b.wifiInfo != nil {
 				if info, err := b.wifiInfo(ifName); err == nil {
 					if strings.TrimSpace(info.SSID) != "" {
-						ssidValue = strings.TrimSpace(info.SSID)
+						ssidValue = info.SSID
 					}
 					if strings.TrimSpace(info.BSSID) != "" {
 						bssidValue = strings.TrimSpace(info.BSSID)
@@ -1706,7 +1706,7 @@ func (b *OpenWrtBackend) resolveWiFiRadioSection(radioIndex int) string {
 // section name (e.g. "default_radio0") by iterating ubus wireless status in the
 // same order as the collector. This ensures Set operations target the correct section.
 func (b *OpenWrtBackend) resolveWiFiIfaceSection(ssidIndex int) string {
-	radios := b.readWirelessRadioStatus()
+	radios := b.openWrtWirelessRadios()
 	if len(radios) == 0 {
 		return ""
 	}
@@ -1722,12 +1722,7 @@ func (b *OpenWrtBackend) resolveWiFiIfaceSection(ssidIndex int) string {
 	for _, key := range radioKeys {
 		radio := radios[key]
 		// Sort interfaces by section name (matches collector)
-		ifaces := append([]openWrtWirelessIfaceStatus(nil), radio.Interfaces...)
-		sort.SliceStable(ifaces, func(i, j int) bool {
-			left := firstNonEmpty(ifaces[i].Section, ifaces[i].IfName)
-			right := firstNonEmpty(ifaces[j].Section, ifaces[j].IfName)
-			return left < right
-		})
+		ifaces := b.reportableWiFiInterfaces(radio)
 		for _, iface := range ifaces {
 			count++
 			if count == ssidIndex {
@@ -2519,6 +2514,10 @@ func mergeOpenWrtRadioStatus(configured, runtimeRadio openWrtWirelessRadioStatus
 	}
 	configured.Config = mergedConfig
 
+	hasConfiguredInterfaces := false
+	for _, iface := range configured.Interfaces {
+		hasConfiguredInterfaces = hasConfiguredInterfaces || iface.Configured
+	}
 	for _, runtimeIface := range runtimeRadio.Interfaces {
 		matched := false
 		for index := range configured.Interfaces {
@@ -2544,7 +2543,7 @@ func mergeOpenWrtRadioStatus(configured, runtimeRadio openWrtWirelessRadioStatus
 			matched = true
 			break
 		}
-		if !matched {
+		if !matched && !hasConfiguredInterfaces {
 			configured.Interfaces = append(configured.Interfaces, runtimeIface)
 		}
 	}
@@ -2563,6 +2562,43 @@ func (b *OpenWrtBackend) existingWiFiIfName(candidate string) string {
 		return candidate
 	}
 	return ""
+}
+
+// reportableWiFiInterfaces returns logical wireless networks, not every Linux
+// link created by the driver. When UCI wifi-iface rows exist they are the
+// stable identity and dynamic ath*.sta*, MLD, AP-VLAN and helper links are
+// deliberately hidden. Runtime-only devices are still supported, but a link
+// must report a real SSID before it becomes a user-facing TR-181 SSID row.
+func (b *OpenWrtBackend) reportableWiFiInterfaces(radio openWrtWirelessRadioStatus) []openWrtWirelessIfaceStatus {
+	configured := false
+	for _, iface := range radio.Interfaces {
+		configured = configured || iface.Configured
+	}
+
+	interfaces := make([]openWrtWirelessIfaceStatus, 0, len(radio.Interfaces))
+	for _, iface := range radio.Interfaces {
+		if configured && !iface.Configured {
+			continue
+		}
+		ssid := configExactString(iface.Config, "ssid")
+		ifName := firstNonEmpty(iface.IfName, b.existingWiFiIfName(configString(iface.Config, "ifname")))
+		if strings.TrimSpace(ssid) == "" && ifName != "" && b.wifiInfo != nil {
+			if info, err := b.wifiInfo(ifName); err == nil {
+				ssid = info.SSID
+			}
+		}
+		if strings.TrimSpace(ssid) == "" {
+			continue
+		}
+		interfaces = append(interfaces, iface)
+	}
+
+	sort.SliceStable(interfaces, func(i, j int) bool {
+		left := firstNonEmpty(interfaces[i].Section, interfaces[i].IfName)
+		right := firstNonEmpty(interfaces[j].Section, interfaces[j].IfName)
+		return left < right
+	})
+	return interfaces
 }
 
 // enrichWirelessRuntime merges runtime-only interfaces into netifd/UCI
@@ -2624,6 +2660,16 @@ func (b *OpenWrtBackend) enrichWirelessRuntime(radios map[string]openWrtWireless
 		}
 		radioKey := b.runtimeRadioKey(radios, iface.PHY)
 		radio := radios[radioKey]
+		hasConfiguredInterfaces := false
+		for _, current := range radio.Interfaces {
+			hasConfiguredInterfaces = hasConfiguredInterfaces || current.Configured
+		}
+		if hasConfiguredInterfaces {
+			// Driver-created AP-VLAN, MLD, station and vendor helper links are
+			// implementation details. A UCI-backed device exposes only its
+			// configured logical wifi-iface rows to TR-181.
+			continue
+		}
 		if radio.Config == nil {
 			radio.Config = map[string]any{}
 		}
@@ -2972,8 +3018,9 @@ func (b *OpenWrtBackend) readWirelessRadioStatusFromUCI() map[string]openWrtWire
 		}
 		configuredIfName := b.existingWiFiIfName(section.Options["ifname"])
 		iface := openWrtWirelessIfaceStatus{
-			Section: section.Name,
-			IfName:  configuredIfName,
+			Section:    section.Name,
+			IfName:     configuredIfName,
+			Configured: true,
 			// UCI is desired configuration, not proof that a link exists.
 			Up:     false,
 			Config: config,
@@ -3059,7 +3106,10 @@ func (b *OpenWrtBackend) readTimeSettings(ctx context.Context) (bool, int, int) 
 	ntpEnabled := parseOpenWrtBool(b.readUCIValue(ctx, "system", "timeserver", "enabled"), true)
 	ntpServerEnabled := parseOpenWrtBool(b.readUCIValue(ctx, "system", "timeserver", "enable_server"), false)
 	servers := b.readUCIList("system", "timeserver", "server")
-	clientCount := len(servers)
+	clientCount := 0
+	if ntpEnabled || len(servers) > 0 {
+		clientCount = 1
+	}
 	serverCount := 0
 	if ntpServerEnabled {
 		serverCount = 1
@@ -3550,15 +3600,23 @@ func (b *OpenWrtBackend) readUCIConfig(config string) (openWrtUCIConfig, error) 
 }
 
 func parseUCIAssignment(line, prefix string) (string, string, bool) {
-	fields := strings.Fields(line)
-	if len(fields) < 3 || fields[0] != prefix {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, prefix) {
 		return "", "", false
 	}
-	name := strings.TrimSpace(fields[1])
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+	separator := strings.IndexAny(rest, " \t")
+	if separator <= 0 {
+		return "", "", false
+	}
+	name := strings.TrimSpace(rest[:separator])
 	if name == "" {
 		return "", "", false
 	}
-	value := strings.Trim(strings.Join(fields[2:], " "), `'"`)
+	value := strings.TrimSpace(rest[separator:])
+	if len(value) >= 2 && ((value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"')) {
+		value = value[1 : len(value)-1]
+	}
 	return name, value, true
 }
 
@@ -4350,6 +4408,19 @@ func configString(config map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func configExactString(config map[string]any, keys ...string) string {
+	for _, key := range keys {
+		raw, ok := config[key]
+		if !ok || raw == nil {
+			continue
+		}
+		if value, ok := raw.(string); ok {
+			return value
+		}
+	}
+	return configString(config, keys...)
 }
 
 func configInt(config map[string]any, keys ...string) int {

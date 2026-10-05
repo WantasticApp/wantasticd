@@ -26,6 +26,7 @@ type easyMeshOperateBackend struct {
 	station  string
 	user     string
 	mode     string
+	action   string
 }
 
 type asyncEasyMeshOperateBackend struct {
@@ -64,6 +65,11 @@ func (b *easyMeshOperateBackend) RemoveEasyMeshStation(_ context.Context, statio
 func (b *easyMeshOperateBackend) SetEasyMeshMode(_ context.Context, mode string) error {
 	b.mode = mode
 	return nil
+}
+
+func (b *easyMeshOperateBackend) RunEasyMeshConsoleAction(_ context.Context, action string) (string, error) {
+	b.action = action
+	return "live EasyMesh data refreshed", nil
 }
 
 func (t *fakeUSPTransport) SendWUSPToServer(data []byte) error {
@@ -420,6 +426,29 @@ func TestUSPRuntimeRoutesEasyMeshModeChange(t *testing.T) {
 	}
 	if backend.mode != "Controller" {
 		t.Fatalf("mode=%q", backend.mode)
+	}
+}
+
+func TestUSPRuntimeRoutesAllowlistedEasyMeshConsoleAction(t *testing.T) {
+	runtime := newTestUSPRuntime(t)
+	backend := &easyMeshOperateBackend{}
+	runtime.rawBackend = backend
+
+	output, err := runtime.handleOperate(
+		context.Background(),
+		"Device.WUSP_MeshTelemetry.EasyMesh.1.DiscoverNeighbors()",
+		wusp.NewMessage(),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("handleOperate: %v", err)
+	}
+	if backend.action != "DiscoverNeighbors" {
+		t.Fatalf("action=%q", backend.action)
+	}
+	message, _ := output.Get("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage")
+	if message.AsString() != "live EasyMesh data refreshed" {
+		t.Fatalf("message=%q", message.AsString())
 	}
 }
 

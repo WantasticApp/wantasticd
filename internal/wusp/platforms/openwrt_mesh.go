@@ -36,22 +36,53 @@ type easyMeshOperationState struct {
 
 func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wusp.Message) {
 	role, roleKnown := b.openWrtDeviceRole(ctx, nil)
+	consoleSnapshot, consoleAvailable := b.readEasyMeshConsoleSnapshot(ctx)
+	if !roleKnown && consoleAvailable && consoleSnapshot.Role != "" {
+		role = consoleSnapshot.Role
+		roleKnown = true
+	}
 	data, err := b.readOpenWrtRealTopo(ctx)
 	if err != nil || len(bytes.TrimSpace(data)) == 0 {
+		if consoleAvailable && consoleSnapshot.Topology != nil {
+			appendMeshSnapshot(msg, meshSnapshot{
+				protocol:       "EasyMesh",
+				implementation: "OpenWrt",
+				topology:       consoleSnapshot.Topology,
+				sampleTime:     b.now().UTC(),
+			})
+			b.appendOpenWrtEasyMeshDevice(ctx, msg, role, consoleSnapshot.Topology, &consoleSnapshot, true)
+			return
+		}
 		if roleKnown {
-			b.appendOpenWrtRoleOnlyEasyMesh(ctx, msg, role)
+			b.appendOpenWrtRoleOnlyEasyMesh(ctx, msg, role, nil)
 		}
 		return
 	}
 	topo, ok := parseOpenWrtRealTopo(data)
 	if !ok {
+		if consoleAvailable && consoleSnapshot.Topology != nil {
+			appendMeshSnapshot(msg, meshSnapshot{
+				protocol:       "EasyMesh",
+				implementation: "OpenWrt",
+				topology:       consoleSnapshot.Topology,
+				sampleTime:     b.now().UTC(),
+			})
+			b.appendOpenWrtEasyMeshDevice(ctx, msg, role, consoleSnapshot.Topology, &consoleSnapshot, true)
+			return
+		}
 		if roleKnown {
-			b.appendOpenWrtRoleOnlyEasyMesh(ctx, msg, role)
+			b.appendOpenWrtRoleOnlyEasyMesh(ctx, msg, role, nil)
 		}
 		return
 	}
 	if topo.protocol == "" && topo.root != nil {
 		topo.protocol = "EasyMesh"
+	}
+	// On relay nodes the vendor console owns the useful neighbor graph while
+	// getRealTopo is frequently empty or local-only. On the controller,
+	// getRealTopo remains authoritative for topology mutation and convergence.
+	if consoleAvailable && role == "Agent" && consoleSnapshot.Topology != nil {
+		topo.root = consoleSnapshot.Topology
 	}
 	b.enrichOpenWrtMeshEvidence(topo.root, linkdiscovery.DefaultSnapshot())
 	appendMeshSnapshot(msg, meshSnapshot{
@@ -66,19 +97,42 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 			role, roleKnown = b.openWrtDeviceRole(ctx, topo.root)
 		}
 		if roleKnown {
-			b.appendOpenWrtEasyMeshDevice(ctx, msg, role, topo.root)
+			b.appendOpenWrtEasyMeshDevice(ctx, msg, role, topo.root, optionalEasyMeshConsoleSnapshot(consoleSnapshot, consoleAvailable), role == "Agent" && consoleAvailable)
 		}
 	}
 }
 
-func (b *OpenWrtBackend) appendOpenWrtRoleOnlyEasyMesh(ctx context.Context, msg *wusp.Message, role string) {
+func optionalEasyMeshConsoleSnapshot(snapshot easyMeshConsoleSnapshot, available bool) *easyMeshConsoleSnapshot {
+	if !available {
+		return nil
+	}
+	return &snapshot
+}
+
+func (b *OpenWrtBackend) readEasyMeshConsoleSnapshot(ctx context.Context) (easyMeshConsoleSnapshot, bool) {
+	if b == nil || b.easyMeshConsole == nil {
+		return easyMeshConsoleSnapshot{}, false
+	}
+	output, err := b.easyMeshConsole.Run(ctx, easyMeshConsoleDetailedStatus)
+	if err != nil {
+		return easyMeshConsoleSnapshot{}, false
+	}
+	return parseEasyMeshConsoleStatus(output, b.readTextFile(b.hostnamePath))
+}
+
+func (b *OpenWrtBackend) appendOpenWrtRoleOnlyEasyMesh(
+	ctx context.Context,
+	msg *wusp.Message,
+	role string,
+	console *easyMeshConsoleSnapshot,
+) {
 	appendMeshSnapshot(msg, meshSnapshot{
 		protocol:       "EasyMesh",
 		implementation: "OpenWrt",
 		sampleTime:     b.now().UTC(),
 	})
 	msg.Set("Device.WUSP_MeshTelemetry.Status", wusp.String("Partial"))
-	b.appendOpenWrtEasyMeshDevice(ctx, msg, role, nil)
+	b.appendOpenWrtEasyMeshDevice(ctx, msg, role, nil, console, console != nil)
 }
 
 func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
@@ -86,12 +140,14 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
 	msg *wusp.Message,
 	role string,
 	liveRoot *meshNode,
+	console *easyMeshConsoleSnapshot,
+	topologyFromConsole bool,
 ) {
 	const protocolPath = "Device.WUSP_MeshTelemetry.Protocol.1."
 	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
 	topologyJSON := b.readEasyMeshTopologyPolicy(ctx)
 	topologyReady := role == "Controller" && easyMeshPolicyMatchesLiveInventory(topologyJSON, liveRoot)
-	operations := easyMeshSupportedOperations(role, liveRoot != nil)
+	operations := easyMeshSupportedOperations(role, liveRoot != nil, console != nil)
 	writable := len(operations) > 0
 	msg.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
 	msg.Set(protocolPath+"Implementation", wusp.String("Vendor"))
@@ -115,12 +171,44 @@ func (b *OpenWrtBackend) appendOpenWrtEasyMeshDevice(
 	if topologyJSON != "" {
 		msg.Set(easyMeshPath+"TopologyJSON", wusp.String(topologyJSON))
 	}
+	if console != nil {
+		appendEasyMeshConsoleDetails(msg, easyMeshPath, *console)
+	}
+	if topologyFromConsole {
+		msg.Set(easyMeshPath+"TopologySource", wusp.String("ezcmd.td.s1"))
+	} else {
+		msg.Set(easyMeshPath+"TopologySource", wusp.String("device.getRealTopo"))
+	}
 	status, phase, message := b.easyMeshOperationSnapshot()
 	if status != "" {
 		msg.Set(easyMeshPath+"LastOperationStatus", wusp.String(status))
 		msg.Set(easyMeshPath+"LastOperationCode", wusp.String(easyMeshOperationCode(status)))
 		msg.Set(easyMeshPath+"LastOperationPhase", wusp.String(phase))
 		msg.Set(easyMeshPath+"LastOperationMessage", wusp.String(message))
+	}
+}
+
+func appendEasyMeshConsoleDetails(msg *wusp.Message, prefix string, console easyMeshConsoleSnapshot) {
+	if console.MAPAgentVersion != "" {
+		msg.Set(prefix+"MAPAgentVersion", wusp.String(console.MAPAgentVersion))
+	}
+	if console.PackageVersion != "" {
+		msg.Set(prefix+"PackageVersion", wusp.String(console.PackageVersion))
+	}
+	if console.CountryCode != "" {
+		msg.Set(prefix+"CountryCode", wusp.String(console.CountryCode))
+	}
+	if mac, err := net.ParseMAC(console.LocalMAC); err == nil && len(mac) == 6 {
+		msg.Set(prefix+"LocalMACAddress", wusp.MAC(mac))
+	}
+	if console.LocalIP != "" {
+		msg.Set(prefix+"LocalIPAddress", wusp.String(console.LocalIP))
+	}
+	if mac, err := net.ParseMAC(console.UpstreamMAC); err == nil && len(mac) == 6 {
+		msg.Set(prefix+"UpstreamMACAddress", wusp.MAC(mac))
+	}
+	if interfacesJSON := encodeEasyMeshConsoleInterfaces(console.Interfaces); interfacesJSON != "" {
+		msg.Set(prefix+"LocalInterfacesJSON", wusp.String(interfacesJSON))
 	}
 }
 
@@ -477,6 +565,33 @@ func (b *OpenWrtBackend) notifyEasyMeshSavedTopology(topologyJSON string) {
 	observer(patch)
 }
 
+func (b *OpenWrtBackend) notifyEasyMeshConsoleSnapshot(snapshot easyMeshConsoleSnapshot) {
+	if b == nil || snapshot.Topology == nil {
+		return
+	}
+	b.easyMeshOperationMu.RLock()
+	observer := b.easyMeshObserver
+	b.easyMeshOperationMu.RUnlock()
+	if observer == nil {
+		return
+	}
+	patch := wusp.NewMessage()
+	appendMeshSnapshot(patch, meshSnapshot{
+		protocol:       "EasyMesh",
+		implementation: "OpenWrt",
+		topology:       snapshot.Topology,
+		sampleTime:     b.now().UTC(),
+	})
+	const easyMeshPath = "Device.WUSP_MeshTelemetry.EasyMesh.1."
+	patch.Set("Device.WUSP_MeshTelemetry.EasyMeshNumberOfEntries", wusp.Uint(1))
+	patch.Set(easyMeshPath+"Alias", wusp.String(strings.ToLower(snapshot.Role)))
+	patch.Set(easyMeshPath+"Status", wusp.String("Running"))
+	patch.Set(easyMeshPath+"Role", wusp.String(snapshot.Role))
+	patch.Set(easyMeshPath+"TopologySource", wusp.String("ezcmd.td.s1"))
+	appendEasyMeshConsoleDetails(patch, easyMeshPath, snapshot)
+	observer(patch)
+}
+
 // Close cancels and joins the one in-flight topology operation. This prevents
 // a service restart from leaving an unowned vendor RPC or convergence poller.
 func (b *OpenWrtBackend) Close() error {
@@ -568,14 +683,23 @@ func validEasyMeshStationName(value string) bool {
 	return true
 }
 
-func easyMeshSupportedOperations(role string, liveTopologyAvailable bool) []string {
-	operations := make([]string, 0, 3)
+func easyMeshSupportedOperations(role string, liveTopologyAvailable, consoleAvailable bool) []string {
+	operations := make([]string, 0, 7)
 	if role == "Controller" && liveTopologyAvailable {
 		operations = append(operations, "ApplyTopology")
 	}
 	operations = append(operations, "RemoveStation")
 	if role == "Agent" {
 		operations = append(operations, "SetMode")
+	}
+	if consoleAvailable {
+		operations = append(
+			operations,
+			"RefreshTopology",
+			"DiscoverNeighbors",
+			"AnnounceTopology",
+			"RefreshRadioCapabilities",
+		)
 	}
 	return operations
 }

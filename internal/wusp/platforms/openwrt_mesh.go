@@ -117,7 +117,13 @@ func (b *OpenWrtBackend) readEasyMeshConsoleSnapshot(ctx context.Context) (easyM
 	if err != nil {
 		return easyMeshConsoleSnapshot{}, false
 	}
-	return parseEasyMeshConsoleStatus(output, b.readTextFile(b.hostnamePath))
+	snapshot, ok := parseEasyMeshConsoleStatus(output, b.readTextFile(b.hostnamePath))
+	if !ok {
+		return easyMeshConsoleSnapshot{}, false
+	}
+	b.enrichEasyMeshConsoleHostnames(&snapshot)
+	b.enrichEasyMeshConsoleTreeHostnames(ctx, &snapshot)
+	return snapshot, true
 }
 
 func (b *OpenWrtBackend) appendOpenWrtRoleOnlyEasyMesh(

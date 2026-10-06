@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"wantastic-agent/internal/linkdiscovery"
 )
 
 const (
@@ -28,6 +30,7 @@ const (
 	easyMeshConsoleDiscovery
 	easyMeshConsoleNotification
 	easyMeshConsoleRadioCapabilities
+	easyMeshConsoleTopologyTree
 )
 
 func (command easyMeshConsoleCommand) text() (string, error) {
@@ -44,6 +47,8 @@ func (command easyMeshConsoleCommand) text() (string, error) {
 		return "td notify", nil
 	case easyMeshConsoleRadioCapabilities:
 		return "td radiocap", nil
+	case easyMeshConsoleTopologyTree:
+		return "td dtt detail", nil
 	default:
 		return "", fmt.Errorf("unsupported EasyMesh console command %d", command)
 	}
@@ -75,6 +80,14 @@ type easyMeshConsoleSnapshot struct {
 
 var easyMeshConsoleDeviceLine = regexp.MustCompile(
 	`(?i)QCA IEEE 1905\.1 device:\s*([0-9a-f:]{17}),\s*IPv4 address:\s*([^\s(]+)`,
+)
+
+var easyMeshConsoleHostnameLine = regexp.MustCompile(
+	`(?i)^(?:host\s*name|hostname|device\s+name|friendly\s+name|ap\s+name)\s*:\s*(.+)$`,
+)
+
+var easyMeshConsoleTopologyTreeLine = regexp.MustCompile(
+	`(?i)^\s*@?\s*=*\s*([0-9a-f]{2}(?::[0-9a-f]{2}){5})\s+-\s+(\S+)\s+-\s+(\S+)\s+-\s+(.+?)\s*$`,
 )
 
 // parseEasyMeshConsoleStatus maps the vendor's td s1 output into the same
@@ -111,15 +124,18 @@ func parseEasyMeshConsoleStatus(raw string, hostname string) (easyMeshConsoleSna
 		case strings.HasPrefix(line, "Local interfaces:"):
 			inLocalInterfaces = true
 			inDatabase = false
+			current = nil
 			currentInterface = nil
 			continue
 		case strings.HasPrefix(line, "Legacy Devices:"):
 			inLocalInterfaces = false
+			current = nil
 			currentInterface = nil
 			continue
 		case strings.HasPrefix(line, "-- DB ("):
 			inDatabase = true
 			inLocalInterfaces = false
+			current = nil
 			currentInterface = nil
 			continue
 		}
@@ -143,11 +159,16 @@ func parseEasyMeshConsoleStatus(raw string, hostname string) (easyMeshConsoleSna
 				if node.role == "" {
 					node.role = snapshot.Role
 				}
-			} else {
-				current = node
 			}
+			current = node
 			nodes = append(nodes, node)
 			continue
+		}
+		if current != nil {
+			if match := easyMeshConsoleHostnameLine.FindStringSubmatch(line); len(match) == 2 {
+				current.name = normalizedEasyMeshHostname(match[1])
+				continue
+			}
 		}
 
 		if inLocalInterfaces {
@@ -164,7 +185,7 @@ func parseEasyMeshConsoleStatus(raw string, hostname string) (easyMeshConsoleSna
 
 		if strings.HasPrefix(line, "Package Version:") {
 			version := valueAfterColon(line)
-			if current == nil && snapshot.PackageVersion == "" {
+			if current == local && snapshot.PackageVersion == "" {
 				snapshot.PackageVersion = version
 			}
 			continue
@@ -232,6 +253,153 @@ func parseEasyMeshConsoleStatus(raw string, hostname string) (easyMeshConsoleSna
 	}
 	snapshot.Topology = collapseMeshContainer(nodes)
 	return snapshot, true
+}
+
+type easyMeshHostnameHints struct {
+	byMAC       map[string]string
+	byIP        map[string]string
+	ambiguousIP map[string]bool
+}
+
+func newEasyMeshHostnameHints() *easyMeshHostnameHints {
+	return &easyMeshHostnameHints{
+		byMAC:       make(map[string]string),
+		byIP:        make(map[string]string),
+		ambiguousIP: make(map[string]bool),
+	}
+}
+
+func (hints *easyMeshHostnameHints) add(macValue, ipValue, hostname string) {
+	if hints == nil {
+		return
+	}
+	hostname = normalizedEasyMeshHostname(hostname)
+	if hostname == "" {
+		return
+	}
+	if mac, err := normalizeEasyMeshMAC(macValue); err == nil && hints.byMAC[mac] == "" {
+		hints.byMAC[mac] = hostname
+	}
+	ip := net.ParseIP(strings.TrimSpace(ipValue))
+	if ip == nil {
+		return
+	}
+	key := ip.String()
+	if hints.ambiguousIP[key] {
+		return
+	}
+	if existing := hints.byIP[key]; existing != "" && !strings.EqualFold(existing, hostname) {
+		delete(hints.byIP, key)
+		hints.ambiguousIP[key] = true
+		return
+	}
+	hints.byIP[key] = hostname
+}
+
+func normalizedEasyMeshHostname(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), "\"'")
+	if value == "" || value == "*" || net.ParseIP(value) != nil {
+		return ""
+	}
+	switch strings.ToLower(value) {
+	case "unknown", "none", "n/a", "null":
+		return ""
+	}
+	if _, err := normalizeEasyMeshMAC(value); err == nil {
+		return ""
+	}
+	return truncateUTF8Bytes(value, 256)
+}
+
+func applyEasyMeshHostnameHints(root *meshNode, hints *easyMeshHostnameHints) {
+	if root == nil || hints == nil {
+		return
+	}
+	for _, node := range flattenMeshForest(normalizedMeshRoots(root)) {
+		if node == nil || normalizedEasyMeshHostname(node.name) != "" {
+			continue
+		}
+		if mac, err := normalizeEasyMeshMAC(firstNonEmpty(node.mac, node.id)); err == nil {
+			if hostname := hints.byMAC[mac]; hostname != "" {
+				node.name = hostname
+				continue
+			}
+		}
+		if ip := net.ParseIP(strings.TrimSpace(node.ip)); ip != nil {
+			node.name = hints.byIP[ip.String()]
+		}
+	}
+}
+
+func easyMeshTopologyHasUnnamedNodes(root *meshNode) bool {
+	for _, node := range flattenMeshForest(normalizedMeshRoots(root)) {
+		if node != nil && normalizedEasyMeshHostname(node.name) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func parseEasyMeshConsoleTopologyHostnames(raw string) *easyMeshHostnameHints {
+	hints := newEasyMeshHostnameHints()
+	for _, rawLine := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		match := easyMeshConsoleTopologyTreeLine.FindStringSubmatch(rawLine)
+		if len(match) != 5 {
+			continue
+		}
+		hints.add(match[1], match[2], match[4])
+	}
+	return hints
+}
+
+func (b *OpenWrtBackend) enrichEasyMeshConsoleHostnames(snapshot *easyMeshConsoleSnapshot) {
+	if b == nil || snapshot == nil || snapshot.Topology == nil {
+		return
+	}
+	hints := newEasyMeshHostnameHints()
+	if rawPolicy := b.readTextFile(b.easyMeshTopologyPath); rawPolicy != "" {
+		if normalized, err := extractEasyMeshTopologyPolicy([]byte(rawPolicy)); err == nil {
+			var topology easyMeshTopology
+			if json.Unmarshal([]byte(normalized), &topology) == nil {
+				for _, node := range topology.DeviceArray {
+					hints.add(node.ALID, "", node.APName)
+				}
+			}
+		}
+	}
+	for _, line := range strings.Split(b.readTextFile(b.dhcpLeasesPath), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 {
+			hints.add(fields[1], fields[2], fields[3])
+		}
+	}
+	for _, neighbor := range linkdiscovery.DefaultSnapshot().MNDP {
+		ip := ""
+		if len(neighbor.IPv4) > 0 {
+			ip = neighbor.IPv4[0].String()
+		} else if neighbor.SourceAddress != nil {
+			ip = neighbor.SourceAddress.String()
+		}
+		hints.add(neighbor.MAC.String(), ip, neighbor.Identity)
+	}
+	applyEasyMeshHostnameHints(snapshot.Topology, hints)
+}
+
+func (b *OpenWrtBackend) enrichEasyMeshConsoleTreeHostnames(
+	ctx context.Context,
+	snapshot *easyMeshConsoleSnapshot,
+) {
+	if b == nil || snapshot == nil || snapshot.Topology == nil || b.easyMeshConsole == nil {
+		return
+	}
+	if !easyMeshTopologyHasUnnamedNodes(snapshot.Topology) {
+		return
+	}
+	output, err := b.easyMeshConsole.Run(ctx, easyMeshConsoleTopologyTree)
+	if err != nil {
+		return
+	}
+	applyEasyMeshHostnameHints(snapshot.Topology, parseEasyMeshConsoleTopologyHostnames(output))
 }
 
 func easyMeshConsoleRole(line string) string {
@@ -374,6 +542,8 @@ func (b *OpenWrtBackend) RunEasyMeshConsoleAction(ctx context.Context, action st
 	if !parsed {
 		return "", fmt.Errorf("EasyMesh %s returned an unreadable topology", action)
 	}
+	b.enrichEasyMeshConsoleHostnames(&snapshot)
+	b.enrichEasyMeshConsoleTreeHostnames(ctx, &snapshot)
 	b.notifyEasyMeshConsoleSnapshot(snapshot)
 
 	switch action {

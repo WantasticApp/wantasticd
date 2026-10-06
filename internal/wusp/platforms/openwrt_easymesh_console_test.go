@@ -3,11 +3,15 @@ package platforms
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"wantastic-agent/internal/wusp"
 )
 
 func TestEasyMeshConsoleClientRunsAllowlistedCommand(t *testing.T) {
@@ -213,6 +217,151 @@ Map-Agent Version : 2
 	}
 	if len(roots[0].children) != 2 {
 		t.Fatalf("root children=%d", len(roots[0].children))
+	}
+}
+
+func TestOpenWrtBackendEasyMeshConsolePublishesKnownHostnames(t *testing.T) {
+	root := t.TempDir()
+	hostnamePath := filepath.Join(root, "hostname")
+	topologyPath := filepath.Join(root, "topo-ezmesh.json")
+	leasesPath := filepath.Join(root, "dhcp.leases")
+	mustWriteFile(t, hostnamePath, "G1TK7EY00023A\n")
+	mustWriteFile(t, topologyPath, `{
+		"topOptPolicy":"strict",
+		"convTimeout":120,
+		"deviceArray":[
+			{"alId":"00:03:7F:BA:DB:AD","parentAlId":"NULL","bStaLinkBand":"6GHL","depth":0,"rssiThresh":-70,"apName":"G1TK7EY00044B"},
+			{"alId":"E0:5D:54:4B:E5:DC","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GHL","depth":1,"rssiThresh":-70,"apName":"stale-local-name"},
+			{"alId":"E0:5D:54:4B:E6:CF","parentAlId":"00:03:7F:BA:DB:AD","bStaLinkBand":"6GHL","depth":1,"rssiThresh":-70,"apName":""}
+		]
+	}`)
+	mustWriteFile(t, leasesPath, "0 E0:5D:54:4B:E6:CF 192.168.200.227 G1TK7EY000506 *\n")
+
+	const output = `Topology Discovery Service module status:
+Mode of operation: Relaying MAP-Agent device
+        QCA IEEE 1905.1 device: E0:5D:54:4B:E5:DC, IPv4 address: 192.168.200.141
+        Country Code: US Upstream Device: 00:03:7F:BA:DB:AD
+        Local interfaces:
+        Legacy Devices:
+-- DB (2 entries):
+        #1: QCA IEEE 1905.1 device: E0:5D:54:4B:E6:CF, IPv4 address: 192.168.200.227 **MAP Agent**
+           Upstream Device: 00:03:7F:BA:DB:AD
+        #2: QCA IEEE 1905.1 device: 00:03:7F:BA:DB:AD, IPv4 address: 192.168.200.1 **MAP Controller**
+           Device Name: 00:03:7F:BA:DB:AD
+           Upstream Device: None`
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		HostnamePath:         hostnamePath,
+		EasyMeshTopologyPath: topologyPath,
+		DHCPLeasesPath:       leasesPath,
+	})
+	t.Cleanup(func() { _ = backend.Close() })
+	backend.easyMeshConsole = easyMeshConsoleFunc(func(
+		context.Context,
+		easyMeshConsoleCommand,
+	) (string, error) {
+		return output, nil
+	})
+
+	snapshot, ok := backend.readEasyMeshConsoleSnapshot(t.Context())
+	if !ok {
+		t.Fatal("readEasyMeshConsoleSnapshot rejected valid td s1 output")
+	}
+	names := make(map[string]string)
+	for _, node := range flattenMeshForest(normalizedMeshRoots(snapshot.Topology)) {
+		names[strings.ToUpper(node.mac)] = node.name
+	}
+	for mac, want := range map[string]string{
+		"00:03:7F:BA:DB:AD": "G1TK7EY00044B",
+		"E0:5D:54:4B:E5:DC": "G1TK7EY00023A",
+		"E0:5D:54:4B:E6:CF": "G1TK7EY000506",
+	} {
+		if got := names[mac]; got != want {
+			t.Errorf("hostname for %s=%q want %q", mac, got, want)
+		}
+	}
+
+	msg := wusp.NewMessage()
+	appendMeshSnapshot(msg, meshSnapshot{
+		protocol:   "EasyMesh",
+		topology:   snapshot.Topology,
+		sampleTime: time.Unix(1_700_000_000, 0),
+	})
+	published := make(map[string]bool)
+	for _, field := range msg.Fields {
+		if strings.HasSuffix(field.Path, ".Hostname") {
+			published[field.Val.AsString()] = true
+		}
+	}
+	for _, hostname := range []string{"G1TK7EY00044B", "G1TK7EY00023A", "G1TK7EY000506"} {
+		if !published[hostname] {
+			t.Errorf("WUSP snapshot omitted hostname %q", hostname)
+		}
+	}
+}
+
+func TestOpenWrtBackendEasyMeshConsoleUsesTopologyTreeHostnames(t *testing.T) {
+	root := t.TempDir()
+	hostnamePath := filepath.Join(root, "hostname")
+	mustWriteFile(t, hostnamePath, "G1TK7EY00023A\n")
+
+	const statusOutput = `Topology Discovery Service module status:
+Mode of operation: Relaying MAP-Agent device
+        QCA IEEE 1905.1 device: E0:5D:54:4B:E5:DC, IPv4 address: 192.168.200.141
+        Country Code: US Upstream Device: 00:03:7F:BA:DB:AD
+        Local interfaces:
+        Legacy Devices:
+-- DB (2 entries):
+        #1: QCA IEEE 1905.1 device: E0:5D:54:4B:E6:CF, IPv4 address: 192.168.200.227 **MAP Agent**
+           Upstream Device: 00:03:7F:BA:DB:AD
+        #2: QCA IEEE 1905.1 device: 00:03:7F:BA:DB:AD, IPv4 address: 192.168.200.1 **MAP Controller**
+           Upstream Device: None`
+	const treeOutput = `@ 00:03:7F:BA:DB:AD - 192.168.200.1   - B - G1TK7EY00044B
+====E0:5D:54:4B:E6:CF - 192.168.200.227 - N - G1TK7EY000506
+====E0:5D:54:4B:E5:DC - 192.168.200.141 - H - G1TK7EY00023A
+xxxxxxxxx[totalCnt:3]xxxxxxxxx`
+
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		HostnamePath:         hostnamePath,
+		EasyMeshTopologyPath: filepath.Join(root, "missing-topology.json"),
+		DHCPLeasesPath:       filepath.Join(root, "missing-dhcp.leases"),
+	})
+	t.Cleanup(func() { _ = backend.Close() })
+	treeRequested := false
+	backend.easyMeshConsole = easyMeshConsoleFunc(func(
+		_ context.Context,
+		command easyMeshConsoleCommand,
+	) (string, error) {
+		switch command {
+		case easyMeshConsoleDetailedStatus:
+			return statusOutput, nil
+		case easyMeshConsoleTopologyTree:
+			treeRequested = true
+			return treeOutput, nil
+		default:
+			return "", fmt.Errorf("unexpected command %d", command)
+		}
+	})
+
+	snapshot, ok := backend.readEasyMeshConsoleSnapshot(t.Context())
+	if !ok {
+		t.Fatal("readEasyMeshConsoleSnapshot rejected valid td s1 output")
+	}
+	if !treeRequested {
+		t.Fatal("readEasyMeshConsoleSnapshot did not request td dtt detail for unnamed nodes")
+	}
+	names := make(map[string]string)
+	for _, node := range flattenMeshForest(normalizedMeshRoots(snapshot.Topology)) {
+		names[strings.ToUpper(node.mac)] = node.name
+	}
+	for mac, want := range map[string]string{
+		"00:03:7F:BA:DB:AD": "G1TK7EY00044B",
+		"E0:5D:54:4B:E5:DC": "G1TK7EY00023A",
+		"E0:5D:54:4B:E6:CF": "G1TK7EY000506",
+	} {
+		if got := names[mac]; got != want {
+			t.Errorf("hostname for %s=%q want %q", mac, got, want)
+		}
 	}
 }
 

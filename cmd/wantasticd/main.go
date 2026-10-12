@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -73,6 +74,44 @@ type autoUpdateFlags struct {
 	noAutoUpdate *bool
 }
 
+// optionalBoolFlag distinguishes an omitted flag from an explicit false so a
+// normal reconnect preserves the value stored in JSON configuration.
+type optionalBoolFlag struct {
+	set   bool
+	value bool
+}
+
+func (f *optionalBoolFlag) String() string {
+	if f == nil {
+		return "false"
+	}
+	return fmt.Sprintf("%t", f.value)
+}
+
+func (f *optionalBoolFlag) Set(value string) error {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return err
+	}
+	f.set = true
+	f.value = parsed
+	return nil
+}
+
+func (f *optionalBoolFlag) IsBoolFlag() bool { return true }
+
+func registerLocalAccessFlag(fs *flag.FlagSet) *optionalBoolFlag {
+	result := &optionalBoolFlag{}
+	fs.Var(result, "allow-local-access", "Expose this device's directly connected private IPv4 LANs to its tenant")
+	return result
+}
+
+func (f *optionalBoolFlag) apply(cfg *config.Config) {
+	if f != nil && f.set {
+		cfg.AllowLocalAccess = f.value
+	}
+}
+
 func registerAutoUpdateFlags(fs *flag.FlagSet, enableHelp, disableHelp string) autoUpdateFlags {
 	return autoUpdateFlags{
 		autoUpdate:   fs.Bool("auto-update", true, enableHelp),
@@ -104,6 +143,7 @@ func handleGenKey() {
 	claimPoll := genCmd.Duration("claim-poll", 10*time.Second, "How often to poll for claim completion when websocket wait is unavailable")
 	verbose := genCmd.Bool("v", false, "Enable verbose logging and debug output after claim")
 	autoUpdateFlags := registerAutoUpdateFlags(genCmd, "Enable automatic self-updates after claim (default on)", "Disable automatic self-updates after claim")
+	localAccess := registerLocalAccessFlag(genCmd)
 	useTray := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 	flagTray := genCmd.Bool("tray", useTray, "Enable system tray GUI after claim")
 	genCmd.Parse(os.Args[2:])
@@ -142,7 +182,7 @@ func handleGenKey() {
 	tunName := autoTUNName()
 	log.Println("Waiting for claim. Press Ctrl+C to stop.")
 	runner.RunServiceHook(func(ctx context.Context) {
-		runWaitClaim(ctx, *outPath, *configPath, claimServerURL, *claimPoll, *verbose, autoUpdate, tunName, useTray)
+		runWaitClaim(ctx, *outPath, *configPath, claimServerURL, *claimPoll, *verbose, autoUpdate, tunName, useTray, localAccess)
 	})
 }
 
@@ -281,6 +321,7 @@ func handleLogin() {
 	server := loginCmd.String("server", "", "Server hostname (shorthand for --portal-url https://HOST)")
 	dev := loginCmd.Bool("dev", false, "Use local dev portal (https://"+auth.DefaultOAuth2DevDomain+")")
 	autoUpdateFlags := registerAutoUpdateFlags(loginCmd, "Enable automatic self-updates after login (default on)", "Disable automatic self-updates after login")
+	localAccess := registerLocalAccessFlag(loginCmd)
 	loginCmd.Parse(os.Args[2:])
 	autoUpdate := autoUpdateFlags.Enabled()
 
@@ -316,6 +357,7 @@ func handleLogin() {
 	log.Printf("Login successful: endpoint=%s:%d, address=%v",
 		cfg.Server.Endpoint, cfg.Server.Port, cfg.Interface.Addresses)
 	cfg.AutoUpdate = autoUpdate
+	localAccess.apply(cfg)
 
 	configPath := auth.DefaultConfigPath()
 	if err := ensureConfigDir(configPath); err != nil {
@@ -337,7 +379,7 @@ func handleLogin() {
 	cfg.Interface.TUNName = autoTUNName()
 
 	runner.RunServiceHook(func(ctx context.Context) {
-		runAgent(ctx, configPath, false, autoUpdate, cfg.Interface.TUNName, false)
+		runAgent(ctx, configPath, false, autoUpdate, cfg.Interface.TUNName, false, localAccess)
 	})
 }
 
@@ -381,6 +423,7 @@ func handleConnect() {
 	claimPoll := connectCmd.Duration("claim-poll", 10*time.Second, "How often to poll for claim completion")
 	verbose := connectCmd.Bool("v", false, "Enable verbose logging and debug output")
 	autoUpdateFlags := registerAutoUpdateFlags(connectCmd, "Enable automatic self-updates (default on)", "Disable automatic self-updates")
+	localAccess := registerLocalAccessFlag(connectCmd)
 
 	useTray := false
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
@@ -426,10 +469,10 @@ func handleConnect() {
 
 	runner.RunServiceHook(func(ctx context.Context) {
 		if *waitClaim {
-			runWaitClaim(ctx, *claimKeyPath, *configPath, resolveClaimServerURL(*serverURL, *server, *portalURL), *claimPoll, *verbose, autoUpdate, tunName, useTray)
+			runWaitClaim(ctx, *claimKeyPath, *configPath, resolveClaimServerURL(*serverURL, *server, *portalURL), *claimPoll, *verbose, autoUpdate, tunName, useTray, localAccess)
 			return
 		}
-		runAgent(ctx, *configPath, *verbose, autoUpdate, tunName, useTray)
+		runAgent(ctx, *configPath, *verbose, autoUpdate, tunName, useTray, localAccess)
 	})
 }
 
@@ -441,7 +484,7 @@ func claimKeyExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL string, pollInterval time.Duration, verbose bool, autoUpdate bool, tunName string, useTray bool) {
+func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL string, pollInterval time.Duration, verbose bool, autoUpdate bool, tunName string, useTray bool, localAccess *optionalBoolFlag) {
 	if pollInterval <= 0 {
 		pollInterval = 10 * time.Second
 	}
@@ -471,7 +514,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		platformdns.EnsureBootstrapHost(parentCtx, claimHost)
 		claim, waitErr := auth.WaitClaimConfig(parentCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
 		if waitErr == nil && claim != nil && claim.Claimed {
-			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray) {
+			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray, localAccess) {
 				return
 			}
 		} else if waitErr != nil && parentCtx.Err() == nil {
@@ -482,7 +525,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		claim, fetchErr := auth.FetchClaimConfig(pollCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
 		cancel()
 		if fetchErr == nil && claim != nil && claim.Claimed {
-			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray) {
+			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray, localAccess) {
 				return
 			}
 		} else if fetchErr != nil && parentCtx.Err() == nil {
@@ -500,7 +543,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 	}
 }
 
-func applyClaimedConfig(parentCtx context.Context, configPath, serverURL string, keyFile *claimKeyFile, claim *auth.ClaimConfig, verbose bool, autoUpdate bool, tunName string, useTray bool) bool {
+func applyClaimedConfig(parentCtx context.Context, configPath, serverURL string, keyFile *claimKeyFile, claim *auth.ClaimConfig, verbose bool, autoUpdate bool, tunName string, useTray bool, localAccess *optionalBoolFlag) bool {
 	cfg, cfgErr := config.LoadFromClaimConfig(serverURL, keyFile.PrivateKey, keyFile.PublicKey, claim)
 	if cfgErr != nil {
 		log.Printf("Claim found but config is not ready: %v", cfgErr)
@@ -512,6 +555,7 @@ func applyClaimedConfig(parentCtx context.Context, configPath, serverURL string,
 		cfg.Verbose = true
 	}
 	cfg.AutoUpdate = autoUpdate
+	localAccess.apply(cfg)
 	if err := ensureConfigDir(configPath); err != nil {
 		log.Fatalf("Failed to prepare config path: %v", err)
 	}
@@ -519,11 +563,11 @@ func applyClaimedConfig(parentCtx context.Context, configPath, serverURL string,
 		log.Fatalf("Failed to save claimed configuration: %v", err)
 	}
 	log.Printf("Device claimed. Configuration saved to %s", configPath)
-	runAgent(parentCtx, configPath, verbose, autoUpdate, tunName, useTray)
+	runAgent(parentCtx, configPath, verbose, autoUpdate, tunName, useTray, localAccess)
 	return true
 }
 
-func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUpdate bool, tunName string, useTray bool) {
+func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUpdate bool, tunName string, useTray bool, localAccess *optionalBoolFlag) {
 	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
@@ -540,6 +584,12 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 	}
 
 	cfg.AutoUpdate = autoUpdate
+	localAccess.apply(cfg)
+	if localAccess != nil && localAccess.set {
+		if err := cfg.Save(); err != nil {
+			log.Printf("Warning: could not persist --allow-local-access setting: %v", err)
+		}
+	}
 
 	// Ensure bootstrap DNS resolution is sane before connecting. The platform
 	// DNS package avoids direct resolver-file writes unless that is safe.
@@ -617,9 +667,10 @@ func handleStatus() {
 	defer resp.Body.Close()
 
 	var status struct {
-		TUNMode bool   `json:"tun_mode"`
-		TUNName string `json:"tun_name"`
-		Running bool   `json:"running"`
+		TUNMode     bool   `json:"tun_mode"`
+		TUNName     string `json:"tun_name"`
+		Running     bool   `json:"running"`
+		LocalAccess bool   `json:"local_access"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		fmt.Printf("Status: Error parsing response: %v\n", err)
@@ -634,7 +685,7 @@ func handleStatus() {
 	if status.TUNMode {
 		modeStr = fmt.Sprintf("TUN (%s)", status.TUNName)
 	}
-	fmt.Printf("Status: %s\nMode: %s\n", state, modeStr)
+	fmt.Printf("Status: %s\nMode: %s\nLocal access: %t\n", state, modeStr, status.LocalAccess)
 }
 
 func handleUpdate() {

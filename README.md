@@ -201,6 +201,32 @@ wantasticd login
 wantasticd login --token <TOKEN>
 ```
 
+### Allow tenant access to this device's local LAN
+
+On Linux and OpenWrt, opt this device into subnet-router mode with:
+
+```sh
+sudo wantasticd connect --config /etc/wantastic --allow-local-access
+```
+
+`--allow-local-access` discovers directly connected private IPv4 subnets (for
+example, `192.168.1.0/24`), enables forwarding with source NAT, and advertises
+those routes to devices connected to the same Wantastic tenant. It does not
+advertise public, default, host, loopback, point-to-point, or Wantastic tunnel
+routes. The feature is off by default.
+
+The same flag is accepted by `login` and by the claim-waiting `genkey` flow.
+When used during login or claim, the setting is saved in the generated JSON
+configuration. To explicitly disable a saved setting, reconnect with:
+
+```sh
+wantasticd connect --config /etc/wantastic --allow-local-access=false
+```
+
+Automatic forwarding/NAT for this feature is currently supported on Linux and
+OpenWrt. Overlapping LAN advertisements from different devices in one tenant
+are rejected by the coordinator to avoid ambiguous or hijacked routes.
+
 ---
 
 ## Service Management

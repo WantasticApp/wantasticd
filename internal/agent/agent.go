@@ -90,12 +90,31 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("start device: %w", err)
 	}
 
+	var localAccessRoutes []string
+	if a.config.AllowLocalAccess {
+		var err error
+		localAccessRoutes, err = a.device.EnableLocalAccess()
+		if err != nil {
+			_ = a.device.Stop()
+			workerCancel()
+			a.mu.Lock()
+			a.running = false
+			a.workerCancel = nil
+			a.mu.Unlock()
+			return fmt.Errorf("enable local access: %w", err)
+		}
+		log.Printf("Local access enabled for tenant routes: %v", localAccessRoutes)
+	}
+
 	workerCount := 2 // HealthCheck + DNSCheck
 	if a.config.AutoUpdate {
 		workerCount++
 	}
 	if a.usp != nil {
 		workerCount += 2
+	}
+	if a.config.AllowLocalAccess {
+		workerCount++
 	}
 	a.wg.Add(workerCount)
 
@@ -105,6 +124,9 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.usp != nil {
 		go a.runWUSPInit(workerCtx)
 		go a.runNetworkSpeedMonitor(workerCtx)
+	}
+	if a.config.AllowLocalAccess {
+		go a.runLocalAccessAdvertiser(workerCtx, localAccessRoutes)
 	}
 
 	if a.config.AutoUpdate {
@@ -119,6 +141,49 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (a *Agent) runLocalAccessAdvertiser(ctx context.Context, routes []string) {
+	defer a.wg.Done()
+	defer func() {
+		if err := a.sendLocalAccessAdvertisement(nil); err != nil {
+			log.Printf("Local-access route revocation could not be delivered: %v", err)
+		}
+		if err := a.device.DisableLocalAccess(); err != nil {
+			log.Printf("Failed to disable local-access forwarding: %v", err)
+		}
+	}()
+
+	send := func() {
+		if err := a.sendLocalAccessAdvertisement(routes); err != nil {
+			log.Printf("Local-access route advertisement failed; will retry: %v", err)
+		}
+	}
+	send()
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.stopCh:
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+func (a *Agent) sendLocalAccessAdvertisement(routes []string) error {
+	if a.config.Server.PublicKey == "" {
+		return fmt.Errorf("no tenant server configured")
+	}
+	payload, err := device.EncodeLocalAccessAdvertisement(routes)
+	if err != nil {
+		return err
+	}
+	return a.device.SendTUNControl(a.config.Server.PublicKey, payload)
 }
 
 // Stop stops the agent and all its components.

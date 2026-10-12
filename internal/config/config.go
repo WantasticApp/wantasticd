@@ -75,8 +75,12 @@ type Config struct {
 	Interface  Interface `json:"interface"`
 	Auth       Auth      `json:"auth"`
 	ExitNode   ExitNode  `json:"exit_node"`
-	Verbose    bool      `json:"verbose"`
-	AutoUpdate bool      `json:"auto_update"`
+	// AllowLocalAccess exposes directly connected private IPv4 subnets to
+	// other devices in the same tenant. It is opt-in because it changes the
+	// host from an overlay endpoint into a subnet router.
+	AllowLocalAccess bool `json:"allow_local_access"`
+	Verbose          bool `json:"verbose"`
+	AutoUpdate       bool `json:"auto_update"`
 
 	filePath   string // path this config was loaded from; not serialised
 	HandoffURL string // confirmation URL returned by register; not serialised

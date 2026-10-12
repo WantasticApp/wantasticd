@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"wantastic-agent/internal/config"
 )
 
 func TestAutoUpdateFlagsDefaultOnAndExplicitOptOut(t *testing.T) {
@@ -56,6 +57,35 @@ func TestAutoUpdateFlagsDefaultOnAndExplicitOptOut(t *testing.T) {
 			}
 			if got := flags.Enabled(); got != tt.want {
 				t.Fatalf("Enabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLocalAccessFlagIsOptInAndSupportsExplicitDisable(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		configured bool
+		want       bool
+	}{
+		{name: "omitted preserves disabled config", configured: false, want: false},
+		{name: "omitted preserves enabled config", configured: true, want: true},
+		{name: "bare flag enables", args: []string{"--allow-local-access"}, want: true},
+		{name: "explicit false disables", args: []string{"--allow-local-access=false"}, configured: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			localAccess := registerLocalAccessFlag(fs)
+			if err := fs.Parse(tt.args); err != nil {
+				t.Fatalf("parse flags: %v", err)
+			}
+			cfg := &config.Config{AllowLocalAccess: tt.configured}
+			localAccess.apply(cfg)
+			if cfg.AllowLocalAccess != tt.want {
+				t.Fatalf("AllowLocalAccess = %v, want %v", cfg.AllowLocalAccess, tt.want)
 			}
 		})
 	}

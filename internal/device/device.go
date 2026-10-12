@@ -58,15 +58,26 @@ type Device struct {
 	exitNodeActive  bool
 	exitNodeShared  bool
 
+	// Local-access subnet routing is independent from exit-node routing. The
+	// sharing side forwards overlay traffic to its private LAN; consuming peers
+	// install tenant-coordinator route advertisements through the server peer.
+	localAccessShared    bool
+	localAccessPublished []string
+	localAccessSources   []string
+	localAccessByOwner   map[[32]byte][]string
+	localAccessRoutes    []string
+	localAccessSyncMu    sync.Mutex
+
 	// Device netstack for P2P connection handling
 	netstack *virtstack.Net
 }
 
 func New(cfg *config.Config) (*Device, error) {
 	return &Device{
-		config:        cfg,
-		stopCh:        make(chan struct{}),
-		peerHostnames: make(map[string]string),
+		config:             cfg,
+		stopCh:             make(chan struct{}),
+		peerHostnames:      make(map[string]string),
+		localAccessByOwner: make(map[[32]byte][]string),
 	}, nil
 }
 
@@ -202,15 +213,23 @@ func (d *Device) Stop() error {
 	routes := d.systemRoutes
 	exitRoutes := d.exitNodeRoutes
 	sharedExitNode := d.exitNodeShared
+	localAccessRoutes := d.localAccessRoutes
+	localAccessPublished := append([]string(nil), d.localAccessPublished...)
+	localAccessSources := append([]string(nil), d.localAccessSources...)
+	sharedLocalAccess := d.localAccessShared
 	d.systemRoutes = nil
 	d.exitNodeRoutes = nil
+	d.localAccessRoutes = nil
+	d.localAccessByOwner = make(map[[32]byte][]string)
 	d.exitNodePeerKey = [32]byte{}
 	d.exitNodeActive = false
 	d.mu.Unlock()
 
 	// Remove all OS routes before closing the TUN interface so the
 	// kernel doesn't leave stale entries pointing at a dead utun index.
-	for _, route := range append(routes, exitRoutes...) {
+	allRoutes := append(append([]string(nil), routes...), exitRoutes...)
+	allRoutes = append(allRoutes, localAccessRoutes...)
+	for _, route := range allRoutes {
 		if err := d.removeRoute(route); err != nil {
 			log.Printf("[TUN] Warning: failed to remove route %s on stop: %v", route, err)
 		}
@@ -219,6 +238,11 @@ func (d *Device) Stop() error {
 	if sharedExitNode {
 		if err := d.disableExitNodeSharing(); err != nil {
 			log.Printf("[TUN] Warning: failed to disable exit node sharing on stop: %v", err)
+		}
+	}
+	if sharedLocalAccess {
+		if err := disableLocalAccessSharingOS(d.tunName, localAccessPublished, localAccessSources); err != nil {
+			log.Printf("[TUN] Warning: failed to disable local-access sharing on stop: %v", err)
 		}
 	}
 

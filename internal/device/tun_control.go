@@ -14,12 +14,16 @@ import (
 type TUNControlAction uint8
 
 const (
-	TUNControlActionRevokeExitNodeRouting  TUNControlAction = 0
-	TUNControlActionUseExitNodeRouting     TUNControlAction = 1
-	TUNControlActionEnableExitNodeSharing  TUNControlAction = 2
-	TUNControlActionRequestExitNodeRouting TUNControlAction = 3
-	TUNControlActionSetExitNodeOffer       TUNControlAction = 4
-	TUNControlActionDisableExitNodeSharing TUNControlAction = 5
+	TUNControlActionRevokeExitNodeRouting   TUNControlAction = 0
+	TUNControlActionUseExitNodeRouting      TUNControlAction = 1
+	TUNControlActionEnableExitNodeSharing   TUNControlAction = 2
+	TUNControlActionRequestExitNodeRouting  TUNControlAction = 3
+	TUNControlActionSetExitNodeOffer        TUNControlAction = 4
+	TUNControlActionDisableExitNodeSharing  TUNControlAction = 5
+	TUNControlActionSetLocalAccessRoutes    TUNControlAction = 6
+	TUNControlActionApplyLocalAccessRoutes  TUNControlAction = 7
+	TUNControlActionRemoveLocalAccessRoutes TUNControlAction = 8
+	TUNControlActionSyncLocalAccessRoutes   TUNControlAction = 9
 )
 
 const tunControlPeerPayloadSize = 1 + 32
@@ -38,6 +42,14 @@ func (a TUNControlAction) String() string {
 		return "set-exit-node-offer"
 	case TUNControlActionDisableExitNodeSharing:
 		return "disable-exit-node-sharing"
+	case TUNControlActionSetLocalAccessRoutes:
+		return "set-local-access-routes"
+	case TUNControlActionApplyLocalAccessRoutes:
+		return "apply-local-access-routes"
+	case TUNControlActionRemoveLocalAccessRoutes:
+		return "remove-local-access-routes"
+	case TUNControlActionSyncLocalAccessRoutes:
+		return "sync-local-access-routes"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(a))
 	}
@@ -98,6 +110,22 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 	}
 
 	action := TUNControlAction(data[0])
+	// Coordinator commands change routing and forwarding state. Accept them
+	// only from the configured tenant server, never from a dynamically
+	// discovered peer.
+	switch action {
+	case TUNControlActionRevokeExitNodeRouting,
+		TUNControlActionUseExitNodeRouting,
+		TUNControlActionEnableExitNodeSharing,
+		TUNControlActionDisableExitNodeSharing,
+		TUNControlActionApplyLocalAccessRoutes,
+		TUNControlActionRemoveLocalAccessRoutes,
+		TUNControlActionSyncLocalAccessRoutes:
+		if !d.isServerTUNControlPeer(peer.PublicKeyHex()) {
+			log.Printf("[TUN] Ignoring unauthorized %s message from %s", action, peer)
+			return
+		}
+	}
 	switch action {
 	case TUNControlActionUseExitNodeRouting:
 		targetPubKey, err := decodeTUNControlPeerKey(data)
@@ -129,6 +157,33 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 		log.Printf("[TUN] Server revoked our duties to be an exit node")
 		if err := d.disableExitNodeSharing(); err != nil {
 			log.Printf("[TUN] Failed to disable exit node sharing: %v", err)
+		}
+	case TUNControlActionApplyLocalAccessRoutes:
+		owner, routes, err := decodeLocalAccessRouteUpdate(data)
+		if err != nil {
+			log.Printf("[TUN] Invalid local-access route update: %v", err)
+			return
+		}
+		if err := d.applyLocalAccessRouteUpdate(owner, routes); err != nil {
+			log.Printf("[TUN] Failed to apply local-access routes: %v", err)
+		}
+	case TUNControlActionRemoveLocalAccessRoutes:
+		owner, err := decodeLocalAccessRouteRemoval(data)
+		if err != nil {
+			log.Printf("[TUN] Invalid local-access route removal: %v", err)
+			return
+		}
+		if err := d.removeLocalAccessRouteUpdate(owner); err != nil {
+			log.Printf("[TUN] Failed to remove local-access routes: %v", err)
+		}
+	case TUNControlActionSyncLocalAccessRoutes:
+		routesByOwner, err := decodeLocalAccessSnapshot(data)
+		if err != nil {
+			log.Printf("[TUN] Invalid local-access route snapshot: %v", err)
+			return
+		}
+		if err := d.applyLocalAccessSnapshot(routesByOwner); err != nil {
+			log.Printf("[TUN] Failed to sync local-access routes: %v", err)
 		}
 	default:
 		log.Printf("[TUN] Ignoring unsupported TUN control action %d (%s) from %s", uint8(action), action, peer)

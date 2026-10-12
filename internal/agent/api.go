@@ -98,6 +98,7 @@ type StatusResponse struct {
 	Running       bool              `json:"running"`
 	DeviceRunning bool              `json:"device_running"`
 	ExitNode      bool              `json:"exit_node"`
+	LocalAccess   bool              `json:"local_access"`
 	IPs           []string          `json:"ips"`
 	PubKey        string            `json:"pubkey"`
 	RxBytes       uint64            `json:"rx_bytes"`
@@ -124,6 +125,7 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Running:       s.agent.IsRunning(),
 		DeviceRunning: s.agent.device.IsRunning(),
 		ExitNode:      s.agent.config.ExitNode.Enabled,
+		LocalAccess:   s.agent.config.AllowLocalAccess,
 		IPs:           ips,
 		PubKey:        s.agent.device.GetPublicKey(),
 		RxBytes:       rx,

@@ -2,124 +2,106 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
-	goruntime "runtime"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"wantastic-agent/internal/agent"
+	"wantastic-agent/internal/auth"
+	"wantastic-agent/internal/claimkey"
 	"wantastic-agent/internal/config"
-	wantasticgrpc "wantastic-agent/internal/grpc"
+	"wantastic-agent/internal/device"
+	"wantastic-agent/pkg/version"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// ─── Data types (mirror agent.StatusResponse) ──────────────────────────────
+const maxManualConfigBytes = 1 << 20
 
 type PeerInfo struct {
 	PublicKey     string `json:"public_key"`
-	Name          string `json:"name"`          // display name from portal WebSocket (empty if not yet received)
-	Hostname      string `json:"hostname"`      // device hostname from portal WebSocket
+	AssignedIP    string `json:"assigned_ip"`
+	Hostname      string `json:"hostname"`
+	MagicName     string `json:"magic_name"`
 	Endpoint      string `json:"endpoint"`
-	AllowedIPs    string `json:"allowed_ips"`
 	RxBytes       uint64 `json:"rx_bytes"`
 	TxBytes       uint64 `json:"tx_bytes"`
-	LastHandshake string `json:"last_handshake"`
-	IsRelay       bool   `json:"is_relay"`
-	IsExitNode    bool   `json:"is_exit_node"`
-	Latency       int64  `json:"latency_ms"`
+	P2PState      string `json:"p2p_state"`
+	Connection    string `json:"connection"`
+	LastHandshake int64  `json:"last_handshake"`
 }
 
 type StatusData struct {
-	Configured    bool       `json:"configured"` // true when the embedded VPN service is running
-	Running       bool       `json:"running"`
-	DeviceRunning bool       `json:"device_running"`
-	TUNMode       bool       `json:"tun_mode"`
-	TUNName       string     `json:"tun_name"`
-	ExitNode      bool       `json:"exit_node"`
-	IPs           []string   `json:"ips"`
-	PubKey        string     `json:"pubkey"`
-	RxBytes       uint64     `json:"rx_bytes"`
-	TxBytes       uint64     `json:"tx_bytes"`
-	Peers         []PeerInfo `json:"peers"`
+	Configured        bool       `json:"configured"`
+	Running           bool       `json:"running"`
+	DeviceRunning     bool       `json:"device_running"`
+	TUNMode           bool       `json:"tun_mode"`
+	TUNName           string     `json:"tun_name"`
+	OfferExitNode     bool       `json:"offer_exit_node"`
+	LocalAccess       bool       `json:"local_access"`
+	LocalAccessRoutes []string   `json:"local_access_routes"`
+	MagicDNS          bool       `json:"magic_dns"`
+	DNSServers        []string   `json:"dns_servers"`
+	IPs               []string   `json:"ips"`
+	PubKey            string     `json:"pubkey"`
+	RxBytes           uint64     `json:"rx_bytes"`
+	TxBytes           uint64     `json:"tx_bytes"`
+	Peers             []PeerInfo `json:"peers"`
 }
 
-type AccountInfo struct {
-	LoggedIn    bool   `json:"logged_in"`
-	Token       string `json:"token"`
-	DisplayName string `json:"display_name"`
-	Email       string `json:"email"`
-	AvatarURL   string `json:"avatar_url"`
+type ClaimLink struct {
+	PublicKey string `json:"public_key"`
+	ServerURL string `json:"server_url"`
+	ClaimURL  string `json:"claim_url"`
+	Reused    bool   `json:"reused"`
 }
 
-// ─── App struct ─────────────────────────────────────────────────────────────
+type PingResult struct {
+	Target     string `json:"target"`
+	IP         string `json:"ip"`
+	Reachable  bool   `json:"reachable"`
+	LatencyMS  int64  `json:"latency_ms"`
+	Connection string `json:"connection"`
+	Message    string `json:"message"`
+}
 
 type App struct {
-	ctx         context.Context
-	auth        *Auth0Client
+	ctx context.Context
+
+	mu          sync.RWMutex
 	agt         *agent.Agent
 	agentCancel context.CancelFunc
-	agentMu     sync.Mutex // protects agent start/stop and configured flag
-	loginMu     sync.Mutex // prevents concurrent StartLogin goroutines
-	configured  bool       // true once the embedded VPN service has started successfully
-	portalWS    *portalWSClient
+	cfg         *config.Config
+	configured  bool
 }
 
-func NewApp() *App {
-	return &App{
-		auth:     NewAuth0Client(),
-		portalWS: newPortalWSClient(),
-	}
-}
+func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-
-	// Start systray icon/menu (blocks its goroutine; controls via menu clicks).
 	go a.startSystray()
-
-	if err := a.startEmbeddedAgent(); err != nil {
-		log.Printf("Desktop mode: failed to start embedded agent: %v", err)
+	if err := a.startEmbeddedAgent(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		wailsruntime.EventsEmit(ctx, "app:error", err.Error())
 	}
-
-	// No config file but a valid stored token exists — silently re-register
-	// and restart the VPN service without forcing the user to log in again.
-	if !a.configured {
-		if tok := a.auth.StoredToken(); tok != "" {
-			log.Printf("Stored token found — attempting silent service recovery")
-			go a.initServiceFromToken(tok)
-		}
+	if !a.IsConfigured() {
+		wailsruntime.WindowShow(ctx)
 	}
-
-	// Show the window on first-run (no config yet) so the user can sign in.
-	// Otherwise the app starts hidden and is accessible via the systray.
-	configPath := defaultConfigPath()
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if a.auth.StoredToken() == "" {
-			wailsruntime.WindowShow(ctx)
-		}
-	}
-
 	go a.pollStatus()
-	go a.tokenRefreshLoop()
 }
 
-func (a *App) shutdown(ctx context.Context) {
-	a.stopEmbeddedAgent()
-}
+func (a *App) shutdown(context.Context) { a.stopEmbeddedAgent() }
 
-// pollStatus emits "status:update" events to the frontend every 5 seconds
 func (a *App) pollStatus() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -137,631 +119,348 @@ func (a *App) pollStatus() {
 }
 
 func (a *App) startEmbeddedAgent() error {
-	configPath := defaultConfigPath()
-
-	// First-run: config hasn't been written yet — the user must log in via the UI.
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		log.Printf("No config file at %s — waiting for first login", configPath)
-		return nil
-	}
-
-	cfg, err := config.LoadFromFile(configPath)
+	cfg, err := config.LoadFromFile(auth.DefaultConfigPath())
 	if err != nil {
-		return fmt.Errorf("load config (%s): %w", configPath, err)
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			return os.ErrNotExist
+		}
+		return fmt.Errorf("load desktop config: %w", err)
 	}
-
 	cfg.Interface.TUNMode = true
-	cfg.Interface.TUNName = autoTUNName()
+	cfg.Interface.TUNName = config.DefaultTunName()
+	return a.startConfig(cfg)
+}
 
-	agentCtx, cancel := context.WithCancel(context.Background())
-	agt, err := startAgentWithRetry(agentCtx, cfg)
+func (a *App) startConfig(cfg *config.Config) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	agt, err := agent.New(cfg)
 	if err != nil {
+		cancel()
+		return fmt.Errorf("create embedded agent: %w", err)
+	}
+	if err := agt.Start(ctx); err != nil {
 		cancel()
 		return fmt.Errorf("start embedded agent: %w", err)
 	}
-
-	a.agentMu.Lock()
-	a.agentCancel = cancel
+	a.mu.Lock()
 	a.agt = agt
+	a.agentCancel = cancel
+	a.cfg = cfg
 	a.configured = true
-	a.agentMu.Unlock()
-	log.Printf("Embedded agent started: TUN=%s", cfg.Interface.TUNName)
+	a.mu.Unlock()
 	return nil
 }
 
 func (a *App) stopEmbeddedAgent() {
-	a.agentMu.Lock()
-	defer a.agentMu.Unlock()
-	if a.agentCancel != nil {
-		a.agentCancel()
-		a.agentCancel = nil
-	}
-	if a.agt != nil {
-		if err := a.agt.Stop(); err != nil {
-			log.Printf("Failed to stop embedded agent: %v", err)
-		}
-		a.agt = nil
-	}
+	a.mu.Lock()
+	agt := a.agt
+	cancel := a.agentCancel
+	a.agt = nil
+	a.agentCancel = nil
 	a.configured = false
-}
-
-func defaultConfigPath() string {
-	base, err := os.UserConfigDir()
-	if err != nil || base == "" {
-		return filepath.Join(".", "wantastic", "config.conf")
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	return filepath.Join(base, "wantastic", "config.conf")
-}
-
-func saveConfigToAppStorage(cfg *config.Config) (string, error) {
-	configPath := defaultConfigPath()
-	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
-		return "", fmt.Errorf("create config dir: %w", err)
-	}
-	if err := cfg.SaveToFile(configPath); err != nil {
-		return "", fmt.Errorf("save config file: %w", err)
-	}
-	return configPath, nil
-}
-
-func autoTUNName() string {
-	if name := os.Getenv("WANTASTIC_TUN_NAME"); name != "" {
-		return name
-	}
-	switch goruntime.GOOS {
-	case "darwin":
-		return "utun"
-	case "linux":
-		return findAvailableTUNName()
-	default:
-		return "wantastic0"
+	if agt != nil {
+		_ = agt.Stop()
 	}
 }
 
-func findAvailableTUNName() string {
-	for i := 0; i < 100; i++ {
-		name := fmt.Sprintf("wantastic%d", i)
-		if !interfaceExists(name) {
-			return name
-		}
+func (a *App) restartConfig(cfg *config.Config) error {
+	a.stopEmbeddedAgent()
+	if err := a.startConfig(cfg); err != nil {
+		return err
 	}
-	return "wantastic0"
-}
-
-func interfaceExists(name string) bool {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-	for _, iface := range ifaces {
-		if iface.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func startAgentWithRetry(ctx context.Context, cfg *config.Config) (*agent.Agent, error) {
-	maxRetries := 10
-	var lastErr error
-
-	for i := 0; i < maxRetries; i++ {
-		agt, err := agent.New(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("create agent: %w", err)
-		}
-
-		if err := agt.Start(ctx); err != nil {
-			lastErr = err
-			if strings.Contains(err.Error(), "address already in use") {
-				_ = agt.Stop()
-				cfg.Interface.ListenPort++
-				continue
-			}
-			return nil, err
-		}
-
-		return agt, nil
-	}
-
-	return nil, fmt.Errorf("failed to start agent after %d attempts: %w", maxRetries, lastErr)
-}
-
-// ─── IPC helpers ────────────────────────────────────────────────────────────
-
-// getIPCPort reads the port the embedded agent's IPC server is bound to.
-// Priority: WTC_IPC_PORT env > $TMPDIR/wantasticd_ipc_port file > "9034".
-func getIPCPort() string {
-	if p := os.Getenv("WTC_IPC_PORT"); p != "" {
-		return p
-	}
-	portFile := filepath.Join(os.TempDir(), "wantasticd_ipc_port")
-	if b, err := os.ReadFile(portFile); err == nil {
-		return strings.TrimSpace(string(b))
-	}
-	return "9034"
-}
-
-func ipcURL(path string) string {
-	return fmt.Sprintf("http://127.0.0.1:%s%s", getIPCPort(), path)
-}
-
-func ipcGet(path string, out interface{}) error {
-	resp, err := http.Get(ipcURL(path))
-	if err != nil {
-		return fmt.Errorf("service not reachable: %w", err)
-	}
-	defer resp.Body.Close()
-	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-func ipcPost(path string) error {
-	resp, err := http.Post(ipcURL(path), "application/json", nil)
-	if err != nil {
-		return fmt.Errorf("service not reachable: %w", err)
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	wailsruntime.EventsEmit(a.ctx, "service:ready", true)
 	return nil
 }
 
-// ─── Wails-bound methods (callable from JS) ──────────────────────────────────
-
-// IsConfigured reports whether the embedded VPN service started successfully.
 func (a *App) IsConfigured() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return a.configured
 }
 
-// GetStatus fetches live VPN status from the embedded service.
-// Returns a zero status (no error) when not yet configured so the frontend
-// can render the onboarding flow rather than an error screen.
 func (a *App) GetStatus() (*StatusData, error) {
-	if !a.configured {
+	a.mu.RLock()
+	configured := a.configured
+	cfg := a.cfg
+	a.mu.RUnlock()
+	if !configured || cfg == nil {
 		return &StatusData{Configured: false}, nil
 	}
 
-	var raw struct {
-		Running       bool     `json:"running"`
-		DeviceRunning bool     `json:"device_running"`
-		TUNMode       bool     `json:"tun_mode"`
-		TUNName       string   `json:"tun_name"`
-		ExitNode      bool     `json:"exit_node"`
-		IPs           []string `json:"ips"`
-		PubKey        string   `json:"pubkey"`
-		RxBytes       uint64   `json:"rx_bytes"`
-		TxBytes       uint64   `json:"tx_bytes"`
-		Peers         []struct {
-			PublicKey     string `json:"public_key"`
-			Endpoint      string `json:"endpoint"`
-			AllowedIPs    string `json:"allowed_ips"`
-			RxBytes       uint64 `json:"rx_bytes"`
-			TxBytes       uint64 `json:"tx_bytes"`
-			LastHandshake string `json:"last_handshake"`
-			IsRelay       bool   `json:"is_relay"`
-			IsExitNode    bool   `json:"is_exit_node"`
-			LatencyMs     int64  `json:"latency_ms"`
-		} `json:"peers"`
-	}
-
+	var raw agent.StatusResponse
 	if err := ipcGet("/api/status", &raw); err != nil {
-		// Service still starting — return configured=true so UI shows a
-		// loading indicator and retries on the next poll tick.
-		return &StatusData{Configured: true, Running: false, DeviceRunning: false}, nil
+		return &StatusData{Configured: true}, nil
 	}
-
-	peers := make([]PeerInfo, len(raw.Peers))
-	for i, p := range raw.Peers {
-		meta := a.portalWS.peerMeta(p.PublicKey)
-		latency := p.LatencyMs
-		if meta.Latency > 0 && latency == 0 {
-			latency = meta.Latency
-		}
-		peers[i] = PeerInfo{
-			PublicKey:     p.PublicKey,
-			Name:          meta.Name,
-			Hostname:      meta.Hostname,
-			Endpoint:      p.Endpoint,
-			AllowedIPs:    p.AllowedIPs,
-			RxBytes:       p.RxBytes,
-			TxBytes:       p.TxBytes,
-			LastHandshake: p.LastHandshake,
-			IsRelay:       p.IsRelay,
-			IsExitNode:    p.IsExitNode,
-			Latency:       latency,
-		}
+	peers := make([]PeerInfo, 0, len(raw.Peers))
+	for _, peer := range raw.Peers {
+		peers = append(peers, PeerInfo{
+			PublicKey: peer.PublicKey, AssignedIP: peer.AssignedIP, Hostname: peer.Hostname,
+			MagicName: magicName(peer), Endpoint: peer.Endpoint, RxBytes: peer.RxBytes,
+			TxBytes: peer.TxBytes, P2PState: peer.P2PState, Connection: peerConnection(peer),
+			LastHandshake: peer.LastHandshake,
+		})
 	}
-
 	return &StatusData{
-		Configured:    true,
-		Running:       raw.Running,
-		DeviceRunning: raw.DeviceRunning,
-		TUNMode:       raw.TUNMode,
-		TUNName:       raw.TUNName,
-		ExitNode:      raw.ExitNode,
-		IPs:           raw.IPs,
-		PubKey:        raw.PubKey,
-		RxBytes:       raw.RxBytes,
-		TxBytes:       raw.TxBytes,
-		Peers:         peers,
+		Configured: true, Running: raw.Running, DeviceRunning: raw.DeviceRunning,
+		TUNMode: raw.TUNMode, TUNName: raw.TUNName, OfferExitNode: raw.ExitNode,
+		LocalAccess: raw.LocalAccess, LocalAccessRoutes: append([]string(nil), cfg.LocalAccessRoutes...),
+		MagicDNS: len(cfg.Interface.DNS) > 0, DNSServers: append([]string(nil), cfg.Interface.DNS...),
+		IPs: raw.IPs, PubKey: raw.PubKey, RxBytes: raw.RxBytes, TxBytes: raw.TxBytes, Peers: peers,
 	}, nil
 }
 
-// ToggleVPN connects or disconnects the VPN tunnel
-func (a *App) ToggleVPN() error {
-	return ipcPost("/api/state/toggle")
-}
-
-// ToggleExitNode enables or disables offering this device as an exit node
-func (a *App) ToggleExitNode() error {
-	return ipcPost("/api/exitnode/toggle")
-}
-
-// SetExitNode routes all traffic through the peer with the given public key
-func (a *App) SetExitNode(pubkey string) error {
-	return ipcPost("/api/exitnode/use?peer=" + pubkey)
-}
-
-// GetIPCPort returns the active IPC port (for debug / diagnostics)
-func (a *App) GetIPCPort() string {
-	return getIPCPort()
-}
-
-// ─── Auth / Account ──────────────────────────────────────────────────────────
-
-// GetAccount returns the current account state
-func (a *App) GetAccount() (*AccountInfo, error) {
-	tok := a.auth.StoredToken()
-	if tok == "" {
-		return &AccountInfo{LoggedIn: false}, nil
+func peerConnection(peer device.PeerInfo) string {
+	if peer.IsP2P && peer.P2PState == "established" {
+		return "direct"
 	}
-	info := a.auth.ParseDisplayClaims(tok)
-	info.LoggedIn = true
-	info.Token = tok
-	return info, nil
+	if peer.IsP2P && peer.P2PState == "trying" {
+		return "trying"
+	}
+	return "relay"
 }
 
-// StartLogin tries the PKCE Authorization Code Flow first (recommended for
-// GUI apps), falling back to the gRPC Device Flow if PKCE is unavailable.
-// "auth:navigate" is emitted with the auth URL to open in the embedded WebView;
-// "" closes it. Emits "auth:complete" and "service:ready" on success.
-func (a *App) StartLogin() {
-	if !a.loginMu.TryLock() {
-		log.Println("StartLogin: flow already in progress, ignoring duplicate call")
-		return
+func magicName(peer device.PeerInfo) string {
+	if host := sanitizeDNSLabel(peer.Hostname); host != "" {
+		return host + ".wantastic"
 	}
-	go func() {
-		defer a.loginMu.Unlock()
+	ip := net.ParseIP(peer.AssignedIP)
+	if ip != nil && ip.To4() != nil {
+		return "node-" + strings.ReplaceAll(ip.To4().String(), ".", "-") + ".wantastic"
+	}
+	return ""
+}
 
-		// PKCE Authorization Code Flow (RFC 7636).
-		// For dev servers (.local/.internal) the embedded WKWebView rejects
-		// self-signed certs silently; open in the system browser instead.
-		// The PKCE callback on localhost:58250 captures the code either way.
-		info, cfg, sessionToken, err := a.auth.RunPKCEFlow(a.ctx, func(authURL string) {
-			if authURL == "" {
-				wailsruntime.EventsEmit(a.ctx, "auth:navigate", "")
-				return
-			}
-			if isDevAuthURL(authURL) {
-				wailsruntime.BrowserOpenURL(a.ctx, authURL)
-			} else {
-				wailsruntime.EventsEmit(a.ctx, "auth:navigate", authURL)
-			}
-		})
-		if err != nil {
-			log.Printf("StartLogin: PKCE flow error: %v", err)
-			wailsruntime.EventsEmit(a.ctx, "auth:error", err.Error())
-			return
+func sanitizeDNSLabel(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	label := make([]byte, 0, min(len(value), 63))
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			label = append(label, byte(r))
+		} else if len(label) > 0 && label[len(label)-1] != '-' {
+			label = append(label, '-')
 		}
-
-		wailsruntime.EventsEmit(a.ctx, "auth:complete", info)
-		if cfg != nil {
-			go a.initServiceWithConfig(cfg, sessionToken)
+		if len(label) == 63 {
+			break
 		}
-	}()
+	}
+	return strings.Trim(string(label), "-")
 }
 
-// initServiceWithConfig persists a pre-fetched WireGuard config to app storage
-// and starts the embedded VPN service. After a successful start, it performs
-// the portal auto-login handoff by navigating the system browser to
-// /api/device-handoff?t=<sessionToken> if a portal session token was returned.
-func (a *App) initServiceWithConfig(cfg *config.Config, sessionToken string) {
-	wailsruntime.EventsEmit(a.ctx, "service:configuring", true)
-	log.Printf("Persisting VPN configuration and starting embedded service…")
+func (a *App) ToggleVPN() error { return ipcPost("/api/state/toggle") }
 
-	// Stop any previously running agent before starting a fresh one.
-	a.agentMu.Lock()
-	if a.agentCancel != nil {
-		a.agentCancel()
-		a.agentCancel = nil
+func (a *App) SetOfferExitNode(enabled bool) error {
+	a.mu.RLock()
+	agt := a.agt
+	a.mu.RUnlock()
+	if agt == nil {
+		return errors.New("Wantastic is not configured")
 	}
-	if a.agt != nil {
-		_ = a.agt.Stop()
-		a.agt = nil
+	return agt.SetOfferExitNode(enabled)
+}
+
+func (a *App) SetExitNode(publicKey string) error {
+	a.mu.RLock()
+	agt := a.agt
+	a.mu.RUnlock()
+	if agt == nil {
+		return errors.New("Wantastic is not configured")
 	}
-	a.configured = false
-	a.agentMu.Unlock()
+	return agt.SetExitNode(strings.TrimSpace(publicKey))
+}
 
-	if _, err := saveConfigToAppStorage(cfg); err != nil {
-		log.Printf("Failed to persist config in app storage: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not save VPN configuration: %v", err))
-		return
-	}
-
-	cfg.Interface.TUNMode = true
-	cfg.Interface.TUNName = autoTUNName()
-
-	agentCtx, agentCancel := context.WithCancel(context.Background())
-	agt, err := startAgentWithRetry(agentCtx, cfg)
+func (a *App) ConfigureLocalAccess(enabled bool, routes []string) error {
+	normalized, err := config.ValidateLocalAccessRoutes(routes)
 	if err != nil {
-		agentCancel()
-		log.Printf("Failed to start embedded VPN service: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not start VPN service: %v", err))
-		return
+		return err
 	}
-
-	a.agentMu.Lock()
-	a.agentCancel = agentCancel
-	a.agt = agt
-	a.configured = true
-	a.agentMu.Unlock()
-	log.Printf("Embedded VPN service started via device flow: TUN=%s", cfg.Interface.TUNName)
-
-	// Step 7 of the auth protocol: auto-login the console WebView
-	if sessionToken != "" {
-		handoffURL := portalBaseURL() + "/api/device-handoff?t=" + sessionToken
-		log.Printf("Device-handoff: navigating WebView to %s", handoffURL)
-		wailsruntime.EventsEmit(a.ctx, "auth:navigate", handoffURL)
-
-		// Start portal WebSocket for real-time peer metadata
-		a.portalWS.start(a.ctx, sessionToken)
+	if len(normalized) > 0 {
+		enabled = true
 	}
-
-	wailsruntime.EventsEmit(a.ctx, "service:ready", true)
+	return a.updateConfig(func(cfg *config.Config) {
+		cfg.AllowLocalAccess = enabled
+		cfg.LocalAccessRoutes = normalized
+	})
 }
 
-// initServiceFromToken registers this device with the Wantastic backend using
-// a stored access token, re-fetches the WireGuard configuration via gRPC
-// RegisterDevice, and starts the embedded VPN service. Called on startup when
-// no config file exists but a valid stored token is present, enabling silent
-// recovery without forcing the user to go through the login flow again.
-func (a *App) initServiceFromToken(token string) {
-	wailsruntime.EventsEmit(a.ctx, "service:configuring", true)
-	log.Printf("Recovering service via stored token (gRPC: %s)…", grpcServerAddr())
-
-	// Stop any previously running agent before starting a fresh one.
-	a.agentMu.Lock()
-	if a.agentCancel != nil {
-		a.agentCancel()
-		a.agentCancel = nil
+func (a *App) updateConfig(update func(*config.Config)) error {
+	path := auth.DefaultConfigPath()
+	cfg, err := config.LoadFromFile(path)
+	if err != nil {
+		return err
 	}
-	if a.agt != nil {
-		_ = a.agt.Stop()
-		a.agt = nil
+	previous, err := os.ReadFile(path)
+	if err != nil {
+		return err
 	}
-	a.configured = false
-	a.agentMu.Unlock()
+	update(cfg)
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.SaveToFile(path); err != nil {
+		return err
+	}
+	if err := a.restartConfig(cfg); err == nil {
+		return nil
+	} else {
+		startErr := err
+		if restoreErr := os.WriteFile(path, previous, 0o600); restoreErr != nil {
+			return fmt.Errorf("apply config: %v; restore previous config: %w", startErr, restoreErr)
+		}
+		if oldCfg, loadErr := config.LoadFromFile(path); loadErr == nil {
+			_ = a.startConfig(oldCfg)
+		}
+		return startErr
+	}
+}
 
-	ctx, cancel := context.WithTimeout(a.ctx, 45*time.Second)
+func (a *App) ImportManualConfig(raw string) error {
+	if len(raw) == 0 {
+		return errors.New("configuration is empty")
+	}
+	if len(raw) > maxManualConfigBytes {
+		return fmt.Errorf("configuration exceeds %d bytes", maxManualConfigBytes)
+	}
+	dir := filepath.Dir(auth.DefaultConfigPath())
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".manual-config-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := io.WriteString(tmp, raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	cfg, err := config.LoadFromFile(tmpPath)
+	if err != nil {
+		return fmt.Errorf("invalid manual config: %w", err)
+	}
+	cfg.Interface.TUNMode = true
+	cfg.Interface.TUNName = config.DefaultTunName()
+	path := auth.DefaultConfigPath()
+	previous, previousErr := os.ReadFile(path)
+	if err := cfg.SaveToFile(path); err != nil {
+		return err
+	}
+	if err := a.restartConfig(cfg); err == nil {
+		return nil
+	} else {
+		startErr := err
+		if previousErr == nil {
+			_ = os.WriteFile(path, previous, 0o600)
+			if oldCfg, loadErr := config.LoadFromFile(path); loadErr == nil {
+				_ = a.startConfig(oldCfg)
+			}
+		}
+		return startErr
+	}
+}
+
+func (a *App) GenerateClaimLink(serverURL string, rotate bool) (*ClaimLink, error) {
+	key, reused, err := claimkey.LoadOrCreate(claimkey.DefaultPath(), serverURL, rotate)
+	if err != nil {
+		return nil, err
+	}
+	return &ClaimLink{PublicKey: key.PublicKey, ServerURL: key.ServerURL, ClaimURL: key.ClaimURL, Reused: reused}, nil
+}
+
+func (a *App) OpenURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && parsed.Hostname() == "localhost")) {
+		return errors.New("refusing to open an invalid or insecure URL")
+	}
+	wailsruntime.BrowserOpenURL(a.ctx, rawURL)
+	return nil
+}
+
+func (a *App) PingPeer(reference string) (*PingResult, error) {
+	status, err := a.GetStatus()
+	if err != nil {
+		return nil, err
+	}
+	reference = strings.TrimSpace(reference)
+	var selected *PeerInfo
+	for i := range status.Peers {
+		peer := &status.Peers[i]
+		if strings.EqualFold(reference, peer.PublicKey) || strings.EqualFold(reference, peer.AssignedIP) ||
+			strings.EqualFold(reference, peer.Hostname) || strings.EqualFold(reference, peer.MagicName) {
+			selected = peer
+			break
+		}
+	}
+	if selected == nil || net.ParseIP(selected.AssignedIP) == nil {
+		return nil, errors.New("peer does not have a usable overlay IP")
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 4*time.Second)
 	defer cancel()
-
-	grpcClient, err := wantasticgrpc.New(grpcServerAddr(), stableDeviceID(), token)
-	if err != nil {
-		log.Printf("Token recovery: failed to connect to gRPC server: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not connect to VPN backend: %v", err))
-		return
+	started := time.Now()
+	cmd := exec.CommandContext(ctx, "ping", pingArgs(selected.AssignedIP)...)
+	output, runErr := cmd.CombinedOutput()
+	message := strings.TrimSpace(string(output))
+	if len(message) > 500 {
+		message = message[:500]
 	}
-	defer grpcClient.Close()
-
-	var nonce uint64
-	if err := binary.Read(rand.Reader, binary.LittleEndian, &nonce); err != nil {
-		nonce = uint64(time.Now().UnixNano())
-	}
-
-	hostname, _ := os.Hostname()
-	regResp, err := grpcClient.RegisterDevice(ctx, nonce, goruntime.GOOS, goruntime.GOARCH, hostname, stableDeviceID())
-	if err != nil {
-		log.Printf("Token recovery: RegisterDevice failed: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not register device: %v", err))
-		return
-	}
-	if !regResp.Success {
-		wailsruntime.EventsEmit(a.ctx, "auth:error", "Device registration was rejected by the server")
-		return
-	}
-
-	cfg, err := config.LoadFromRegisterResponse(regResp, token, nonce, grpcServerAddr())
-	if err != nil {
-		log.Printf("Token recovery: config decrypt failed: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not decrypt VPN config: %v", err))
-		return
-	}
-	if cfg.Auth.Token == "" {
-		cfg.Auth.Token = token
-	}
-
-	configPath, err := saveConfigToAppStorage(cfg)
-	if err != nil {
-		log.Printf("Token recovery: failed to persist config: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not save VPN configuration: %v", err))
-		return
-	}
-	log.Printf("VPN configuration saved to app storage: %s", configPath)
-
-	cfg.Interface.TUNMode = true
-	cfg.Interface.TUNName = autoTUNName()
-
-	agentCtx, agentCancel := context.WithCancel(context.Background())
-	agt, err := startAgentWithRetry(agentCtx, cfg)
-	if err != nil {
-		agentCancel()
-		log.Printf("Token recovery: failed to start embedded VPN service: %v", err)
-		wailsruntime.EventsEmit(a.ctx, "auth:error", fmt.Sprintf("Could not start VPN service: %v", err))
-		return
-	}
-
-	a.agentMu.Lock()
-	a.agentCancel = agentCancel
-	a.agt = agt
-	a.configured = true
-	a.agentMu.Unlock()
-	log.Printf("Embedded VPN service started via token recovery: TUN=%s", cfg.Interface.TUNName)
-
-	// Silent recovery: do NOT emit auth:navigate — the user didn't trigger a
-	// login so we must not open the portal overlay or redirect the WebView.
-
-	// Start portal WebSocket for real-time peer metadata.
-	// regResp.GetToken() is the portal session token (may differ from the access token).
-	if sessionToken := regResp.GetToken(); sessionToken != "" {
-		a.portalWS.start(a.ctx, sessionToken)
-	}
-
-	wailsruntime.EventsEmit(a.ctx, "service:ready", true)
+	return &PingResult{
+		Target: selected.MagicName, IP: selected.AssignedIP, Reachable: runErr == nil,
+		LatencyMS: time.Since(started).Milliseconds(), Connection: selected.Connection, Message: message,
+	}, nil
 }
 
-// Logout stops the VPN, closes the portal WebSocket, and clears the stored token.
-func (a *App) Logout() error {
-	a.portalWS.stop()
-	a.stopEmbeddedAgent()
-	return a.auth.ClearToken()
-}
-
-// OpenConsoleWebView opens the Wantastic portal.
-// For dev servers (.local/.internal) the embedded WKWebView rejects self-signed
-// certs and blocks WebSockets — open in the system browser instead.
-// For production (valid TLS cert) show it as a full-screen in-app overlay.
-func (a *App) OpenConsoleWebView() {
-	tok := a.auth.StoredToken()
-	target := portalBaseURL()
-	if tok != "" {
-		target += "/#access_token=" + tok
-	}
-	if isDevAuthURL(target) {
-		wailsruntime.BrowserOpenURL(a.ctx, target)
-		return
-	}
-	wailsruntime.WindowSetSize(a.ctx, 1100, 740)
-	wailsruntime.EventsEmit(a.ctx, "console:open", target)
-}
-
-// CloseConsoleWebView closes the console overlay and restores the compact window size.
-func (a *App) CloseConsoleWebView() {
-	wailsruntime.EventsEmit(a.ctx, "console:close", nil)
-	wailsruntime.WindowSetSize(a.ctx, 420, 640)
-}
-
-// tokenRefreshLoop silently re-registers the device every 23 hours to keep
-// the WireGuard config and session token fresh. Errors are non-fatal.
-func (a *App) tokenRefreshLoop() {
-	ticker := time.NewTicker(23 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-ticker.C:
-			tok := a.auth.StoredToken()
-			if tok == "" {
-				continue
-			}
-			log.Printf("tokenRefreshLoop: refreshing session via stored token")
-			go a.initServiceFromToken(tok)
-		}
-	}
-}
-
-// isDevAuthURL returns true for OAuth URLs targeting local dev servers
-// (.local/.internal) where WKWebView would silently reject self-signed certs.
-func isDevAuthURL(rawURL string) bool {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-	h := strings.ToLower(u.Hostname())
-	return strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".internal")
-}
-
-// OpenConsole opens the Wantastic console in the system browser.
-// Uses portalBaseURL() so dev builds hit wantastic.local automatically.
-func (a *App) OpenConsole() {
-	tok := a.auth.StoredToken()
-	target := portalBaseURL()
-	if tok != "" {
-		target += "/#access_token=" + tok
-	}
-	wailsruntime.BrowserOpenURL(a.ctx, target)
-}
-
-// GetPortalHost returns the current portal hostname for UI display.
-func (a *App) GetPortalHost() string {
-	u, err := url.Parse(portalBaseURL())
-	if err != nil || u.Host == "" {
-		return "console.wantastic.app"
-	}
-	return u.Host
-}
-
-// WindowShow brings the main window to the foreground
-func (a *App) WindowShow() {
-	wailsruntime.WindowShow(a.ctx)
-}
-
-// WindowHide hides the main window
-func (a *App) WindowHide() {
-	wailsruntime.WindowHide(a.ctx)
-}
-
-// WindowStartDrag is a no-op — dragging is handled via CSS -webkit-app-region
-func (a *App) WindowStartDrag() {}
-
-// ─── Utility ─────────────────────────────────────────────────────────────────
-
-func formatBytes(b uint64) string {
-	switch {
-	case b >= 1<<30:
-		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
-	case b >= 1<<20:
-		return fmt.Sprintf("%.2f MB", float64(b)/(1<<20))
-	case b >= 1<<10:
-		return fmt.Sprintf("%.2f KB", float64(b)/(1<<10))
+func pingArgs(ip string) []string {
+	switch runtime.GOOS {
+	case "windows":
+		return []string{"-n", "1", "-w", "2000", ip}
+	case "darwin":
+		return []string{"-n", "-c", "1", "-W", "2000", ip}
 	default:
-		return fmt.Sprintf("%d B", b)
+		return []string{"-n", "-c", "1", "-W", "2", ip}
 	}
 }
 
-// TruncateKey returns e.g. "ABCD1234…" for display
-func (a *App) TruncateKey(key string) string {
-	if len(key) <= 8 {
-		return key
-	}
-	return key[:8] + "…"
-}
+func ipcURL(path string) string { return "http://127.0.0.1:" + agent.GetIPCPort() + path }
 
-// FormatBytes exposes the byte formatter to JS
-func (a *App) FormatBytes(b uint64) string {
-	return formatBytes(b)
-}
-
-// GetVersion returns the app version string
-func (a *App) GetVersion() string {
-	return "1.0.0"
-}
-
-// IsDaemonRunning checks whether the embedded service IPC is reachable
-func (a *App) IsDaemonRunning() bool {
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get(ipcURL("/api/status"))
+func ipcGet(path string, target any) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(ipcURL(path))
 	if err != nil {
-		return false
+		return err
 	}
-	resp.Body.Close()
-	return true
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("local service returned %s", resp.Status)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(target)
 }
 
-// PubKeyShort returns a display-friendly truncated pubkey
-func (a *App) PubKeyShort(key string) string {
-	key = strings.TrimRight(key, "=")
-	if len(key) > 12 {
-		return key[:6] + "…" + key[len(key)-4:]
+func ipcPost(path string) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(ipcURL(path), "application/json", nil)
+	if err != nil {
+		return err
 	}
-	return key
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("local service returned %s", resp.Status)
+	}
+	return nil
 }
+
+func (a *App) OpenConsole()       { wailsruntime.BrowserOpenURL(a.ctx, "https://console.wantastic.app") }
+func (a *App) WindowShow()        { wailsruntime.WindowShow(a.ctx) }
+func (a *App) WindowHide()        { wailsruntime.WindowHide(a.ctx) }
+func (a *App) WindowStartDrag()   {}
+func (a *App) GetVersion() string { return version.Version }

@@ -44,22 +44,18 @@ func (a *App) onSystrayReady() {
 	mIP.Disable()
 	systray.AddSeparator()
 
-	mToggle  := systray.AddMenuItem("Connect", "Toggle VPN connection")
-	mLogin   := systray.AddMenuItem("Sign In…", "Sign in to Wantastic")
+	mToggle := systray.AddMenuItem("Connect", "Toggle VPN connection")
+	mClaim := systray.AddMenuItem("Generate Claim Link", "Claim this device into a tenant")
 	mConsole := systray.AddMenuItem("Open Console", "Open the Wantastic portal")
-	mShow    := systray.AddMenuItem("Show Window", "Bring the window to the front")
+	mShow := systray.AddMenuItem("Show Wantastic", "Open peer and routing controls")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit Wantastic", "Stop VPN and exit")
-
-	// Initial visibility: hide login/console until we know auth state.
-	mLogin.Hide()
-	mConsole.Hide()
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	// Refresh immediately on first tick.
-	a.updateTray(mStatus, mIP, mToggle, mLogin, mConsole)
+	a.updateTray(mStatus, mIP, mToggle)
 
 	for {
 		select {
@@ -83,16 +79,19 @@ func (a *App) onSystrayReady() {
 				}
 			}()
 
-		case <-mLogin.ClickedCh:
-			wailsruntime.WindowShow(a.ctx)
-			a.StartLogin()
+		case <-mClaim.ClickedCh:
+			claim, err := a.GenerateClaimLink("https://console.wantastic.app", false)
+			if err != nil {
+				log.Printf("systray: GenerateClaimLink: %v", err)
+				continue
+			}
+			_ = a.OpenURL(claim.ClaimURL)
 
 		case <-mConsole.ClickedCh:
-			wailsruntime.WindowShow(a.ctx)
-			a.OpenConsoleWebView()
+			a.OpenConsole()
 
 		case <-ticker.C:
-			a.updateTray(mStatus, mIP, mToggle, mLogin, mConsole)
+			a.updateTray(mStatus, mIP, mToggle)
 		}
 	}
 }
@@ -100,7 +99,7 @@ func (a *App) onSystrayReady() {
 // updateTray refreshes tray menu labels and item visibility.
 func (a *App) updateTray(
 	mStatus, mIP *systray.MenuItem,
-	mToggle, mLogin, mConsole *systray.MenuItem,
+	mToggle *systray.MenuItem,
 ) {
 	st, err := a.GetStatus()
 	if err == nil && st != nil {
@@ -122,11 +121,4 @@ func (a *App) updateTray(
 		mIP.SetTitle(fmt.Sprintf("IP: %s", ip))
 	}
 
-	if a.auth.StoredToken() == "" {
-		mLogin.Show()
-		mConsole.Hide()
-	} else {
-		mLogin.Hide()
-		mConsole.Show()
-	}
 }

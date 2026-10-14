@@ -58,9 +58,9 @@ const (
 	MessageResponseType    = 2
 	MessageCookieReplyType = 3
 	MessageTransportType   = 4
-	MessageStatsType       = 5
 	MessagePunchType       = 6
-	MessageTUNControlType  = 7 // P2P TUN mode coordination for exit node
+	MessageTUNControlType  = 7 // TUN control coordination for exit-node
+	MessageWUSPType        = 8 // WUSP (USP agent) control-plane traffic over encrypted transport
 )
 
 const (
@@ -786,7 +786,6 @@ func (peer *Peer) BeginSymmetricSession() error {
 	}
 
 	peer.handshakeCount.Add(1)
-	go peer.SendStats()
 
 	return nil
 }

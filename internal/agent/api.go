@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"wantastic-agent/internal/device"
@@ -30,11 +31,15 @@ func NewAPIServer(a *Agent) *APIServer {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
+	mux.HandleFunc("/api/exitnode/offer", s.handleSetExitNodeOffer)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
 
 	s.server = &http.Server{
-		Addr:    "127.0.0.1:9034",
-		Handler: mux,
+		Addr:              "127.0.0.1:9034",
+		Handler:           mux,
+		ReadHeaderTimeout: 2 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	return s
@@ -98,6 +103,7 @@ type StatusResponse struct {
 	Running       bool              `json:"running"`
 	DeviceRunning bool              `json:"device_running"`
 	ExitNode      bool              `json:"exit_node"`
+	LocalAccess   bool              `json:"local_access"`
 	IPs           []string          `json:"ips"`
 	PubKey        string            `json:"pubkey"`
 	RxBytes       uint64            `json:"rx_bytes"`
@@ -124,6 +130,7 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Running:       s.agent.IsRunning(),
 		DeviceRunning: s.agent.device.IsRunning(),
 		ExitNode:      s.agent.config.ExitNode.Enabled,
+		LocalAccess:   s.agent.config.AllowLocalAccess,
 		IPs:           ips,
 		PubKey:        s.agent.device.GetPublicKey(),
 		RxBytes:       rx,
@@ -136,30 +143,28 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if !allowLocalMutation(w, r) {
 		return
 	}
 
 	log.Println("[API] VPN State toggle requested via IPC")
-
-	go func() {
-		if s.agent.device.IsRunning() {
-			s.agent.device.Stop()
-			log.Println("[API] Stopped VPN Device via API")
-		} else {
-			s.agent.device.Start()
-			log.Println("[API] Started VPN Device via API")
-		}
-	}()
+	var err error
+	if s.agent.device.IsRunning() {
+		err = s.agent.device.Stop()
+	} else {
+		err = s.agent.device.Start()
+	}
+	if err != nil {
+		http.Error(w, "could not toggle VPN state", http.StatusConflict)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"toggled\"}")
+	_, _ = fmt.Fprint(w, "{\"status\":\"toggled\"}")
 }
 
 func (s *APIServer) handleToggleExitNode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if !allowLocalMutation(w, r) {
 		return
 	}
 
@@ -175,21 +180,50 @@ func (s *APIServer) handleToggleExitNode(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintf(w, "{\"status\":\"pending\"}")
 }
 
+func (s *APIServer) handleSetExitNodeOffer(w http.ResponseWriter, r *http.Request) {
+	if !allowLocalMutation(w, r) {
+		return
+	}
+	enabled, err := strconv.ParseBool(r.URL.Query().Get("enabled"))
+	if err != nil {
+		http.Error(w, "enabled must be true or false", http.StatusBadRequest)
+		return
+	}
+	if err := s.agent.SetOfferExitNode(enabled); err != nil {
+		http.Error(w, "could not update exit-node offer", http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, "{\"enabled\":%t}", enabled)
+}
+
 func (s *APIServer) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if !allowLocalMutation(w, r) {
 		return
 	}
 
 	peerPubKey := r.URL.Query().Get("peer")
 	log.Printf("[API] Exit Node set requested via IPC to peer: %s", peerPubKey)
 
-	go func() {
-		if err := s.agent.SetExitNode(peerPubKey); err != nil {
-			log.Printf("[API] Failed to set exit node routing: %v", err)
-		}
-	}()
+	if err := s.agent.SetExitNode(peerPubKey); err != nil {
+		log.Printf("[API] Failed to set exit node routing: %v", err)
+		http.Error(w, "could not update exit-node route", http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, "{\"status\":\"requested\"}")
+}
 
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"pending\"}")
+func allowLocalMutation(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	// Native clients do not send Origin. Reject browser-originated requests so
+	// an arbitrary website cannot toggle a loopback-bound VPN service via CSRF.
+	if r.Header.Get("Origin") != "" {
+		http.Error(w, "browser-originated IPC is not allowed", http.StatusForbidden)
+		return false
+	}
+	return true
 }

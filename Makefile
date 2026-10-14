@@ -1,113 +1,92 @@
-# Makefile for Wantastic desktop app
-# Wails is now the primary build tool — the project root is the Go package.
-
-# Go parameters
 GOCMD=go
 VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT?=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE?=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
-LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=$(VERSION) -X wantastic-agent/pkg/version.Commit=$(COMMIT) -X wantastic-agent/pkg/version.BuildDate=$(DATE)"
-GOBUILD=$(GOCMD) build -ldflags=$(LDFLAGS)
-GOCLEAN=$(GOCMD) clean
-GOTEST=$(GOCMD) test
-BINARY_NAME=wantastic
-COMPRESS=upx -9 -v
-# WAILS_TAGS=nosystray
+MACOSX_DEPLOYMENT_TARGET?=13.0
+LDFLAGS=-s -w -X wantastic-agent/pkg/version.Version=$(VERSION) -X wantastic-agent/pkg/version.Commit=$(COMMIT) -X wantastic-agent/pkg/version.BuildDate=$(DATE)
+DESKTOP_LDFLAGS=$(LDFLAGS)
+ifeq ($(shell uname -s),Darwin)
+DESKTOP_LDFLAGS+=-extldflags=-mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
+endif
+GOBUILD=$(GOCMD) build -ldflags="$(LDFLAGS)"
+BINARY_NAME=wantasticd
+CMD_PATH=./cmd/wantasticd
 
-# ── Primary desktop build (Wails) ────────────────────────────────────────────
-# Wails injects required build tags and embeds the frontend automatically.
-# All desktop builds MUST use `wails build`; never use plain `go build` for them.
+ADB_GOOS?=linux
+ADB_GOARCH?=arm
+ADB_GOARM?=7
+ADB_TEST_BINARY=bin/wusp-device-test
+ADB_AGENT_GOARCH?=arm
+ADB_AGENT_GOARM?=7
+ADB_AGENT_BINARY=bin/wantasticd-linux-$(ADB_AGENT_GOARCH)
+ADB_AGENT_REMOTE_PATH?=/usr/bin/wantasticd
+ADB_AGENT_SERVICE?=wantasticd
+ADB_AGENT_CONFIG_PATH?=/etc/wantastic
 
-# Install frontend dependencies
-deps:
-	cd gui/frontend && pnpm install
+TARGETS := darwin/arm64 linux/386 linux/amd64 linux/arm linux/arm64 linux/loong64 \
+	linux/mips linux/mips64 linux/mips64le linux/mipsle linux/ppc64 linux/ppc64le \
+	linux/riscv64 linux/s390x windows/amd64
 
-# Hot-reload dev mode (Vite + Go, live editing)
-dev:
-	WANTASTIC_PORTAL_URL=http://wantastic.local wails dev
+all: build
 
-# Alias kept for convenience
-gui-dev: dev
-
-# Production desktop build → bin/wantastic (current platform)
 build:
-	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -o bin/$(BINARY_NAME)
+	@mkdir -p bin
+	$(GOBUILD) -o bin/$(BINARY_NAME) $(CMD_PATH)
 
-# Run production build straight after building
-run:
-	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -o bin/$(BINARY_NAME) && ./bin/$(BINARY_NAME)
+desktop:
+	go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 build -clean -ldflags "$(DESKTOP_LDFLAGS)"
 
-# macOS arm64 (Apple Silicon)
-build-mac:
-	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -platform darwin/arm64 -o bin/$(BINARY_NAME)-darwin-arm64
-
-# Windows amd64
-build-windows:
-	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -platform windows/amd64 -o bin/$(BINARY_NAME)-windows-amd64.exe
-
-# Linux amd64
-build-linux:
-	WANTASTIC_PORTAL_URL=https://console.wantastic.app wails build -tags $(WAILS_TAGS) -platform linux/amd64 -o bin/$(BINARY_NAME)-linux-amd64
-
-# ── Headless cross-compiled binaries (no GUI, for routers / servers) ─────────
-# These targets produce lightweight headless builds (no Wails, no frontend).
-# Build tags: nosystray disables the tray; noegtui disables Wails webview.
-HEADLESS_LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=$(VERSION) -X wantastic-agent/pkg/version.Commit=$(COMMIT) -X wantastic-agent/pkg/version.BuildDate=$(DATE)"
-GOBUILD_HEADLESS=$(GOCMD) build -tags nosystray -ldflags=$(HEADLESS_LDFLAGS)
-
-CROSS_TARGETS := \
-	linux/386 \
-	linux/amd64 \
-	linux/arm \
-	linux/arm64 \
-	linux/loong64 \
-	linux/mips \
-	linux/mips64 \
-	linux/mips64le \
-	linux/mipsle \
-	linux/ppc64 \
-	linux/ppc64le \
-	linux/riscv64 \
-	linux/s390x \
-	windows/amd64
+desktop-dev:
+	go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 dev
 
 build-all:
-	@for target in $(CROSS_TARGETS); do \
-		echo "Building headless for $$target"; \
+	@for target in $(TARGETS); do \
+		echo "Building for $$target"; \
 		mkdir -p bin; \
-		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) \
-			$(GOBUILD_HEADLESS) -o bin/$(BINARY_NAME)-$$(echo $$target | tr '/' '-') internal/agent/...; \
+		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) CGO_ENABLED=0 \
+			$(GOCMD) build -tags nosystray -ldflags="$(LDFLAGS)" \
+			-o bin/$(BINARY_NAME)-$$(echo $$target | tr '/' '-') $(CMD_PATH); \
 	done
-	@echo "Building headless for linux/armv7"
-	GOOS=linux GOARCH=arm GOARM=7 $(GOBUILD_HEADLESS) -o bin/$(BINARY_NAME)-linux-armv7 ./internal/agent/...
+	@mkdir -p bin
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 $(GOCMD) build -tags nosystray -ldflags="$(LDFLAGS)" -o bin/$(BINARY_NAME)-linux-armv7 $(CMD_PATH)
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-
-clean:
-	$(GOCLEAN)
-	rm -rf bin
-
-genproto:
-	protoc -Iproto --go_out=internal/grpc/proto --go_opt=paths=source_relative \
-		--go-grpc_out=internal/grpc/proto --go-grpc_opt=paths=source_relative \
-		auth.proto
+GOBUILD_IWINFO=CGO_ENABLED=1 $(GOCMD) build -tags iwinfo -ldflags="$(LDFLAGS)"
+build-iwinfo:
+	@mkdir -p bin
+	$(GOBUILD_IWINFO) -o bin/$(BINARY_NAME)-iwinfo $(CMD_PATH)
 
 test:
-	$(GOTEST) -v ./...
+	$(GOCMD) test -tags nosystray ./...
 
-# Copy icon into the Wails build directory
-install-icons:
-	@echo "Installing icons…"
-	@mkdir -p gui/build
-	@cp /Users/kimo/Desktop/kmoz000/ISPApp-TunnelHub/cmd/web/portal/app/public/logo/512.png \
-	     gui/build/appicon.png
-	@cp /Users/kimo/Desktop/kmoz000/ISPApp-TunnelHub/cmd/web/portal/app/public/logo/512.png \
-	     gui/frontend/public/logo.png
-	@echo "Icons installed."
+clean:
+	$(GOCMD) clean
+	rm -rf bin build/bin
+
+run: build
+	./bin/$(BINARY_NAME) connect -config traditional_wg.conf -v
 
 release:
 	git tag -a $(firstword $(filter-out release,$(MAKECMDGOALS))) -m "Release $(firstword $(filter-out release,$(MAKECMDGOALS)))"
 	git push origin $(firstword $(filter-out release,$(MAKECMDGOALS)))
 
-.PHONY: all build build-all build-mac build-windows build-linux clean run dev gui-dev \
-        deps genproto test install-icons release
+adb-test-build:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=$(ADB_GOOS) GOARCH=$(ADB_GOARCH) GOARM=$(ADB_GOARM) $(GOCMD) build -trimpath -o $(ADB_TEST_BINARY) ./cmd/test
+
+adb-test-run: adb-test-build
+	@ADB_LIVE_ONCE=1 ADB_BINARY=$(ADB_TEST_BINARY) ADB_TEST_ARGS='$(ADB_TEST_ARGS)' tools/adb-live.sh
+
+adb-live:
+	@ADB_BINARY=$(ADB_TEST_BINARY) ADB_TEST_ARGS='$(ADB_TEST_ARGS)' tools/adb-live.sh
+
+adb-wantasticd-build:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(ADB_AGENT_GOARCH) GOARM=$(ADB_AGENT_GOARM) $(GOBUILD) -trimpath -o $(ADB_AGENT_BINARY) $(CMD_PATH)
+
+adb-wantasticd-update: adb-wantasticd-build
+	@ADB_BINARY=$(ADB_AGENT_BINARY) ADB_REMOTE_PATH=$(ADB_AGENT_REMOTE_PATH) ADB_SERVICE=$(ADB_AGENT_SERVICE) ADB_CONFIG_PATH=$(ADB_AGENT_CONFIG_PATH) tools/adb-update-wantasticd.sh
+
+adb-wantasticd: adb-wantasticd-update
+
+.PHONY: all build desktop desktop-dev build-all build-iwinfo test clean run release \
+	adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update adb-wantasticd

@@ -29,8 +29,8 @@ func main() {
 		DisableResize:     false,
 		Fullscreen:        false,
 		Frameless:         false,
-		StartHidden:       true,  // app starts hidden; show via systray or startup logic
-		HideWindowOnClose: true,  // X hides to tray; Quit is in the tray menu
+		StartHidden:       true, // app starts hidden; show via systray or startup logic
+		HideWindowOnClose: true, // X hides to tray; Quit is in the tray menu
 		AssetServer: &assetserver.Options{
 			Assets: frontendAssets,
 		},
@@ -50,7 +50,7 @@ func main() {
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
 			// Note: ActivationPolicy (no-Dock-icon / accessory mode) is not yet
-			// exposed in Wails v2.11.0 mac.Options. The app will show a Dock icon
+			// exposed in Wails v2 mac.Options. The app will show a Dock icon
 			// until Wails exposes this option (it is already commented out upstream).
 		},
 		Windows: &windows.Options{

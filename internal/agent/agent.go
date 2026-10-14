@@ -2,48 +2,37 @@ package agent
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"time"
-	"wantastic-agent/internal/stats"
+	platformdns "wantastic-agent/internal/platform/dns"
 	"wantastic-agent/internal/update"
 
 	"wantastic-agent/internal/config"
 	"wantastic-agent/internal/device"
-	"wantastic-agent/internal/grpc"
-	pb "wantastic-agent/internal/grpc/proto"
 	"wantastic-agent/pkg/version"
 )
 
-// Agent represents the main agent that manages the WireGuard device and gRPC communication
+// Agent manages the WireGuard device, local health workers, and optional auto-update.
 type Agent struct {
 	config  *config.Config
 	device  *device.Device
-	client  *grpc.Client
 	updater *update.Manager
-	stats   *stats.Server
+	usp     *uspRuntime
 
-	mu      sync.RWMutex
-	running bool
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	mu           sync.RWMutex
+	running      bool
+	stopCh       chan struct{}
+	workerCancel context.CancelFunc
+	wg           sync.WaitGroup
 
 	apiServer *APIServer
 }
 
-// New creates a new Agent with the provided configuration
+// New creates a new Agent with the provided configuration.
 func New(cfg *config.Config) (*Agent, error) {
-	return NewWithClient(cfg, nil)
-}
-
-// NewWithClient creates a new Agent with the provided configuration and optional gRPC client
-// If client is nil, the agent will create one automatically based on the configuration
-func NewWithClient(cfg *config.Config, client *grpc.Client) (*Agent, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -57,18 +46,19 @@ func NewWithClient(cfg *config.Config, client *grpc.Client) (*Agent, error) {
 
 	updater := update.NewManager(version.Version)
 
-	// Initialize stats server
-	statsServer := stats.NewServer(dev, version.Version)
-
-	// Link the metrics serializer to the WireGuard driver so it can be pushed over P2P
-	dev.SetStatsProvider(statsServer.GetSerializedMetrics)
+	uspRuntime, err := newUSPRuntime(cfg, dev, version.Version)
+	if err != nil {
+		return nil, fmt.Errorf("create usp runtime: %w", err)
+	}
+	if uspRuntime != nil {
+		dev.SetWUSPHandler(uspRuntime.HandlePeerPacket)
+	}
 
 	agt := &Agent{
 		config:  cfg,
 		device:  dev,
 		updater: updater,
-		stats:   statsServer,
-		client:  client, // Store the pre-configured client
+		usp:     uspRuntime,
 		stopCh:  make(chan struct{}),
 	}
 	agt.apiServer = NewAPIServer(agt)
@@ -76,82 +66,74 @@ func NewWithClient(cfg *config.Config, client *grpc.Client) (*Agent, error) {
 }
 
 // Start starts the agent and its components.
-// It first checks if the agent is already running, and if so, returns an error.
-// Start initializes and starts the agent with the provided context.
-// This begins device operation, network stack initialization, and optional gRPC client connection.
-// Returns an error if the agent is already running or if initialization fails.
 func (a *Agent) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
 		return fmt.Errorf("agent already running")
 	}
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	a.workerCancel = workerCancel
+	a.stopCh = make(chan struct{})
 	a.running = true
 	a.mu.Unlock()
 
-	// Use pre-configured client if available, otherwise create one if authentication credentials are provided
-	if a.client == nil {
-		if a.config.Auth.ServerURL != "" && a.config.Auth.Token != "" {
-			client, err := grpc.New(a.config.Auth.ServerURL, a.config.DeviceID, a.config.Auth.Token)
-			if err != nil {
-				log.Printf("Warning: could not create gRPC client, running with local configuration only: %v", err)
-			} else {
-				a.client = client
-				if err := a.runOnce(ctx); err != nil {
-					log.Printf("Warning: initial configuration fetch failed, running with local configuration: %v", err)
-				}
-			}
-		} else {
-			log.Printf("Running with local configuration only (no gRPC authentication required)")
-		}
-	} else {
-		// Use the pre-configured client
-		if err := a.runOnce(ctx); err != nil {
-			log.Printf("Warning: initial configuration fetch failed with pre-configured client: %v", err)
-		}
-	}
-
-	// Wire up the gRPC client so the device can validate and execute export
-	// requests received via P2P TUN control messages (subtype 8).
-	if a.client != nil {
-		a.device.SetGRPCClient(a.client)
-	}
-
 	if err := a.device.Start(); err != nil {
+		workerCancel()
+		a.mu.Lock()
+		a.running = false
+		a.workerCancel = nil
+		a.mu.Unlock()
 		return fmt.Errorf("start device: %w", err)
 	}
 
-	// Start stats server
-	if a.config.Verbose {
-		if err := a.stats.Start(); err != nil {
-			log.Printf("Warning: failed to start stats server: %v", err)
+	var localAccessRoutes []string
+	if a.config.AllowLocalAccess {
+		var err error
+		localAccessRoutes, err = a.device.EnableLocalAccess(a.config.LocalAccessRoutes)
+		if err != nil {
+			_ = a.device.Stop()
+			workerCancel()
+			a.mu.Lock()
+			a.running = false
+			a.workerCancel = nil
+			a.mu.Unlock()
+			return fmt.Errorf("enable local access: %w", err)
 		}
+		log.Printf("Local access enabled for tenant routes: %v", localAccessRoutes)
 	}
 
-	// Start background workers
-	// We always run HealthCheck and DNSCheck (Linux)
-	workerCount := 2
+	workerCount := 2 // HealthCheck + DNSCheck
 	if a.config.AutoUpdate {
-		workerCount++ // UpdateChecker
+		workerCount++
 	}
-	if a.client != nil {
-		workerCount += 2 // GRPC + ConfigMonitor
+	if a.usp != nil {
+		workerCount += 2
+	}
+	if a.config.AllowLocalAccess {
+		workerCount++
 	}
 	a.wg.Add(workerCount)
 
-	go a.runHealthCheck(ctx)
-	go a.runDNSCheck(ctx)
+	go a.runHealthCheck(workerCtx)
+	go a.runDNSCheck(workerCtx)
+
+	if a.usp != nil {
+		go a.runWUSPInit(workerCtx)
+		go a.runNetworkSpeedMonitor(workerCtx)
+	}
+	if a.config.AllowLocalAccess {
+		go a.runLocalAccessAdvertiser(workerCtx, localAccessRoutes)
+	}
 
 	if a.config.AutoUpdate {
 		log.Println("Auto-update enabled")
-		go a.runUpdateChecker(ctx)
+		go a.runUpdateChecker(workerCtx)
 	} else {
-		log.Println("Auto-update disabled (use --auto-update to enable)")
-	}
-
-	if a.client != nil {
-		go a.runGRPCClient(ctx)
-		go a.runConfigMonitor(ctx)
+		log.Println("Auto-update disabled")
 	}
 
 	if err := a.apiServer.Start(); err != nil {
@@ -161,24 +143,50 @@ func (a *Agent) Start(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) runOnce(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
+func (a *Agent) runLocalAccessAdvertiser(ctx context.Context, routes []string) {
+	defer a.wg.Done()
+	defer func() {
+		if err := a.sendLocalAccessAdvertisement(nil); err != nil {
+			log.Printf("Local-access route revocation could not be delivered: %v", err)
+		}
+		if err := a.device.DisableLocalAccess(); err != nil {
+			log.Printf("Failed to disable local-access forwarding: %v", err)
+		}
+	}()
 
-	if err := a.checkForConfigUpdates(ctx); err != nil {
-		return err
+	send := func() {
+		if err := a.sendLocalAccessAdvertisement(routes); err != nil {
+			log.Printf("Local-access route advertisement failed; will retry: %v", err)
+		}
 	}
-	return nil
+	send()
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.stopCh:
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
 }
 
-// Stop stops the agent and its components.
-// It first checks if the agent is already stopped, and if so, returns nil.
-// If not, it sets the running flag to false and unlocks the mutex.
-// Then, it closes the stopCh channel if it hasn't been closed already.
-// After that, it waits for all goroutines to finish.
-// If a gRPC client is available, it closes it.
-// Finally, it stops the netstack and device components.
-// Returns an error if any component fails to stop.
+func (a *Agent) sendLocalAccessAdvertisement(routes []string) error {
+	if a.config.Server.PublicKey == "" {
+		return fmt.Errorf("no tenant server configured")
+	}
+	payload, err := device.EncodeLocalAccessAdvertisement(routes)
+	if err != nil {
+		return err
+	}
+	return a.device.SendTUNControl(a.config.Server.PublicKey, payload)
+}
+
+// Stop stops the agent and all its components.
 func (a *Agent) Stop() error {
 	a.mu.Lock()
 	if !a.running {
@@ -186,28 +194,26 @@ func (a *Agent) Stop() error {
 		return nil
 	}
 	a.running = false
+	workerCancel := a.workerCancel
+	a.workerCancel = nil
 
-	// Only close stopCh if it hasn't been closed already
 	select {
 	case <-a.stopCh:
-		// Channel already closed
 	default:
 		close(a.stopCh)
 	}
 	a.mu.Unlock()
 
-	a.wg.Wait()
-
-	if a.stats != nil {
-		a.stats.Stop()
+	if workerCancel != nil {
+		workerCancel()
 	}
+	if a.usp != nil {
+		a.usp.Close()
+	}
+	a.wg.Wait()
 
 	if err := a.device.Stop(); err != nil {
 		log.Printf("Error stopping device: %v", err)
-	}
-
-	if a.client != nil {
-		a.client.Close()
 	}
 
 	if a.apiServer != nil {
@@ -217,24 +223,14 @@ func (a *Agent) Stop() error {
 	return nil
 }
 
-func (a *Agent) runGRPCClient(ctx context.Context) {
+func (a *Agent) runWUSPInit(ctx context.Context) {
 	defer a.wg.Done()
+	a.usp.runInit(ctx)
+}
 
-	ticker := time.NewTicker(a.config.Auth.RefreshTime)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.stopCh:
-			return
-		case <-ticker.C:
-			if err := a.client.RefreshAuth(ctx); err != nil {
-				log.Printf("Auth refresh failed: %v", err)
-			}
-		}
-	}
+func (a *Agent) runNetworkSpeedMonitor(ctx context.Context) {
+	defer a.wg.Done()
+	a.usp.runNetworkSpeedMonitor(ctx, a.stopCh)
 }
 
 func (a *Agent) runHealthCheck(ctx context.Context) {
@@ -257,63 +253,14 @@ func (a *Agent) runHealthCheck(ctx context.Context) {
 	}
 }
 
-func (a *Agent) runConfigMonitor(ctx context.Context) {
-	defer a.wg.Done()
-
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.stopCh:
-			return
-		case <-ticker.C:
-			if err := a.checkForConfigUpdates(ctx); err != nil {
-				log.Printf("Config update check failed: %v", err)
-			}
-		}
-	}
-}
-
 func (a *Agent) runDNSCheck(ctx context.Context) {
 	defer a.wg.Done()
 
-	// Only run on Linux
-	if runtime.GOOS != "linux" {
-		return
-	}
+	// Initial assertion + periodic re-assertion. Frequent enough to recover
+	// quickly from external rewrites (DHCP, netifd, container restarts).
+	platformdns.ApplyTunnel(ctx, a.config.Interface.DNS)
 
-	checkDNS := func() {
-		// Read /etc/resolv.conf
-		content, err := os.ReadFile("/etc/resolv.conf")
-		if err != nil {
-			return
-		}
-		s := string(content)
-
-		// Check if reliable DNS exists
-		if !strings.Contains(s, "1.1.1.1") && !strings.Contains(s, "8.8.8.8") {
-			// Append if running as root/privileged
-			f, err := os.OpenFile("/etc/resolv.conf", os.O_APPEND|os.O_WRONLY, 0644)
-			if err != nil {
-				// Likely permission denied if not root; silent fail is okay as we can't do anything
-				return
-			}
-			defer f.Close()
-
-			log.Println("DNS Worker: Adding reliable nameservers (1.1.1.1, 8.8.8.8) to /etc/resolv.conf")
-			if _, err := f.WriteString("\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"); err != nil {
-				log.Printf("Warning: DNS worker failed to update resolv.conf: %v", err)
-			}
-		}
-	}
-
-	// Initial check
-	checkDNS()
-
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -323,7 +270,7 @@ func (a *Agent) runDNSCheck(ctx context.Context) {
 		case <-a.stopCh:
 			return
 		case <-ticker.C:
-			checkDNS()
+			platformdns.ApplyTunnel(ctx, a.config.Interface.DNS)
 		}
 	}
 }
@@ -335,8 +282,10 @@ func (a *Agent) runUpdateChecker(ctx context.Context) {
 	initial := time.NewTimer(1 * time.Minute)
 	defer initial.Stop()
 
-	// Daily check
-	ticker := time.NewTicker(24 * time.Hour)
+	// Keep the fleet current without requiring a service restart. Release
+	// artifacts are immutable, so an hourly version-marker request is cheap and
+	// avoids leaving long-running routers one day behind a control-plane fix.
+	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 
 	check := func() {
@@ -370,7 +319,7 @@ func (a *Agent) performSelfUpdate(ctx context.Context, version string) {
 	}
 	updated, err := a.updater.CheckAndUpdate(ctx, version)
 	if err != nil {
-		log.Printf("Self-update failed: %v", err)
+		log.Printf("Self-update failed; agent remains active and will retry on the next scheduled check: %v", err)
 		return
 	}
 	if updated {
@@ -380,50 +329,6 @@ func (a *Agent) performSelfUpdate(ctx context.Context, version string) {
 		// Exit the process so supervisor (e.g. systemd) restarts it with new binary
 		os.Exit(0)
 	}
-}
-
-func (a *Agent) checkForConfigUpdates(ctx context.Context) error {
-	resp, err := a.client.GetConfiguration(ctx)
-	if err != nil {
-		return fmt.Errorf("get configuration: %w", err)
-	}
-
-	if resp.UpdateAvailable {
-		if a.config.AutoUpdate {
-			log.Printf("Update available via Config: %s -> %s", a.updater.GetCurrentVersion(), resp.UpdateVersion)
-			a.performSelfUpdate(ctx, resp.UpdateVersion)
-		} else {
-			log.Printf("Update available: %s -> %s (auto-update disabled, run with --auto-update to enable)", a.updater.GetCurrentVersion(), resp.UpdateVersion)
-		}
-	}
-
-	if err := a.applyConfiguration(resp); err != nil {
-		return fmt.Errorf("apply configuration: %w", err)
-	}
-
-	return nil
-}
-
-func (a *Agent) applyConfiguration(resp *pb.GetConfigurationResponse) error {
-	if resp.DeviceConfig != nil {
-		if err := a.device.UpdateConfig(resp.DeviceConfig); err != nil {
-			return fmt.Errorf("update device config: %w", err)
-		}
-	}
-
-	if resp.ServerConfig != nil {
-		if err := a.device.UpdateServerConfig(resp.ServerConfig); err != nil {
-			return fmt.Errorf("update server config: %w", err)
-		}
-	}
-
-	if resp.ExitNodeConfig != nil {
-		if err := a.device.UpdateExitNodeConfig(resp.ExitNodeConfig); err != nil {
-			return fmt.Errorf("update exit node config: %w", err)
-		}
-	}
-
-	return nil
 }
 
 // IsRunning returns true if the agent is running, false otherwise.
@@ -443,18 +348,9 @@ func (a *Agent) SetExitNode(peerPubKey string) error {
 		return fmt.Errorf("no server configured for exit node coordination")
 	}
 
-	data := make([]byte, 33)
-	if peerPubKey == "none" {
-		data[0] = 3 // Action 3: Client Request Routing (All zeros = Direct Mode / Disable Exit Node)
-	} else {
-		// Ensure peerPubKey hex converts successfully
-		decoded, err := hex.DecodeString(peerPubKey)
-		if err != nil || len(decoded) != 32 {
-			return fmt.Errorf("invalid peer public key for routing: %s", peerPubKey)
-		}
-
-		data[0] = 3 // Action 3: Client requests server to establish exit node route
-		copy(data[1:], decoded)
+	data, err := device.EncodeExitNodeSelectionTUNControl(peerPubKey)
+	if err != nil {
+		return fmt.Errorf("invalid peer public key for routing: %w", err)
 	}
 
 	log.Printf("[Agent] Sending Exit Node Routing request to peer %s via Noise Protocol TUN control", peerPubKey)
@@ -463,20 +359,32 @@ func (a *Agent) SetExitNode(peerPubKey string) error {
 
 // ToggleOfferExitNode toggles whether this device offers itself as an exit node locally and informs the server natively over WireGuard Noise.
 func (a *Agent) ToggleOfferExitNode() error {
-	a.mu.Lock()
+	a.mu.RLock()
 	enabled := !a.config.ExitNode.Enabled
+	a.mu.RUnlock()
+	return a.SetOfferExitNode(enabled)
+}
+
+// SetOfferExitNode explicitly controls whether this device may be selected as
+// an exit node. The value is persisted before it is announced to the tenant
+// coordinator, so a restart cannot silently change the user's choice.
+func (a *Agent) SetOfferExitNode(enabled bool) error {
+	a.mu.Lock()
+	previous := a.config.ExitNode.Enabled
 	a.config.ExitNode.Enabled = enabled
 	serverPubKey := a.config.Server.PublicKey
+	cfg := a.config
 	a.mu.Unlock()
 
+	if err := cfg.Save(); err != nil {
+		a.mu.Lock()
+		a.config.ExitNode.Enabled = previous
+		a.mu.Unlock()
+		return fmt.Errorf("persist exit-node preference: %w", err)
+	}
+
 	if serverPubKey != "" && a.device != nil {
-		data := make([]byte, 2)
-		data[0] = 4 // Action 4: Toggle Offer Exit Node status updates
-		if enabled {
-			data[1] = 1
-		} else {
-			data[1] = 0
-		}
+		data := device.EncodeExitNodeOfferTUNControl(enabled)
 		log.Printf("[Agent] Sending Exit Node offer status (%v) to server via Noise Protocol", enabled)
 		return a.device.SendTUNControl(serverPubKey, data)
 	}

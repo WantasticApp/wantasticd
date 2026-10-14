@@ -5,6 +5,11 @@ import (
 	"net"
 )
 
+const (
+	p2pCandidatePayloadMagic = "WPC1"
+	p2pCandidateAddrLen      = 18 // 16-byte IP + 2-byte UDP port
+)
+
 // P2P message subtypes
 const (
 	P2PSubtypeRegister     = 1 // Client -> Server: Register my endpoints
@@ -107,4 +112,76 @@ func (m *P2PMessage) SetObservedAddr(addr *net.UDPAddr) {
 	}
 	copy(m.ObservedIP[:], addr.IP.To16())
 	m.ObservedPort = uint16(addr.Port)
+}
+
+func AppendP2PCandidatePayload(prefix []byte, candidates []net.UDPAddr) []byte {
+	encoded := EncodeP2PCandidatePayload(candidates)
+	if len(encoded) == 0 {
+		return prefix
+	}
+	out := make([]byte, 0, len(prefix)+len(encoded))
+	out = append(out, prefix...)
+	out = append(out, encoded...)
+	return out
+}
+
+func EncodeP2PCandidatePayload(candidates []net.UDPAddr) []byte {
+	if len(candidates) == 0 {
+		return nil
+	}
+	buf := make([]byte, 4+1, 4+1+len(candidates)*p2pCandidateAddrLen)
+	copy(buf[:4], p2pCandidatePayloadMagic)
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Port <= 0 {
+			continue
+		}
+		ip := candidate.IP.To16()
+		if ip == nil {
+			continue
+		}
+		key := (&net.UDPAddr{IP: ip, Port: candidate.Port}).String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		if int(buf[4]) == 255 {
+			break
+		}
+		seen[key] = struct{}{}
+		buf[4]++
+		buf = append(buf, make([]byte, p2pCandidateAddrLen)...)
+		offset := len(buf) - p2pCandidateAddrLen
+		copy(buf[offset:offset+16], ip)
+		binary.BigEndian.PutUint16(buf[offset+16:offset+18], uint16(candidate.Port))
+	}
+	if buf[4] == 0 {
+		return nil
+	}
+	return buf
+}
+
+func DecodeP2PCandidatePayload(payload []byte, offset int) []net.UDPAddr {
+	if offset < 0 || len(payload) < offset+5 || string(payload[offset:offset+4]) != p2pCandidatePayloadMagic {
+		return nil
+	}
+	count := int(payload[offset+4])
+	pos := offset + 5
+	if len(payload) < pos+count*p2pCandidateAddrLen {
+		return nil
+	}
+
+	candidates := make([]net.UDPAddr, 0, count)
+	for i := 0; i < count; i++ {
+		rawIP := append(net.IP(nil), payload[pos:pos+16]...)
+		port := int(binary.BigEndian.Uint16(payload[pos+16 : pos+18]))
+		if ip4 := rawIP.To4(); ip4 != nil {
+			rawIP = append(net.IP(nil), ip4...)
+		}
+		if port > 0 && rawIP.To16() != nil {
+			candidates = append(candidates, net.UDPAddr{IP: rawIP, Port: port})
+		}
+		pos += p2pCandidateAddrLen
+	}
+	return candidates
 }

@@ -6,9 +6,9 @@
 package device
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -16,8 +16,8 @@ import (
 
 	"wantastic-agent/internal/device/wireguard-go/conn"
 	"wantastic-agent/internal/device/wireguard-go/tun"
+	"wantastic-agent/internal/wusp"
 
-	"github.com/andybalholm/brotli"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -81,66 +81,6 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.peer = nil
 }
 
-func (peer *Peer) SendStats() {
-	if !peer.isRunning.Load() {
-		peer.device.log.Verbosef("%v - SendStats: Peer not running", peer)
-		return
-	}
-
-	// Check if this peer is configured to receive stats
-	if !peer.SendStatsEnabled.Load() {
-		peer.device.log.Verbosef("%v - SendStats: Stats not enabled", peer)
-		return
-	}
-
-	// Payload generation
-	var statsData []byte
-
-	if peer.device.statsProvider != nil {
-		// Layer 1: Get custom binary serialized "Big Data"
-		statsData = peer.device.statsProvider()
-	} else {
-		// Fallback: Simple stats (Timestamp | RX | TX)
-		statsData = make([]byte, 24)
-		binary.LittleEndian.PutUint64(statsData[0:], uint64(time.Now().UnixNano()))
-		binary.LittleEndian.PutUint64(statsData[8:], peer.rxBytes.Load())
-		binary.LittleEndian.PutUint64(statsData[16:], peer.txBytes.Load())
-	}
-
-	// Layer 2: Brotli Compression
-	var b bytes.Buffer
-	w := brotli.NewWriterLevel(&b, brotli.BestCompression)
-	w.Write(statsData)
-	w.Close() // Flush to buffer
-	compressed := b.Bytes()
-
-	elem := peer.device.NewOutboundElement()
-	elem.msgType = MessageStatsType
-
-	if len(compressed) > 1200 {
-		peer.device.log.Errorf("%v - Stats payload too large: %d (Max ~1200)", peer, len(compressed))
-		// We allow up to roughly safe MTU for this special packet
-	}
-
-	copy(elem.buffer[MessageTransportHeaderSize:], compressed)
-	elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(compressed)]
-
-	elemsContainer := peer.device.GetOutboundElementsContainer()
-	elemsContainer.elems = append(elemsContainer.elems, elem)
-
-	select {
-	case peer.queue.staged <- elemsContainer:
-		peer.device.log.Verbosef("%v - Sending stats packet (Count: %d)", peer, peer.handshakeCount.Load())
-	default:
-		peer.device.PutMessageBuffer(elem.buffer)
-		peer.device.PutOutboundElement(elem)
-		peer.device.PutOutboundElementsContainer(elemsContainer)
-		return
-	}
-
-	peer.SendStagedPackets()
-}
-
 func (peer *Peer) SendTUNControl(data []byte) {
 	if !peer.isRunning.Load() {
 		peer.device.log.Verbosef("%v - SendTUNControl: Peer not running", peer)
@@ -172,6 +112,86 @@ func (peer *Peer) SendTUNControl(data []byte) {
 	}
 
 	peer.SendStagedPackets()
+}
+
+func (peer *Peer) SendWUSP(data []byte) error {
+	return peer.SendWUSPFragmented(data, wusp.WUSPMaxDatagramPayload)
+}
+
+func (peer *Peer) SendWUSPFragmented(data []byte, maxDatagramPayload int) error {
+	if !peer.isRunning.Load() {
+		peer.device.log.Verbosef("%v - SendWUSP: Peer not running", peer)
+		return fmt.Errorf("peer not running")
+	}
+
+	// Always wrap in control fragments — even for small payloads. The fragment
+	// header carries an explicit payload size, which lets the receiver strip
+	// WireGuard's padding zeros after decryption. Without this, a 479-byte
+	// payload gets padded to 480 and the decoder chokes on the trailing zero.
+	frames, err := wusp.FragmentUSPControlPayload(data, peer.device.nextWUSPFragmentMessageID(), maxDatagramPayload)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to fragment WUSP payload: %v", peer, err)
+		return err
+	}
+
+	// Queue ALL fragments before calling SendStagedPackets — this prevents
+	// partial fragment delivery when the queue drains between iterations.
+	for _, frame := range frames {
+		if len(frame) > wusp.WUSPMaxDatagramPayload {
+			peer.device.log.Errorf("%v - WUSP payload too large: %d (Max %d)", peer, len(frame), wusp.WUSPMaxDatagramPayload)
+			return fmt.Errorf("wusp payload too large: %d", len(frame))
+		}
+
+		elemsContainer := peer.device.GetOutboundElementsContainer()
+		elem := peer.device.NewOutboundElement()
+		elem.msgType = MessageWUSPType
+		copy(elem.buffer[MessageTransportHeaderSize:], frame)
+		elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(frame)]
+		elemsContainer.elems = append(elemsContainer.elems, elem)
+
+		// Blocking send — WUSP control messages must not be silently dropped.
+		// The queue is large (512 slots) so this will rarely block.
+		peer.queue.staged <- elemsContainer
+	}
+	peer.SendStagedPackets()
+	peer.device.log.Verbosef("%v - Sending %d WUSP packet(s)", peer, len(frames))
+	return nil
+}
+
+func (peer *Peer) SendWUSPDatagram(data []byte) error {
+	if !peer.isRunning.Load() {
+		peer.device.log.Verbosef("%v - SendWUSPDatagram: Peer not running", peer)
+		return fmt.Errorf("peer not running")
+	}
+	if len(data) > wusp.WUSPMaxDatagramPayload {
+		peer.device.log.Errorf("%v - WUSP datagram too large: %d (Max %d)", peer, len(data), wusp.WUSPMaxDatagramPayload)
+		return fmt.Errorf("wusp datagram too large: %d", len(data))
+	}
+
+	elemsContainer := peer.device.GetOutboundElementsContainer()
+	elem := peer.device.NewOutboundElement()
+	elem.msgType = MessageWUSPType
+	copy(elem.buffer[MessageTransportHeaderSize:], data)
+	elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(data)]
+	elemsContainer.elems = append(elemsContainer.elems, elem)
+	peer.queue.staged <- elemsContainer
+	peer.SendStagedPackets()
+	return nil
+}
+
+func (peer *Peer) releaseStagedWUSPPackets(elemsContainer *QueueOutboundElementsContainer) {
+	if elemsContainer == nil {
+		return
+	}
+	for _, elem := range elemsContainer.elems {
+		if elem == nil {
+			continue
+		}
+		peer.device.PutMessageBuffer(elem.buffer)
+		peer.device.PutOutboundElement(elem)
+	}
+	elemsContainer.elems = elemsContainer.elems[:0]
+	peer.device.PutOutboundElementsContainer(elemsContainer)
 }
 
 /* Queues a keepalive if no packets are queued for peer
@@ -358,6 +378,9 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+				if client := device.GetP2PClient(); client != nil {
+					client.ObserveDestination(dst)
+				}
 				peer = device.allowedips.Lookup(dst)
 
 			case 6:
@@ -365,6 +388,9 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
+				if client := device.GetP2PClient(); client != nil {
+					client.ObserveDestination(dst)
+				}
 				peer = device.allowedips.Lookup(dst)
 
 			default:

@@ -57,8 +57,6 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
-
-	SendStatsEnabled atomic.Bool // Enable sending custom MessageType 5
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -126,13 +124,6 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 
 	peer.endpoint.Lock()
 	endpoint := peer.endpoint.val
-
-	// If P2P subsystem has established a direct endpoint, prefer it
-	if peer.device.p2pClient != nil {
-		if p2pEndpoint := peer.device.p2pClient.GetEndpointForPeer(peer.handshake.remoteStatic); p2pEndpoint != nil {
-			endpoint = p2pEndpoint
-		}
-	}
 
 	if endpoint == nil {
 		peer.endpoint.Unlock()

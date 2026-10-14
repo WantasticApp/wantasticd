@@ -94,12 +94,12 @@ jobs:
             -CertStoreLocation 'Cert:\CurrentUser\My' `
             -NotAfter (Get-Date).AddYears(3)
           try {
-            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-              Sort-Object FullName |
-              Select-Object -Last 1
-            if (-not $signTool) { throw 'signtool.exe was not found' }
-            & $signTool.FullName sign /fd SHA256 /sha1 $certificate.Thumbprint build/bin/wantastic.exe
-            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+            Set-AuthenticodeSignature `
+              -FilePath build/bin/wantastic.exe `
+              -Certificate $certificate `
+              -HashAlgorithm SHA256 `
+              -IncludeChain All `
+              -Force | Out-Null
             $signature = Get-AuthenticodeSignature -LiteralPath build/bin/wantastic.exe
             $signatureStatus = $signature.Status.ToString()
             if ($signatureStatus -notin @('Valid', 'NotTrusted')) {

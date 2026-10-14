@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -129,6 +130,13 @@ func (a *App) startEmbeddedAgent() error {
 	}
 	cfg.Interface.TUNMode = true
 	cfg.Interface.TUNName = config.DefaultTunName()
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
+		a.mu.Lock()
+		a.cfg = cfg
+		a.configured = true
+		a.mu.Unlock()
+		return nil
+	}
 	return a.startConfig(cfg)
 }
 
@@ -209,7 +217,7 @@ func (a *App) GetStatus() (*StatusData, error) {
 		Configured: true, Running: raw.Running, DeviceRunning: raw.DeviceRunning,
 		TUNMode: raw.TUNMode, TUNName: raw.TUNName, OfferExitNode: raw.ExitNode,
 		LocalAccess: raw.LocalAccess, LocalAccessRoutes: append([]string(nil), cfg.LocalAccessRoutes...),
-		MagicDNS: len(cfg.Interface.DNS) > 0, DNSServers: append([]string(nil), cfg.Interface.DNS...),
+		MagicDNS: magicDNSActive(cfg.Interface.DNS), DNSServers: append([]string(nil), cfg.Interface.DNS...),
 		IPs: raw.IPs, PubKey: raw.PubKey, RxBytes: raw.RxBytes, TxBytes: raw.TxBytes, Peers: peers,
 	}, nil
 }
@@ -254,21 +262,27 @@ func sanitizeDNSLabel(value string) string {
 func (a *App) ToggleVPN() error { return ipcPost("/api/state/toggle") }
 
 func (a *App) SetOfferExitNode(enabled bool) error {
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
+		return ipcPost(fmt.Sprintf("/api/exitnode/offer?enabled=%t", enabled))
+	}
 	a.mu.RLock()
 	agt := a.agt
 	a.mu.RUnlock()
 	if agt == nil {
-		return errors.New("Wantastic is not configured")
+		return errors.New("wantastic is not configured")
 	}
 	return agt.SetOfferExitNode(enabled)
 }
 
 func (a *App) SetExitNode(publicKey string) error {
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
+		return ipcPost("/api/exitnode/use?peer=" + url.QueryEscape(strings.TrimSpace(publicKey)))
+	}
 	a.mu.RLock()
 	agt := a.agt
 	a.mu.RUnlock()
 	if agt == nil {
-		return errors.New("Wantastic is not configured")
+		return errors.New("wantastic is not configured")
 	}
 	return agt.SetExitNode(strings.TrimSpace(publicKey))
 }
@@ -288,6 +302,9 @@ func (a *App) ConfigureLocalAccess(enabled bool, routes []string) error {
 }
 
 func (a *App) updateConfig(update func(*config.Config)) error {
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
+		return errors.New("configuration changes require restarting the privileged development agent")
+	}
 	path := auth.DefaultConfigPath()
 	cfg, err := config.LoadFromFile(path)
 	if err != nil {
@@ -319,6 +336,9 @@ func (a *App) updateConfig(update func(*config.Config)) error {
 }
 
 func (a *App) ImportManualConfig(raw string) error {
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
+		return errors.New("manual import is disabled while using the privileged development agent")
+	}
 	if len(raw) == 0 {
 		return errors.New("configuration is empty")
 	}
@@ -394,17 +414,15 @@ func (a *App) PingPeer(reference string) (*PingResult, error) {
 		return nil, err
 	}
 	reference = strings.TrimSpace(reference)
-	var selected *PeerInfo
-	for i := range status.Peers {
-		peer := &status.Peers[i]
-		if strings.EqualFold(reference, peer.PublicKey) || strings.EqualFold(reference, peer.AssignedIP) ||
-			strings.EqualFold(reference, peer.Hostname) || strings.EqualFold(reference, peer.MagicName) {
-			selected = peer
-			break
-		}
+	a.mu.RLock()
+	cfg := a.cfg
+	a.mu.RUnlock()
+	if cfg == nil {
+		return nil, errors.New("wantastic is not configured")
 	}
-	if selected == nil || net.ParseIP(selected.AssignedIP) == nil {
-		return nil, errors.New("peer does not have a usable overlay IP")
+	selected, err := selectPingTarget(reference, status.Peers, cfg.Server.AllowedIPs)
+	if err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 4*time.Second)
 	defer cancel()
@@ -421,6 +439,33 @@ func (a *App) PingPeer(reference string) (*PingResult, error) {
 	}, nil
 }
 
+func selectPingTarget(reference string, peers []PeerInfo, allowedRoutes []string) (*PeerInfo, error) {
+	for i := range peers {
+		peer := &peers[i]
+		if strings.EqualFold(reference, peer.PublicKey) || strings.EqualFold(reference, peer.AssignedIP) ||
+			strings.EqualFold(reference, peer.Hostname) || strings.EqualFold(reference, peer.MagicName) {
+			if net.ParseIP(peer.AssignedIP) == nil {
+				return nil, errors.New("peer does not have a usable overlay IP")
+			}
+			return peer, nil
+		}
+	}
+	ip, err := netip.ParseAddr(reference)
+	if err != nil {
+		return nil, errors.New("peer was not found")
+	}
+	for _, raw := range allowedRoutes {
+		prefix, parseErr := netip.ParsePrefix(strings.TrimSpace(raw))
+		if parseErr == nil && prefix.Contains(ip) {
+			peer := device.PeerInfo{AssignedIP: ip.String()}
+			return &PeerInfo{
+				AssignedIP: ip.String(), MagicName: magicName(peer), Connection: "relay",
+			}, nil
+		}
+	}
+	return nil, errors.New("IP is outside the configured tenant routes")
+}
+
 func pingArgs(ip string) []string {
 	switch runtime.GOOS {
 	case "windows":
@@ -432,11 +477,13 @@ func pingArgs(ip string) []string {
 	}
 }
 
-func ipcURL(path string) string { return "http://127.0.0.1:" + agent.GetIPCPort() + path }
-
 func ipcGet(path string, target any) error {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(ipcURL(path))
+	req, err := agent.NewIPCRequest(context.Background(), http.MethodGet, path)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -449,7 +496,12 @@ func ipcGet(path string, target any) error {
 
 func ipcPost(path string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post(ipcURL(path), "application/json", nil)
+	req, err := agent.NewIPCRequest(context.Background(), http.MethodPost, path)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -458,6 +510,16 @@ func ipcPost(path string) error {
 		return fmt.Errorf("local service returned %s", resp.Status)
 	}
 	return nil
+}
+
+func magicDNSActive(servers []string) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	// Native DNS application is currently implemented only by the Linux
+	// adapter. macOS and Windows must not claim MagicDNS is active merely
+	// because addresses were present in a config file.
+	return runtime.GOOS == "linux"
 }
 
 func (a *App) showMainWindow() {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -90,14 +91,14 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						return
 
 					case <-mToggleOnOff.ClickedCh:
-						go http.Post("http://127.0.0.1:9034/api/state/toggle", "application/json", nil)
+						go trayIPCAction("/api/state/toggle")
 
 					case <-mToggleExit.ClickedCh:
-						go http.Post("http://127.0.0.1:9034/api/exitnode/toggle", "application/json", nil)
+						go trayIPCAction("/api/exitnode/toggle")
 
 					case <-ticker.C:
 						// Fetch latest status via local API
-						resp, err := http.Get("http://127.0.0.1:9034/api/status")
+						resp, err := trayIPC(http.MethodGet, "/api/status")
 						if err != nil {
 							continue
 						}
@@ -154,6 +155,27 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			log.Println("Systray finished")
 		},
 	)
+}
+
+func trayIPC(method, path string) (*http.Response, error) {
+	req, err := agent.NewIPCRequest(context.Background(), method, path)
+	if err != nil {
+		return nil, err
+	}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return (&http.Client{Timeout: 2 * time.Second}).Do(req)
+}
+
+func trayIPCAction(path string) {
+	resp, err := trayIPC(http.MethodPost, path)
+	if err != nil {
+		log.Printf("tray IPC action failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 }
 
 func newPeerMenuGroup(parent *systray.MenuItem, emptyTitle string) *peerMenuGroup {

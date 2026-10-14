@@ -3,6 +3,8 @@ package agent
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -35,5 +37,109 @@ func TestAllowLocalMutation(t *testing.T) {
 				t.Fatalf("status = %d, want %d", response.Code, tt.code)
 			}
 		})
+	}
+}
+
+func TestIPCAuthorization(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	s := &APIServer{token: token}
+	handler := s.authorize(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	tests := []struct {
+		name string
+		host string
+		auth string
+		code int
+	}{
+		{name: "valid", host: "127.0.0.1:9034", auth: "Bearer " + token, code: http.StatusNoContent},
+		{name: "missing token", host: "127.0.0.1:9034", code: http.StatusUnauthorized},
+		{name: "wrong scheme", host: "127.0.0.1:9034", auth: "Basic " + token, code: http.StatusUnauthorized},
+		{name: "wrong host", host: "attacker.example:9034", auth: "Bearer " + token, code: http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9034/api/status", nil)
+			req.Host = tt.host
+			req.Header.Set("Authorization", tt.auth)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != tt.code {
+				t.Fatalf("status = %d, want %d", response.Code, tt.code)
+			}
+		})
+	}
+}
+
+func TestNewAPIServerGeneratesProcessCredential(t *testing.T) {
+	t.Setenv("WTC_IPC_TOKEN", "")
+	t.Setenv("WTC_IPC_TOKEN_FILE", "")
+	s := NewAPIServer(nil)
+	if s.tokenError != nil {
+		t.Fatalf("NewAPIServer() token error = %v", s.tokenError)
+	}
+	if len(s.token) != 64 {
+		t.Fatalf("generated token length = %d, want 64", len(s.token))
+	}
+	if os.Getenv("WTC_IPC_TOKEN") != s.token {
+		t.Fatal("generated token was not scoped to the current process")
+	}
+}
+
+func TestReadIPCTokenRejectsLoosePermissions(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("POSIX permission test")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("0123456789abcdef0123456789abcdef\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WTC_IPC_TOKEN", "")
+	t.Setenv("WTC_IPC_TOKEN_FILE", path)
+	if _, err := readIPCToken(); err == nil {
+		t.Fatal("readIPCToken() accepted a group/world-readable token file")
+	}
+}
+
+func TestValidIPCPort(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{raw: " 9091\n", want: "9091", ok: true},
+		{raw: "1023", ok: false},
+		{raw: "65536", ok: false},
+		{raw: "9091/path", ok: false},
+	}
+	for _, tt := range tests {
+		got, ok := validIPCPort(tt.raw)
+		if got != tt.want || ok != tt.ok {
+			t.Fatalf("validIPCPort(%q) = %q, %t; want %q, %t", tt.raw, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestIPCDiscoveryRoundTrip(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	path := filepath.Join(t.TempDir(), "ipc-discovery")
+	t.Setenv("WTC_IPC_PORT", "")
+	t.Setenv("WTC_IPC_PORT_FILE", path)
+	t.Setenv("WTC_IPC_TOKEN", "")
+	t.Setenv("WTC_IPC_TOKEN_FILE", "")
+	if err := writeIPCPortFile(9091, token); err != nil {
+		t.Fatalf("writeIPCPortFile() error = %v", err)
+	}
+	if got := GetIPCPort(); got != "9091" {
+		t.Fatalf("GetIPCPort() = %q, want 9091", got)
+	}
+	got, err := readIPCToken()
+	if err != nil {
+		t.Fatalf("readIPCToken() error = %v", err)
+	}
+	if got != token {
+		t.Fatal("readIPCToken() did not return the discovery credential")
 	}
 }

@@ -55,8 +55,8 @@ func (c *darwinController) RouteReplace(ifname string, dst netip.Prefix) error {
 	if dst.Addr().Is6() {
 		family = "-inet6"
 	}
-	// Delete first (idempotent), then add
-	exec.Command("route", "-q", "-n", "delete", family, network).Run()
+	// Never delete an existing route owned by another VPN. The caller tracks
+	// routes it successfully adds and removes only those during shutdown.
 	out, err := exec.Command("route", "-n", "add", family, network, "-interface", ifname).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("route add: %v: %s", err, out)

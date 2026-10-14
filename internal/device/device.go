@@ -22,7 +22,6 @@ import (
 
 	"wantastic-agent/internal/device/wireguard-go/conn"
 	"wantastic-agent/internal/device/wireguard-go/tun"
-	virtstack "wantastic-agent/internal/device/wireguard-go/tun/netstack"
 
 	"golang.org/x/crypto/curve25519"
 )
@@ -67,9 +66,6 @@ type Device struct {
 	localAccessByOwner   map[[32]byte][]string
 	localAccessRoutes    []string
 	localAccessSyncMu    sync.Mutex
-
-	// Device netstack for P2P connection handling
-	netstack *virtstack.Net
 }
 
 func New(cfg *config.Config) (*Device, error) {
@@ -88,7 +84,7 @@ func (d *Device) IsRunning() bool {
 	return d.running
 }
 
-func (d *Device) Start() error {
+func (d *Device) Start() (retErr error) {
 	d.mu.Lock()
 	if d.running {
 		d.mu.Unlock()
@@ -100,12 +96,7 @@ func (d *Device) Start() error {
 	var tunDev tun.Device
 	var err error
 
-	addrs := make([]netip.Addr, len(d.config.Interface.Addresses))
-	for i, prefix := range d.config.Interface.Addresses {
-		addrs[i] = prefix.Addr()
-	}
-
-	tunDev, err = d.startTUNMode(addrs)
+	tunDev, err = d.startTUNMode()
 
 	if err != nil {
 		d.mu.Lock()
@@ -115,6 +106,33 @@ func (d *Device) Start() error {
 	}
 
 	d.tunDev = tunDev
+	// Startup is transactional: a partially configured adapter or route must
+	// never be reported as connected, and must not be left behind on failure.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		d.mu.Lock()
+		routes := append([]string(nil), d.systemRoutes...)
+		d.systemRoutes = nil
+		d.running = false
+		wd := d.device
+		td := d.tunDev
+		d.device = nil
+		d.tunDev = nil
+		d.nativeTun = nil
+		d.mu.Unlock()
+		for _, route := range routes {
+			if err := d.removeRoute(route); err != nil {
+				log.Printf("[TUN] Warning: failed to roll back route %s: %v", route, err)
+			}
+		}
+		if wd != nil {
+			wd.Close()
+		} else if td != nil {
+			_ = td.Close()
+		}
+	}()
 
 	// 4. Start WireGuard
 	logger := wgdevice.NewLogger(wgdevice.LogLevelError, fmt.Sprintf("(%s) ", d.config.DeviceID))
@@ -131,16 +149,10 @@ func (d *Device) Start() error {
 	d.device = wd
 
 	if err := d.applyConfig(); err != nil {
-		d.mu.Lock()
-		d.running = false
-		d.mu.Unlock()
 		return err
 	}
 
 	if err := wd.Up(); err != nil {
-		d.mu.Lock()
-		d.running = false
-		d.mu.Unlock()
 		return fmt.Errorf("device up: %w", err)
 	}
 
@@ -153,7 +165,7 @@ func (d *Device) Start() error {
 			continue
 		}
 		if err := d.addRoute(ip); err != nil {
-			log.Printf("Warning: failed to add OS route for AllowedIP %s: %v", ip, err)
+			return fmt.Errorf("install required route %s: %w", ip, err)
 		} else {
 			// Track it so it doesn't get infinitely added by P2P later
 			d.mu.Lock()
@@ -562,7 +574,7 @@ func (d *Device) GetTransferStats() (uint64, uint64, error) {
 
 // startTUNMode creates a native system TUN device for exit node functionality
 // This allows the system to route all traffic through the WireGuard tunnel
-func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
+func (d *Device) startTUNMode() (tun.Device, error) {
 	log.Printf("Initializing system TUN mode for exit node functionality...")
 
 	tunName := d.config.Interface.TUNName
@@ -582,17 +594,9 @@ func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
 	log.Printf("Created TUN interface: %s", actualName)
 
 	if err := setupTUNInterface(actualName, d.config.Interface.Addresses); err != nil {
-		log.Printf("Warning: failed to setup TUN interface networking: %v", err)
-	}
-
-	// Create a parallel Userspace Netstack bound to the native TUN IP
-	// This ensures P2P hole-punching and internal WireGuard routing is accelerated in Go userspace
-	ns, err := d.createMinimalNetstack(addrs)
-	if err != nil {
-		log.Printf("Warning: hybrid virtstack creation failed: %v", err)
-	} else {
-		d.netstack = ns
-		log.Printf("Initialized secondary userspace virtstack for P2P acceleration")
+		_ = nativeTun.Close()
+		d.nativeTun = nil
+		return nil, fmt.Errorf("configure TUN interface %s: %w", actualName, err)
 	}
 
 	log.Printf("TUN mode initialized successfully on %s", actualName)
@@ -610,21 +614,6 @@ func (d *Device) cleanupTUNMode() {
 	}
 
 	log.Printf("TUN mode cleanup complete")
-}
-
-// createMinimalNetstack creates a minimal netstack for DNS resolution in TUN mode
-// This is needed because some code paths expect a netstack for DNS lookups
-func (d *Device) createMinimalNetstack(addrs []netip.Addr) (*virtstack.Net, error) {
-	// We create a minimal netstack that can forward DNS queries, using virtstack
-	// We bind it strictly to the TUN interface's IP payload for any DNS requests
-	// made by the CLI. CreateNetTUN returns the TUN interface and the Netstack.
-	// Since we already created a TUN interface organically in startTUNMode, building another
-	// overlapping structure will result in 2 interfaces, but we discard the extra one for now:
-	_, ns, err := virtstack.CreateNetTUN(addrs, nil, d.config.Interface.MTU)
-	if err != nil {
-		return nil, fmt.Errorf("could not create virtstack: %v", err)
-	}
-	return ns, nil
 }
 
 // GetTUNName returns the name of the TUN interface (if in TUN mode)

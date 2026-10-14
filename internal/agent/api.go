@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"wantastic-agent/internal/device"
@@ -17,8 +21,10 @@ import (
 
 // APIServer represents the local IPC server for the systray and CLI
 type APIServer struct {
-	agent  *Agent
-	server *http.Server
+	agent      *Agent
+	server     *http.Server
+	token      string
+	tokenError error
 }
 
 // NewAPIServer creates a new API Server instance
@@ -26,6 +32,18 @@ func NewAPIServer(a *Agent) *APIServer {
 	mux := http.NewServeMux()
 	s := &APIServer{
 		agent: a,
+	}
+	s.token, s.tokenError = readConfiguredIPCToken()
+	if s.tokenError == nil && s.token == "" {
+		var tokenBytes [32]byte
+		if _, err := rand.Read(tokenBytes[:]); err != nil {
+			s.tokenError = fmt.Errorf("generate IPC credential: %w", err)
+		} else {
+			s.token = hex.EncodeToString(tokenBytes[:])
+			if err := os.Setenv("WTC_IPC_TOKEN", s.token); err != nil {
+				s.tokenError = fmt.Errorf("publish process IPC credential: %w", err)
+			}
+		}
 	}
 
 	mux.HandleFunc("/api/status", s.handleStatus)
@@ -36,7 +54,7 @@ func NewAPIServer(a *Agent) *APIServer {
 
 	s.server = &http.Server{
 		Addr:              "127.0.0.1:9034",
-		Handler:           mux,
+		Handler:           s.authorize(mux),
 		ReadHeaderTimeout: 2 * time.Second,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
@@ -47,11 +65,19 @@ func NewAPIServer(a *Agent) *APIServer {
 
 // Start begins serving the local IPC API
 func (s *APIServer) Start() error {
+	if s.tokenError != nil {
+		return fmt.Errorf("configure IPC authentication: %w", s.tokenError)
+	}
 	port := 9034
+	customPort := strings.TrimSpace(os.Getenv("WTC_IPC_PORT"))
 
 	// Support dynamic IPC ports via WTC_IPC_PORT env to avoid conflicts in localized e2e
-	if customPort := os.Getenv("WTC_IPC_PORT"); customPort != "" {
-		fmt.Sscanf(customPort, "%d", &port)
+	if customPort != "" {
+		parsed, ok := validIPCPort(customPort)
+		if !ok {
+			return fmt.Errorf("invalid WTC_IPC_PORT %q", customPort)
+		}
+		port, _ = strconv.Atoi(parsed)
 	}
 
 	var listener net.Listener
@@ -68,14 +94,16 @@ func (s *APIServer) Start() error {
 	}
 
 	if err != nil {
-		log.Printf("IPC API Error: failed to find open port")
-		return nil // Non-fatal for the agent core
+		return fmt.Errorf("IPC API: failed to bind a loopback port: %w", err)
 	}
 
 	// Share selected port for local tray & cli clients
 	os.Setenv("WTC_IPC_PORT", fmt.Sprintf("%d", port))
-	portFile := filepath.Join(os.TempDir(), "wantasticd_ipc_port")
-	os.WriteFile(portFile, []byte(fmt.Sprintf("%d", port)), 0644)
+	if customPort == "" {
+		if err := writeIPCPortFile(port, s.token); err != nil {
+			log.Printf("IPC API Warning: could not publish discovery port: %v", err)
+		}
+	}
 
 	log.Printf("Starting local IPC API on %s", s.server.Addr)
 
@@ -85,6 +113,66 @@ func (s *APIServer) Start() error {
 		}
 	}()
 	return nil
+}
+
+func (s *APIServer) authorize(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil || host != "127.0.0.1" {
+			http.Error(w, "loopback host required", http.StatusForbidden)
+			return
+		}
+		if s.token != "" {
+			authorization := r.Header.Get("Authorization")
+			if !strings.HasPrefix(authorization, "Bearer ") {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			provided := strings.TrimPrefix(authorization, "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeIPCPortFile(port int, token string) error {
+	path := ipcPortFile()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink at %s", path)
+	}
+	payload, err := json.Marshal(ipcDiscovery{Port: port, Token: token})
+	if err != nil {
+		return err
+	}
+	payload, err = protectIPCDiscovery(payload)
+	if err != nil {
+		return fmt.Errorf("protect IPC discovery: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".ipc-port-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // Stop gracefully shuts down the API

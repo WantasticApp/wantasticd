@@ -110,14 +110,16 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
             $signature = Get-AuthenticodeSignature -LiteralPath build/bin/wantastic.exe
             $signatureStatus = $signature.Status.ToString()
-            if ($signatureStatus -notin @('Valid', 'NotTrusted')) {
-              throw "Authenticode signature status is $signatureStatus"
+            $expectedUntrustedRoot = $signatureStatus -eq 'UnknownError' -and
+              $signature.StatusMessage -match '(?i)(0x800B0109|root certificate.*not trusted)'
+            if ($signatureStatus -notin @('Valid', 'NotTrusted') -and -not $expectedUntrustedRoot) {
+              throw "Authenticode signature status is $signatureStatus`: $($signature.StatusMessage)"
             }
             if (-not $signature.SignerCertificate -or
               $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
               throw 'Authenticode signer does not match the generated Wantastic certificate'
             }
-            Write-Host "Verified embedded Wantastic signature (status: $signatureStatus)"
+            Write-Host "Verified embedded Wantastic signature (status: $signatureStatus; $($signature.StatusMessage))"
           }
           catch {
             Write-Output "::error title=Windows self-signing failed::$($_.Exception.Message)"

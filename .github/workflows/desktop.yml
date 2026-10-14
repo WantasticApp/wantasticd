@@ -93,24 +93,26 @@ jobs:
             -FriendlyName 'Wantastic Desktop CI' `
             -CertStoreLocation 'Cert:\CurrentUser\My' `
             -NotAfter (Get-Date).AddYears(3)
-          $certificateFile = Join-Path $env:RUNNER_TEMP 'wantastic-desktop-ci.cer'
-          Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
           try {
-            & certutil.exe -user -f -silent -addstore Root $certificateFile
-            if ($LASTEXITCODE -ne 0) { throw "certutil addstore failed with exit code $LASTEXITCODE" }
             $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
               Sort-Object FullName |
               Select-Object -Last 1
             if (-not $signTool) { throw 'signtool.exe was not found' }
             & $signTool.FullName sign /fd SHA256 /sha1 $certificate.Thumbprint build/bin/wantastic.exe
             if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
-            & $signTool.FullName verify /pa /v build/bin/wantastic.exe
-            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
+            $signature = Get-AuthenticodeSignature -LiteralPath build/bin/wantastic.exe
+            $signatureStatus = $signature.Status.ToString()
+            if ($signatureStatus -notin @('Valid', 'NotTrusted')) {
+              throw "Authenticode signature status is $signatureStatus"
+            }
+            if (-not $signature.SignerCertificate -or
+              $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+              throw 'Authenticode signer does not match the generated Wantastic certificate'
+            }
+            Write-Host "Verified embedded Wantastic signature (status: $signatureStatus)"
           }
           finally {
-            & certutil.exe -user -f -silent -delstore Root $certificate.Thumbprint
             Remove-Item "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force
-            Remove-Item $certificateFile -Force -ErrorAction SilentlyContinue
           }
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

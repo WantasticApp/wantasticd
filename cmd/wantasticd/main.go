@@ -689,7 +689,7 @@ func handleTray() {
 }
 
 func handleStatus() {
-	resp, err := http.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/api/status")
+	resp, err := doIPC(http.MethodGet, "/api/status", 2*time.Second)
 	if err != nil {
 		fmt.Println("Status: Offline (Daemon is not running or not reachable)")
 		return
@@ -748,7 +748,7 @@ func handleUpdate() {
 }
 
 func handlePeers() {
-	resp, err := http.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/api/status")
+	resp, err := doIPC(http.MethodGet, "/api/status", 2*time.Second)
 	if err != nil {
 		log.Fatalf("Failed to reach daemon: %v", err)
 	}
@@ -824,8 +824,7 @@ type cliPeer struct {
 }
 
 func findPeer(reference string) (*cliPeer, error) {
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/api/status")
+	resp, err := doIPC(http.MethodGet, "/api/status", 2*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("reach wantasticd: %w", err)
 	}
@@ -875,7 +874,12 @@ func handleExitNode() {
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	post := func(path string) {
-		resp, err := client.Post("http://127.0.0.1:"+agent.GetIPCPort()+path, "application/json", nil)
+		req, err := agent.NewIPCRequest(context.Background(), http.MethodPost, path)
+		if err != nil {
+			log.Fatalf("prepare wantasticd request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
 		if err != nil {
 			log.Fatalf("reach wantasticd: %v", err)
 		}
@@ -899,6 +903,14 @@ func handleExitNode() {
 		post("/api/exitnode/use?peer=" + url.QueryEscape(peer))
 	}
 	fmt.Println("Exit-node setting accepted")
+}
+
+func doIPC(method, path string, timeout time.Duration) (*http.Response, error) {
+	req, err := agent.NewIPCRequest(context.Background(), method, path)
+	if err != nil {
+		return nil, err
+	}
+	return (&http.Client{Timeout: timeout}).Do(req)
 }
 
 func printUsage() {

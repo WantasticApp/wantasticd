@@ -137,7 +137,8 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 
 	if err := a.apiServer.Start(); err != nil {
-		log.Printf("Warning: failed to start local IPC API: %v", err)
+		_ = a.Stop()
+		return fmt.Errorf("start local IPC API: %w", err)
 	}
 
 	return nil

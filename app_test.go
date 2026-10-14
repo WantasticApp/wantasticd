@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/xml"
 	"errors"
+	"io"
+	"os"
 	"runtime"
 	"testing"
 
@@ -30,6 +33,38 @@ func TestPeerConnection(t *testing.T) {
 	}
 }
 
+func TestWindowsManifestUsesExplicitSafeElevation(t *testing.T) {
+	t.Parallel()
+	f, err := os.Open("build/windows/wails.exe.manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	decoder := xml.NewDecoder(f)
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("parse manifest: %v", err)
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "requestedExecutionLevel" {
+			continue
+		}
+		attrs := make(map[string]string, len(start.Attr))
+		for _, attr := range start.Attr {
+			attrs[attr.Name.Local] = attr.Value
+		}
+		if attrs["level"] != "requireAdministrator" || attrs["uiAccess"] != "false" {
+			t.Fatalf("requestedExecutionLevel = %#v", attrs)
+		}
+		return
+	}
+	t.Fatal("requestedExecutionLevel not found")
+}
+
 func TestMagicName(t *testing.T) {
 	t.Parallel()
 	if got := magicName(device.PeerInfo{Hostname: "Office AP #1", AssignedIP: "10.8.0.7"}); got != "office-ap-1.wantastic" {
@@ -48,6 +83,32 @@ func TestPingArgsKeepsTargetAsOneArgument(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && len(args) < 5 {
 		t.Fatalf("pingArgs() = %v", args)
+	}
+}
+
+func TestMagicDNSStatusMatchesPlatformSupport(t *testing.T) {
+	t.Parallel()
+	got := magicDNSActive([]string{"10.255.255.33"})
+	want := runtime.GOOS == "linux"
+	if got != want {
+		t.Fatalf("magicDNSActive() = %t, want %t on %s", got, want, runtime.GOOS)
+	}
+	if magicDNSActive(nil) {
+		t.Fatal("magicDNSActive(nil) = true")
+	}
+}
+
+func TestSelectPingTargetAllowsOnlyTenantRoute(t *testing.T) {
+	t.Parallel()
+	selected, err := selectPingTarget("10.255.255.36", nil, []string{"10.255.255.32/27"})
+	if err != nil {
+		t.Fatalf("selectPingTarget() error = %v", err)
+	}
+	if selected.AssignedIP != "10.255.255.36" || selected.MagicName != "node-10-255-255-36.wantastic" {
+		t.Fatalf("selectPingTarget() = %#v", selected)
+	}
+	if _, err := selectPingTarget("1.1.1.1", nil, []string{"10.255.255.32/27"}); err == nil {
+		t.Fatal("selectPingTarget() accepted an address outside the tenant route")
 	}
 }
 

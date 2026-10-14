@@ -6,14 +6,11 @@ package device
 import "fmt"
 
 func enableExitNodeSharingOS(tunName string) (string, error) {
-	if err := ctl.IPForwardingSet(true); err != nil {
-		return "", err
-	}
-	return "IP forwarding enabled. NAT requires manual configuration on Windows.", nil
+	return "", fmt.Errorf("exit-node sharing requires a privileged service with managed NAT on Windows")
 }
 
 func disableExitNodeSharingOS(tunName string) error {
-	return ctl.IPForwardingSet(false)
+	return nil
 }
 
 func enableLocalAccessSharingOS(tunName string, routes, sources []string) error {

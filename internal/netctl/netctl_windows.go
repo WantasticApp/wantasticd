@@ -34,7 +34,8 @@ func (c *windowsController) AddrAdd(ifname string, addr netip.Prefix) error {
 	if addr.Addr().Is6() {
 		family = "ipv6"
 	}
-	return exec.Command("netsh", "interface", family, "add", "address", ifname, addr.String()).Run()
+	return exec.Command("netsh", "interface", family, "add", "address",
+		"name="+ifname, "address="+addr.String(), "store=active").Run()
 }
 
 func (c *windowsController) AddrDel(ifname string, addr netip.Prefix) error {
@@ -42,7 +43,8 @@ func (c *windowsController) AddrDel(ifname string, addr netip.Prefix) error {
 	if addr.Addr().Is6() {
 		family = "ipv6"
 	}
-	return exec.Command("netsh", "interface", family, "delete", "address", ifname, addr.Addr().String()).Run()
+	return exec.Command("netsh", "interface", family, "delete", "address",
+		"name="+ifname, "address="+addr.Addr().String(), "store=active").Run()
 }
 
 func (c *windowsController) RouteReplace(ifname string, dst netip.Prefix) error {
@@ -50,9 +52,10 @@ func (c *windowsController) RouteReplace(ifname string, dst netip.Prefix) error 
 	if dst.Addr().Is6() {
 		family = "ipv6"
 	}
-	// Delete first (idempotent)
-	exec.Command("netsh", "interface", family, "delete", "route", dst.String(), ifname).Run()
-	return exec.Command("netsh", "interface", family, "add", "route", dst.String(), ifname).Run()
+	// Do not replace a route owned by another VPN. A conflicting route must
+	// fail closed instead of being deleted and silently hijacked.
+	return exec.Command("netsh", "interface", family, "add", "route",
+		"prefix="+dst.String(), "interface="+ifname, "store=active").Run()
 }
 
 func (c *windowsController) RouteDel(ifname string, dst netip.Prefix) error {
@@ -60,7 +63,8 @@ func (c *windowsController) RouteDel(ifname string, dst netip.Prefix) error {
 	if dst.Addr().Is6() {
 		family = "ipv6"
 	}
-	return exec.Command("netsh", "interface", family, "delete", "route", dst.String(), ifname).Run()
+	return exec.Command("netsh", "interface", family, "delete", "route",
+		"prefix="+dst.String(), "interface="+ifname, "store=active").Run()
 }
 
 func (c *windowsController) RouteGetDefault() (string, netip.Addr, error) {

@@ -49,9 +49,6 @@ func main() {
 			Appearance:           mac.NSAppearanceNameDarkAqua,
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
-			// Note: ActivationPolicy (no-Dock-icon / accessory mode) is not yet
-			// exposed in Wails v2 mac.Options. The app will show a Dock icon
-			// until Wails exposes this option (it is already commented out upstream).
 		},
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,

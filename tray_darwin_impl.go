@@ -7,8 +7,8 @@ package main
 
 /*
 #cgo CFLAGS: -x objective-c
-#cgo LDFLAGS: -framework Foundation
-#import <Foundation/Foundation.h>
+#cgo LDFLAGS: -framework Cocoa
+#import <Cocoa/Cocoa.h>
 
 extern void goTrayDispatchCB(void);
 
@@ -19,6 +19,18 @@ void dispatchSyncMainImpl(void) {
     // because Wails calls OnStartup only after NSApplicationMain is active).
     dispatch_sync(dispatch_get_main_queue(), ^{
         goTrayDispatchCB();
+    });
+}
+
+void configureTrayOnlyAppImpl(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    });
+}
+
+void activateDesktopAppImpl(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp activateIgnoringOtherApps:YES];
     });
 }
 */

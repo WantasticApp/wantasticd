@@ -9,6 +9,8 @@ package main
 
 /*
 extern void dispatchSyncMainImpl(void);
+extern void configureTrayOnlyAppImpl(void);
+extern void activateDesktopAppImpl(void);
 */
 import "C"
 
@@ -31,4 +33,14 @@ func goTrayDispatchCB() {
 func dispatchSyncMain(fn func()) {
 	_trayPendingFn = fn
 	C.dispatchSyncMainImpl()
+}
+
+// configureTrayOnlyApp makes Wantastic a menu-bar application without a Dock
+// icon. The Wails window remains available and is opened from the tray.
+func configureTrayOnlyApp() {
+	C.configureTrayOnlyAppImpl()
+}
+
+func activateDesktopApp() {
+	C.activateDesktopAppImpl()
 }

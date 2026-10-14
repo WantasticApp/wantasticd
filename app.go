@@ -90,12 +90,13 @@ func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	configureTrayOnlyApp()
 	go a.startSystray()
 	if err := a.startEmbeddedAgent(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		wailsruntime.EventsEmit(ctx, "app:error", err.Error())
 	}
 	if !a.IsConfigured() {
-		wailsruntime.WindowShow(ctx)
+		a.showMainWindow()
 	}
 	go a.pollStatus()
 }
@@ -459,8 +460,17 @@ func ipcPost(path string) error {
 	return nil
 }
 
+func (a *App) showMainWindow() {
+	if a.ctx == nil {
+		return
+	}
+	activateDesktopApp()
+	wailsruntime.WindowUnminimise(a.ctx)
+	wailsruntime.WindowShow(a.ctx)
+}
+
 func (a *App) OpenConsole()       { wailsruntime.BrowserOpenURL(a.ctx, "https://console.wantastic.app") }
-func (a *App) WindowShow()        { wailsruntime.WindowShow(a.ctx) }
+func (a *App) WindowShow()        { a.showMainWindow() }
 func (a *App) WindowHide()        { wailsruntime.WindowHide(a.ctx) }
 func (a *App) WindowStartDrag()   {}
 func (a *App) GetVersion() string { return version.Version }

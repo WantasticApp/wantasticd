@@ -262,10 +262,21 @@ make desktop
 ```
 
 The dedicated `.github/workflows/desktop.yml` workflow builds native artifacts
-on macOS, Windows, and Linux runners. Linux/OpenWrt currently provide automatic
-kernel forwarding and source NAT for advertised LAN routes; macOS and Windows
-can consume those routes, but offering a local subnet there still requires an
-administrator-managed forwarding/NAT setup.
+on macOS, Windows, and Linux runners. The app and tray use the Wantastic shield;
+left-clicking the tray opens the compact Wails window, while right-clicking
+opens connection status and actions. On macOS it runs as a menu-bar-only app.
+
+CI ad-hoc signs and verifies the macOS bundle and signs the Windows executable
+with an ephemeral self-signed code-signing certificate. These signatures prove
+artifact integrity inside the build but are not publicly trusted, so a clean
+machine can still show Gatekeeper or SmartScreen warnings. Public distribution
+requires an Apple Developer ID plus notarization and a trusted Authenticode
+certificate. Linux artifacts are not code-signed.
+
+Linux/OpenWrt currently provide automatic kernel forwarding and source NAT for
+advertised LAN routes; macOS and Windows can consume those routes, but offering
+a local subnet there still requires an administrator-managed forwarding/NAT
+setup.
 
 ---
 

@@ -76,9 +76,41 @@ jobs:
           ARGS=(build -clean -platform "${{ matrix.platform }}" -ldflags "$LD_FLAGS")
           if [[ -n "$TAGS" ]]; then ARGS+=(-tags "$TAGS"); fi
           go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 "${ARGS[@]}"
-      - name: Package macOS application
+      - name: Ad-hoc sign and package macOS application
         if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent build/bin/Wantastic.app build/bin/wantastic-macos-universal.zip
+        run: |
+          codesign --force --deep --sign - --timestamp=none build/bin/Wantastic.app
+          codesign --verify --deep --strict --verbose=2 build/bin/Wantastic.app
+          ditto -c -k --sequesterRsrc --keepParent build/bin/Wantastic.app build/bin/wantastic-macos-universal.zip
+      - name: Self-sign Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificate = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject 'CN=Wantastic Desktop' `
+            -FriendlyName 'Wantastic Desktop CI' `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -NotAfter (Get-Date).AddYears(3)
+          $rootStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+          $rootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+          $rootStore.Add($certificate)
+          try {
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName |
+              Select-Object -Last 1
+            if (-not $signTool) { throw 'signtool.exe was not found' }
+            & $signTool.FullName sign /fd SHA256 /sha1 $certificate.Thumbprint build/bin/wantastic.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+            & $signTool.FullName verify /pa /v build/bin/wantastic.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
+          }
+          finally {
+            $rootStore.Remove($certificate)
+            $rootStore.Close()
+            Remove-Item "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force
+          }
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
         with:

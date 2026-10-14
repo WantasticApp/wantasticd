@@ -37,6 +37,7 @@ func (a *App) onSystrayReady() {
 	// Other platforms: use the colour icon.
 	systray.SetTemplateIcon(assets.TrayIconTemplate, assets.TrayIcon)
 	systray.SetTooltip("Wantastic VPN")
+	systray.SetOnTapped(a.showMainWindow)
 
 	mStatus := systray.AddMenuItem("Status: –", "")
 	mStatus.Disable()
@@ -47,7 +48,7 @@ func (a *App) onSystrayReady() {
 	mToggle := systray.AddMenuItem("Connect", "Toggle VPN connection")
 	mClaim := systray.AddMenuItem("Generate Claim Link", "Claim this device into a tenant")
 	mConsole := systray.AddMenuItem("Open Console", "Open the Wantastic portal")
-	mShow := systray.AddMenuItem("Show Wantastic", "Open peer and routing controls")
+	mShow := systray.AddMenuItem("Open Wantastic", "Open peer and routing controls")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit Wantastic", "Stop VPN and exit")
 
@@ -70,7 +71,7 @@ func (a *App) onSystrayReady() {
 			return
 
 		case <-mShow.ClickedCh:
-			wailsruntime.WindowShow(a.ctx)
+			a.showMainWindow()
 
 		case <-mToggle.ClickedCh:
 			go func() {
@@ -102,23 +103,48 @@ func (a *App) updateTray(
 	mToggle *systray.MenuItem,
 ) {
 	st, err := a.GetStatus()
+	presentation := makeTrayPresentation(st, err)
+	mToggle.SetTitle(presentation.toggleTitle)
+	mStatus.SetTitle(presentation.statusTitle)
+	mIP.SetTitle(presentation.ipTitle)
+	systray.SetTooltip(presentation.tooltip)
+}
+
+type trayPresentation struct {
+	statusTitle string
+	ipTitle     string
+	toggleTitle string
+	tooltip     string
+}
+
+func makeTrayPresentation(st *StatusData, err error) trayPresentation {
+	state := "Unavailable"
+	toggle := "Connect"
+	ip := "–"
+
 	if err == nil && st != nil {
-		if st.Running {
-			mToggle.SetTitle("Disconnect")
-			mStatus.SetTitle("Status: Connected")
-		} else {
-			mToggle.SetTitle("Connect")
-			if st.Configured {
-				mStatus.SetTitle("Status: Disconnected")
-			} else {
-				mStatus.SetTitle("Status: Not configured")
-			}
+		switch {
+		case st.Running:
+			state = "Connected"
+			toggle = "Disconnect"
+		case st.Configured:
+			state = "Disconnected"
+		default:
+			state = "Not configured"
 		}
-		ip := "–"
-		if len(st.IPs) > 0 {
+		if len(st.IPs) > 0 && st.IPs[0] != "" {
 			ip = st.IPs[0]
 		}
-		mIP.SetTitle(fmt.Sprintf("IP: %s", ip))
 	}
 
+	tooltip := fmt.Sprintf("Wantastic VPN — %s", state)
+	if ip != "–" {
+		tooltip = fmt.Sprintf("%s — %s", tooltip, ip)
+	}
+	return trayPresentation{
+		statusTitle: fmt.Sprintf("Status: %s", state),
+		ipTitle:     fmt.Sprintf("IP: %s", ip),
+		toggleTitle: toggle,
+		tooltip:     tooltip,
+	}
 }

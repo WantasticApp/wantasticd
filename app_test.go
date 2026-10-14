@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"runtime"
 	"testing"
 
@@ -47,5 +48,65 @@ func TestPingArgsKeepsTargetAsOneArgument(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && len(args) < 5 {
 		t.Fatalf("pingArgs() = %v", args)
+	}
+}
+
+func TestMakeTrayPresentation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		status     *StatusData
+		err        error
+		wantStatus string
+		wantIP     string
+		wantToggle string
+		wantTip    string
+	}{
+		{
+			name: "connected",
+			status: &StatusData{
+				Configured: true,
+				Running:    true,
+				IPs:        []string{"10.20.0.7"},
+			},
+			wantStatus: "Status: Connected",
+			wantIP:     "IP: 10.20.0.7",
+			wantToggle: "Disconnect",
+			wantTip:    "Wantastic VPN — Connected — 10.20.0.7",
+		},
+		{
+			name:       "disconnected",
+			status:     &StatusData{Configured: true},
+			wantStatus: "Status: Disconnected",
+			wantIP:     "IP: –",
+			wantToggle: "Connect",
+			wantTip:    "Wantastic VPN — Disconnected",
+		},
+		{
+			name:       "not configured",
+			status:     &StatusData{},
+			wantStatus: "Status: Not configured",
+			wantIP:     "IP: –",
+			wantToggle: "Connect",
+			wantTip:    "Wantastic VPN — Not configured",
+		},
+		{
+			name:       "unavailable",
+			err:        errors.New("status failed"),
+			wantStatus: "Status: Unavailable",
+			wantIP:     "IP: –",
+			wantToggle: "Connect",
+			wantTip:    "Wantastic VPN — Unavailable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := makeTrayPresentation(tt.status, tt.err)
+			if got.statusTitle != tt.wantStatus || got.ipTitle != tt.wantIP ||
+				got.toggleTitle != tt.wantToggle || got.tooltip != tt.wantTip {
+				t.Fatalf("makeTrayPresentation() = %#v", got)
+			}
+		})
 	}
 }

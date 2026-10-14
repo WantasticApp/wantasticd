@@ -8,3 +8,7 @@ package main
 func dispatchSyncMain(fn func()) {
 	fn()
 }
+
+func configureTrayOnlyApp() {}
+
+func activateDesktopApp() {}

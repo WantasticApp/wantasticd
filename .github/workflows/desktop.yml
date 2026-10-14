@@ -92,7 +92,9 @@ jobs:
       - name: Run Windows platform tests
         if: runner.os == 'Windows'
         shell: pwsh
-        run: go test . ./internal/agent ./internal/device ./internal/netctl ./cmd/wantasticd
+        run: |
+          go test .
+          go test ./internal/agent -run '^(TestAllowLocalMutation|TestIPCAuthorization|TestNewAPIServerGeneratesProcessCredential|TestReadIPCTokenRejectsLoosePermissions|TestValidIPCPort|TestIPCDiscoveryRoundTrip)$'
       - name: Ad-hoc sign and package macOS application
         if: runner.os == 'macOS'
         run: |

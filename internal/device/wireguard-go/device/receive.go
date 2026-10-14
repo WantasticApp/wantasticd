@@ -32,7 +32,7 @@ type QueueInboundElement struct {
 	counter  uint64
 	keypair  *Keypair
 	endpoint conn.Endpoint
-	isStats  bool
+	msgType  uint32
 }
 
 type QueueInboundElementsContainer struct {
@@ -142,7 +142,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check if transport
 
-			case MessageTransportType, MessageStatsType:
+			case MessageTransportType, MessageWUSPType:
 
 				// check size
 
@@ -175,7 +175,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
-				elem.isStats = (msgType == MessageStatsType)
+				elem.msgType = msgType
 
 				elemsForPeer, ok := elemsByPeer[peer]
 				if !ok {
@@ -213,10 +213,8 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				if len(p2pData) == 41 && p2pData[0] == P2PSubtypePunchPacket {
 					endpointStr := endpoints[i].DstToString()
 					srcAddr, err := net.ResolveUDPAddr("udp", endpointStr)
-					if err == nil && device.p2pClient != nil {
-						msgData := make([]byte, len(p2pData))
-						copy(msgData, p2pData)
-						go device.p2pClient.HandlePunch(msgData, srcAddr)
+					if client := device.GetP2PClient(); err == nil && client != nil {
+						client.EnqueuePunch(p2pData, srcAddr)
 					}
 
 					bufsArrs[i] = device.GetMessageBuffer()
@@ -230,8 +228,8 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					copy(msgData, p2pData)
 
 					msg := DecodeP2PMessage(msgData)
-					if msg != nil && device.p2pClient != nil {
-						go device.p2pClient.HandleMessage(msg)
+					if client := device.GetP2PClient(); msg != nil && client != nil {
+						client.EnqueueMessage(msg)
 					}
 
 					bufsArrs[i] = device.GetMessageBuffer()
@@ -245,7 +243,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				}
 
 			case MessageTUNControlType:
-				// P2P TUN mode coordination for exit node functionality
+				// TUN control coordination for exit-node and export functionality
 				// Format: [4-byte type][payload...]
 				if len(packet) < 8 {
 					continue
@@ -534,15 +532,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			// check for stats
-			if elem.isStats {
-				device.log.Verbosef("%v - Received stats packet: %d bytes (raw decrypted)", peer, len(elem.packet))
-				if device.statsHandler != nil {
-					device.statsHandler(peer, elem.packet)
-				}
-				continue
-			}
-
 			if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
 				continue
 			}
@@ -555,10 +544,23 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
-			if elem.isStats {
-				device.log.Verbosef("%v - Received stats packet: %d bytes", peer, len(elem.packet))
-				if device.statsHandler != nil {
-					device.statsHandler(peer, elem.packet)
+			switch elem.msgType {
+			case MessageWUSPType:
+				payload, assembled, err := device.consumeWUSPPayload(peer, elem.packet)
+				if err != nil {
+					device.log.Verbosef("%v - Dropping malformed WUSP packet: %v", peer, err)
+					continue
+				}
+				if !assembled {
+					continue
+				}
+				device.log.Verbosef("%v - Received WUSP packet: %d bytes, first4=%x", peer, len(payload), payload[:min(4, len(payload))])
+				if device.wuspHandler != nil {
+					// Dispatch in a goroutine so that a slow WUSP handler (e.g. GetAll
+					// collecting the full TR-181 tree) does not block the receive pipeline
+					// and starve IP traffic delivery.
+					payloadCopy := append([]byte(nil), payload...)
+					go device.wuspHandler(peer, payloadCopy)
 				}
 				continue
 			}

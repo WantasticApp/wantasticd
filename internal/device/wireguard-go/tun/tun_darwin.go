@@ -8,6 +8,7 @@ package tun
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -17,7 +18,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const utunControlName = "com.apple.net.utun_control"
+const (
+	utunControlName = "com.apple.net.utun_control"
+
+	sysprotoControl = 2
+
+	utunOptIfName        = 2
+	utunOptEnableChannel = 17
+	utunOptEnableNetif   = 20
+)
+
+func isOptionalUTUNOptErr(err error) bool {
+	return err == nil ||
+		err == unix.ENOPROTOOPT ||
+		err == unix.ENOTSUP ||
+		err == unix.EINVAL
+}
 
 type NativeTun struct {
 	name        string
@@ -104,6 +120,20 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, fmt.Errorf("IoctlGetCtlInfo: %w", err)
 	}
 
+	enableNetif := 1
+	if err := unix.SetsockoptInt(fd, sysprotoControl, utunOptEnableNetif, enableNetif); !isOptionalUTUNOptErr(err) {
+		unix.Close(fd)
+		return nil, fmt.Errorf("enable utun netif: %w", err)
+	} else if err != nil {
+		log.Printf("[TUN] utun netif optimization unavailable, falling back to classic utun path: %v", err)
+	}
+	if err := unix.SetsockoptInt(fd, sysprotoControl, utunOptEnableChannel, 1); !isOptionalUTUNOptErr(err) {
+		unix.Close(fd)
+		return nil, fmt.Errorf("enable utun channel: %w", err)
+	} else if err != nil {
+		log.Printf("[TUN] utun channel optimization unavailable, falling back to classic utun path: %v", err)
+	}
+
 	sc := &unix.SockaddrCtl{
 		ID:   ctlInfo.Id,
 		Unit: uint32(ifIndex) + 1,
@@ -181,8 +211,8 @@ func (tun *NativeTun) Name() (string, error) {
 	tun.operateOnFd(func(fd uintptr) {
 		tun.name, err = unix.GetsockoptString(
 			int(fd),
-			2, /* #define SYSPROTO_CONTROL 2 */
-			2, /* #define UTUN_OPT_IFNAME 2 */
+			sysprotoControl,
+			utunOptIfName,
 		)
 	})
 

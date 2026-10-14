@@ -1,55 +1,73 @@
 export namespace main {
-	
-	export class AccountInfo {
-	    logged_in: boolean;
-	    token: string;
-	    display_name: string;
-	    email: string;
-	    avatar_url: string;
-	
+
+	export class ClaimLink {
+	    public_key: string;
+	    server_url: string;
+	    claim_url: string;
+	    reused: boolean;
+
 	    static createFrom(source: any = {}) {
-	        return new AccountInfo(source);
+	        return new ClaimLink(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.logged_in = source["logged_in"];
-	        this.token = source["token"];
-	        this.display_name = source["display_name"];
-	        this.email = source["email"];
-	        this.avatar_url = source["avatar_url"];
+	        this.public_key = source["public_key"];
+	        this.server_url = source["server_url"];
+	        this.claim_url = source["claim_url"];
+	        this.reused = source["reused"];
 	    }
 	}
 	export class PeerInfo {
 	    public_key: string;
-	    name: string;
+	    assigned_ip: string;
 	    hostname: string;
+	    magic_name: string;
 	    endpoint: string;
-	    allowed_ips: string;
 	    rx_bytes: number;
 	    tx_bytes: number;
-	    last_handshake: string;
-	    is_relay: boolean;
-	    is_exit_node: boolean;
-	    latency_ms: number;
-	
+	    p2p_state: string;
+	    connection: string;
+	    last_handshake: number;
+
 	    static createFrom(source: any = {}) {
 	        return new PeerInfo(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.public_key = source["public_key"];
-	        this.name = source["name"];
+	        this.assigned_ip = source["assigned_ip"];
 	        this.hostname = source["hostname"];
+	        this.magic_name = source["magic_name"];
 	        this.endpoint = source["endpoint"];
-	        this.allowed_ips = source["allowed_ips"];
 	        this.rx_bytes = source["rx_bytes"];
 	        this.tx_bytes = source["tx_bytes"];
+	        this.p2p_state = source["p2p_state"];
+	        this.connection = source["connection"];
 	        this.last_handshake = source["last_handshake"];
-	        this.is_relay = source["is_relay"];
-	        this.is_exit_node = source["is_exit_node"];
+	    }
+	}
+	export class PingResult {
+	    target: string;
+	    ip: string;
+	    reachable: boolean;
+	    latency_ms: number;
+	    connection: string;
+	    message: string;
+
+	    static createFrom(source: any = {}) {
+	        return new PingResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.target = source["target"];
+	        this.ip = source["ip"];
+	        this.reachable = source["reachable"];
 	        this.latency_ms = source["latency_ms"];
+	        this.connection = source["connection"];
+	        this.message = source["message"];
 	    }
 	}
 	export class StatusData {
@@ -58,17 +76,21 @@ export namespace main {
 	    device_running: boolean;
 	    tun_mode: boolean;
 	    tun_name: string;
-	    exit_node: boolean;
+	    offer_exit_node: boolean;
+	    local_access: boolean;
+	    local_access_routes: string[];
+	    magic_dns: boolean;
+	    dns_servers: string[];
 	    ips: string[];
 	    pubkey: string;
 	    rx_bytes: number;
 	    tx_bytes: number;
 	    peers: PeerInfo[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new StatusData(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.configured = source["configured"];
@@ -76,14 +98,18 @@ export namespace main {
 	        this.device_running = source["device_running"];
 	        this.tun_mode = source["tun_mode"];
 	        this.tun_name = source["tun_name"];
-	        this.exit_node = source["exit_node"];
+	        this.offer_exit_node = source["offer_exit_node"];
+	        this.local_access = source["local_access"];
+	        this.local_access_routes = source["local_access_routes"];
+	        this.magic_dns = source["magic_dns"];
+	        this.dns_servers = source["dns_servers"];
 	        this.ips = source["ips"];
 	        this.pubkey = source["pubkey"];
 	        this.rx_bytes = source["rx_bytes"];
 	        this.tx_bytes = source["tx_bytes"];
 	        this.peers = this.convertValues(source["peers"], PeerInfo);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -104,4 +130,3 @@ export namespace main {
 	}
 
 }
-

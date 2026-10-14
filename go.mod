@@ -1,30 +1,33 @@
 module wantastic-agent
 
-go 1.24.5
+go 1.27.2
 
 require (
 	fyne.io/systray v1.12.0
-	github.com/andybalholm/brotli v1.2.0
+	github.com/bgptools/mndp v0.0.0-20231212115012-3273940ea35e
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/getlantern/systray v1.2.2
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/mdlayher/genetlink v1.3.2
+	github.com/honeybbq/goubus v1.4.0
+	github.com/maltegrosse/go-modemmanager v0.1.4
+	github.com/mdlayher/lldp v0.0.0-20150915211757-afd9f83164c5
 	github.com/mdlayher/netlink v1.8.0
 	github.com/mdlayher/wifi v0.7.2
-	github.com/prometheus/procfs v0.19.2
+	github.com/mdp/qrterminal/v3 v3.2.1
+	github.com/showwin/speedtest-go v1.7.11
 	github.com/stratoberry/go-gpsd v1.3.0
-	github.com/wailsapp/wails/v2 v2.11.0
-	golang.org/x/crypto v0.47.0
-	golang.org/x/net v0.48.0
-	golang.org/x/sys v0.40.0
+	github.com/wailsapp/wails/v2 v2.15.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
-	google.golang.org/grpc v1.78.0
-	google.golang.org/protobuf v1.36.10
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 )
 
 require (
+	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect
 	github.com/getlantern/errors v0.0.0-20190325191628-abdb3e3e36f7 // indirect
@@ -34,7 +37,6 @@ require (
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/jchv/go-winloader v0.0.0-20210711035445-715c2860da7e // indirect
@@ -44,8 +46,10 @@ require (
 	github.com/leaanthony/gosod v1.0.4 // indirect
 	github.com/leaanthony/slicer v1.6.0 // indirect
 	github.com/leaanthony/u v1.1.1 // indirect
-	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mdlayher/ethernet v0.0.0-20220221185849-529eae5b6118 // indirect
+	github.com/mdlayher/genetlink v1.3.2 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
@@ -57,8 +61,9 @@ require (
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
+	rsc.io/qr v0.2.0 // indirect
 )

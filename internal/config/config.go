@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -14,9 +15,10 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-	pb "wantastic-agent/internal/grpc/proto"
+	"wantastic-agent/internal/auth"
 
 	"github.com/denisbrodbeck/machineid"
 	"github.com/google/uuid"
@@ -73,10 +75,19 @@ type Config struct {
 	Interface  Interface `json:"interface"`
 	Auth       Auth      `json:"auth"`
 	ExitNode   ExitNode  `json:"exit_node"`
-	Verbose    bool      `json:"verbose"`
-	AutoUpdate bool      `json:"auto_update"`
+	// AllowLocalAccess exposes directly connected private IPv4 subnets to
+	// other devices in the same tenant. It is opt-in because it changes the
+	// host from an overlay endpoint into a subnet router.
+	AllowLocalAccess bool `json:"allow_local_access"`
+	// LocalAccessRoutes optionally pins the private IPv4 prefixes advertised by
+	// this device. An empty list keeps automatic directly-connected discovery.
+	// Host routes are valid, so a single LAN device may be exposed as /32.
+	LocalAccessRoutes []string `json:"local_access_routes,omitempty"`
+	Verbose           bool     `json:"verbose"`
+	AutoUpdate        bool     `json:"auto_update"`
 
-	filePath string // path this config was loaded from; not serialised
+	filePath   string // path this config was loaded from; not serialised
+	HandoffURL string // confirmation URL returned by register; not serialised
 }
 
 type Server struct {
@@ -85,7 +96,6 @@ type Server struct {
 	PublicKey           string   `json:"public_key"`
 	AllowedIPs          []string `json:"allowed_ips"`
 	PersistentKeepalive int      `json:"persistent_keepalive"`
-	SendStats           bool     `json:"send_stats"`
 }
 
 type Interface struct {
@@ -99,8 +109,17 @@ type Interface struct {
 
 // Auth holds the authentication credentials for the agent.
 type Auth struct {
-	ServerURL   string        `json:"server_url"`
-	Token       string        `json:"token"`
+	// PortalURL is the HTTPS portal base used for re-registration
+	// (e.g. "https://console.wantastic.app").
+	PortalURL string `json:"portal_url,omitempty"`
+
+	// ServerURL is the gRPC runtime server for GetConfiguration / RefreshAuth
+	// (e.g. "auth.wantastic.app:443").  Populated from the portal register response.
+	ServerURL string `json:"server_url,omitempty"`
+
+	// Token is the long-lived session token for gRPC runtime calls.
+	Token string `json:"token"`
+
 	RefreshTime time.Duration `json:"refresh_time"`
 }
 
@@ -246,78 +265,136 @@ func parseTraditionalWireGuardConfig(configData string) (Config, error) {
 		cfg.GenerateDeviceID()
 	}
 
-	// Default to sending stats for traditional configs (users can opt-out if we add a flag later)
-	cfg.Server.SendStats = true
-
 	return cfg, nil
 }
 
-// LoadFromRegisterResponse builds a Config from a RegisterDeviceResponse and the
-// Auth0 access token that was used to obtain it. The nonce must be the same value
-// passed to RegisterDevice so that the ChaCha20-Poly1305 decryption succeeds.
-// This is the preferred path for the Wails desktop agent — the gRPC device flow
-// calls RegisterDevice internally and surfaces both the token and nonce.
-func LoadFromRegisterResponse(resp *pb.RegisterDeviceResponse, accessToken string, nonce uint64, serverURL string) (*Config, error) {
-	if !resp.Success {
-		return nil, fmt.Errorf("registration failed")
+// LoadFromDeviceFlow runs the RFC 8628 HTTP device authorization flow:
+//
+//  1. Shows a QR code + user code and polls until the user approves.
+//  2. Calls POST /api/agent/register with the access token.
+//  3. Decrypts the returned WireGuard config (ChaCha20-Poly1305).
+//
+// portalURL is the HTTPS portal base (e.g. "https://console.wantastic.app").
+func LoadFromDeviceFlow(ctx context.Context, portalURL string) (*Config, error) {
+	accessToken, err := auth.RunDeviceFlow(ctx, portalURL, auth.DefaultOAuth2ClientID)
+	if err != nil {
+		return nil, fmt.Errorf("device flow: %w", err)
+	}
+	return registerAndDecryptConfig(ctx, portalURL, accessToken)
+}
+
+// LoadFromToken registers the device using a direct access token (skips OAuth2).
+// portalURL is the HTTPS portal base (e.g. "https://console.wantastic.app").
+func LoadFromToken(ctx context.Context, portalURL, token string) (*Config, error) {
+	return registerAndDecryptConfig(ctx, portalURL, token)
+}
+
+func LoadFromClaimConfig(portalURL, privateKey, publicKey string, claim *auth.ClaimConfig) (*Config, error) {
+	if claim == nil {
+		return nil, fmt.Errorf("claim config missing")
+	}
+	if !claim.Claimed {
+		return nil, fmt.Errorf("device has not been claimed yet")
+	}
+	if strings.TrimSpace(claim.ServerKey) == "" {
+		return nil, fmt.Errorf("claim config missing server_key")
+	}
+	if strings.TrimSpace(claim.AssignedIP) == "" {
+		return nil, fmt.Errorf("claim config missing assigned_ip")
+	}
+	address, err := netip.ParsePrefix(strings.TrimSpace(claim.AssignedIP))
+	if err != nil {
+		return nil, fmt.Errorf("parse assigned_ip: %w", err)
+	}
+	endpointHost := strings.TrimSpace(claim.Endpoint)
+	endpointPort := claim.ListenPort
+	if host, port, splitErr := net.SplitHostPort(endpointHost); splitErr == nil {
+		endpointHost = strings.Trim(host, "[]")
+		if parsedPort, scanErr := strconv.Atoi(port); scanErr == nil && parsedPort > 0 {
+			endpointPort = parsedPort
+		}
+	}
+	if endpointPort == 0 {
+		endpointPort = 51820
+	}
+	mtu := claim.MTU
+	if mtu == 0 {
+		mtu = 1420
+	}
+	keepalive := claim.PersistentKeepalive
+	if keepalive == 0 {
+		keepalive = 25
 	}
 
-	if len(resp.EncryptedConfig) > 0 {
-		// Derive key from Auth0 access token: Key = SHA256(accessToken)
-		hash := sha256.Sum256([]byte(accessToken))
-		key := hash[:]
-
-		// Nonce: 12 bytes, first 8 are the little-endian uint64 nonce
-		nonceBytes := make([]byte, 12)
-		binary.LittleEndian.PutUint64(nonceBytes[:8], nonce)
-
-		aead, err := chacha20poly1305.New(key)
-		if err != nil {
-			return nil, fmt.Errorf("create cipher: %w", err)
-		}
-
-		decrypted, err := aead.Open(nil, nonceBytes, resp.EncryptedConfig, nil)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt config: %w", err)
-		}
-
-		cfgStruct, err := parseTraditionalWireGuardConfig(string(decrypted))
-		if err != nil {
-			return nil, fmt.Errorf("parse decrypted config: %w", err)
-		}
-
-		cfg := &cfgStruct
-		cfg.Auth.ServerURL = serverURL
-		cfg.Auth.Token = resp.Token
-		cfg.GenerateDeviceID()
-		return cfg, nil
-	}
-
-	// Fallback: use raw protobuf fields when no encrypted config is present
-	log.Println("⚠️  No encrypted configuration received, using raw fields")
 	cfg := &Config{
+		PrivateKey: strings.TrimSpace(privateKey),
+		PublicKey:  strings.TrimSpace(publicKey),
 		Server: Server{
-			Endpoint:            resp.Endpoint,
-			PublicKey:           resp.ServerKey,
-			AllowedIPs:          resp.AllowedIps,
-			PersistentKeepalive: int(resp.PersistentKeepalive),
-			SendStats:           true,
+			Endpoint:            endpointHost,
+			Port:                endpointPort,
+			PublicKey:           strings.TrimSpace(claim.ServerKey),
+			AllowedIPs:          claim.AllowedIPs,
+			PersistentKeepalive: keepalive,
 		},
 		Interface: Interface{
-			MTU:        int(resp.Mtu),
-			ListenPort: int(resp.ListenPort),
-			DNS:        resp.DnsServers,
+			Addresses:  []netip.Prefix{address},
+			ListenPort: 0,
+			MTU:        mtu,
+			DNS:        claim.DNSServers,
+		},
+		Auth: Auth{
+			PortalURL: portalURL,
 		},
 	}
-	cfg.Auth.ServerURL = serverURL
-	cfg.Auth.Token = resp.Token
+	cfg.GenerateDeviceID()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
 
-	for _, route := range resp.Routes {
-		if prefix, err := netip.ParsePrefix(route); err == nil {
-			cfg.Interface.Addresses = append(cfg.Interface.Addresses, prefix)
-		}
+// registerAndDecryptConfig calls POST /api/agent/register over HTTPS, decrypts
+// the returned WireGuard config, and returns a ready-to-use Config.
+//
+// No gRPC is used in this path — the portal is the only network endpoint.
+func registerAndDecryptConfig(ctx context.Context, portalURL, accessToken string) (*Config, error) {
+	hashedID, err := auth.HashedDeviceID()
+	if err != nil {
+		return nil, fmt.Errorf("get device id: %w", err)
 	}
 
+	regResp, nonce, err := auth.RegisterDevice(ctx, portalURL, accessToken, hashedID)
+	if err != nil {
+		return nil, fmt.Errorf("register device: %w", err)
+	}
+
+	// Derive decryption key: SHA256(access_token)
+	hash := sha256.Sum256([]byte(accessToken))
+	// Nonce: little-endian uint64 zero-padded to 12 bytes
+	nonceBytes := make([]byte, 12)
+	binary.LittleEndian.PutUint64(nonceBytes[:8], nonce)
+
+	aead, err := chacha20poly1305.New(hash[:])
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+	decrypted, err := aead.Open(nil, nonceBytes, regResp.EncryptedConfig, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt config: %w", err)
+	}
+
+	cfgStruct, err := parseTraditionalWireGuardConfig(string(decrypted))
+	if err != nil {
+		return nil, fmt.Errorf("parse decrypted config: %w", err)
+	}
+
+	cfg := &cfgStruct
+	cfg.Auth.PortalURL = portalURL
+	cfg.Auth.Token = regResp.Token
+	if regResp.ServerURL != "" {
+		cfg.Auth.ServerURL = regResp.ServerURL
+	}
+	cfg.HandoffURL = regResp.HandoffURL
 	cfg.GenerateDeviceID()
 	return cfg, nil
 }
@@ -329,6 +406,13 @@ func LoadFromRegisterResponse(resp *pb.RegisterDeviceResponse, accessToken strin
 func (c *Config) Validate() error {
 	if c.PrivateKey == "" {
 		return fmt.Errorf("private key required")
+	}
+	if strings.TrimSpace(c.Server.PublicKey) == "" {
+		return fmt.Errorf("server public key required")
+	}
+	serverPublicKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(c.Server.PublicKey))
+	if err != nil || len(serverPublicKey) != 32 {
+		return fmt.Errorf("server public key must be a base64-encoded 32-byte WireGuard key")
 	}
 	if c.Server.Endpoint == "" {
 		return fmt.Errorf("server endpoint required")
@@ -359,7 +443,42 @@ func (c *Config) Validate() error {
 	if c.Auth.RefreshTime == 0 {
 		c.Auth.RefreshTime = 24 * time.Hour
 	}
+	if _, err := ValidateLocalAccessRoutes(c.LocalAccessRoutes); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ValidateLocalAccessRoutes normalizes an explicit local-access route list.
+// Only RFC1918 IPv4 prefixes are accepted. /32 is deliberately supported for
+// sharing one host without exposing its entire subnet.
+func ValidateLocalAccessRoutes(routes []string) ([]string, error) {
+	if len(routes) > 16 {
+		return nil, fmt.Errorf("too many local-access routes: %d (maximum 16)", len(routes))
+	}
+	seen := make(map[netip.Prefix]struct{}, len(routes))
+	prefixes := make([]netip.Prefix, 0, len(routes))
+	for _, raw := range routes {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("invalid local-access route %q: %w", raw, err)
+		}
+		prefix = prefix.Masked()
+		if !prefix.Addr().Is4() || !prefix.Addr().IsPrivate() || prefix.Bits() < 8 || prefix.Bits() > 32 {
+			return nil, fmt.Errorf("local-access route must be private IPv4 between /8 and /32: %s", prefix)
+		}
+		if _, ok := seen[prefix]; ok {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Slice(prefixes, func(i, j int) bool { return prefixes[i].String() < prefixes[j].String() })
+	normalized := make([]string, len(prefixes))
+	for i, prefix := range prefixes {
+		normalized[i] = prefix.String()
+	}
+	return normalized, nil
 }
 
 // DefaultTunName returns the default tun device name for the platform.
@@ -415,7 +534,12 @@ func (c *Config) GenerateDeviceID() {
 
 		if !useMac {
 			log.Printf("Warning: no stable hardware identifier (machine-id or MAC) found.")
-			log.Printf("Falling back to a random device ID. This device may be re-registered if the configuration is lost.")
+			if serial, serialErr := auth.PersistentSerialNumber(); serialErr == nil && strings.TrimSpace(serial) != "" {
+				hash := sha256.Sum256([]byte("serial:" + strings.TrimSpace(serial)))
+				c.DeviceID = hex.EncodeToString(hash[:])
+				return
+			}
+			log.Printf("Falling back to a random device ID. This device may be re-registered if the persistent identity store is unavailable.")
 			c.DeviceID = uuid.New().String()
 			return
 		}
@@ -439,7 +563,25 @@ func (c *Config) SaveToFile(path string) error {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("write config file: %w", err)
 	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("secure config file permissions: %w", err)
+	}
+	c.filePath = path
 
+	return nil
+}
+
+// CheckWritable returns an error if the config file cannot be written to.
+// Used as a pre-flight check before performing irreversible operations.
+func (c *Config) CheckWritable() error {
+	if c.filePath == "" {
+		return fmt.Errorf("config has no file path")
+	}
+	f, err := os.OpenFile(c.filePath, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("config file not writable: %w", err)
+	}
+	f.Close()
 	return nil
 }
 
@@ -471,6 +613,9 @@ func (c *Config) Clone() *Config {
 		backup.ExitNode.ExitDNS = make([]string, len(c.ExitNode.ExitDNS))
 		copy(backup.ExitNode.ExitDNS, c.ExitNode.ExitDNS)
 	}
+	if len(c.LocalAccessRoutes) > 0 {
+		backup.LocalAccessRoutes = append([]string(nil), c.LocalAccessRoutes...)
+	}
 	return &backup
 }
 
@@ -490,30 +635,4 @@ func (c *Config) Save() error {
 		return fmt.Errorf("write temp config: %w", err)
 	}
 	return os.Rename(tmp, c.filePath)
-}
-
-// UpdateFromGRPC updates the configuration from a GRPC response.
-// It populates the interface addresses, listen port, and MTU from the device config.
-// It also populates the server endpoint, port, and public key from the server config.
-// Returns an error if any step of the process fails.
-func (c *Config) UpdateFromGRPC(resp *pb.GetConfigurationResponse) error {
-	if resp.DeviceConfig != nil {
-		for _, addr := range resp.DeviceConfig.Addresses {
-			prefix, err := netip.ParsePrefix(addr)
-			if err != nil {
-				return fmt.Errorf("parse address %s: %w", addr, err)
-			}
-			c.Interface.Addresses = append(c.Interface.Addresses, prefix)
-		}
-		c.Interface.ListenPort = int(resp.DeviceConfig.ListenPort)
-		c.Interface.MTU = int(resp.DeviceConfig.Mtu)
-	}
-
-	if resp.ServerConfig != nil {
-		c.Server.Endpoint = resp.ServerConfig.Endpoint
-		c.Server.Port = int(resp.ServerConfig.Port)
-		c.Server.PublicKey = resp.ServerConfig.PublicKey
-	}
-
-	return nil
 }

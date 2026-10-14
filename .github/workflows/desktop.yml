@@ -92,14 +92,22 @@ jobs:
             -Subject 'CN=Wantastic Desktop' `
             -FriendlyName 'Wantastic Desktop CI' `
             -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -KeyExportPolicy Exportable `
             -NotAfter (Get-Date).AddYears(3)
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'wantastic-desktop-ci.pfx'
+          $pfxPasswordText = [Guid]::NewGuid().ToString('N')
+          $pfxPassword = ConvertTo-SecureString $pfxPasswordText -AsPlainText -Force
           try {
-            Set-AuthenticodeSignature `
-              -FilePath build/bin/wantastic.exe `
-              -Certificate $certificate `
-              -HashAlgorithm SHA256 `
-              -IncludeChain All `
-              -Force | Out-Null
+            Export-PfxCertificate `
+              -Cert $certificate `
+              -FilePath $pfxPath `
+              -Password $pfxPassword | Out-Null
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName |
+              Select-Object -Last 1
+            if (-not $signTool) { throw 'signtool.exe was not found' }
+            & $signTool.FullName sign /fd SHA256 /f $pfxPath /p $pfxPasswordText build/bin/wantastic.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
             $signature = Get-AuthenticodeSignature -LiteralPath build/bin/wantastic.exe
             $signatureStatus = $signature.Status.ToString()
             if ($signatureStatus -notin @('Valid', 'NotTrusted')) {
@@ -111,8 +119,13 @@ jobs:
             }
             Write-Host "Verified embedded Wantastic signature (status: $signatureStatus)"
           }
+          catch {
+            Write-Output "::error title=Windows self-signing failed::$($_.Exception.Message)"
+            throw
+          }
           finally {
             Remove-Item "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
           }
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

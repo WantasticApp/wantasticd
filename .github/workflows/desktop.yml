@@ -93,10 +93,11 @@ jobs:
             -FriendlyName 'Wantastic Desktop CI' `
             -CertStoreLocation 'Cert:\CurrentUser\My' `
             -NotAfter (Get-Date).AddYears(3)
-          $rootStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
-          $rootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-          $rootStore.Add($certificate)
+          $certificateFile = Join-Path $env:RUNNER_TEMP 'wantastic-desktop-ci.cer'
+          Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
           try {
+            & certutil.exe -user -f -silent -addstore Root $certificateFile
+            if ($LASTEXITCODE -ne 0) { throw "certutil addstore failed with exit code $LASTEXITCODE" }
             $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
               Sort-Object FullName |
               Select-Object -Last 1
@@ -107,9 +108,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
           }
           finally {
-            $rootStore.Remove($certificate)
-            $rootStore.Close()
+            & certutil.exe -user -f -silent -delstore Root $certificate.Thumbprint
             Remove-Item "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force
+            Remove-Item $certificateFile -Force -ErrorAction SilentlyContinue
           }
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

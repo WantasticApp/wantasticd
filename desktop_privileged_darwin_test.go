@@ -3,8 +3,10 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,5 +74,30 @@ func TestValidateHelperPath(t *testing.T) {
 	}
 	if err := validateHelperPath(unexpected, uid, gid); err == nil {
 		t.Fatal("validateHelperPath() accepted an unexpected filename")
+	}
+}
+
+func TestNormalizeHelperErrorIncludesBoundedHelperCause(t *testing.T) {
+	t.Parallel()
+	stderr := "2026/10/15 privileged tunnel helper: start tunnel agent: enable local access: packet-filter setup failed\n"
+	err := normalizeHelperError(errors.New("exit status 1"), stderr)
+	if got := err.Error(); got != "privileged tunnel helper could not start: start tunnel agent: enable local access: packet-filter setup failed" {
+		t.Fatalf("normalizeHelperError() = %q", got)
+	}
+
+	longDetail := strings.Repeat("x", 800)
+	err = normalizeHelperError(errors.New("exit status 1"), "privileged tunnel helper: "+longDetail)
+	if len(strings.TrimPrefix(err.Error(), "privileged tunnel helper could not start: ")) != 512 {
+		t.Fatalf("helper detail was not bounded: %d", len(err.Error()))
+	}
+}
+
+func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
+	t.Parallel()
+	buffer := newTailBuffer(8)
+	_, _ = buffer.Write([]byte("12345"))
+	_, _ = buffer.Write([]byte("67890"))
+	if got := buffer.String(); got != "34567890" {
+		t.Fatalf("tailBuffer = %q, want %q", got, "34567890")
 	}
 }

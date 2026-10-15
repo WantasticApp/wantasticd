@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -24,14 +25,17 @@ type Agent struct {
 	updater *update.Manager
 	usp     *uspRuntime
 
-	mu           sync.RWMutex
-	running      bool
-	stopCh       chan struct{}
-	shutdownCh   chan struct{}
-	shutdownOnce sync.Once
-	workerCancel context.CancelFunc
-	wg           sync.WaitGroup
-	dnsActive    atomic.Bool
+	mu                sync.RWMutex
+	running           bool
+	stopCh            chan struct{}
+	shutdownCh        chan struct{}
+	shutdownOnce      sync.Once
+	workerCancel      context.CancelFunc
+	wg                sync.WaitGroup
+	dnsActive         atomic.Bool
+	localAccessMu     sync.Mutex
+	localAccessRoutes []string
+	localAccessWake   chan struct{}
 
 	apiServer *APIServer
 }
@@ -60,12 +64,13 @@ func New(cfg *config.Config) (*Agent, error) {
 	}
 
 	agt := &Agent{
-		config:     cfg,
-		device:     dev,
-		updater:    updater,
-		usp:        uspRuntime,
-		stopCh:     make(chan struct{}),
-		shutdownCh: make(chan struct{}),
+		config:          cfg,
+		device:          dev,
+		updater:         updater,
+		usp:             uspRuntime,
+		stopCh:          make(chan struct{}),
+		shutdownCh:      make(chan struct{}),
+		localAccessWake: make(chan struct{}, 1),
 	}
 	agt.apiServer = NewAPIServer(agt)
 	return agt, nil
@@ -122,16 +127,16 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 		log.Printf("Local access enabled for tenant routes: %v", localAccessRoutes)
 	}
+	a.mu.Lock()
+	a.localAccessRoutes = append([]string(nil), localAccessRoutes...)
+	a.mu.Unlock()
 
-	workerCount := 3 // HealthCheck + DNSCheck + ExitNodeAdvertiser
+	workerCount := 4 // HealthCheck + DNSCheck + ExitNodeAdvertiser + LocalAccessAdvertiser
 	if a.config.AutoUpdate {
 		workerCount++
 	}
 	if a.usp != nil {
 		workerCount += 2
-	}
-	if a.config.AllowLocalAccess {
-		workerCount++
 	}
 	a.wg.Add(workerCount)
 
@@ -143,9 +148,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		go a.runWUSPInit(workerCtx)
 		go a.runNetworkSpeedMonitor(workerCtx)
 	}
-	if a.config.AllowLocalAccess {
-		go a.runLocalAccessAdvertiser(workerCtx, localAccessRoutes)
-	}
+	go a.runLocalAccessAdvertiser(workerCtx)
 
 	if a.config.AutoUpdate {
 		log.Println("Auto-update enabled")
@@ -162,18 +165,27 @@ func (a *Agent) Start(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) runLocalAccessAdvertiser(ctx context.Context, routes []string) {
+func (a *Agent) runLocalAccessAdvertiser(ctx context.Context) {
 	defer a.wg.Done()
 	defer func() {
 		if err := a.sendLocalAccessAdvertisement(nil); err != nil {
 			log.Printf("Local-access route revocation could not be delivered: %v", err)
 		}
+		a.localAccessMu.Lock()
+		defer a.localAccessMu.Unlock()
 		if err := a.device.DisableLocalAccess(); err != nil {
 			log.Printf("Failed to disable local-access forwarding: %v", err)
 		}
 	}()
 
 	send := func() {
+		a.mu.RLock()
+		enabled := a.config.AllowLocalAccess
+		routes := append([]string(nil), a.localAccessRoutes...)
+		a.mu.RUnlock()
+		if !enabled {
+			routes = nil
+		}
 		if err := a.sendLocalAccessAdvertisement(routes); err != nil {
 			log.Printf("Local-access route advertisement failed; will retry: %v", err)
 		}
@@ -188,10 +200,84 @@ func (a *Agent) runLocalAccessAdvertiser(ctx context.Context, routes []string) {
 			return
 		case <-a.stopCh:
 			return
+		case <-a.localAccessWake:
+			send()
 		case <-ticker.C:
 			send()
 		}
 	}
+}
+
+// SetLocalAccessRuntime applies an already-persisted desktop preference to the
+// live privileged agent. It avoids tearing down the TUN for a firewall/routing
+// change and rolls the previous OS state back if the replacement cannot apply.
+func (a *Agent) SetLocalAccessRuntime(enabled bool, routes []string) error {
+	normalized, err := config.ValidateLocalAccessRoutes(routes)
+	if err != nil {
+		return err
+	}
+	if len(normalized) > 0 {
+		enabled = true
+	}
+
+	a.localAccessMu.Lock()
+	defer a.localAccessMu.Unlock()
+	a.mu.RLock()
+	overlayRoutes := append([]string(nil), a.config.Server.AllowedIPs...)
+	previousEnabled := a.config.AllowLocalAccess
+	previousApplied := append([]string(nil), a.localAccessRoutes...)
+	a.mu.RUnlock()
+	if err := config.ValidateLocalAccessOverlaySeparation(normalized, overlayRoutes); err != nil {
+		return err
+	}
+
+	if previousEnabled {
+		if err := a.device.DisableLocalAccess(); err != nil {
+			return fmt.Errorf("disable previous local-access routes: %w", err)
+		}
+	}
+
+	var applied []string
+	if enabled {
+		applied, err = a.device.EnableLocalAccess(normalized)
+		if err != nil {
+			if previousEnabled {
+				restored, restoreErr := a.device.EnableLocalAccess(previousApplied)
+				if restoreErr == nil {
+					a.mu.Lock()
+					a.localAccessRoutes = restored
+					a.mu.Unlock()
+				} else {
+					a.mu.Lock()
+					a.config.AllowLocalAccess = false
+					a.config.LocalAccessRoutes = nil
+					a.localAccessRoutes = nil
+					a.mu.Unlock()
+					return errors.Join(
+						fmt.Errorf("apply local-access routes: %w", err),
+						fmt.Errorf("restore previous local-access routes: %w", restoreErr),
+					)
+				}
+			}
+			return fmt.Errorf("apply local-access routes: %w", err)
+		}
+	}
+
+	a.mu.Lock()
+	a.config.AllowLocalAccess = enabled
+	a.config.LocalAccessRoutes = append([]string(nil), normalized...)
+	a.localAccessRoutes = append([]string(nil), applied...)
+	a.mu.Unlock()
+	select {
+	case a.localAccessWake <- struct{}{}:
+	default:
+	}
+	if enabled {
+		log.Printf("Local access updated for tenant routes: %v", applied)
+	} else {
+		log.Printf("Local access disabled")
+	}
+	return nil
 }
 
 func (a *Agent) sendLocalAccessAdvertisement(routes []string) error {

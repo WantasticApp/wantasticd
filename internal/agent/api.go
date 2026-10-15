@@ -53,6 +53,7 @@ func NewAPIServer(a *Agent) *APIServer {
 	mux.HandleFunc("/api/exitnode/offer", s.handleSetExitNodeOffer)
 	mux.HandleFunc("/api/exitnode/offer/runtime", s.handleSetExitNodeOfferRuntime)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
+	mux.HandleFunc("/api/local-access/runtime", s.handleSetLocalAccessRuntime)
 
 	s.server = &http.Server{
 		Addr:              "127.0.0.1:9034",
@@ -328,6 +329,27 @@ func (s *APIServer) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, "{\"status\":\"requested\"}")
+}
+
+func (s *APIServer) handleSetLocalAccessRuntime(w http.ResponseWriter, r *http.Request) {
+	if !allowLocalMutation(w, r) {
+		return
+	}
+	enabled, err := strconv.ParseBool(r.URL.Query().Get("enabled"))
+	if err != nil {
+		http.Error(w, "enabled must be true or false", http.StatusBadRequest)
+		return
+	}
+	routes := append([]string(nil), r.URL.Query()["route"]...)
+	if err := s.agent.SetLocalAccessRuntime(enabled, routes); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Enabled bool     `json:"enabled"`
+		Routes  []string `json:"routes"`
+	}{Enabled: enabled, Routes: routes})
 }
 
 func allowLocalMutation(w http.ResponseWriter, r *http.Request) bool {

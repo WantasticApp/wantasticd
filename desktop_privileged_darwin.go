@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -199,6 +200,9 @@ end repeat
 do shell script commandLine with administrator privileges
 end run`
 	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", append([]string{"-e", script}, args...)...)
+	stderr := newTailBuffer(8 << 10)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = stderr
 	result := make(chan error, 1)
 	if err := cmd.Start(); err != nil {
 		a.finishPrivilegedStart(epoch, err)
@@ -215,7 +219,7 @@ end run`
 			return
 		case err := <-result:
 			if ctx.Err() == nil {
-				a.finishPrivilegedStart(epoch, normalizeHelperError(err))
+				a.finishPrivilegedStart(epoch, normalizeHelperError(err, stderr.String()))
 			}
 			return
 		case <-ticker.C:
@@ -273,15 +277,76 @@ func (a *App) finishPrivilegedStart(epoch uint64, err error) {
 	a.updateTray(status, statusErr)
 }
 
-func normalizeHelperError(err error) error {
+func normalizeHelperError(err error, stderr string) error {
 	if err == nil {
 		return errors.New("privileged tunnel helper stopped")
 	}
-	text := strings.ToLower(err.Error())
+	text := strings.ToLower(err.Error() + "\n" + stderr)
 	if strings.Contains(text, "canceled") || strings.Contains(text, "cancelled") || strings.Contains(text, "-128") {
 		return errors.New("administrator authorization was cancelled")
 	}
+	if detail := privilegedHelperDetail(stderr); detail != "" {
+		return fmt.Errorf("privileged tunnel helper could not start: %s", detail)
+	}
 	return errors.New("privileged tunnel helper could not start")
+}
+
+func privilegedHelperDetail(stderr string) string {
+	const marker = "privileged tunnel helper:"
+	lines := strings.Split(strings.ReplaceAll(stderr, "\r", ""), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		position := strings.Index(strings.ToLower(line), marker)
+		if position < 0 {
+			continue
+		}
+		detail := strings.TrimSpace(line[position+len(marker):])
+		if len(detail) > 512 {
+			detail = detail[:512]
+		}
+		return strings.Map(func(char rune) rune {
+			if char < 0x20 || char == 0x7f {
+				return -1
+			}
+			return char
+		}, detail)
+	}
+	return ""
+}
+
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+	max  int
+}
+
+func newTailBuffer(max int) *tailBuffer {
+	return &tailBuffer{max: max}
+}
+
+func (b *tailBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	written := len(data)
+	if b.max <= 0 {
+		return written, nil
+	}
+	if len(data) >= b.max {
+		b.data = append(b.data[:0], data[len(data)-b.max:]...)
+		return written, nil
+	}
+	b.data = append(b.data, data...)
+	if overflow := len(b.data) - b.max; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:b.max]
+	}
+	return written, nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(append([]byte(nil), b.data...))
 }
 
 func validateOwnedPrivateFile(path string, maxSize int64) (uint32, uint32, error) {

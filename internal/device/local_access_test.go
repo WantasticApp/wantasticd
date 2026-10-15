@@ -147,6 +147,22 @@ func TestLocalAccessSourceRoutes(t *testing.T) {
 	}
 }
 
+func TestValidateLocalAccessSeparation(t *testing.T) {
+	t.Parallel()
+	if err := validateLocalAccessSeparation(
+		[]string{"192.168.50.0/24", "172.16.4.25/32"},
+		[]string{"10.255.255.32/27"},
+	); err != nil {
+		t.Fatalf("validateLocalAccessSeparation() error = %v", err)
+	}
+	if err := validateLocalAccessSeparation(
+		[]string{"10.255.255.36/32"},
+		[]string{"10.255.255.32/27"},
+	); err == nil {
+		t.Fatal("validateLocalAccessSeparation() accepted an overlay address as a LAN route")
+	}
+}
+
 func TestRouteOverlapsAny(t *testing.T) {
 	t.Parallel()
 

@@ -59,3 +59,19 @@ func TestValidateLocalAccessRoutesSupportsHostRoutes(t *testing.T) {
 		t.Fatal("public /32 was accepted")
 	}
 }
+
+func TestValidateLocalAccessOverlaySeparation(t *testing.T) {
+	t.Parallel()
+	if err := ValidateLocalAccessOverlaySeparation(
+		[]string{"192.168.1.25/32"},
+		[]string{"10.255.255.32/27"},
+	); err != nil {
+		t.Fatalf("ValidateLocalAccessOverlaySeparation() error = %v", err)
+	}
+	if err := ValidateLocalAccessOverlaySeparation(
+		[]string{"10.255.255.36/32"},
+		[]string{"10.255.255.32/27"},
+	); err == nil || !strings.Contains(err.Error(), "overlaps tenant overlay") {
+		t.Fatalf("overlapping local route error = %v", err)
+	}
+}

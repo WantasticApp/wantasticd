@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -424,10 +425,47 @@ func (a *App) ConfigureLocalAccess(enabled bool, routes []string) error {
 	if len(normalized) > 0 {
 		enabled = true
 	}
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" || a.usesExternalAgent() {
+		return a.persistExternalLocalAccess(enabled, normalized)
+	}
 	return a.updateConfig(func(cfg *config.Config) {
 		cfg.AllowLocalAccess = enabled
 		cfg.LocalAccessRoutes = normalized
 	})
+}
+
+func (a *App) persistExternalLocalAccess(enabled bool, routes []string) error {
+	path := auth.DefaultConfigPath()
+	previous, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read local-access preference: %w", err)
+	}
+	cfg, err := config.Parse(previous)
+	if err != nil {
+		return fmt.Errorf("parse local-access preference: %w", err)
+	}
+	cfg.AllowLocalAccess = enabled
+	cfg.LocalAccessRoutes = append([]string(nil), routes...)
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.SaveToFile(path); err != nil {
+		return fmt.Errorf("persist local-access preference: %w", err)
+	}
+	query := url.Values{"enabled": []string{strconv.FormatBool(enabled)}}
+	for _, route := range routes {
+		query.Add("route", route)
+	}
+	if err := ipcPost("/api/local-access/runtime?" + query.Encode()); err != nil {
+		if restoreErr := auth.WritePrivateFile(path, previous); restoreErr != nil {
+			return fmt.Errorf("apply local-access preference: %v; restore config: %w", err, restoreErr)
+		}
+		return fmt.Errorf("apply local-access preference: %w", err)
+	}
+	a.mu.Lock()
+	a.cfg = cfg
+	a.mu.Unlock()
+	return nil
 }
 
 func (a *App) updateConfig(update func(*config.Config)) error {

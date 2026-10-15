@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"wantastic-agent/internal/config"
@@ -24,6 +25,32 @@ func TestHandleSetExitNodeOfferRuntime(t *testing.T) {
 	}
 	if !agt.config.ExitNode.Enabled {
 		t.Fatal("runtime exit-node offer was not applied")
+	}
+}
+
+func TestHandleSetLocalAccessRuntimeRejectsOverlayRoute(t *testing.T) {
+	t.Parallel()
+	agt := &Agent{
+		config: &config.Config{
+			Server: config.Server{AllowedIPs: []string{"10.255.255.32/27"}},
+		},
+		localAccessWake: make(chan struct{}, 1),
+	}
+	server := &APIServer{agent: agt}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"http://127.0.0.1/api/local-access/runtime?enabled=true&route=10.255.255.36%2F32",
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	server.handleSetLocalAccessRuntime(response, req)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusConflict)
+	}
+	if body := response.Body.String(); !strings.Contains(body, "overlaps tenant overlay") {
+		t.Fatalf("response = %q, want overlay separation error", body)
 	}
 }
 

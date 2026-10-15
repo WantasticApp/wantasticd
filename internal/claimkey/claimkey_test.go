@@ -1,9 +1,10 @@
 package claimkey
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
+
+	"wantastic-agent/internal/auth"
 )
 
 func TestLoadOrCreateReusesAndRotatesIdentity(t *testing.T) {
@@ -27,12 +28,8 @@ func TestLoadOrCreateReusesAndRotatesIdentity(t *testing.T) {
 	if third.PublicKey == first.PublicKey {
 		t.Fatal("rotation preserved the old public key")
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("claim key mode = %o, want 600", info.Mode().Perm())
+	if err := auth.CheckPrivateFilePermissions(path); err != nil {
+		t.Fatalf("claim key permissions: %v", err)
 	}
 }
 

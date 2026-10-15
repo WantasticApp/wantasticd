@@ -38,7 +38,7 @@ func BenchmarkUSPRuntimeTunnelTransferUpload100MB(b *testing.B) {
 					Method: wusp.USPAgentMethodUpload,
 					Transfer: &wusp.USPTransferRequest{
 						Path: "Device.DeviceInfo.VendorConfigFile.1.",
-						URI:  "file://" + target,
+						URI:  localFileURI(target),
 						Metadata: map[string]string{
 							"size": strconv.FormatInt(uspBenchmarkTransferSize, 10),
 						},
@@ -170,7 +170,7 @@ func BenchmarkUSPRuntimeTunnelTransferDownload100MB(b *testing.B) {
 					Method: wusp.USPAgentMethodDownload,
 					Transfer: &wusp.USPTransferRequest{
 						Path: "Device.DeviceInfo.VendorConfigFile.1.",
-						URI:  "file://" + source,
+						URI:  localFileURI(source),
 					},
 				})
 				if err != nil {

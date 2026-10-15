@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -23,28 +22,36 @@ import (
 	"wantastic-agent/internal/claimkey"
 	"wantastic-agent/internal/config"
 	"wantastic-agent/internal/device"
+	"wantastic-agent/internal/netprobe"
+	platformdns "wantastic-agent/internal/platform/dns"
 	"wantastic-agent/pkg/version"
 
-	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 const maxManualConfigBytes = 1 << 20
 
+const desktopClaimPollInterval = 10 * time.Second
+
+type claimConfigFetcher func(context.Context, string, string, string) (*auth.ClaimConfig, error)
+
 type PeerInfo struct {
-	PublicKey     string `json:"public_key"`
-	AssignedIP    string `json:"assigned_ip"`
-	Hostname      string `json:"hostname"`
-	MagicName     string `json:"magic_name"`
-	Endpoint      string `json:"endpoint"`
-	RxBytes       uint64 `json:"rx_bytes"`
-	TxBytes       uint64 `json:"tx_bytes"`
-	P2PState      string `json:"p2p_state"`
-	Connection    string `json:"connection"`
-	LastHandshake int64  `json:"last_handshake"`
+	PublicKey      string `json:"public_key"`
+	AssignedIP     string `json:"assigned_ip"`
+	Hostname       string `json:"hostname"`
+	MagicName      string `json:"magic_name"`
+	Endpoint       string `json:"endpoint"`
+	RxBytes        uint64 `json:"rx_bytes"`
+	TxBytes        uint64 `json:"tx_bytes"`
+	P2PState       string `json:"p2p_state"`
+	Connection     string `json:"connection"`
+	OffersExitNode bool   `json:"offers_exit_node"`
+	LastHandshake  int64  `json:"last_handshake"`
 }
 
 type StatusData struct {
 	Configured        bool       `json:"configured"`
+	Starting          bool       `json:"starting"`
 	Running           bool       `json:"running"`
 	DeviceRunning     bool       `json:"device_running"`
 	TUNMode           bool       `json:"tun_mode"`
@@ -69,40 +76,79 @@ type ClaimLink struct {
 }
 
 type PingResult struct {
-	Target     string `json:"target"`
-	IP         string `json:"ip"`
-	Reachable  bool   `json:"reachable"`
-	LatencyMS  int64  `json:"latency_ms"`
-	Connection string `json:"connection"`
-	Message    string `json:"message"`
+	Target     string       `json:"target"`
+	IP         string       `json:"ip"`
+	Reachable  bool         `json:"reachable"`
+	LatencyMS  int64        `json:"latency_ms"`
+	Connection string       `json:"connection"`
+	Message    string       `json:"message"`
+	Samples    []PingSample `json:"samples"`
+	AverageMS  int64        `json:"average_ms"`
+	PacketLoss int          `json:"packet_loss"`
+}
+
+type PingSample struct {
+	LatencyMS int64 `json:"latency_ms"`
+	Reachable bool  `json:"reachable"`
 }
 
 type App struct {
-	ctx context.Context
+	ctx        context.Context
+	desktop    *application.App
+	window     application.Window
+	tray       *application.SystemTray
+	trayMenu   *application.Menu
+	trayStatus *application.MenuItem
+	trayIP     *application.MenuItem
+	trayToggle *application.MenuItem
 
-	mu          sync.RWMutex
-	agt         *agent.Agent
-	agentCancel context.CancelFunc
-	cfg         *config.Config
-	configured  bool
+	mu                  sync.RWMutex
+	agt                 *agent.Agent
+	agentCancel         context.CancelFunc
+	claimCancel         context.CancelFunc
+	claimEpoch          uint64
+	cfg                 *config.Config
+	configured          bool
+	starting            bool
+	externalOwned       bool
+	helperEpoch         uint64
+	helperMarker        string
+	claimConnectPending bool
+
+	waitClaimConfig   claimConfigFetcher
+	fetchClaimConfig  claimConfigFetcher
+	hashedDeviceID    func() (string, error)
+	applyDesktopClaim func(*claimkey.File, *auth.ClaimConfig) error
 }
 
-func NewApp() *App { return &App{} }
-
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-	configureTrayOnlyApp()
-	go a.startSystray()
-	if err := a.startEmbeddedAgent(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		wailsruntime.EventsEmit(ctx, "app:error", err.Error())
+func NewApp(desktop *application.App) *App {
+	return &App{
+		desktop:          desktop,
+		waitClaimConfig:  auth.WaitClaimConfig,
+		fetchClaimConfig: auth.FetchClaimConfig,
+		hashedDeviceID:   auth.HashedDeviceID,
 	}
+}
+
+func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
+	a.ctx = ctx
+	if err := a.startEmbeddedAgent(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.desktop.Event.Emit("app:error", err.Error())
+	}
+	status, statusErr := a.GetStatus()
+	a.updateTray(status, statusErr)
 	if !a.IsConfigured() {
 		a.showMainWindow()
 	}
 	go a.pollStatus()
+	return nil
 }
 
-func (a *App) shutdown(context.Context) { a.stopEmbeddedAgent() }
+func (a *App) ServiceShutdown() error {
+	a.stopClaimWatcher()
+	a.stopEmbeddedAgent()
+	return nil
+}
 
 func (a *App) pollStatus() {
 	ticker := time.NewTicker(5 * time.Second)
@@ -114,7 +160,10 @@ func (a *App) pollStatus() {
 		case <-ticker.C:
 			status, err := a.GetStatus()
 			if err == nil {
-				wailsruntime.EventsEmit(a.ctx, "status:update", status)
+				a.desktop.Event.Emit("status:update", status)
+				a.updateTray(status, nil)
+			} else {
+				a.updateTray(nil, err)
 			}
 		}
 	}
@@ -141,6 +190,9 @@ func (a *App) startEmbeddedAgent() error {
 }
 
 func (a *App) startConfig(cfg *config.Config) error {
+	if handled, err := a.startPrivilegedAgentIfNeeded(cfg); handled {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	agt, err := agent.New(cfg)
 	if err != nil {
@@ -156,6 +208,8 @@ func (a *App) startConfig(cfg *config.Config) error {
 	a.agentCancel = cancel
 	a.cfg = cfg
 	a.configured = true
+	a.starting = false
+	a.externalOwned = false
 	a.mu.Unlock()
 	return nil
 }
@@ -164,10 +218,22 @@ func (a *App) stopEmbeddedAgent() {
 	a.mu.Lock()
 	agt := a.agt
 	cancel := a.agentCancel
+	externalOwned := a.externalOwned
+	marker := a.helperMarker
 	a.agt = nil
 	a.agentCancel = nil
 	a.configured = false
+	a.starting = false
+	a.externalOwned = false
+	a.helperMarker = ""
+	a.helperEpoch++
 	a.mu.Unlock()
+	if externalOwned {
+		_ = ipcPost("/api/shutdown")
+	}
+	if marker != "" {
+		_ = os.Remove(marker)
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -181,7 +247,7 @@ func (a *App) restartConfig(cfg *config.Config) error {
 	if err := a.startConfig(cfg); err != nil {
 		return err
 	}
-	wailsruntime.EventsEmit(a.ctx, "service:ready", true)
+	a.desktop.Event.Emit("service:ready", true)
 	return nil
 }
 
@@ -194,31 +260,44 @@ func (a *App) IsConfigured() bool {
 func (a *App) GetStatus() (*StatusData, error) {
 	a.mu.RLock()
 	configured := a.configured
+	starting := a.starting
 	cfg := a.cfg
 	a.mu.RUnlock()
 	if !configured || cfg == nil {
-		return &StatusData{Configured: false}, nil
+		return &StatusData{Configured: false, Starting: starting}, nil
 	}
 
 	var raw agent.StatusResponse
 	if err := ipcGet("/api/status", &raw); err != nil {
-		return &StatusData{Configured: true}, nil
+		return &StatusData{Configured: true, Starting: starting}, nil
 	}
 	peers := make([]PeerInfo, 0, len(raw.Peers))
 	for _, peer := range raw.Peers {
+		// The coordinator is a transport peer, not a tenant device. It has no
+		// overlay address and must not appear as a selectable "device".
+		if net.ParseIP(strings.TrimSpace(peer.AssignedIP)) == nil {
+			continue
+		}
 		peers = append(peers, PeerInfo{
 			PublicKey: peer.PublicKey, AssignedIP: peer.AssignedIP, Hostname: peer.Hostname,
 			MagicName: magicName(peer), Endpoint: peer.Endpoint, RxBytes: peer.RxBytes,
 			TxBytes: peer.TxBytes, P2PState: peer.P2PState, Connection: peerConnection(peer),
-			LastHandshake: peer.LastHandshake,
+			LastHandshake:  peer.LastHandshake,
+			OffersExitNode: peer.OffersExitNode,
 		})
 	}
+	ips := append([]string(nil), raw.IPs...)
+	if len(ips) == 0 {
+		for _, prefix := range cfg.Interface.Addresses {
+			ips = append(ips, prefix.String())
+		}
+	}
 	return &StatusData{
-		Configured: true, Running: raw.Running, DeviceRunning: raw.DeviceRunning,
+		Configured: true, Starting: starting, Running: raw.Running, DeviceRunning: raw.DeviceRunning,
 		TUNMode: raw.TUNMode, TUNName: raw.TUNName, OfferExitNode: raw.ExitNode,
 		LocalAccess: raw.LocalAccess, LocalAccessRoutes: append([]string(nil), cfg.LocalAccessRoutes...),
-		MagicDNS: magicDNSActive(cfg.Interface.DNS), DNSServers: append([]string(nil), cfg.Interface.DNS...),
-		IPs: raw.IPs, PubKey: raw.PubKey, RxBytes: raw.RxBytes, TxBytes: raw.TxBytes, Peers: peers,
+		MagicDNS: raw.MagicDNS, DNSServers: append([]string(nil), cfg.Interface.DNS...),
+		IPs: ips, PubKey: raw.PubKey, RxBytes: raw.RxBytes, TxBytes: raw.TxBytes, Peers: peers,
 	}, nil
 }
 
@@ -259,11 +338,29 @@ func sanitizeDNSLabel(value string) string {
 	return strings.Trim(string(label), "-")
 }
 
-func (a *App) ToggleVPN() error { return ipcPost("/api/state/toggle") }
+func (a *App) ToggleVPN() error {
+	a.mu.RLock()
+	cfg := a.cfg
+	configured := a.configured
+	starting := a.starting
+	managedExternally := a.externalOwned || os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1"
+	hasEmbeddedAgent := a.agt != nil
+	a.mu.RUnlock()
+	if starting {
+		return errors.New("secure tunnel is still starting")
+	}
+	if runtime.GOOS == "darwin" && configured && cfg != nil && !managedExternally && !hasEmbeddedAgent {
+		return a.restartConfig(cfg)
+	}
+	return ipcPost("/api/state/toggle")
+}
 
 func (a *App) SetOfferExitNode(enabled bool) error {
 	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
 		return ipcPost(fmt.Sprintf("/api/exitnode/offer?enabled=%t", enabled))
+	}
+	if a.usesExternalAgent() {
+		return a.persistExternalExitNodeOffer(enabled)
 	}
 	a.mu.RLock()
 	agt := a.agt
@@ -274,8 +371,34 @@ func (a *App) SetOfferExitNode(enabled bool) error {
 	return agt.SetOfferExitNode(enabled)
 }
 
+func (a *App) persistExternalExitNodeOffer(enabled bool) error {
+	path := auth.DefaultConfigPath()
+	previous, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read exit-node preference: %w", err)
+	}
+	cfg, err := config.Parse(previous)
+	if err != nil {
+		return fmt.Errorf("parse exit-node preference: %w", err)
+	}
+	cfg.ExitNode.Enabled = enabled
+	if err := cfg.SaveToFile(path); err != nil {
+		return fmt.Errorf("persist exit-node preference: %w", err)
+	}
+	if err := ipcPost(fmt.Sprintf("/api/exitnode/offer/runtime?enabled=%t", enabled)); err != nil {
+		if restoreErr := auth.WritePrivateFile(path, previous); restoreErr != nil {
+			return fmt.Errorf("apply exit-node preference: %v; restore config: %w", err, restoreErr)
+		}
+		return fmt.Errorf("apply exit-node preference: %w", err)
+	}
+	a.mu.Lock()
+	a.cfg = cfg
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *App) SetExitNode(publicKey string) error {
-	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" {
+	if os.Getenv("WANTASTIC_DESKTOP_EXTERNAL_AGENT") == "1" || a.usesExternalAgent() {
 		return ipcPost("/api/exitnode/use?peer=" + url.QueryEscape(strings.TrimSpace(publicKey)))
 	}
 	a.mu.RLock()
@@ -285,6 +408,12 @@ func (a *App) SetExitNode(publicKey string) error {
 		return errors.New("wantastic is not configured")
 	}
 	return agt.SetExitNode(strings.TrimSpace(publicKey))
+}
+
+func (a *App) usesExternalAgent() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.externalOwned
 }
 
 func (a *App) ConfigureLocalAccess(enabled bool, routes []string) error {
@@ -372,23 +501,7 @@ func (a *App) ImportManualConfig(raw string) error {
 	}
 	cfg.Interface.TUNMode = true
 	cfg.Interface.TUNName = config.DefaultTunName()
-	path := auth.DefaultConfigPath()
-	previous, previousErr := os.ReadFile(path)
-	if err := cfg.SaveToFile(path); err != nil {
-		return err
-	}
-	if err := a.restartConfig(cfg); err == nil {
-		return nil
-	} else {
-		startErr := err
-		if previousErr == nil {
-			_ = os.WriteFile(path, previous, 0o600)
-			if oldCfg, loadErr := config.LoadFromFile(path); loadErr == nil {
-				_ = a.startConfig(oldCfg)
-			}
-		}
-		return startErr
-	}
+	return a.persistAndRestartConfig(cfg)
 }
 
 func (a *App) GenerateClaimLink(serverURL string, rotate bool) (*ClaimLink, error) {
@@ -396,7 +509,175 @@ func (a *App) GenerateClaimLink(serverURL string, rotate bool) (*ClaimLink, erro
 	if err != nil {
 		return nil, err
 	}
+	a.startClaimWatcher(key)
 	return &ClaimLink{PublicKey: key.PublicKey, ServerURL: key.ServerURL, ClaimURL: key.ClaimURL, Reused: reused}, nil
+}
+
+func (a *App) startClaimWatcher(key *claimkey.File) {
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+
+	a.mu.Lock()
+	previousCancel := a.claimCancel
+	a.claimCancel = cancel
+	a.claimEpoch++
+	epoch := a.claimEpoch
+	a.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
+
+	go a.watchClaim(ctx, epoch, key)
+}
+
+func (a *App) stopClaimWatcher() {
+	a.mu.Lock()
+	cancel := a.claimCancel
+	a.claimCancel = nil
+	a.claimEpoch++
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (a *App) watchClaim(ctx context.Context, epoch uint64, key *claimkey.File) {
+	deviceID, err := a.hashedDeviceID()
+	if err != nil {
+		a.emitError(fmt.Errorf("prepare device claim identity: %w", err))
+		return
+	}
+	if parsed, parseErr := url.Parse(key.ServerURL); parseErr == nil {
+		platformdns.EnsureBootstrapHost(ctx, parsed.Hostname())
+	}
+
+	ticker := time.NewTicker(desktopClaimPollInterval)
+	defer ticker.Stop()
+	for {
+		claim, waitErr := a.waitClaimConfig(ctx, key.ServerURL, deviceID, key.PublicKey)
+		if waitErr == nil {
+			if a.applyClaimIfCurrent(ctx, epoch, key, claim) {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				continue
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
+		pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		claim, fetchErr := a.fetchClaimConfig(pollCtx, key.ServerURL, deviceID, key.PublicKey)
+		cancel()
+		if fetchErr == nil && a.applyClaimIfCurrent(ctx, epoch, key, claim) {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if waitErr != nil && fetchErr != nil {
+			a.emitError(fmt.Errorf("waiting for device claim: websocket: %v; polling: %w", waitErr, fetchErr))
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (a *App) applyClaimIfCurrent(
+	ctx context.Context,
+	epoch uint64,
+	key *claimkey.File,
+	claim *auth.ClaimConfig,
+) bool {
+	if claim == nil || !claim.Claimed || ctx.Err() != nil {
+		return false
+	}
+	a.mu.RLock()
+	current := epoch == a.claimEpoch
+	a.mu.RUnlock()
+	if !current {
+		return false
+	}
+
+	apply := a.applyDesktopClaim
+	if apply == nil {
+		apply = a.activateClaimedConfig
+	}
+	if err := apply(key, claim); err != nil {
+		a.emitError(fmt.Errorf("activate claimed device: %w", err))
+		return false
+	}
+	a.mu.Lock()
+	if epoch == a.claimEpoch {
+		a.claimCancel = nil
+	}
+	a.mu.Unlock()
+	return true
+}
+
+func (a *App) activateClaimedConfig(key *claimkey.File, claim *auth.ClaimConfig) error {
+	cfg, err := config.LoadFromClaimConfig(key.ServerURL, key.PrivateKey, key.PublicKey, claim)
+	if err != nil {
+		return fmt.Errorf("load claimed configuration: %w", err)
+	}
+	cfg.Interface.TUNMode = true
+	cfg.Interface.TUNName = config.DefaultTunName()
+	if err := a.persistAndRestartConfig(cfg); err != nil {
+		return fmt.Errorf("connect claimed device: %w", err)
+	}
+	a.mu.Lock()
+	a.claimConnectPending = a.starting
+	pending := a.claimConnectPending
+	a.mu.Unlock()
+	status, statusErr := a.GetStatus()
+	if statusErr == nil && !pending {
+		a.desktop.Event.Emit("status:update", status)
+		a.desktop.Event.Emit("claim:connected", true)
+	}
+	a.updateTray(status, statusErr)
+	return nil
+}
+
+func (a *App) persistAndRestartConfig(cfg *config.Config) error {
+	path := auth.DefaultConfigPath()
+	previous, previousErr := os.ReadFile(path)
+	if previousErr != nil && !os.IsNotExist(previousErr) {
+		return fmt.Errorf("read existing configuration: %w", previousErr)
+	}
+	if err := cfg.SaveToFile(path); err != nil {
+		return fmt.Errorf("save configuration: %w", err)
+	}
+	startErr := a.restartConfig(cfg)
+	if startErr == nil {
+		return nil
+	}
+	if previousErr != nil {
+		return startErr
+	}
+	if restoreErr := os.WriteFile(path, previous, 0o600); restoreErr != nil {
+		return fmt.Errorf("connect: %v; restore previous configuration: %w", startErr, restoreErr)
+	}
+	if oldCfg, loadErr := config.LoadFromFile(path); loadErr == nil {
+		_ = a.startConfig(oldCfg)
+	}
+	return startErr
+}
+
+func (a *App) emitError(err error) {
+	if err != nil && a.desktop != nil {
+		a.desktop.Event.Emit("app:error", err.Error())
+	}
 }
 
 func (a *App) OpenURL(rawURL string) error {
@@ -404,8 +685,7 @@ func (a *App) OpenURL(rawURL string) error {
 	if err != nil || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && parsed.Hostname() == "localhost")) {
 		return errors.New("refusing to open an invalid or insecure URL")
 	}
-	wailsruntime.BrowserOpenURL(a.ctx, rawURL)
-	return nil
+	return a.desktop.Browser.OpenURL(rawURL)
 }
 
 func (a *App) PingPeer(reference string) (*PingResult, error) {
@@ -424,18 +704,45 @@ func (a *App) PingPeer(reference string) (*PingResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(a.ctx, 4*time.Second)
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 6*time.Second)
 	defer cancel()
-	started := time.Now()
-	cmd := exec.CommandContext(ctx, "ping", pingArgs(selected.AssignedIP)...)
-	output, runErr := cmd.CombinedOutput()
-	message := strings.TrimSpace(string(output))
-	if len(message) > 500 {
-		message = message[:500]
+	const sampleCount = 6
+	samples := make([]PingSample, 0, sampleCount)
+	var total time.Duration
+	received := 0
+	message := "No ICMP replies"
+	for i := 0; i < sampleCount; i++ {
+		sampleCtx, sampleCancel := context.WithTimeout(ctx, 750*time.Millisecond)
+		latency, sampleMessage, runErr := netprobe.Ping(sampleCtx, selected.AssignedIP)
+		sampleCancel()
+		sample := PingSample{Reachable: runErr == nil}
+		if runErr == nil {
+			sample.LatencyMS = max(1, latency.Milliseconds())
+			total += latency
+			received++
+			message = sampleMessage
+		}
+		samples = append(samples, sample)
+		if i+1 < sampleCount {
+			select {
+			case <-ctx.Done():
+				i = sampleCount
+			case <-time.After(75 * time.Millisecond):
+			}
+		}
+	}
+	average := int64(0)
+	if received > 0 {
+		average = max(1, (total / time.Duration(received)).Milliseconds())
 	}
 	return &PingResult{
-		Target: selected.MagicName, IP: selected.AssignedIP, Reachable: runErr == nil,
-		LatencyMS: time.Since(started).Milliseconds(), Connection: selected.Connection, Message: message,
+		Target: selected.MagicName, IP: selected.AssignedIP, Reachable: received > 0,
+		LatencyMS: average, AverageMS: average, PacketLoss: (sampleCount - received) * 100 / sampleCount,
+		Connection: selected.Connection, Message: message, Samples: samples,
 	}, nil
 }
 
@@ -464,17 +771,6 @@ func selectPingTarget(reference string, peers []PeerInfo, allowedRoutes []string
 		}
 	}
 	return nil, errors.New("IP is outside the configured tenant routes")
-}
-
-func pingArgs(ip string) []string {
-	switch runtime.GOOS {
-	case "windows":
-		return []string{"-n", "1", "-w", "2000", ip}
-	case "darwin":
-		return []string{"-n", "-c", "1", "-W", "2000", ip}
-	default:
-		return []string{"-n", "-c", "1", "-W", "2", ip}
-	}
 }
 
 func ipcGet(path string, target any) error {
@@ -507,32 +803,136 @@ func ipcPost(path string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		detail := strings.TrimSpace(string(message))
+		if detail != "" {
+			return errors.New(detail)
+		}
 		return fmt.Errorf("local service returned %s", resp.Status)
 	}
 	return nil
 }
 
-func magicDNSActive(servers []string) bool {
-	if len(servers) == 0 {
-		return false
-	}
-	// Native DNS application is currently implemented only by the Linux
-	// adapter. macOS and Windows must not claim MagicDNS is active merely
-	// because addresses were present in a config file.
-	return runtime.GOOS == "linux"
-}
-
 func (a *App) showMainWindow() {
-	if a.ctx == nil {
+	if a.window == nil {
 		return
 	}
-	activateDesktopApp()
-	wailsruntime.WindowUnminimise(a.ctx)
-	wailsruntime.WindowShow(a.ctx)
+	if a.tray != nil {
+		a.tray.ShowWindow()
+		return
+	}
+	a.window.Show().Focus()
 }
 
-func (a *App) OpenConsole()       { wailsruntime.BrowserOpenURL(a.ctx, "https://console.wantastic.app") }
-func (a *App) WindowShow()        { a.showMainWindow() }
-func (a *App) WindowHide()        { wailsruntime.WindowHide(a.ctx) }
+func (a *App) setWindow(window application.Window) {
+	a.window = window
+}
+
+func (a *App) setSystemTray(tray *application.SystemTray) {
+	a.tray = tray
+	tray.SetLabel("Offline")
+	menu := a.desktop.NewMenu()
+	a.trayStatus = menu.Add("Offline")
+	a.trayStatus.SetEnabled(false)
+	a.trayIP = menu.Add("IP: —")
+	a.trayIP.SetEnabled(false)
+	menu.AddSeparator()
+	a.trayToggle = menu.Add("Connect")
+	a.trayToggle.OnClick(func(*application.Context) {
+		go func() {
+			if err := a.ToggleVPN(); err != nil {
+				a.desktop.Event.Emit("app:error", err.Error())
+			}
+		}()
+	})
+	menu.Add("Devices").OnClick(func(*application.Context) { a.showSection("devices") })
+	menu.Add("Network").OnClick(func(*application.Context) { a.showSection("network") })
+	menu.Add("Open App").OnClick(func(*application.Context) { a.showMainWindow() })
+	menu.AddSeparator()
+	menu.Add("Generate Claim Link").OnClick(func(*application.Context) {
+		go func() {
+			claim, err := a.GenerateClaimLink("https://console.wantastic.app", false)
+			if err != nil {
+				a.desktop.Event.Emit("app:error", err.Error())
+				return
+			}
+			_ = a.OpenURL(claim.ClaimURL)
+		}()
+	})
+	menu.Add("Settings").OnClick(func(*application.Context) { a.showSection("settings") })
+	menu.AddSeparator()
+	menu.Add("Quit Wantastic").OnClick(func(*application.Context) { a.desktop.Quit() })
+	a.trayMenu = menu
+	tray.SetMenu(menu)
+}
+
+func (a *App) showSection(section string) {
+	a.desktop.Event.Emit("navigate", section)
+	a.showMainWindow()
+}
+
+func (a *App) updateTray(status *StatusData, statusErr error) {
+	if a.trayMenu == nil || a.trayStatus == nil || a.trayIP == nil || a.trayToggle == nil {
+		return
+	}
+	presentation := makeTrayPresentation(status, statusErr)
+	a.tray.SetLabel(presentation.trayLabel)
+	a.trayStatus.SetLabel(presentation.statusTitle)
+	a.trayIP.SetLabel(presentation.ipTitle)
+	a.trayToggle.SetLabel(presentation.toggleTitle)
+	a.trayToggle.SetEnabled(presentation.toggleEnabled)
+	a.tray.SetTooltip(presentation.tooltip)
+	a.trayMenu.Update()
+}
+
+type trayPresentation struct {
+	trayLabel     string
+	statusTitle   string
+	ipTitle       string
+	toggleTitle   string
+	toggleEnabled bool
+	tooltip       string
+}
+
+func makeTrayPresentation(status *StatusData, statusErr error) trayPresentation {
+	state := "Offline"
+	toggle := "Connect"
+	toggleEnabled := false
+	ip := "–"
+	if statusErr == nil && status != nil {
+		toggleEnabled = status.Configured && !status.Starting
+		switch {
+		case status.Starting:
+			state = "Starting"
+			toggle = "Starting…"
+		case status.Running && status.DeviceRunning:
+			state = "Online"
+			toggle = "Disconnect"
+		}
+		if len(status.IPs) > 0 && status.IPs[0] != "" {
+			ip = strings.SplitN(status.IPs[0], "/", 2)[0]
+		}
+	}
+	tooltip := "Wantastic — " + state
+	if ip != "–" {
+		tooltip += " — " + ip
+	}
+	return trayPresentation{
+		trayLabel:     state,
+		statusTitle:   state,
+		ipTitle:       "IP: " + ip,
+		toggleTitle:   toggle,
+		toggleEnabled: toggleEnabled,
+		tooltip:       tooltip,
+	}
+}
+
+func (a *App) OpenConsole() { _ = a.desktop.Browser.OpenURL("https://console.wantastic.app") }
+func (a *App) WindowShow()  { a.showMainWindow() }
+func (a *App) WindowHide() {
+	if a.window != nil {
+		a.window.Hide()
+	}
+}
 func (a *App) WindowStartDrag()   {}
 func (a *App) GetVersion() string { return version.Version }

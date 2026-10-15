@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,6 +76,7 @@ type uspRuntime struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	transport              uspTransport
+	agentMu                sync.RWMutex
 	agent                  *wusp.USPAgent
 	dataModelCache         *persistentDataModelCache
 	rawBackend             wusp.DataBackend
@@ -97,6 +99,8 @@ type uspRuntime struct {
 	initState  atomic.Int32
 	initReady  chan struct{} // closed once initState == uspInitReady
 	warmupDone chan struct{} // closed after initial live cellular collection
+	closeOnce  sync.Once
+	background sync.WaitGroup
 }
 
 type USPRuntimeStats struct {
@@ -147,6 +151,21 @@ type uspRuntimeStats struct {
 	transferPayloadBytes       atomic.Uint64
 	transferDurationNS         atomic.Uint64
 	transferDurationMaxNS      atomic.Uint64
+}
+
+func (r *uspRuntime) setAgent(agent *wusp.USPAgent) {
+	r.agentMu.Lock()
+	r.agent = agent
+	r.agentMu.Unlock()
+}
+
+func (r *uspRuntime) uspAgent() *wusp.USPAgent {
+	if r == nil {
+		return nil
+	}
+	r.agentMu.RLock()
+	defer r.agentMu.RUnlock()
+	return r.agent
 }
 
 func (r *uspRuntime) StatsSnapshot() USPRuntimeStats {
@@ -237,6 +256,15 @@ func observeUSPUint64Max(target *atomic.Uint64, value uint64) {
 }
 
 func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion string) (*uspRuntime, error) {
+	return newUSPRuntimeWithBackend(cfg, transport, softwareVersion, nil)
+}
+
+func newUSPRuntimeWithBackend(
+	cfg *config.Config,
+	transport uspTransport,
+	softwareVersion string,
+	backend wusp.DataBackend,
+) (*uspRuntime, error) {
 	if cfg == nil {
 		log.Printf("[USP] WUSP disabled: no configuration provided")
 		return nil, nil
@@ -259,7 +287,9 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 
 	log.Printf("[USP] Runtime initializing: deviceID=%q serial=%q controllerKey=%q", cfg.DeviceID, wuspSerial, controllerPublicKeyHex)
 
-	backend := platforms.NewBackend(platforms.Options{})
+	if backend == nil {
+		backend = platforms.NewBackend(platforms.Options{})
+	}
 	networkSpeed := newNetworkSpeedManager(auth.PersistentFilePath("network-speed.json"))
 	telemetryBackend := &networkTelemetryBackend{backend: backend, speed: networkSpeed}
 	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
@@ -282,14 +312,14 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		initReady:     make(chan struct{}),
 		warmupDone:    make(chan struct{}),
 	}
-	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
+	runtime.setAgent(wusp.NewUSPAgent(wusp.USPAgentOptions{
 		Collector:       cachedBackend,
 		Setter:          cachedBackend,
 		UploadHandler:   runtime.handleUpload,
 		DownloadHandler: runtime.handleDownload,
 		OperateHandler:  runtime.handleOperate,
 		EventSender:     runtime, // uspRuntime implements wusp.USPEventSender
-	})
+	}))
 	if controller, ok := backend.(interface {
 		SetEasyMeshObserver(func(*wusp.Message))
 	}); ok {
@@ -298,7 +328,8 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	cachedBackend.SetChangeObserver(func(previous, current *wusp.Message) {
 		go runtime.emitDataModelChanges(previous, current)
 	})
-	if err := runtime.agent.Bootstrap(wusp.FillOptions{
+	runtimeAgent := runtime.uspAgent()
+	if err := runtimeAgent.Bootstrap(wusp.FillOptions{
 		Profile:   wusp.FillProfileRealistic,
 		DeviceID:  wuspSerial,
 		Timestamp: time.Now().UTC(),
@@ -307,7 +338,9 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		runtime.Close()
 		return nil, err
 	}
+	runtime.background.Add(1)
 	go func() {
+		defer runtime.background.Done()
 		defer close(runtime.warmupDone)
 		defer cachedBackend.Start(runtime.ctx)
 		started := time.Now()
@@ -347,7 +380,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 		"Device.WUSP.TransferCompression": wusp.List(wusp.String("stream-chunk-lz4")),
 	}
 	for path, val := range wuspOverrides {
-		if err := runtime.agent.Set(path, val); err != nil {
+		if err := runtimeAgent.Set(path, val); err != nil {
 			log.Printf("[USP] WARNING: Set(%s) failed: %v", path, err)
 		}
 	}
@@ -586,7 +619,11 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 
 	if req.Method == wusp.USPAgentMethodGetSupportedProtocol {
 		diaglog.Printf("[USP] Replying GetSupportedProtocol directly: id=%d", req.ID)
-		protocol := r.agent.GetSupportedProtocol()
+		agent := r.uspAgent()
+		if agent == nil {
+			return fmt.Errorf("usp agent unavailable")
+		}
+		protocol := agent.GetSupportedProtocol()
 		protocol.ControlTransport = wusp.WUSPControlTransportReliable
 		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:       req.ID,
@@ -622,8 +659,12 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		err  error
 	}
 	resultCh := make(chan requestResult, 1)
+	agent := r.uspAgent()
+	if agent == nil {
+		return fmt.Errorf("usp agent unavailable")
+	}
 	go func() {
-		resp, err := r.agent.HandleRequest(ctx, req)
+		resp, err := agent.HandleRequest(ctx, req)
 		resultCh <- requestResult{resp: resp, err: err}
 	}()
 	var resp wusp.USPAgentResponse
@@ -1138,7 +1179,8 @@ func (r *uspRuntime) cachedCellularOperateStatus(index int, status, output, smsI
 }
 
 func (r *uspRuntime) emitCellularOperateValueChanges(msg *wusp.Message) {
-	if r == nil || r.agent == nil || msg == nil || len(msg.Fields) == 0 {
+	agent := r.uspAgent()
+	if agent == nil || msg == nil || len(msg.Fields) == 0 {
 		return
 	}
 	fields := append([]wusp.Field(nil), msg.Fields...)
@@ -1149,7 +1191,7 @@ func (r *uspRuntime) emitCellularOperateValueChanges(msg *wusp.Message) {
 			if !strings.HasPrefix(field.Path, "Device.WUSP_CellularControl.Interface.") {
 				continue
 			}
-			if err := r.agent.EmitValueChange(ctx, field.Path, wusp.ValueToString(field.Val)); err != nil {
+			if err := agent.EmitValueChange(ctx, field.Path, wusp.ValueToString(field.Val)); err != nil {
 				log.Printf("[USP] Cellular operate notify warning: continue_on_error=true path=%q err=%v", field.Path, err)
 				return
 			}
@@ -1272,7 +1314,7 @@ func (r *uspRuntime) localUpload(req wusp.USPTransferRequest) (wusp.USPTransferR
 	}
 	return wusp.USPTransferResult{
 		Path:  req.Path,
-		URI:   "file://" + targetPath,
+		URI:   localFileURI(targetPath),
 		Bytes: int64(len(body)),
 		Metadata: map[string]string{
 			wusp.TransferMetadataDestination: targetPath,
@@ -1341,7 +1383,7 @@ func (r *uspRuntime) localDownload(req wusp.USPTransferRequest) (wusp.USPTransfe
 		}
 		return wusp.USPTransferResult{
 			Path:  req.Path,
-			URI:   "file://" + sourcePath,
+			URI:   localFileURI(sourcePath),
 			Bytes: info.Size(),
 			Metadata: map[string]string{
 				wusp.TransferMetadataSource:      sourcePath,
@@ -1352,7 +1394,7 @@ func (r *uspRuntime) localDownload(req wusp.USPTransferRequest) (wusp.USPTransfe
 
 	return wusp.USPTransferResult{
 		Path:  req.Path,
-		URI:   "file://" + sourcePath,
+		URI:   localFileURI(sourcePath),
 		Bytes: info.Size(),
 		Metadata: map[string]string{
 			wusp.TransferMetadataSource: sourcePath,
@@ -1410,22 +1452,77 @@ func schemeFromURI(raw string) string {
 }
 
 func localPathFromURI(raw string) string {
+	return localPathFromURIForOS(raw, runtime.GOOS)
+}
+
+func localPathFromURIForOS(raw, goos string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
 	}
+	lower := strings.ToLower(raw)
+	if goos == "windows" && strings.HasPrefix(lower, "file://") {
+		legacyPath := raw[len("file://"):]
+		if len(legacyPath) >= 2 && legacyPath[1] == ':' {
+			return strings.ReplaceAll(legacyPath, "/", `\`)
+		}
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u == nil {
+		if strings.HasPrefix(lower, "file://") {
+			path, unescapeErr := url.PathUnescape(raw[len("file://"):])
+			if unescapeErr != nil {
+				return ""
+			}
+			if goos == "windows" {
+				return strings.ReplaceAll(path, "/", `\`)
+			}
+			return path
+		}
 		return raw
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "":
 		return raw
 	case "file":
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return ""
+		}
+		if goos == "windows" {
+			path := u.Path
+			if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+				return `\\` + u.Host + strings.ReplaceAll(path, "/", `\`)
+			}
+			if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+				path = path[1:]
+			}
+			return strings.ReplaceAll(path, "/", `\`)
+		}
+		if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+			return ""
+		}
 		return u.Path
 	default:
 		return ""
 	}
+}
+
+func localFileURI(path string) string {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	if runtime.GOOS == "windows" {
+		if strings.HasPrefix(path, "//") {
+			parts := strings.SplitN(strings.TrimPrefix(path, "//"), "/", 2)
+			fileURL := &url.URL{Scheme: "file", Host: parts[0]}
+			if len(parts) == 2 {
+				fileURL.Path = "/" + parts[1]
+			}
+			return fileURL.String()
+		}
+		if len(path) >= 2 && path[1] == ':' {
+			path = "/" + path
+		}
+	}
+	return (&url.URL{Scheme: "file", Path: path}).String()
 }
 
 func sanitizeTransferName(path string) string {
@@ -1495,7 +1592,8 @@ const dataModelChangeEventName = "DataModelChange!"
 // graph changes, then emits them immediately. This is deliberately independent
 // of the 60-second collector so cloud and portal state cannot lag the device.
 func (r *uspRuntime) handleEasyMeshUpdate(patch *wusp.Message) {
-	if r == nil || r.agent == nil || patch == nil || len(patch.Fields) == 0 {
+	agent := r.uspAgent()
+	if agent == nil || patch == nil || len(patch.Fields) == 0 {
 		return
 	}
 	if r.dataModelCache != nil {
@@ -1514,7 +1612,7 @@ func (r *uspRuntime) handleEasyMeshUpdate(patch *wusp.Message) {
 	}
 	notifyCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if err := r.agent.Emit(notifyCtx, wusp.USPEvent{
+	if err := agent.Emit(notifyCtx, wusp.USPEvent{
 		Type:         wusp.USPEventTypeEvent,
 		EventName:    dataModelChangeEventName,
 		ObjPath:      "Device.WUSP_MeshTelemetry.EasyMesh.1.",
@@ -1530,21 +1628,28 @@ func (r *uspRuntime) Close() {
 	if r == nil {
 		return
 	}
-	if r.cancel != nil {
-		r.cancel()
-	}
-	if closer, ok := r.rawBackend.(interface{ Close() error }); ok {
-		if err := closer.Close(); err != nil {
-			log.Printf("[USP] backend shutdown warning: %v", err)
+	r.closeOnce.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
 		}
-	}
+		r.background.Wait()
+		if r.dataModelCache != nil {
+			r.dataModelCache.Close()
+		}
+		if closer, ok := r.rawBackend.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				log.Printf("[USP] backend shutdown warning: %v", err)
+			}
+		}
+	})
 }
 
 // emitDataModelChanges turns each successful periodic platform collection into
 // compact push updates. The transport fragments large events, while bounded
 // batches avoid making one changed counter hold every other update hostage.
 func (r *uspRuntime) emitDataModelChanges(previous, current *wusp.Message) {
-	if r == nil || r.agent == nil {
+	agent := r.uspAgent()
+	if agent == nil {
 		return
 	}
 	params := changedDataModelParams(previous, current)
@@ -1587,7 +1692,7 @@ func (r *uspRuntime) emitDataModelChanges(previous, current *wusp.Message) {
 				batchMessage.Set(path, value)
 			}
 		}
-		if err := r.agent.Emit(ctx, wusp.USPEvent{
+		if err := agent.Emit(ctx, wusp.USPEvent{
 			Type:         wusp.USPEventTypeEvent,
 			EventName:    dataModelChangeEventName,
 			ObjPath:      "Device.",
@@ -1769,7 +1874,11 @@ func (r *uspRuntime) initializeOnce(ctx context.Context) error {
 }
 
 func (r *uspRuntime) emitOnBoardRequest(ctx context.Context) error {
-	return r.agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
+	agent := r.uspAgent()
+	if agent == nil {
+		return fmt.Errorf("usp agent unavailable")
+	}
+	return agent.EmitOnBoardRequest(ctx, wusp.USPOnBoardInfo{
 		SerialNumber:                   r.deviceID,
 		Manufacturer:                   "Wantastic",
 		ProductClass:                   "wantasticd",

@@ -108,14 +108,8 @@ func write(path string, value *File) error {
 	if err != nil {
 		return fmt.Errorf("marshal claim key: %w", err)
 	}
-	if err := auth.EnsureParentDir(path, 0o700); err != nil {
-		return fmt.Errorf("create claim-key directory: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := auth.WritePrivateFile(path, data); err != nil {
 		return fmt.Errorf("write claim key: %w", err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("secure claim key permissions: %w", err)
 	}
 	return nil
 }

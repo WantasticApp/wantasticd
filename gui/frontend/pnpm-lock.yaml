@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@wailsio/runtime':
+        specifier: 3.0.0-beta.29
+        version: 3.0.0-beta.29
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -442,6 +445,9 @@ packages:
     engines: {node: ^14.18.0 || >=16.0.0}
     peerDependencies:
       vite: ^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0
+
+  '@wailsio/runtime@3.0.0-beta.29':
+    resolution: {integrity: sha512-ZrYvyb2vJ8rAn9mdBBbpNsNRk8Yg5+0DCWhfIQbfoNyI329Lwu8irPYqRneFuNlttA39qsQ0a5mG4mbgBF8g3g==}
 
   baseline-browser-mapping@2.10.0:
     resolution: {integrity: sha512-lIyg0szRfYbiy67j9KN8IyeD7q7hcmqnJ1ddWmNt19ItGpNN64mnllmxUNFIOdOm6by97jlL6wfpTTJrmnjWAA==}
@@ -928,6 +934,8 @@ snapshots:
       vite: 5.4.21
     transitivePeerDependencies:
       - supports-color
+
+  '@wailsio/runtime@3.0.0-beta.29': {}
 
   baseline-browser-mapping@2.10.0: {}
 

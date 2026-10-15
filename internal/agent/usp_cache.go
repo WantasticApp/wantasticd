@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -11,14 +12,18 @@ import (
 	"sync"
 	"time"
 
+	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/diaglog"
 	"wantastic-agent/internal/wusp"
 )
 
 type persistentDataModelCache struct {
-	backend  wusp.DataBackend
-	path     string
-	interval time.Duration
+	backend   wusp.DataBackend
+	path      string
+	interval  time.Duration
+	ctx       context.Context
+	cancel    context.CancelFunc
+	persistMu sync.Mutex
 
 	mu             sync.RWMutex
 	msg            *wusp.Message
@@ -26,7 +31,13 @@ type persistentDataModelCache struct {
 	refreshDone    chan struct{}
 	lastRefreshErr error
 	changeObserver func(previous, current *wusp.Message)
+	revision       uint64
+	patchVersions  map[string]uint64
 	startOnce      sync.Once
+	closeOnce      sync.Once
+	lifecycleMu    sync.Mutex
+	closed         bool
+	background     sync.WaitGroup
 }
 
 type dataModelCacheRefreshStatus struct {
@@ -38,7 +49,15 @@ type dataModelCacheRefreshStatus struct {
 }
 
 func newPersistentDataModelCache(backend wusp.DataBackend, path string, interval time.Duration) *persistentDataModelCache {
-	c := &persistentDataModelCache{backend: backend, path: path, interval: interval}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &persistentDataModelCache{
+		backend:       backend,
+		path:          path,
+		interval:      interval,
+		ctx:           ctx,
+		cancel:        cancel,
+		patchVersions: make(map[string]uint64),
+	}
 	if c.interval <= 0 {
 		c.interval = time.Minute
 	}
@@ -128,8 +147,17 @@ func (c *persistentDataModelCache) Patch(msg *wusp.Message) error {
 	if c == nil || msg == nil || len(msg.Fields) == 0 {
 		return nil
 	}
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
 	c.mu.Lock()
+	c.revision++
+	patchRevision := c.revision
 	merged := mergeCachedMessageFields(c.msg, msg.Fields)
+	for _, field := range msg.Fields {
+		if path := strings.TrimSpace(field.Path); path != "" {
+			c.patchVersions[path] = patchRevision
+		}
+	}
 	c.msg = cloneCachedMessage(merged)
 	c.mu.Unlock()
 
@@ -145,18 +173,20 @@ func (c *persistentDataModelCache) Patch(msg *wusp.Message) error {
 
 func (c *persistentDataModelCache) Start(ctx context.Context) {
 	c.startOnce.Do(func() {
-		go func() {
+		c.launchBackground(func() {
 			ticker := time.NewTicker(c.interval)
 			defer ticker.Stop()
 			for {
 				select {
+				case <-c.ctx.Done():
+					return
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
 					c.refreshAsync()
 				}
 			}
-		}()
+		})
 	})
 }
 
@@ -166,7 +196,15 @@ func (c *persistentDataModelCache) Refresh(ctx context.Context) error {
 	}
 	done, started := c.beginRefresh()
 	if !started {
-		return nil
+		select {
+		case <-done:
+			c.mu.RLock()
+			err := c.lastRefreshErr
+			c.mu.RUnlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return c.refreshOwned(ctx, done)
 }
@@ -231,11 +269,29 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	if msg == nil || len(msg.Fields) == 0 {
 		return fmt.Errorf("collect data model cache: empty snapshot")
 	}
-	c.mu.RLock()
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
+	c.mu.Lock()
 	previous := cloneCachedMessage(c.msg)
-	c.mu.RUnlock()
+	patchedFields := make([]wusp.Field, 0)
+	for _, field := range previous.Fields {
+		patchRevision, patched := c.patchVersions[field.Path]
+		if !patched {
+			continue
+		}
+		collected, collectedOK := msg.Get(field.Path)
+		if collectedOK && collected.Tag == field.Val.Tag && wusp.ValueToString(collected) == wusp.ValueToString(field.Val) {
+			if c.patchVersions[field.Path] == patchRevision {
+				delete(c.patchVersions, field.Path)
+			}
+			continue
+		}
+		patchedFields = append(patchedFields, field)
+	}
+	c.mu.Unlock()
 	msg = preserveLastCompleteCellularSnapshot(previous, msg)
 	msg = preserveLastSMSInboxSnapshot(previous, msg)
+	msg = mergeCachedMessageFields(msg, patchedFields)
 	status.FieldCount = len(msg.Fields)
 	status.CellularFieldCount = countCellularSnapshotFields(msg)
 	encoded, err := wusp.EncodeMessageLZ4(msg)
@@ -275,12 +331,7 @@ func writeDataModelCacheRefreshStatus(cachePath string, status dataModelCacheRef
 	if err != nil {
 		return
 	}
-	path := cachePath + ".status.json"
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	_ = writeCacheAtomically(cachePath+".status.json", data)
 }
 
 var cellularSnapshotPrefixes = []string{
@@ -427,13 +478,40 @@ func hasSnapshotPrefix(path string, prefixes []string) bool {
 }
 
 func (c *persistentDataModelCache) refreshAsync() {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), c.interval)
+	c.launchBackground(func() {
+		ctx, cancel := context.WithTimeout(c.ctx, c.interval)
 		defer cancel()
-		if err := c.Refresh(ctx); err != nil {
+		if err := c.Refresh(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[USP] DataModel cache refresh warning: continue_on_error=true err=%v", err)
 		}
+	})
+}
+
+func (c *persistentDataModelCache) launchBackground(run func()) bool {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closed {
+		return false
+	}
+	c.background.Add(1)
+	go func() {
+		defer c.background.Done()
+		run()
 	}()
+	return true
+}
+
+func (c *persistentDataModelCache) Close() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		c.lifecycleMu.Lock()
+		c.closed = true
+		c.cancel()
+		c.lifecycleMu.Unlock()
+		c.background.Wait()
+	})
 }
 
 // refreshAfterMutation reconciles the optimistic cache patch without delaying
@@ -459,14 +537,23 @@ func (c *persistentDataModelCache) load() {
 }
 
 func writeCacheAtomically(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create data model cache directory: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return fmt.Errorf("write data model cache: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close data model cache: %w", err)
+	}
+	if err := auth.WritePrivateFile(tmpPath, data); err != nil {
+		return fmt.Errorf("write data model cache: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("commit data model cache: %w", err)
 	}
 	return nil

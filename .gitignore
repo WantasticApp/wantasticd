@@ -9,6 +9,7 @@ vendor/
 gobuild/
 .gocache/
 .gotmp/
+.task/
 tmp/
 node_modules/
 !cmd/wantasticd/tray.go
@@ -22,5 +23,6 @@ wantasticd-linux
 bulk_install.sh
 .claude/
 *.conf
+build/
 test.rsc
 device-claim-key.json

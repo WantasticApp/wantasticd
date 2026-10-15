@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	platformdns "wantastic-agent/internal/platform/dns"
 	"wantastic-agent/internal/update"
@@ -25,8 +27,11 @@ type Agent struct {
 	mu           sync.RWMutex
 	running      bool
 	stopCh       chan struct{}
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
 	workerCancel context.CancelFunc
 	wg           sync.WaitGroup
+	dnsActive    atomic.Bool
 
 	apiServer *APIServer
 }
@@ -55,14 +60,26 @@ func New(cfg *config.Config) (*Agent, error) {
 	}
 
 	agt := &Agent{
-		config:  cfg,
-		device:  dev,
-		updater: updater,
-		usp:     uspRuntime,
-		stopCh:  make(chan struct{}),
+		config:     cfg,
+		device:     dev,
+		updater:    updater,
+		usp:        uspRuntime,
+		stopCh:     make(chan struct{}),
+		shutdownCh: make(chan struct{}),
 	}
 	agt.apiServer = NewAPIServer(agt)
 	return agt, nil
+}
+
+// ShutdownRequested is closed when an authenticated local IPC client asks the
+// owning process to terminate. It is primarily used by the privileged desktop
+// helper, whose lifecycle is controlled by the unprivileged tray process.
+func (a *Agent) ShutdownRequested() <-chan struct{} {
+	return a.shutdownCh
+}
+
+func (a *Agent) requestShutdown() {
+	a.shutdownOnce.Do(func() { close(a.shutdownCh) })
 }
 
 // Start starts the agent and its components.
@@ -106,7 +123,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		log.Printf("Local access enabled for tenant routes: %v", localAccessRoutes)
 	}
 
-	workerCount := 2 // HealthCheck + DNSCheck
+	workerCount := 3 // HealthCheck + DNSCheck + ExitNodeAdvertiser
 	if a.config.AutoUpdate {
 		workerCount++
 	}
@@ -120,6 +137,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	go a.runHealthCheck(workerCtx)
 	go a.runDNSCheck(workerCtx)
+	go a.runExitNodeAdvertiser(workerCtx)
 
 	if a.usp != nil {
 		go a.runWUSPInit(workerCtx)
@@ -185,6 +203,41 @@ func (a *Agent) sendLocalAccessAdvertisement(routes []string) error {
 		return err
 	}
 	return a.device.SendTUNControl(a.config.Server.PublicKey, payload)
+}
+
+func (a *Agent) runExitNodeAdvertiser(ctx context.Context) {
+	defer a.wg.Done()
+
+	send := func() {
+		if err := a.sendExitNodeOffer(); err != nil {
+			log.Printf("Exit-node offer advertisement failed; will retry: %v", err)
+		}
+	}
+	send()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.stopCh:
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+func (a *Agent) sendExitNodeOffer() error {
+	a.mu.RLock()
+	enabled := a.config.ExitNode.Enabled
+	serverPubKey := a.config.Server.PublicKey
+	a.mu.RUnlock()
+	if serverPubKey == "" || a.device == nil {
+		return nil
+	}
+	return a.device.SendTUNControl(serverPubKey, device.EncodeExitNodeOfferTUNControl(enabled))
 }
 
 // Stop stops the agent and all its components.
@@ -256,10 +309,18 @@ func (a *Agent) runHealthCheck(ctx context.Context) {
 
 func (a *Agent) runDNSCheck(ctx context.Context) {
 	defer a.wg.Done()
+	defer func() {
+		platformdns.RemoveTunnel(a.config.Interface.TUNName)
+		a.dnsActive.Store(false)
+	}()
 
 	// Initial assertion + periodic re-assertion. Frequent enough to recover
 	// quickly from external rewrites (DHCP, netifd, container restarts).
-	platformdns.ApplyTunnel(ctx, a.config.Interface.DNS)
+	apply := func() {
+		result := platformdns.ApplyTunnel(ctx, a.config.Interface.DNS, a.config.Interface.TUNName)
+		a.dnsActive.Store(len(a.config.Interface.DNS) != 0 && !result.Skipped)
+	}
+	apply()
 
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
@@ -271,7 +332,7 @@ func (a *Agent) runDNSCheck(ctx context.Context) {
 		case <-a.stopCh:
 			return
 		case <-ticker.C:
-			platformdns.ApplyTunnel(ctx, a.config.Interface.DNS)
+			apply()
 		}
 	}
 }
@@ -339,6 +400,12 @@ func (a *Agent) IsRunning() bool {
 	return a.running
 }
 
+// MagicDNSActive reports whether the platform DNS adapter successfully
+// applied the tunnel resolver state during this agent run.
+func (a *Agent) MagicDNSActive() bool {
+	return a.dnsActive.Load()
+}
+
 // SetExitNode instructs the server to route this device's traffic through the given peer exit node natively over WireGuard Noise.
 func (a *Agent) SetExitNode(peerPubKey string) error {
 	a.mu.RLock()
@@ -347,6 +414,18 @@ func (a *Agent) SetExitNode(peerPubKey string) error {
 
 	if serverPubKey == "" {
 		return fmt.Errorf("no server configured for exit node coordination")
+	}
+	if strings.TrimSpace(peerPubKey) != "" && !strings.EqualFold(strings.TrimSpace(peerPubKey), "none") {
+		offered := false
+		for _, peer := range a.device.GetDetailedPeers() {
+			if strings.EqualFold(peer.PublicKey, strings.TrimSpace(peerPubKey)) && peer.OffersExitNode {
+				offered = true
+				break
+			}
+		}
+		if !offered {
+			return fmt.Errorf("selected device is not advertising exit-node mode")
+		}
 	}
 
 	data, err := device.EncodeExitNodeSelectionTUNControl(peerPubKey)
@@ -373,7 +452,6 @@ func (a *Agent) SetOfferExitNode(enabled bool) error {
 	a.mu.Lock()
 	previous := a.config.ExitNode.Enabled
 	a.config.ExitNode.Enabled = enabled
-	serverPubKey := a.config.Server.PublicKey
 	cfg := a.config
 	a.mu.Unlock()
 
@@ -384,11 +462,20 @@ func (a *Agent) SetOfferExitNode(enabled bool) error {
 		return fmt.Errorf("persist exit-node preference: %w", err)
 	}
 
-	if serverPubKey != "" && a.device != nil {
-		data := device.EncodeExitNodeOfferTUNControl(enabled)
-		log.Printf("[Agent] Sending Exit Node offer status (%v) to server via Noise Protocol", enabled)
-		return a.device.SendTUNControl(serverPubKey, data)
-	}
-
+	a.SetOfferExitNodeRuntime(enabled)
 	return nil
+}
+
+// SetOfferExitNodeRuntime applies an already-persisted preference to the live
+// agent. Privileged desktop helpers use this after the unprivileged owner has
+// safely written the config, so root never rewrites a user-owned secret file.
+func (a *Agent) SetOfferExitNodeRuntime(enabled bool) {
+	a.mu.Lock()
+	a.config.ExitNode.Enabled = enabled
+	a.mu.Unlock()
+	log.Printf("[Agent] Sending Exit Node offer status (%v) to server via Noise Protocol", enabled)
+	if err := a.sendExitNodeOffer(); err != nil {
+		// The periodic advertiser retries after transient coordinator failures.
+		log.Printf("[Agent] Exit Node offer will retry after coordinator error: %v", err)
+	}
 }

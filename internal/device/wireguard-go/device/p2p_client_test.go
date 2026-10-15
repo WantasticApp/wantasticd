@@ -147,6 +147,23 @@ func TestHandlePeerListBuildsTrafficDrivenIndexWithoutEagerAttempt(t *testing.T)
 	}
 }
 
+func TestHandlePeerListDecodesExitNodeCapability(t *testing.T) {
+	t.Parallel()
+	client := &P2PClient{
+		device: &Device{log: NewLogger(LogLevelSilent, "")},
+		peers:  make(map[uint32]*DiscoveredPeer),
+	}
+	payload := testPeerListPayload(42)
+	payload[4+73] = 1 | 2
+
+	client.handlePeerList(&P2PMessage{Payload: payload})
+
+	peer := client.peers[42]
+	if peer == nil || !peer.P2PCapable || !peer.OffersExitNode {
+		t.Fatalf("peer capabilities = %#v, want P2P and exit-node offer", peer)
+	}
+}
+
 func TestObserveDestinationCoalescesAttempts(t *testing.T) {
 	client := NewP2PClient(&Device{})
 	defer client.Close()

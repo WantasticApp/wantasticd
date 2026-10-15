@@ -139,7 +139,7 @@ func (r *uspRuntime) startUploadSession(req wusp.USPAgentRequest, peerPublicKeyH
 	}
 	result := wusp.USPTransferResult{
 		Path:  req.Transfer.Path,
-		URI:   "file://" + targetPath,
+		URI:   localFileURI(targetPath),
 		Bytes: 0,
 		Metadata: map[string]string{
 			wusp.TransferMetadataTransport:   "wg-stream",
@@ -175,7 +175,7 @@ func (r *uspRuntime) startDownloadSession(req wusp.USPAgentRequest, peerPublicKe
 	}
 	result := wusp.USPTransferResult{
 		Path:  req.Transfer.Path,
-		URI:   "file://" + sourcePath,
+		URI:   localFileURI(sourcePath),
 		Bytes: info.Size(),
 		Metadata: map[string]string{
 			wusp.TransferMetadataTransport: "wg-stream",

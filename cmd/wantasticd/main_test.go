@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -9,8 +11,80 @@ import (
 	"strings"
 	"testing"
 
+	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 )
+
+func TestPersistExternalExitNodeOffer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("WANTASTIC_CONFIG", path)
+	cfg := &config.Config{
+		PrivateKey: "configured",
+		Server: config.Server{
+			Endpoint:  "127.0.0.1",
+			PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		},
+	}
+	if err := cfg.SaveToFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	var posted string
+	if err := persistExternalExitNodeOffer(true, func(path string) error {
+		posted = path
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if posted != "/api/exitnode/offer/runtime?enabled=true" {
+		t.Fatalf("posted path = %q", posted)
+	}
+	loaded, err := config.LoadFromFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.ExitNode.Enabled {
+		t.Fatal("exit-node preference was not persisted")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestPersistExternalExitNodeOfferRollsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("WANTASTIC_CONFIG", path)
+	cfg := &config.Config{
+		PrivateKey: "configured",
+		Server: config.Server{
+			Endpoint:  "127.0.0.1",
+			PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		},
+	}
+	if err := cfg.SaveToFile(path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = persistExternalExitNodeOffer(true, func(string) error { return errors.New("helper unavailable") })
+	if err == nil {
+		t.Fatal("runtime failure was not returned")
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(before) {
+		t.Fatal("config was not restored after runtime apply failed")
+	}
+}
 
 func TestAutoUpdateFlagsDefaultOnAndExplicitOptOut(t *testing.T) {
 	tests := []struct {
@@ -154,10 +228,8 @@ func TestLoadOrCreateClaimKeyReusesIdentityAndPersistsServerChange(t *testing.T)
 	if persisted.ServerURL != second.ServerURL || persisted.ClaimURL != second.ClaimURL {
 		t.Fatalf("persisted claim metadata = %#v, want server and QR metadata %#v", persisted, second)
 	}
-	if info, err := os.Stat(path); err != nil {
-		t.Fatalf("stat claim key: %v", err)
-	} else if info.Mode().Perm() != 0o600 {
-		t.Fatalf("claim key permissions = %o, want 600", info.Mode().Perm())
+	if err := auth.CheckPrivateFilePermissions(path); err != nil {
+		t.Fatalf("claim key permissions: %v", err)
 	}
 }
 

@@ -39,6 +39,7 @@ func lookupHostWithServer(ctx context.Context, server, host string) ([]string, e
 // generate /etc/resolv.conf from a platform DNS manager.
 type Request struct {
 	Servers               []string
+	InterfaceName         string
 	IncludeExisting       bool
 	IncludePublicFallback bool
 	Reason                string
@@ -130,9 +131,14 @@ func probeResolverServers(ctx context.Context, servers []string, host string) []
 	return out
 }
 
-func ApplyTunnel(ctx context.Context, servers []string) Result {
+func ApplyTunnel(ctx context.Context, servers []string, interfaceName ...string) Result {
+	name := ""
+	if len(interfaceName) != 0 {
+		name = strings.TrimSpace(interfaceName[0])
+	}
 	result, err := Apply(ctx, Request{
 		Servers:               servers,
+		InterfaceName:         name,
 		IncludeExisting:       true,
 		IncludePublicFallback: true,
 		Reason:                "tunnel DNS",
@@ -147,6 +153,19 @@ func ApplyTunnel(ctx context.Context, servers []string) Result {
 		log.Printf("DNS: skipped (%s)", result.Reason)
 	}
 	return result
+}
+
+// RemoveTunnel removes DNS state that was installed specifically for the
+// Wantastic tunnel. Platform adapters must leave unrelated resolver state
+// untouched.
+func RemoveTunnel(interfaceName ...string) {
+	name := ""
+	if len(interfaceName) != 0 {
+		name = strings.TrimSpace(interfaceName[0])
+	}
+	if err := removeTunnel(name); err != nil {
+		log.Printf("DNS: tunnel DNS cleanup failed: %v", err)
+	}
 }
 
 func desiredServers(req Request, existing []string) []string {

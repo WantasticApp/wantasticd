@@ -34,10 +34,10 @@ build:
 	$(GOBUILD) -o bin/$(BINARY_NAME) $(CMD_PATH)
 
 desktop:
-	go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 build -clean -ldflags "$(DESKTOP_LDFLAGS)"
+	go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.29 task package WANTASTIC_LDFLAGS='$(DESKTOP_LDFLAGS)'
 
 desktop-dev:
-	go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 dev
+	go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.29 dev -config ./build/config.yml
 
 build-all:
 	@for target in $(TARGETS); do \

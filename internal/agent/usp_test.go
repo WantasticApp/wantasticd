@@ -34,6 +34,18 @@ type asyncEasyMeshOperateBackend struct {
 	started string
 }
 
+type testUSPBackend struct {
+	msg *wusp.Message
+}
+
+func (b testUSPBackend) Collect(context.Context, ...string) (*wusp.Message, error) {
+	return cloneCachedMessage(b.msg), nil
+}
+
+func (b testUSPBackend) Set(context.Context, string, wusp.Value) error { return nil }
+
+func (b testUSPBackend) Delete(context.Context, ...string) error { return nil }
+
 func (b *asyncEasyMeshOperateBackend) StartApplyEasyMeshTopology(_ context.Context, topology string) error {
 	b.started = topology
 	return nil
@@ -171,7 +183,7 @@ func TestUSPRuntimeReplaysDuplicateOperateWithoutExecutingTwice(t *testing.T) {
 	)
 
 	executions := 0
-	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
+	runtime.setAgent(wusp.NewUSPAgent(wusp.USPAgentOptions{
 		OperateHandler: func(_ context.Context, path string, _ *wusp.Message, _ map[string]string) (*wusp.Message, error) {
 			executions++
 			if path != command {
@@ -181,7 +193,7 @@ func TestUSPRuntimeReplaysDuplicateOperateWithoutExecutingTwice(t *testing.T) {
 			output.Set(object+"LastOperationStatus", wusp.String("Pending"))
 			return output, nil
 		},
-	})
+	}))
 	request := wusp.USPAgentRequest{
 		ID:         requestID,
 		Method:     wusp.USPAgentMethodOperate,
@@ -360,12 +372,19 @@ func TestUSPRuntimePushesEasyMeshOperationUpdateImmediately(t *testing.T) {
 	patch.Set("Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationMessage", wusp.String("Topology policy saved"))
 	runtime.handleEasyMeshUpdate(patch)
 
-	_, event := readMatchingOutboundEvent(
-		t,
-		runtime.transport.(*fakeUSPTransport),
-		time.Second,
-		wusp.USPEventTypeEvent,
-	)
+	req := readMatchingOutboundRequest(t, runtime.transport.(*fakeUSPTransport), time.Second, func(req wusp.USPAgentRequest) bool {
+		if req.Method != wusp.USPAgentMethodNotify || !wusp.IsEventNotifyRequest(req) {
+			return false
+		}
+		event, err := wusp.DecodeEventFromRequest(req)
+		return err == nil && event.Type == wusp.USPEventTypeEvent &&
+			event.EventName == dataModelChangeEventName &&
+			event.Params["Device.WUSP_MeshTelemetry.EasyMesh.1.LastOperationPhase"] == "Converging"
+	})
+	event, err := wusp.DecodeEventFromRequest(req)
+	if err != nil {
+		t.Fatalf("DecodeEventFromRequest: %v", err)
+	}
 	if event.EventName != dataModelChangeEventName {
 		t.Fatalf("event name=%q", event.EventName)
 	}
@@ -549,7 +568,7 @@ func TestChangedDataModelParamsIncludesAuthoritativeCurrentRows(t *testing.T) {
 func TestUSPRuntimePushesBatchedDataModelChangeEvent(t *testing.T) {
 	transport := &fakeUSPTransport{sendCh: make(chan []byte, 8)}
 	runtime := &uspRuntime{transport: transport}
-	runtime.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{EventSender: runtime})
+	runtime.setAgent(wusp.NewUSPAgent(wusp.USPAgentOptions{EventSender: runtime}))
 	previous := wusp.NewMessage()
 	previous.Set("Device.WiFi.Radio.1.Channel", wusp.Uint(36))
 	current := wusp.NewMessage()
@@ -624,7 +643,7 @@ func TestUSPRuntimeUploadAndDownload(t *testing.T) {
 	uploadTarget := filepath.Join(root, "uploaded.bin")
 	uploadResult, err := runtime.handleUpload(context.Background(), wusp.USPTransferRequest{
 		Path:    "Device.DeviceInfo.ProvisioningCode",
-		URI:     "file://" + uploadTarget,
+		URI:     localFileURI(uploadTarget),
 		Payload: []byte("hello-world"),
 	})
 	if err != nil {
@@ -667,6 +686,60 @@ func TestUSPRuntimeUploadAndDownload(t *testing.T) {
 	}
 }
 
+func TestLocalPathFromURIForOS(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		uri  string
+		want string
+	}{
+		{
+			name: "unix file URI",
+			goos: "linux",
+			uri:  "file:///tmp/wantastic%20upload.bin",
+			want: "/tmp/wantastic upload.bin",
+		},
+		{
+			name: "Windows standard drive URI",
+			goos: "windows",
+			uri:  "file:///C:/Users/Alice/AppData/Local/upload.bin",
+			want: `C:\Users\Alice\AppData\Local\upload.bin`,
+		},
+		{
+			name: "Windows legacy drive URI",
+			goos: "windows",
+			uri:  `file://C:\Users\Alice\upload.bin`,
+			want: `C:\Users\Alice\upload.bin`,
+		},
+		{
+			name: "Windows UNC URI",
+			goos: "windows",
+			uri:  "file://fileserver/share/upload.bin",
+			want: `\\fileserver\share\upload.bin`,
+		},
+		{
+			name: "remote Unix file URI rejected",
+			goos: "linux",
+			uri:  "file://fileserver/share/upload.bin",
+			want: "",
+		},
+		{
+			name: "non-file URI rejected",
+			goos: "windows",
+			uri:  "https://example.com/upload.bin",
+			want: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := localPathFromURIForOS(test.uri, test.goos); got != test.want {
+				t.Fatalf("localPathFromURIForOS(%q, %q) = %q, want %q", test.uri, test.goos, got, test.want)
+			}
+		})
+	}
+}
+
 func TestUSPRuntimeTunnelTransferUpload(t *testing.T) {
 	runtime := newTestUSPRuntime(t)
 	root := t.TempDir()
@@ -678,7 +751,7 @@ func TestUSPRuntimeTunnelTransferUpload(t *testing.T) {
 		Method: wusp.USPAgentMethodUpload,
 		Transfer: &wusp.USPTransferRequest{
 			Path: "Device.DeviceInfo.ProvisioningCode",
-			URI:  "file://" + target,
+			URI:  localFileURI(target),
 			Metadata: map[string]string{
 				"size": strconv.Itoa(len(payload)),
 			},
@@ -702,6 +775,9 @@ func TestUSPRuntimeTunnelTransferUpload(t *testing.T) {
 		t.Fatalf("replyFrames=%d want=1", len(replyFrames))
 	}
 	resp := decodeControlResponseDatagram(t, replyFrames[0])
+	if resp.Transfer == nil {
+		t.Fatalf("upload control response has no transfer result: error=%q", resp.Error)
+	}
 	sessionID, err := strconv.ParseUint(resp.Transfer.Metadata[wusp.TransferMetadataSessionID], 10, 64)
 	if err != nil {
 		t.Fatalf("ParseUint(session_id) returned error: %v", err)
@@ -777,7 +853,7 @@ func TestUSPRuntimeTunnelTransferDownload(t *testing.T) {
 		Method: wusp.USPAgentMethodDownload,
 		Transfer: &wusp.USPTransferRequest{
 			Path: "Device.DeviceInfo.VendorConfigFile.{i}.",
-			URI:  "file://" + source,
+			URI:  localFileURI(source),
 		},
 	})
 	if err != nil {
@@ -970,6 +1046,7 @@ func TestUSPRuntimeUnauthorizedPeerRejected(t *testing.T) {
 
 func newTestUSPRuntime(tb testing.TB) *uspRuntime {
 	tb.Helper()
+	tb.Setenv("WANTASTIC_STATE_DIR", tb.TempDir())
 
 	cfg := &config.Config{
 		DeviceID: "test-device",
@@ -978,13 +1055,25 @@ func newTestUSPRuntime(tb testing.TB) *uspRuntime {
 		},
 	}
 	transport := &fakeUSPTransport{sendCh: make(chan []byte, 2048)}
-	runtime, err := newUSPRuntime(cfg, transport, "test-0.0.0")
+	msg := wusp.NewMessage()
+	msg.Set("Device.DeviceInfo.HostName", wusp.String("test-host"))
+	msg.Set("Device.DeviceInfo.Manufacturer", wusp.String("Wantastic"))
+	msg.Set("Device.DeviceInfo.ProductClass", wusp.String("WG-Router"))
+	msg.Set("Device.DeviceInfo.SerialNumber", wusp.String("TEST-SERIAL-001"))
+	msg.Set("Device.DeviceInfo.SoftwareVersion", wusp.String("test-0.0.0"))
+	runtime, err := newUSPRuntimeWithBackend(
+		cfg,
+		transport,
+		"test-0.0.0",
+		testUSPBackend{msg: msg},
+	)
 	if err != nil {
 		tb.Fatalf("newUSPRuntime: %v", err)
 	}
 	if runtime == nil {
 		tb.Fatal("newUSPRuntime returned nil")
 	}
+	tb.Cleanup(runtime.Close)
 	return runtime
 }
 

@@ -632,15 +632,16 @@ func base64ToHex(b64 string) (string, error) {
 }
 
 type PeerInfo struct {
-	PublicKey     string `json:"public_key"`
-	AssignedIP    string `json:"assigned_ip"` // VPN IP (e.g. "172.16.0.12")
-	Hostname      string `json:"hostname"`
-	Endpoint      string `json:"endpoint"`
-	RxBytes       uint64 `json:"rx_bytes"`
-	TxBytes       uint64 `json:"tx_bytes"`
-	IsP2P         bool   `json:"is_p2p"`
-	P2PState      string `json:"p2p_state"` // "discovered"|"trying"|"established"|"failed"|""
-	LastHandshake int64  `json:"last_handshake"`
+	PublicKey      string `json:"public_key"`
+	AssignedIP     string `json:"assigned_ip"` // VPN IP (e.g. "172.16.0.12")
+	Hostname       string `json:"hostname"`
+	Endpoint       string `json:"endpoint"`
+	RxBytes        uint64 `json:"rx_bytes"`
+	TxBytes        uint64 `json:"tx_bytes"`
+	IsP2P          bool   `json:"is_p2p"`
+	OffersExitNode bool   `json:"offers_exit_node"`
+	P2PState       string `json:"p2p_state"` // "discovered"|"trying"|"established"|"failed"|""
+	LastHandshake  int64  `json:"last_handshake"`
 }
 
 // GetDetailedPeers returns live peer topology: WireGuard IPC data merged with
@@ -730,6 +731,7 @@ func (d *Device) GetDetailedPeers() []PeerInfo {
 			if info, ok := byPubKey[pubHex]; ok {
 				// Already in WireGuard IPC — just enrich with P2P state and IP
 				info.P2PState = stateStr
+				info.OffersExitNode = dp.OffersExitNode
 				if info.AssignedIP == "" {
 					info.AssignedIP = assignedIP
 				}
@@ -739,11 +741,12 @@ func (d *Device) GetDetailedPeers() []PeerInfo {
 			} else {
 				// Relay-only peer: not yet in WireGuard, add it
 				byPubKey[pubHex] = &PeerInfo{
-					PublicKey:  pubHex,
-					AssignedIP: assignedIP,
-					Hostname:   d.getPeerHostname(pubHex),
-					IsP2P:      true,
-					P2PState:   stateStr,
+					PublicKey:      pubHex,
+					AssignedIP:     assignedIP,
+					Hostname:       d.getPeerHostname(pubHex),
+					IsP2P:          true,
+					OffersExitNode: dp.OffersExitNode,
+					P2PState:       stateStr,
 				}
 			}
 		}

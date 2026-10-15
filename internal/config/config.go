@@ -132,6 +132,17 @@ func LoadFromFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	cfg.filePath = path
+	return cfg, nil
+}
+
+// Parse loads configuration bytes without reopening a filesystem path. This is
+// used by privileged callers after a no-follow, ownership-checked file read.
+func Parse(data []byte) (*Config, error) {
 
 	// Try to parse as JSON first
 	var cfg Config
@@ -139,12 +150,11 @@ func LoadFromFile(path string) (*Config, error) {
 		if err := cfg.Validate(); err != nil {
 			return nil, fmt.Errorf("validate config: %w", err)
 		}
-		cfg.filePath = path
 		return &cfg, nil
 	}
 
 	// If JSON parsing fails, try to parse as traditional WireGuard config
-	cfg, err = parseTraditionalWireGuardConfig(string(data))
+	cfg, err := parseTraditionalWireGuardConfig(string(data))
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -153,7 +163,6 @@ func LoadFromFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
-	cfg.filePath = path
 	return &cfg, nil
 }
 
@@ -560,11 +569,8 @@ func (c *Config) SaveToFile(path string) error {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := auth.WritePrivateFile(path, data); err != nil {
 		return fmt.Errorf("write config file: %w", err)
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("secure config file permissions: %w", err)
 	}
 	c.filePath = path
 
@@ -631,7 +637,7 @@ func (c *Config) Save() error {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 	tmp := c.filePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := auth.WritePrivateFile(tmp, data); err != nil {
 		return fmt.Errorf("write temp config: %w", err)
 	}
 	return os.Rename(tmp, c.filePath)

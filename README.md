@@ -252,7 +252,7 @@ are rejected by the coordinator to avoid ambiguous or hijacked routes.
 
 ## Desktop app
 
-The `Desktop` branch includes a Wails v2 tray application for macOS, Windows,
+The `Desktop` branch includes a Wails v3 tray application for macOS, Windows,
 and Linux. It embeds the same agent and exposes peer status, overlay ping,
 claim-link generation, manual configuration, exit-node controls, tenant DNS
 status, and local-network route assignment. Build it with:

@@ -66,3 +66,5 @@ func detectLinuxDNSManager() string {
 	}
 	return "plain-file"
 }
+
+func removeTunnel(string) error { return nil }

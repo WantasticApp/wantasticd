@@ -1,15 +1,33 @@
 package main
 
 import (
-	"encoding/xml"
+	"context"
 	"errors"
-	"io"
 	"os"
-	"runtime"
+	"strings"
 	"testing"
+	"time"
 
+	"wantastic-agent/internal/auth"
+	"wantastic-agent/internal/claimkey"
 	"wantastic-agent/internal/device"
+	"wantastic-agent/internal/netprobe"
 )
+
+func TestWindowsDesktopManifestIsUnprivileged(t *testing.T) {
+	t.Parallel()
+	manifest, err := os.ReadFile("build/windows/wails.exe.manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(manifest)
+	if !strings.Contains(text, `requestedExecutionLevel level="asInvoker" uiAccess="false"`) {
+		t.Fatal("desktop manifest must run asInvoker; privileged operations belong in the service")
+	}
+	if strings.Contains(text, `level="requireAdministrator"`) {
+		t.Fatal("desktop UI must not request administrator privileges")
+	}
+}
 
 func TestPeerConnection(t *testing.T) {
 	t.Parallel()
@@ -33,38 +51,6 @@ func TestPeerConnection(t *testing.T) {
 	}
 }
 
-func TestWindowsManifestUsesExplicitSafeElevation(t *testing.T) {
-	t.Parallel()
-	f, err := os.Open("build/windows/wails.exe.manifest")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	decoder := xml.NewDecoder(f)
-	for {
-		token, err := decoder.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("parse manifest: %v", err)
-		}
-		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Local != "requestedExecutionLevel" {
-			continue
-		}
-		attrs := make(map[string]string, len(start.Attr))
-		for _, attr := range start.Attr {
-			attrs[attr.Name.Local] = attr.Value
-		}
-		if attrs["level"] != "requireAdministrator" || attrs["uiAccess"] != "false" {
-			t.Fatalf("requestedExecutionLevel = %#v", attrs)
-		}
-		return
-	}
-	t.Fatal("requestedExecutionLevel not found")
-}
-
 func TestMagicName(t *testing.T) {
 	t.Parallel()
 	if got := magicName(device.PeerInfo{Hostname: "Office AP #1", AssignedIP: "10.8.0.7"}); got != "office-ap-1.wantastic" {
@@ -75,26 +61,10 @@ func TestMagicName(t *testing.T) {
 	}
 }
 
-func TestPingArgsKeepsTargetAsOneArgument(t *testing.T) {
+func TestNativePingRejectsCommandInput(t *testing.T) {
 	t.Parallel()
-	args := pingArgs("10.8.0.7")
-	if got := args[len(args)-1]; got != "10.8.0.7" {
-		t.Fatalf("last ping argument = %q", got)
-	}
-	if runtime.GOOS != "windows" && len(args) < 5 {
-		t.Fatalf("pingArgs() = %v", args)
-	}
-}
-
-func TestMagicDNSStatusMatchesPlatformSupport(t *testing.T) {
-	t.Parallel()
-	got := magicDNSActive([]string{"10.255.255.33"})
-	want := runtime.GOOS == "linux"
-	if got != want {
-		t.Fatalf("magicDNSActive() = %t, want %t on %s", got, want, runtime.GOOS)
-	}
-	if magicDNSActive(nil) {
-		t.Fatal("magicDNSActive(nil) = true")
+	if _, _, err := netprobe.Ping(context.Background(), "10.8.0.7; open /Applications/Calculator.app"); err == nil {
+		t.Fatal("native ping accepted a command-like address")
 	}
 }
 
@@ -119,6 +89,7 @@ func TestMakeTrayPresentation(t *testing.T) {
 		status     *StatusData
 		err        error
 		wantStatus string
+		wantLabel  string
 		wantIP     string
 		wantToggle string
 		wantTip    string
@@ -126,48 +97,105 @@ func TestMakeTrayPresentation(t *testing.T) {
 		{
 			name: "connected",
 			status: &StatusData{
-				Configured: true,
-				Running:    true,
-				IPs:        []string{"10.20.0.7"},
+				Configured:    true,
+				Running:       true,
+				DeviceRunning: true,
+				IPs:           []string{"10.20.0.7"},
 			},
-			wantStatus: "Status: Connected",
+			wantStatus: "Online",
+			wantLabel:  "Online",
 			wantIP:     "IP: 10.20.0.7",
 			wantToggle: "Disconnect",
-			wantTip:    "Wantastic VPN — Connected — 10.20.0.7",
+			wantTip:    "Wantastic — Online — 10.20.0.7",
+		},
+		{
+			name:       "starting",
+			status:     &StatusData{Configured: true, Starting: true},
+			wantStatus: "Starting",
+			wantLabel:  "Starting",
+			wantIP:     "IP: –",
+			wantToggle: "Starting…",
+			wantTip:    "Wantastic — Starting",
 		},
 		{
 			name:       "disconnected",
 			status:     &StatusData{Configured: true},
-			wantStatus: "Status: Disconnected",
+			wantStatus: "Offline",
+			wantLabel:  "Offline",
 			wantIP:     "IP: –",
 			wantToggle: "Connect",
-			wantTip:    "Wantastic VPN — Disconnected",
+			wantTip:    "Wantastic — Offline",
 		},
 		{
 			name:       "not configured",
 			status:     &StatusData{},
-			wantStatus: "Status: Not configured",
+			wantStatus: "Offline",
+			wantLabel:  "Offline",
 			wantIP:     "IP: –",
 			wantToggle: "Connect",
-			wantTip:    "Wantastic VPN — Not configured",
+			wantTip:    "Wantastic — Offline",
 		},
 		{
 			name:       "unavailable",
 			err:        errors.New("status failed"),
-			wantStatus: "Status: Unavailable",
+			wantStatus: "Offline",
+			wantLabel:  "Offline",
 			wantIP:     "IP: –",
 			wantToggle: "Connect",
-			wantTip:    "Wantastic VPN — Unavailable",
+			wantTip:    "Wantastic — Offline",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := makeTrayPresentation(tt.status, tt.err)
-			if got.statusTitle != tt.wantStatus || got.ipTitle != tt.wantIP ||
+			if got.trayLabel != tt.wantLabel || got.statusTitle != tt.wantStatus || got.ipTitle != tt.wantIP ||
 				got.toggleTitle != tt.wantToggle || got.tooltip != tt.wantTip {
 				t.Fatalf("makeTrayPresentation() = %#v", got)
 			}
 		})
+	}
+}
+
+func TestGenerateClaimLinkStartsAutomaticConnectionWatcher(t *testing.T) {
+	t.Setenv("WANTASTIC_CONFIG_DIR", t.TempDir())
+	app := NewApp(nil)
+	app.ctx = context.Background()
+	app.hashedDeviceID = func() (string, error) { return "desktop-device-id", nil }
+	app.waitClaimConfig = func(
+		_ context.Context,
+		serverURL string,
+		deviceID string,
+		publicKey string,
+	) (*auth.ClaimConfig, error) {
+		if serverURL != "https://console.wantastic.app" || deviceID != "desktop-device-id" || publicKey == "" {
+			t.Errorf("unexpected claim watcher input: server=%q device=%q key=%q", serverURL, deviceID, publicKey)
+		}
+		return &auth.ClaimConfig{Claimed: true}, nil
+	}
+	app.fetchClaimConfig = func(context.Context, string, string, string) (*auth.ClaimConfig, error) {
+		return nil, errors.New("polling should not be needed")
+	}
+	connected := make(chan string, 1)
+	app.applyDesktopClaim = func(key *claimkey.File, claim *auth.ClaimConfig) error {
+		if !claim.Claimed {
+			t.Error("automatic connection received an unclaimed configuration")
+		}
+		connected <- key.PublicKey
+		return nil
+	}
+	t.Cleanup(app.stopClaimWatcher)
+
+	link, err := app.GenerateClaimLink("https://console.wantastic.app", false)
+	if err != nil {
+		t.Fatalf("GenerateClaimLink: %v", err)
+	}
+	select {
+	case publicKey := <-connected:
+		if publicKey != link.PublicKey {
+			t.Fatalf("connected public key=%q want %q", publicKey, link.PublicKey)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("claim watcher did not activate the claimed configuration")
 	}
 }

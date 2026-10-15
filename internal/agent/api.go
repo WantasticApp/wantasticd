@@ -48,8 +48,10 @@ func NewAPIServer(a *Agent) *APIServer {
 
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
+	mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
 	mux.HandleFunc("/api/exitnode/offer", s.handleSetExitNodeOffer)
+	mux.HandleFunc("/api/exitnode/offer/runtime", s.handleSetExitNodeOfferRuntime)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
 
 	s.server = &http.Server{
@@ -190,6 +192,7 @@ type StatusResponse struct {
 	TUNName       string            `json:"tun_name"`
 	Running       bool              `json:"running"`
 	DeviceRunning bool              `json:"device_running"`
+	MagicDNS      bool              `json:"magic_dns"`
 	ExitNode      bool              `json:"exit_node"`
 	LocalAccess   bool              `json:"local_access"`
 	IPs           []string          `json:"ips"`
@@ -217,6 +220,7 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		TUNName:       s.agent.config.Interface.TUNName,
 		Running:       s.agent.IsRunning(),
 		DeviceRunning: s.agent.device.IsRunning(),
+		MagicDNS:      s.agent.MagicDNSActive(),
 		ExitNode:      s.agent.config.ExitNode.Enabled,
 		LocalAccess:   s.agent.config.AllowLocalAccess,
 		IPs:           ips,
@@ -251,6 +255,16 @@ func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprint(w, "{\"status\":\"toggled\"}")
 }
 
+func (s *APIServer) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if !allowLocalMutation(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = fmt.Fprint(w, "{\"status\":\"stopping\"}")
+	s.agent.requestShutdown()
+}
+
 func (s *APIServer) handleToggleExitNode(w http.ResponseWriter, r *http.Request) {
 	if !allowLocalMutation(w, r) {
 		return
@@ -278,9 +292,23 @@ func (s *APIServer) handleSetExitNodeOffer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.agent.SetOfferExitNode(enabled); err != nil {
-		http.Error(w, "could not update exit-node offer", http.StatusConflict)
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, "{\"enabled\":%t}", enabled)
+}
+
+func (s *APIServer) handleSetExitNodeOfferRuntime(w http.ResponseWriter, r *http.Request) {
+	if !allowLocalMutation(w, r) {
+		return
+	}
+	enabled, err := strconv.ParseBool(r.URL.Query().Get("enabled"))
+	if err != nil {
+		http.Error(w, "enabled must be true or false", http.StatusBadRequest)
+		return
+	}
+	s.agent.SetOfferExitNodeRuntime(enabled)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, "{\"enabled\":%t}", enabled)
 }
@@ -295,7 +323,7 @@ func (s *APIServer) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.agent.SetExitNode(peerPubKey); err != nil {
 		log.Printf("[API] Failed to set exit node routing: %v", err)
-		http.Error(w, "could not update exit-node route", http.StatusConflict)
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

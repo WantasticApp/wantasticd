@@ -6,7 +6,26 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"wantastic-agent/internal/config"
 )
+
+func TestHandleSetExitNodeOfferRuntime(t *testing.T) {
+	t.Parallel()
+	agt := &Agent{config: &config.Config{}}
+	server := &APIServer{agent: agt}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/exitnode/offer/runtime?enabled=true", nil)
+	response := httptest.NewRecorder()
+
+	server.handleSetExitNodeOfferRuntime(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if !agt.config.ExitNode.Enabled {
+		t.Fatal("runtime exit-node offer was not applied")
+	}
+}
 
 func TestAllowLocalMutation(t *testing.T) {
 	t.Parallel()
@@ -37,6 +56,25 @@ func TestAllowLocalMutation(t *testing.T) {
 				t.Fatalf("status = %d, want %d", response.Code, tt.code)
 			}
 		})
+	}
+}
+
+func TestHandleShutdown(t *testing.T) {
+	t.Parallel()
+	agt := &Agent{shutdownCh: make(chan struct{})}
+	server := &APIServer{agent: agt}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/shutdown", nil)
+	response := httptest.NewRecorder()
+
+	server.handleShutdown(response, req)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
+	}
+	select {
+	case <-agt.ShutdownRequested():
+	default:
+		t.Fatal("shutdown request was not delivered")
 	}
 }
 

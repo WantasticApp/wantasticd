@@ -1,68 +1,118 @@
 package main
 
 import (
-	"context"
 	"embed"
+	"io/fs"
 	"log"
+	"os"
+	"runtime"
+	"time"
 
-	"github.com/wailsapp/wails/v2"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
-	"github.com/wailsapp/wails/v2/pkg/options/mac"
-	"github.com/wailsapp/wails/v2/pkg/options/windows"
+	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
+
+	"wantastic-agent/assets"
 )
 
 //go:embed all:gui/frontend/dist
 var frontendAssets embed.FS
 
 func main() {
-	app := NewApp()
-
-	err := wails.Run(&options.App{
-		Title:             "Wantastic",
-		Width:             420,
-		Height:            640,
-		MinWidth:          380,
-		MinHeight:         520,
-		MaxWidth:          1400,
-		MaxHeight:         1000,
-		DisableResize:     false,
-		Fullscreen:        false,
-		Frameless:         false,
-		StartHidden:       true, // app starts hidden; show via systray or startup logic
-		HideWindowOnClose: true, // X hides to tray; Quit is in the tray menu
-		AssetServer: &assetserver.Options{
-			Assets: frontendAssets,
-		},
-		BackgroundColour: &options.RGBA{R: 10, G: 12, B: 20, A: 255},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
-		OnBeforeClose:    app.beforeClose,
-		Bind: []interface{}{
-			app,
-		},
-		Mac: &mac.Options{
-			About: &mac.AboutInfo{
-				Title:   "Wantastic",
-				Message: "Wantastic VPN Desktop Client\n© 2026 Wantastic",
-			},
-			Appearance:           mac.NSAppearanceNameDarkAqua,
-			WebviewIsTransparent: false,
-			WindowIsTranslucent:  false,
-		},
-		Windows: &windows.Options{
-			WebviewIsTransparent: false,
-			WindowIsTranslucent:  false,
-			DisablePinchZoom:     true,
-			DisableWindowIcon:    false,
-		},
-	})
-
+	if handled, err := runPrivilegedAgentMode(); handled {
+		if err != nil {
+			log.Printf("privileged tunnel helper: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	webAssets, err := fs.Sub(frontendAssets, "gui/frontend/dist")
 	if err != nil {
 		log.Fatal(err)
 	}
-}
 
-func (a *App) beforeClose(_ context.Context) bool {
-	return false // allow close
+	desktop := application.New(application.Options{
+		Name:        "Wantastic",
+		Description: "Secure access to your Wantastic tenant network",
+		Icon:        assets.TrayIcon,
+		Assets: application.AssetOptions{
+			Handler:        application.AssetFileServerFS(webAssets),
+			DisableLogging: true,
+		},
+		Mac: application.MacOptions{
+			ActivationPolicy: application.ActivationPolicyAccessory,
+			ApplicationShouldTerminateAfterLastWindowClosed: false,
+		},
+		Windows: application.WindowsOptions{
+			DisableQuitOnLastWindowClosed: true,
+		},
+		Linux: application.LinuxOptions{
+			DisableQuitOnLastWindowClosed: true,
+			ApplicationID:                 "app.wantastic.desktop",
+			ProgramName:                   "Wantastic",
+		},
+	})
+
+	service := NewApp(desktop)
+	desktop.RegisterService(application.NewService(service))
+	windowURL := "/"
+	if os.Getenv("WANTASTIC_DESKTOP_PREVIEW") == "1" {
+		windowURL = "/?preview=1"
+	}
+
+	window := desktop.Window.NewWithOptions(application.WebviewWindowOptions{
+		Name:                       "wantastic-tray",
+		Title:                      "Wantastic",
+		Width:                      420,
+		Height:                     680,
+		MinWidth:                   420,
+		MinHeight:                  680,
+		MaxWidth:                   420,
+		MaxHeight:                  680,
+		Frameless:                  true,
+		AlwaysOnTop:                true,
+		Hidden:                     true,
+		DisableResize:              true,
+		HideOnEscape:               true,
+		HideOnFocusLost:            true,
+		DefaultContextMenuDisabled: true,
+		BackgroundColour:           application.NewRGB(7, 17, 27),
+		URL:                        windowURL,
+		Windows: application.WindowsWindow{
+			HiddenOnTaskbar:         true,
+			Theme:                   application.Dark,
+			NonClientRegionSupport:  true,
+			GeneralAutofillEnabled:  false,
+			PasswordAutosaveEnabled: false,
+		},
+		Mac: application.MacWindow{
+			Appearance:  application.NSAppearanceNameDarkAqua,
+			WindowClass: application.MacWindowClassPanel,
+			CornerType:  application.MacWindowCornerTypeRounded,
+			WindowLevel: application.MacWindowLevelFloating,
+			TabbingMode: application.MacWindowTabbingModeDisallowed,
+			PanelPreferences: application.MacPanelPreferences{
+				FloatingPanel: true,
+			},
+		},
+	})
+	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
+		window.Hide()
+		event.Cancel()
+	})
+	service.setWindow(window)
+
+	tray := desktop.SystemTray.New()
+	tray.SetTooltip("Wantastic")
+	if runtime.GOOS == "darwin" {
+		tray.SetTemplateIcon(assets.TrayIconTemplate)
+	} else {
+		tray.SetIcon(assets.TrayIcon)
+		tray.SetDarkModeIcon(assets.TrayIcon)
+	}
+	tray.AttachWindow(window).WindowOffset(6).WindowDebounce(180 * time.Millisecond)
+	service.setSystemTray(tray)
+
+	if err := desktop.Run(); err != nil {
+		log.Fatal(err)
+	}
 }

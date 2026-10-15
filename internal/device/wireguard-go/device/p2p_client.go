@@ -76,6 +76,7 @@ type DiscoveredPeer struct {
 	CandidateAddrs []net.UDPAddr
 	NATType        NATType
 	P2PCapable     bool
+	OffersExitNode bool
 
 	State         P2PState
 	DirectConn    *net.UDPConn
@@ -484,7 +485,9 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		peer.LocalAddr = localAddr
 		peer.ObservedAddr = observedAddr
 		peer.NATType = NATType(msg.Payload[offset+72])
-		peer.P2PCapable = msg.Payload[offset+73] == 1
+		capabilities := msg.Payload[offset+73]
+		peer.P2PCapable = capabilities&1 != 0
+		peer.OffersExitNode = capabilities&2 != 0
 		peer.AssignedIP = assignedIP
 		peer.LastSeen = now
 		if _, ok := c.attemptGates[peerID]; !ok {

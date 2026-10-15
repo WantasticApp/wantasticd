@@ -183,6 +183,9 @@ func writePersistentFile(path, value string, perm os.FileMode) error {
 	if err := EnsureParentDir(path, 0o700); err != nil {
 		return fmt.Errorf("create persistent directory: %w", err)
 	}
+	if perm == 0o600 {
+		return WritePrivateFile(path, []byte(value))
+	}
 	return os.WriteFile(path, []byte(value), perm)
 }
 

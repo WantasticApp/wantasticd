@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -22,6 +21,7 @@ import (
 	"time"
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
+	"wantastic-agent/internal/netprobe"
 	platformdns "wantastic-agent/internal/platform/dns"
 	"wantastic-agent/internal/update"
 
@@ -313,14 +313,8 @@ func writeClaimKeyFile(path string, keyFile *claimKeyFile) error {
 	if err != nil {
 		return fmt.Errorf("marshal key file: %w", err)
 	}
-	if err := auth.EnsureParentDir(path, 0o700); err != nil {
-		return fmt.Errorf("create key directory: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := auth.WritePrivateFile(path, data); err != nil {
 		return fmt.Errorf("write key file: %w", err)
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("secure key file permissions: %w", err)
 	}
 	return nil
 }
@@ -697,10 +691,13 @@ func handleStatus() {
 	defer resp.Body.Close()
 
 	var status struct {
-		TUNMode     bool   `json:"tun_mode"`
-		TUNName     string `json:"tun_name"`
-		Running     bool   `json:"running"`
-		LocalAccess bool   `json:"local_access"`
+		TUNMode       bool     `json:"tun_mode"`
+		TUNName       string   `json:"tun_name"`
+		Running       bool     `json:"running"`
+		MagicDNS      bool     `json:"magic_dns"`
+		OfferExitNode bool     `json:"exit_node"`
+		LocalAccess   bool     `json:"local_access"`
+		IPs           []string `json:"ips"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		fmt.Printf("Status: Error parsing response: %v\n", err)
@@ -715,7 +712,8 @@ func handleStatus() {
 	if status.TUNMode {
 		modeStr = fmt.Sprintf("TUN (%s)", status.TUNName)
 	}
-	fmt.Printf("Status: %s\nMode: %s\nLocal access: %t\n", state, modeStr, status.LocalAccess)
+	fmt.Printf("Status: %s\nMode: %s\nOverlay addresses: %s\nMagicDNS: %t\nExit node offered: %t\nLocal access: %t\n",
+		state, modeStr, strings.Join(status.IPs, ", "), status.MagicDNS, status.OfferExitNode, status.LocalAccess)
 }
 
 func handleUpdate() {
@@ -756,19 +754,23 @@ func handlePeers() {
 
 	var data struct {
 		Peers []struct {
-			PublicKey  string `json:"public_key"`
-			AssignedIP string `json:"assigned_ip"`
-			Hostname   string `json:"hostname"`
-			P2PState   string `json:"p2p_state"`
+			PublicKey      string `json:"public_key"`
+			AssignedIP     string `json:"assigned_ip"`
+			Hostname       string `json:"hostname"`
+			P2PState       string `json:"p2p_state"`
+			OffersExitNode bool   `json:"offers_exit_node"`
 		} `json:"peers"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		log.Fatalf("Failed to decode discovery results: %v", err)
 	}
 
-	fmt.Printf("%-18s %-28s %-12s %s\n", "IP ADDRESS", "MAGIC NAME", "CONNECTION", "PUBLIC KEY")
-	fmt.Println(strings.Repeat("-", 90))
+	fmt.Printf("%-18s %-28s %-12s %-10s %s\n", "IP ADDRESS", "MAGIC NAME", "CONNECTION", "EXIT NODE", "PUBLIC KEY")
+	fmt.Println(strings.Repeat("-", 102))
 	for _, p := range data.Peers {
+		if net.ParseIP(strings.TrimSpace(p.AssignedIP)) == nil {
+			continue
+		}
 		hostname := p.Hostname
 		if hostname == "" {
 			hostname = magicNameForIP(p.AssignedIP)
@@ -779,7 +781,11 @@ func handlePeers() {
 		} else if p.P2PState == "trying" {
 			connection = "trying"
 		}
-		fmt.Printf("%-18s %-28s %-12s %s\n", p.AssignedIP, hostname, connection, p.PublicKey)
+		exitNode := "no"
+		if p.OffersExitNode {
+			exitNode = "available"
+		}
+		fmt.Printf("%-18s %-28s %-12s %-10s %s\n", p.AssignedIP, hostname, connection, exitNode, p.PublicKey)
 	}
 }
 
@@ -800,9 +806,7 @@ func handlePing() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	started := time.Now()
-	cmd := exec.CommandContext(ctx, "ping", platformPingArgs(peer.AssignedIP)...)
-	output, runErr := cmd.CombinedOutput()
+	elapsed, message, runErr := netprobe.Ping(ctx, peer.AssignedIP)
 	connection := "relay"
 	if peer.P2PState == "established" {
 		connection = "direct"
@@ -810,10 +814,10 @@ func handlePing() {
 		connection = "trying (relay remains active)"
 	}
 	if runErr != nil {
-		fmt.Printf("peer=%s ip=%s connection=%s reachable=false\n%s\n", target, peer.AssignedIP, connection, strings.TrimSpace(string(output)))
+		fmt.Printf("peer=%s ip=%s connection=%s reachable=false error=%s\n", target, peer.AssignedIP, connection, runErr)
 		os.Exit(1)
 	}
-	fmt.Printf("peer=%s ip=%s connection=%s reachable=true elapsed=%s\n", target, peer.AssignedIP, connection, time.Since(started).Round(time.Millisecond))
+	fmt.Printf("peer=%s ip=%s connection=%s reachable=true elapsed=%s detail=%q\n", target, peer.AssignedIP, connection, elapsed.Round(time.Millisecond), message)
 }
 
 type cliPeer struct {
@@ -853,17 +857,6 @@ func magicNameForIP(ip string) string {
 	return "node-" + strings.ReplaceAll(parsed.To4().String(), ".", "-") + ".wantastic"
 }
 
-func platformPingArgs(ip string) []string {
-	switch runtime.GOOS {
-	case "windows":
-		return []string{"-n", "1", "-w", "2000", ip}
-	case "darwin":
-		return []string{"-n", "-c", "1", "-W", "2000", ip}
-	default:
-		return []string{"-n", "-c", "1", "-W", "2", ip}
-	}
-}
-
 func handleExitNode() {
 	exitCmd := flag.NewFlagSet("exit-node", flag.ExitOnError)
 	offer := exitCmd.String("offer", "", "Offer this device as an exit node: true or false")
@@ -873,36 +866,69 @@ func handleExitNode() {
 		log.Fatal("usage: wantasticd exit-node --offer=true|false or --use=<public-key|none>")
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	post := func(path string) {
+	post := func(path string) error {
 		req, err := agent.NewIPCRequest(context.Background(), http.MethodPost, path)
 		if err != nil {
-			log.Fatalf("prepare wantasticd request: %v", err)
+			return fmt.Errorf("prepare wantasticd request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Fatalf("reach wantasticd: %v", err)
+			return fmt.Errorf("reach wantasticd: %w", err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			log.Fatalf("wantasticd returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			return fmt.Errorf("wantasticd returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 		}
+		return nil
 	}
 	if *offer != "" {
-		if _, err := strconv.ParseBool(*offer); err != nil {
+		enabled, err := strconv.ParseBool(*offer)
+		if err != nil {
 			log.Fatalf("--offer must be true or false")
 		}
-		post("/api/exitnode/offer?enabled=" + url.QueryEscape(*offer))
+		err = post("/api/exitnode/offer?enabled=" + url.QueryEscape(*offer))
+		if err != nil && strings.Contains(err.Error(), "config has no file path") {
+			err = persistExternalExitNodeOffer(enabled, post)
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	if *use != "" {
 		peer := *use
 		if strings.EqualFold(peer, "none") {
 			peer = ""
 		}
-		post("/api/exitnode/use?peer=" + url.QueryEscape(peer))
+		if err := post("/api/exitnode/use?peer=" + url.QueryEscape(peer)); err != nil {
+			log.Fatal(err)
+		}
 	}
 	fmt.Println("Exit-node setting accepted")
+}
+
+func persistExternalExitNodeOffer(enabled bool, post func(string) error) error {
+	path := auth.DefaultConfigPath()
+	previous, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read exit-node preference: %w", err)
+	}
+	cfg, err := config.Parse(previous)
+	if err != nil {
+		return fmt.Errorf("parse exit-node preference: %w", err)
+	}
+	cfg.ExitNode.Enabled = enabled
+	if err := cfg.SaveToFile(path); err != nil {
+		return fmt.Errorf("persist exit-node preference: %w", err)
+	}
+	if err := post("/api/exitnode/offer/runtime?enabled=" + strconv.FormatBool(enabled)); err != nil {
+		if restoreErr := auth.WritePrivateFile(path, previous); restoreErr != nil {
+			return fmt.Errorf("apply exit-node preference: %v; restore config: %w", err, restoreErr)
+		}
+		return fmt.Errorf("apply exit-node preference: %w", err)
+	}
+	return nil
 }
 
 func doIPC(method, path string, timeout time.Duration) (*http.Response, error) {

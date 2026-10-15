@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -16,37 +17,59 @@ import (
 // system_profiler / airport CLI parsing.
 type darwinController struct{}
 
+const (
+	darwinIfconfigPath = "/sbin/ifconfig"
+	darwinRoutePath    = "/sbin/route"
+	darwinSysctlPath   = "/usr/sbin/sysctl"
+)
+
 func newController() Controller { return &darwinController{} }
 
 func (c *darwinController) Close() error { return nil }
 
 func (c *darwinController) LinkSetUp(ifname string) error {
-	return exec.Command("ifconfig", ifname, "up").Run()
+	_, err := runDarwinAdmin(darwinIfconfigPath, ifname, "up")
+	return err
 }
 
 func (c *darwinController) LinkSetDown(ifname string) error {
-	return exec.Command("ifconfig", ifname, "down").Run()
+	_, err := runDarwinAdmin(darwinIfconfigPath, ifname, "down")
+	return err
 }
 
 func (c *darwinController) LinkSetMTU(ifname string, mtu int) error {
-	return exec.Command("ifconfig", ifname, "mtu", fmt.Sprintf("%d", mtu)).Run()
+	_, err := runDarwinAdmin(darwinIfconfigPath, ifname, "mtu", fmt.Sprintf("%d", mtu))
+	return err
 }
 
 func (c *darwinController) AddrAdd(ifname string, addr netip.Prefix) error {
 	ip := addr.Addr().String()
 	if addr.Addr().Is4() {
-		return exec.Command("ifconfig", ifname, "inet", ip, ip, "netmask", "255.255.255.255", "up").Run()
+		_, err := runDarwinAdmin(
+			darwinIfconfigPath,
+			ifname,
+			"inet",
+			ip,
+			ip,
+			"netmask",
+			"255.255.255.255",
+			"up",
+		)
+		return err
 	}
 	bits := fmt.Sprintf("%d", addr.Bits())
-	return exec.Command("ifconfig", ifname, "inet6", ip, bits, "up").Run()
+	_, err := runDarwinAdmin(darwinIfconfigPath, ifname, "inet6", ip, bits, "up")
+	return err
 }
 
 func (c *darwinController) AddrDel(ifname string, addr netip.Prefix) error {
 	ip := addr.Addr().String()
 	if addr.Addr().Is4() {
-		return exec.Command("ifconfig", ifname, "inet", ip, "delete").Run()
+		_, err := runDarwinAdmin(darwinIfconfigPath, ifname, "inet", ip, "delete")
+		return err
 	}
-	return exec.Command("ifconfig", ifname, "inet6", ip, "delete").Run()
+	_, err := runDarwinAdmin(darwinIfconfigPath, ifname, "inet6", ip, "delete")
+	return err
 }
 
 func (c *darwinController) RouteReplace(ifname string, dst netip.Prefix) error {
@@ -57,7 +80,7 @@ func (c *darwinController) RouteReplace(ifname string, dst netip.Prefix) error {
 	}
 	// Never delete an existing route owned by another VPN. The caller tracks
 	// routes it successfully adds and removes only those during shutdown.
-	out, err := exec.Command("route", "-n", "add", family, network, "-interface", ifname).CombinedOutput()
+	out, err := runDarwinAdmin(darwinRoutePath, "-n", "add", family, network, "-interface", ifname)
 	if err != nil {
 		return fmt.Errorf("route add: %v: %s", err, out)
 	}
@@ -70,11 +93,12 @@ func (c *darwinController) RouteDel(ifname string, dst netip.Prefix) error {
 	if dst.Addr().Is6() {
 		family = "-inet6"
 	}
-	return exec.Command("route", "-n", "delete", family, network, "-interface", ifname).Run()
+	_, err := runDarwinAdmin(darwinRoutePath, "-n", "delete", family, network, "-interface", ifname)
+	return err
 }
 
 func (c *darwinController) RouteGetDefault() (string, netip.Addr, error) {
-	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
+	out, err := exec.Command(darwinRoutePath, "-n", "get", "default").CombinedOutput()
 	if err != nil {
 		return "", netip.Addr{}, err
 	}
@@ -94,7 +118,7 @@ func (c *darwinController) RouteGetDefault() (string, netip.Addr, error) {
 }
 
 func (c *darwinController) WiFiGetCapabilities(ifname string) (*WiFiCapabilities, error) {
-	out, err := exec.Command("system_profiler", "SPAirPortDataType").CombinedOutput()
+	out, err := exec.Command("/usr/sbin/system_profiler", "SPAirPortDataType").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("system_profiler: %w", err)
 	}
@@ -146,11 +170,32 @@ func (c *darwinController) IPForwardingSet(enabled bool) error {
 	if enabled {
 		val = "1"
 	}
-	if out, err := exec.Command("sysctl", "-w", "net.inet.ip.forwarding="+val).CombinedOutput(); err != nil {
+	if out, err := runDarwinAdmin(darwinSysctlPath, "-w", "net.inet.ip.forwarding="+val); err != nil {
 		return fmt.Errorf("sysctl ipv4: %s", out)
 	}
-	exec.Command("sysctl", "-w", "net.inet6.ip6.forwarding="+val).Run()
-	return nil
+	_, err := runDarwinAdmin(darwinSysctlPath, "-w", "net.inet6.ip6.forwarding="+val)
+	return err
+}
+
+func runDarwinAdmin(path string, args ...string) ([]byte, error) {
+	if os.Geteuid() == 0 {
+		return exec.Command(path, args...).CombinedOutput()
+	}
+	command := shellQuote(path)
+	for _, arg := range args {
+		command += " " + shellQuote(arg)
+	}
+	return exec.Command(
+		"/usr/bin/osascript",
+		"-e", "on run argv",
+		"-e", "do shell script (item 1 of argv) with administrator privileges",
+		"-e", "end run",
+		command,
+	).CombinedOutput()
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 // Helpers

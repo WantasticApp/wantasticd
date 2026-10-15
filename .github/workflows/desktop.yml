@@ -29,8 +29,8 @@ jobs:
           sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
       - name: Go tests and vet
         run: |
-          go test -race -tags "nosystray webkit2_41" . ./internal/config ./internal/device ./internal/agent ./internal/claimkey ./internal/netctl ./cmd/wantasticd
-          go vet -tags "nosystray webkit2_41" ./...
+          go test -race -tags gtk3 . ./internal/config ./internal/device ./internal/agent ./internal/claimkey ./internal/netctl ./internal/netprobe ./cmd/wantasticd
+          go vet -tags gtk3 ./...
       - name: Dependency vulnerability scan
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -51,18 +51,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-24.04
+            task: linux:build
+            artifact: wantastic-desktop-linux-amd64
+            tags: gtk3
           - os: macos-14
-            platform: darwin/universal
+            task: darwin:package:universal
             artifact: wantastic-desktop-macos-universal
             tags: ''
           - os: windows-2025
-            platform: windows/amd64
+            task: windows:build
             artifact: wantastic-desktop-windows-amd64
             tags: ''
-          - os: ubuntu-24.04
-            platform: linux/amd64
-            artifact: wantastic-desktop-linux-amd64
-            tags: webkit2_41
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -83,22 +83,16 @@ jobs:
       - name: Build desktop application
         shell: bash
         run: |
-          TAGS="${{ matrix.tags }}"
           LD_FLAGS="-s -w -X wantastic-agent/pkg/version.Version=desktop-${GITHUB_SHA::8} -X wantastic-agent/pkg/version.Commit=${GITHUB_SHA::8}"
           if [[ "${{ runner.os }}" == "macOS" ]]; then LD_FLAGS+=" -extldflags=-mmacosx-version-min=13.0"; fi
-          ARGS=(build -clean -platform "${{ matrix.platform }}" -ldflags "$LD_FLAGS")
-          if [[ -n "$TAGS" ]]; then ARGS+=(-tags "$TAGS"); fi
-          go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 "${ARGS[@]}"
+          go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.29 task "${{ matrix.task }}" EXTRA_TAGS="${{ matrix.tags }}" WANTASTIC_LDFLAGS="$LD_FLAGS"
       - name: Run Windows platform tests
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          go test .
-          go test ./internal/agent -run '^(TestAllowLocalMutation|TestIPCAuthorization|TestNewAPIServerGeneratesProcessCredential|TestReadIPCTokenRejectsLoosePermissions|TestValidIPCPort|TestIPCDiscoveryRoundTrip)$'
+        run: go test . ./internal/auth ./internal/claimkey ./internal/config ./internal/agent ./internal/device ./internal/netctl ./cmd/wantasticd
       - name: Ad-hoc sign and package macOS application
         if: runner.os == 'macOS'
         run: |
-          codesign --force --deep --sign - --timestamp=none build/bin/Wantastic.app
           codesign --verify --deep --strict --verbose=2 build/bin/Wantastic.app
           ditto -c -k --sequesterRsrc --keepParent build/bin/Wantastic.app build/bin/wantastic-macos-universal.zip
       - name: Self-sign Windows application
@@ -133,8 +127,8 @@ jobs:
             & $manifestTool.FullName "-inputresource:build/bin/wantastic.exe;#1" "-out:$manifestOutput"
             if ($LASTEXITCODE -ne 0) { throw "mt.exe failed with exit code $LASTEXITCODE" }
             $manifest = Get-Content -LiteralPath $manifestOutput -Raw
-            if ($manifest -notmatch 'requestedExecutionLevel\s+level="requireAdministrator"\s+uiAccess="false"') {
-              throw 'Wantastic executable is missing the required safe UAC execution level'
+            if ($manifest -notmatch 'requestedExecutionLevel\s+level="asInvoker"\s+uiAccess="false"') {
+              throw 'Wantastic UI must run unprivileged; expected asInvoker in the embedded manifest'
             }
             & $signTool.FullName sign /fd SHA256 /f $pfxPath /p $pfxPasswordText build/bin/wantastic.exe
             if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }

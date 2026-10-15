@@ -53,7 +53,7 @@ func newInMemoryUSPRuntime(tb testing.TB) *uspRuntime {
 	_ = a.Set("Device.WUSP.Enable", wusp.Bool(true))
 	_ = a.Set("Device.WUSP.Status", wusp.String("Enabled"))
 	_ = a.Set("Device.WUSP.ProtocolVersion", wusp.String(wusp.WUSPModelVersion))
-	rt.agent = a
+	rt.setAgent(a)
 	return rt
 }
 
@@ -146,12 +146,12 @@ func TestIntegration_OperateCommandPathMetadataSurvivesWire(t *testing.T) {
 	const commandPath = objectPath + "RefreshGNSS()"
 
 	var invoked string
-	rt.agent = wusp.NewUSPAgent(wusp.USPAgentOptions{
+	rt.setAgent(wusp.NewUSPAgent(wusp.USPAgentOptions{
 		OperateHandler: func(_ context.Context, path string, _ *wusp.Message, _ map[string]string) (*wusp.Message, error) {
 			invoked = path
 			return wusp.NewMessage(), nil
 		},
-	})
+	}))
 
 	resp := ctrlRequest(t, rt, wusp.USPAgentRequest{
 		ID:         integrationNextID(),

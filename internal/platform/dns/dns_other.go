@@ -1,5 +1,4 @@
-//go:build !linux
-// +build !linux
+//go:build !linux && !windows && !darwin
 
 package dns
 
@@ -19,3 +18,5 @@ func Apply(ctx context.Context, req Request) (Result, error) {
 		Servers: servers,
 	}, nil
 }
+
+func removeTunnel(string) error { return nil }

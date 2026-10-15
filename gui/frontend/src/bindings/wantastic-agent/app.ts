@@ -55,6 +55,14 @@ export function SetExitNode(publicKey: string): $CancellablePromise<void> {
     return $Call.ByID(841020187, publicKey);
 }
 
+/**
+ * SetLanguage keeps the native tray menu aligned with the language selected in
+ * the desktop window. Unknown locale variants safely fall back to English.
+ */
+export function SetLanguage(language: string): $CancellablePromise<void> {
+    return $Call.ByID(3105553901, language);
+}
+
 export function SetOfferExitNode(enabled: boolean): $CancellablePromise<void> {
     return $Call.ByID(4202551791, enabled);
 }

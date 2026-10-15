@@ -157,6 +157,32 @@ func TestMakeTrayPresentation(t *testing.T) {
 	}
 }
 
+func TestMakeTrayPresentationLanguages(t *testing.T) {
+	t.Parallel()
+	status := &StatusData{Configured: true, Running: true, DeviceRunning: true, IPs: []string{"10.20.0.7/32"}}
+	tests := []struct {
+		language string
+		state    string
+		toggle   string
+	}{
+		{language: "fr-FR", state: "En ligne", toggle: "Déconnecter"},
+		{language: "es", state: "En línea", toggle: "Desconectar"},
+		{language: "de_DE", state: "Online", toggle: "Trennen"},
+		{language: "ar", state: "متصل", toggle: "قطع الاتصال"},
+		{language: "unsupported", state: "Online", toggle: "Disconnect"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.language, func(t *testing.T) {
+			t.Parallel()
+			got := makeTrayPresentationForLanguage(status, nil, tt.language)
+			if got.statusTitle != tt.state || got.trayLabel != tt.state || got.toggleTitle != tt.toggle {
+				t.Fatalf("makeTrayPresentationForLanguage(%q) = %#v", tt.language, got)
+			}
+		})
+	}
+}
+
 func TestGenerateClaimLinkStartsAutomaticConnectionWatcher(t *testing.T) {
 	t.Setenv("WANTASTIC_CONFIG_DIR", t.TempDir())
 	app := NewApp(nil)

@@ -29,7 +29,7 @@ jobs:
           CGO_ENABLED: 0
         run: go vet -tags nosystray ./assets ./cmd/... ./internal/... ./pkg/...
       - name: Validate installers
-        run: sh -n install.sh scripts/install.sh internal/update/self-update.sh
+        run: make install-check
 
   create-release:
     needs: quality

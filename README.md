@@ -1,326 +1,256 @@
 <div align="center">
 
-# wantasticd
+# Wantastic
 
-**Wantastic Networking Daemon** — a lightweight, cross-platform WireGuard-based mesh networking agent.
+**A secure WireGuard-based tenant network for desktop, servers, routers, and embedded devices.**
 
-[![Stars](https://img.shields.io/github/stars/kmoz000/wantasticd?style=flat-square&logo=github&label=Stars)](https://github.com/kmoz000/wantasticd/stargazers)
-[![Release](https://img.shields.io/github/v/release/kmoz000/wantasticd?style=flat-square)](https://github.com/kmoz000/wantasticd/releases)
-[![License](https://img.shields.io/github/license/kmoz000/wantasticd?style=flat-square)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20OpenWrt-blue?style=flat-square)](#installation)
+[![Release](https://img.shields.io/github/v/release/WantasticApp/wantasticd?style=flat-square)](https://github.com/WantasticApp/wantasticd/releases)
+[![Desktop](https://github.com/WantasticApp/wantasticd/actions/workflows/desktop.yml/badge.svg?branch=Desktop)](https://github.com/WantasticApp/wantasticd/actions/workflows/desktop.yml)
+[![Platforms](https://img.shields.io/badge/Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20OpenWrt-supported-258bd2?style=flat-square)](#platform-support)
 
 </div>
 
----
+`wantasticd` is the Wantastic networking agent. It joins a device to its tenant
+overlay, keeps traffic encrypted with WireGuard, tries authenticated direct P2P
+paths, and retains the tenant relay as the availability fallback when a NAT or
+firewall prevents direct UDP connectivity.
 
-## What is wantasticd?
+The `Desktop` branch also contains the compact Wails v3 tray application used
+on macOS, Windows, and Linux. The CLI and desktop app share the same agent,
+configuration, identity, MagicDNS, P2P, exit-node, and local-access logic.
 
-`wantasticd` is the agent daemon for the [Wantastic](https://wantastic.app) overlay network. It uses a WireGuard-based protocol to create secure, high-performance peer-to-peer tunnels between devices — across NAT, firewalls, and heterogeneous networks.
+## Features
 
-It runs as a system service on Linux (systemd, procd/OpenWrt, OpenRC, SysV, BusyBox), macOS (launchd), and Windows.
+- WireGuard-encrypted tenant overlay
+- Direct P2P path discovery with automatic relay fallback
+- Stable device claim links and automatic post-claim connection
+- Manual Wantastic JSON and WireGuard configuration import
+- MagicDNS status and tenant device discovery
+- Six-sample overlay ping chart
+- Exit-node advertisement and selection safeguards
+- Opt-in private LAN advertisement, including `/32` host routes
+- System service installers for Linux, OpenWrt, macOS, and Windows
+- Frameless Wantastic tray UI with native platform packaging
 
----
+Direct P2P cannot be guaranteed through every NAT or a network that blocks UDP.
+Wantastic keeps the encrypted relay path available so connectivity does not
+depend on successful hole punching.
 
-## Performance
+## Install the CLI and service
 
-Wantasticd uses a **Userspace Hybrid Netstack** — combining a Go userspace WireGuard implementation with kernel-bypass techniques for maximum throughput.
-
-| Scenario | Throughput |
-|---|---|
-| Local loopback (P2P) | ~10 Gbps |
-| LAN peer-to-peer | ~2–5 Gbps |
-| WAN / cloud relay | Limited by ISP uplink |
-
-> See the full [P2P Performance Benchmarks](./p2pbenchmark.md) for detailed results.
-
----
-
-## P2P
-
-Wantasticd establishes **direct peer-to-peer tunnels** whenever a validated
-WireGuard path can be punched through the current NAT/firewall. Traffic keeps
-using the authenticated tenant hub relay until that direct handshake succeeds,
-and automatically returns to the relay if the direct path becomes stale. No
-mesh VPN can guarantee a direct path through every NAT or UDP-blocking firewall;
-the relay is the availability fallback.
-
-- **ICE-like hole punching** through NAT
-- **WireGuard encryption** end-to-end
-- **Persistent keepalive** for connection stability on embedded/mobile networks
-- **Automatic reconnect** managed by the system service
-
-To run the P2P end-to-end test suite:
-
-```bash
-./e2e/run_p2p_test.sh
-```
-
----
-
-## Installation
-
-### Linux & macOS — one-liner
+Linux, OpenWrt, and macOS:
 
 ```sh
-curl -sSL https://get.wantastic.app/install.sh | sh
+curl -fsSL https://get.wantastic.app/install.sh | sh
 ```
 
-The installer automatically:
-- Detects your OS and architecture (`linux/amd64`, `arm64`, `arm`, `mips`, `riscv64`, `ppc64le`, ...)
-- Remounts read-only filesystems (OpenWrt)
-- Adds reliable DNS if needed
-- Installs the binary to `/usr/bin/wantasticd` or `/usr/local/bin/wantasticd`
-- Registers and starts a system service (systemd / procd / OpenRC / SysV / BusyBox / launchd)
-
-### Windows
-
-Open PowerShell as Administrator:
+Windows PowerShell, run as Administrator:
 
 ```powershell
 irm https://get.wantastic.app/install.ps1 | iex
 ```
 
----
+The installer detects the operating system and architecture, installs the
+matching release archive, and configures the native service manager. It does
+not overwrite an existing configuration.
 
-## Authentication
+## Join a tenant
 
-After installation the agent needs credentials in `/etc/wantastic` to connect. There are three ways to authenticate:
+### Claim link
 
-### Factory claim QR
-
-For sold devices, generate a stable WireGuard key and claim QR. By default this
-command keeps running forever, waits for the customer claim, writes the final
-config, and connects automatically:
+Generate a stable device key and wait for the signed-in user to claim it:
 
 ```sh
-wantasticd genkey --out /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
+wantasticd genkey \
+  --out /etc/wantastic/device-claim-key.json \
+  --server-url https://console.wantastic.app
 ```
 
-The command saves the private key locally, prints the public key, and renders a QR code for:
+The private key remains on the device. The command prints a claim URL containing
+only the public key, waits for approval, writes the resulting configuration,
+and connects automatically. Use `--no-wait` only for a factory workflow that
+will complete the claim later.
 
-```text
-https://console.wantastic.app/#desktop?claim_public_key=<PUBLIC_KEY>
-```
-
-For a self-hosted Wantastic server, pass your own domain:
-
-```sh
-wantasticd genkey --out /etc/wantastic/device-claim-key.json --server-url https://wantastic.example.com
-```
-
-Anyone with that QR can claim the device into their signed-in Wantastic team on that server. Keep the generated JSON file on the device image and do not print the private key unless you are in a secure factory workflow.
-
-To generate the key and exit without waiting, pass `--no-wait`:
-
-```sh
-wantasticd genkey --no-wait --out /etc/wantastic/device-claim-key.json --server-url https://console.wantastic.app
-```
-
-If a config has not been claimed yet, `connect` also enters claim-waiting mode automatically when the claim key exists:
-
-```sh
-wantasticd connect --claim-key /etc/wantastic/device-claim-key.json --server-url https://wantastic.example.com
-```
-
----
-
-### 1. Interactive browser login
-
-```sh
-curl -sSL https://get.wantastic.app/install.sh | sh -s -- --login
-```
-
-Or after install:
+### Browser or token login
 
 ```sh
 wantasticd login
+wantasticd login --token '<ENROLLMENT_TOKEN>'
 ```
 
-Opens `console.wantastic.app` in your browser. After you approve, the config is written to `/etc/wantastic` automatically.
+Use browser login for an interactive workstation. Use a scoped enrollment token
+for headless provisioning and automation; do not place tokens in source files,
+shell history, or images.
 
----
+### Manual WireGuard configuration
 
-### 2. Token login (headless / automated)
-
-Ideal for CI pipelines, bulk installs, and embedded devices with no browser.
-
-**Where to get a token:** Go to **My Account → Secrets** in the console and click **+ New Secret**.
-
-![Enrollment Secrets](docs/secrets.png)
-
-```sh
-# Install + authenticate in one command
-curl -sSL https://get.wantastic.app/install.sh | sh -s -- --token <YOUR_TOKEN>
-```
-
-Or after install:
-
-```sh
-wantasticd login --token <YOUR_TOKEN>
-```
-
----
-
-### 3. Manual config file (SD card / provisioning / offline)
-
-Copy the WireGuard config directly from the console: open your device, go to **Device Configuration → WireGuard** tab, and copy the config block.
-
-![Device Configuration WireGuard](docs/device-config.png)
-
-Write it to `/etc/wantastic` on the device:
+Wantastic accepts a standard WireGuard client configuration:
 
 ```ini
 [Interface]
-PrivateKey = <YOUR_PRIVATE_KEY>
-Address    = 10.x.x.x/32
+PrivateKey = <DEVICE_PRIVATE_KEY>
+Address = 10.x.x.x/32
+DNS = <TENANT_DNS>, <FALLBACK_DNS>
 
 [Peer]
-PublicKey           = <YOUR_SERVER_PUBLIC_KEY>
-Endpoint            = wg.wantastic.app:51820
-AllowedIPs          = 10.0.0.0/8
+PublicKey = <SERVER_PUBLIC_KEY>
+Endpoint = wg.wantastic.app:51820
+AllowedIPs = <TENANT_PREFIX>
 PersistentKeepalive = 25
 ```
 
 ```sh
-vi /etc/wantastic
 wantasticd connect --config /etc/wantastic
 ```
 
-You can pre-write this file to an SD card before first boot — the installer **never overwrites** an existing `/etc/wantastic`.
+Configuration and claim-key files are written as private files. Never publish
+a real WireGuard private key or enrollment token in an issue, commit, or CI log.
 
----
-
-## Usage
+## CLI usage
 
 ```sh
-# Connect using config file
+# Connect and inspect the local agent
 wantasticd connect --config /etc/wantastic
-
-# Check connection status
 wantasticd status
-
-# List devices and their direct/relay state
 wantasticd peers
 
-# Ping by device name, overlay IP, or public key
+# Ping by MagicDNS name, overlay address, or public key
 wantasticd ping node-10-20-0-4.wantastic
 
-# Offer this device or select another device as an exit node
+# Offer this device as an exit node or select an advertised exit node
 wantasticd exit-node --offer=true
 wantasticd exit-node --use=<PEER_PUBLIC_KEY>
 
-# Login interactively
-wantasticd login
-
-# Login with token
-wantasticd login --token <TOKEN>
+# Stop using an exit node
+wantasticd exit-node --use=none
 ```
 
-### Allow tenant access to this device's local LAN
+An exit node can be selected only when that peer is actively advertising
+exit-node capability.
 
-On Linux and OpenWrt, opt this device into subnet-router mode with:
+## Allow tenant access to a local network
+
+Local access turns the device into an opt-in subnet router for other devices in
+the same tenant. Automatic discovery advertises directly connected RFC 1918
+IPv4 LANs:
 
 ```sh
 sudo wantasticd connect --config /etc/wantastic --allow-local-access
 ```
 
-`--allow-local-access` discovers directly connected private IPv4 subnets (for
-example, `192.168.1.0/24`), enables forwarding with source NAT, and advertises
-those routes to devices connected to the same Wantastic tenant. It does not
-advertise public, default, loopback, point-to-point, or Wantastic tunnel routes.
-The feature is off by default.
-
-Use an explicit comma-separated route list when automatic discovery is too
-broad. Private `/32` host routes are accepted:
+Explicit private routes are comma-separated. `/32` is supported when only one
+LAN host should be exposed:
 
 ```sh
 sudo wantasticd connect --config /etc/wantastic \
-  --advertise-routes=192.168.1.0/24,10.20.30.40/32
+  --advertise-routes=192.168.50.0/24,172.16.4.25/32
 ```
 
-The same flag is accepted by `login` and by the claim-waiting `genkey` flow.
-When used during login or claim, the setting is saved in the generated JSON
-configuration. To explicitly disable a saved setting, reconnect with:
+The route validator rejects public prefixes, default routes, malformed input,
+more than 16 routes, and routes that overlap the Wantastic overlay source. The
+feature is disabled by default.
+
+On Linux and OpenWrt, Wantastic installs narrowly scoped forwarding, packet
+marking, and source-NAT rules. On macOS, the privileged desktop helper enables
+IPv4 forwarding and loads NAT/pass rules only into the dedicated
+`com.apple/wantastic` PF anchor; it does not flush or replace the system ruleset.
+The helper removes its anchor and restores the previous forwarding/PF state
+when local access stops. Windows can consume advertised tenant routes, while
+offering a Windows LAN remains disabled until the native service owns its
+forwarding and Firewall policy.
+
+## Desktop application
+
+The desktop app is a fixed-size, frameless tray application with the Wantastic
+logo and explicit Online/Offline status. It provides:
+
+- connect and disconnect control
+- tenant device list and direct/relay path status
+- MagicDNS and traffic status
+- six-sample device ping visualization
+- claim-link creation and automatic claim connection
+- manual Wantastic JSON or WireGuard import
+- exit-node controls gated by peer advertisement
+- local-access subnet and `/32` assignment
+
+macOS runs the tunnel in an administrator-authorized helper while the Wails UI
+remains unprivileged. Windows also keeps the UI manifest at `asInvoker`; native
+system changes belong to the service boundary rather than the webview process.
+
+CI creates ad-hoc/self-signed desktop artifacts. Those signatures provide build
+integrity but are not a substitute for Apple notarization or a publicly trusted
+Windows Authenticode certificate.
+
+## Build and test
+
+Requirements:
+
+- Go 1.27.2 or newer compatible toolchain
+- Node.js 22 and pnpm 11
+- Wails v3 platform dependencies
+- Linux desktop builds: GTK 3/4, WebKitGTK 4.1/6.0, and Ayatana AppIndicator
+
+The Makefile is the supported developer entrypoint:
 
 ```sh
-wantasticd connect --config /etc/wantastic --allow-local-access=false
+make help
+make test
+make test-desktop
+make frontend-build
+make desktop-dev
+make desktop-build
+make desktop-package
 ```
 
-Automatic forwarding/NAT for this feature is currently supported on Linux and
-OpenWrt. Overlapping LAN advertisements from different devices in one tenant
-are rejected by the coordinator to avoid ambiguous or hijacked routes.
-
-## Desktop app
-
-The `Desktop` branch includes a Wails v3 tray application for macOS, Windows,
-and Linux. It embeds the same agent and exposes peer status, overlay ping,
-claim-link generation, manual configuration, exit-node controls, tenant DNS
-status, and local-network route assignment. Build it with:
+Build the universal, ad-hoc-signed macOS bundle on a Mac:
 
 ```sh
-make desktop
+make desktop-macos-universal
 ```
 
-The dedicated `.github/workflows/desktop.yml` workflow builds native artifacts
-on macOS, Windows, and Linux runners. The app and tray use the Wantastic shield;
-left-clicking the tray opens the compact Wails window, while right-clicking
-opens connection status and actions. On macOS it runs as a menu-bar-only app.
+Build every CLI release architecture:
 
-CI ad-hoc signs and verifies the macOS bundle and signs the Windows executable
-with an ephemeral self-signed code-signing certificate. These signatures prove
-artifact integrity inside the build but are not publicly trusted, so a clean
-machine can still show Gatekeeper or SmartScreen warnings. Public distribution
-requires an Apple Developer ID plus notarization and a trusted Authenticode
-certificate. Linux artifacts are not code-signed.
-
-Linux/OpenWrt currently provide automatic kernel forwarding and source NAT for
-advertised LAN routes; macOS and Windows can consume those routes, but offering
-a local subnet there still requires an administrator-managed forwarding/NAT
-setup.
-
----
-
-## Service Management
-
-The installer registers wantasticd as a system service automatically. You can manage it with the standard init tools for your platform:
-
-**systemd**
 ```sh
+make cli-all
+```
+
+Run the release gates and the binary vulnerability scan:
+
+```sh
+make check
+make audit
+```
+
+The P2P container test remains available as a purpose-built end-to-end check:
+
+```sh
+./e2e/run_p2p_test.sh
+```
+
+## Platform support
+
+| Platform | CLI/service | Desktop | Offer local LAN |
+|---|---:|---:|---:|
+| Linux amd64/arm64/arm/386 | Yes | Yes | Yes |
+| OpenWrt mips/arm families | Yes | No | Yes |
+| macOS amd64/arm64 | Yes | Universal app | Yes, privileged PF helper |
+| Windows amd64 | Yes | Yes | Not yet |
+| Linux loong64/ppc64/riscv64/s390x | CLI release | No | Platform-dependent |
+
+The Desktop workflow builds and verifies native artifacts on macOS, Ubuntu, and
+Windows. Release tags publish the CLI archive matrix separately.
+
+## Service management
+
+```sh
+# systemd
 systemctl status wantasticd
 systemctl restart wantasticd
-systemctl stop wantasticd
-```
 
-**OpenWrt (procd)**
-```sh
+# OpenWrt/procd
 /etc/init.d/wantasticd status
 /etc/init.d/wantasticd restart
-/etc/init.d/wantasticd stop
-```
 
-**macOS (launchd)**
-```sh
+# macOS launchd
 launchctl list | grep wantastic
-launchctl stop com.wantastic.wantasticd
 ```
-
----
-
-## Supported Platforms
-
-| OS | Init System | Architectures |
-|---|---|---|
-| Linux | systemd | amd64, arm64, arm, 386 |
-| OpenWrt | procd | mips, mipsle, mips64, mips64le, arm, arm64 |
-| Alpine Linux | OpenRC | amd64, arm64, arm |
-| Debian/Ubuntu (legacy) | SysV | amd64, arm64 |
-| Embedded Linux | BusyBox | arm, mipsle |
-| macOS | launchd | amd64, arm64 |
-| Windows | SCM | amd64 |
-| Linux | any | riscv64, ppc64le |
-
----
-
-## License
-
-See [LICENSE](LICENSE).

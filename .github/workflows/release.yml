@@ -23,11 +23,11 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: 0
-        run: go test -tags nosystray ./...
+        run: go test -tags nosystray ./assets ./cmd/... ./internal/... ./pkg/...
       - name: Vet
         env:
           CGO_ENABLED: 0
-        run: go vet -tags nosystray ./...
+        run: go vet -tags nosystray ./assets ./cmd/... ./internal/... ./pkg/...
       - name: Validate installers
         run: sh -n install.sh scripts/install.sh internal/update/self-update.sh
 

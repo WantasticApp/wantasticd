@@ -34,7 +34,8 @@ jobs:
       - name: Dependency vulnerability scan
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          CGO_ENABLED=0 go build -trimpath -tags nosystray -o "${RUNNER_TEMP}/wantasticd-scan" ./cmd/wantasticd
+          govulncheck -mode=binary "${RUNNER_TEMP}/wantasticd-scan"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

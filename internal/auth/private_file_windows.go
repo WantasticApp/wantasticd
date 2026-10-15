@@ -5,7 +5,6 @@ package auth
 import (
 	"fmt"
 	"os"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -114,20 +113,82 @@ func checkPrivateFilePermissions(path string) error {
 	if control&windows.SE_DACL_PROTECTED == 0 {
 		return fmt.Errorf("private-file DACL inherits permissions")
 	}
-	_, userSID, err := privateFileSecurityDescriptor()
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return fmt.Errorf("read private-file DACL: %w", err)
+	}
+	if dacl == nil {
+		return fmt.Errorf("private file has no DACL")
+	}
+	if dacl.AceCount != 3 {
+		return fmt.Errorf("private-file DACL contains %d access entries; want 3", dacl.AceCount)
+	}
+
+	_, userSIDString, err := privateFileSecurityDescriptor()
 	if err != nil {
 		return err
 	}
-	sddl := descriptor.String()
-	if sddl == "" {
-		return fmt.Errorf("encode private-file security descriptor")
+	userSID, err := windows.StringToSid(userSIDString)
+	if err != nil {
+		return fmt.Errorf("parse current Windows user SID: %w", err)
 	}
-	if strings.Count(sddl, "(") != 3 || strings.Contains(sddl, "(D;") {
-		return fmt.Errorf("private-file DACL contains unexpected access entries")
+	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return fmt.Errorf("create SYSTEM SID: %w", err)
 	}
-	for _, trustee := range []string{"SY", "BA", userSID} {
-		if !strings.Contains(sddl, ";;;"+trustee+")") {
-			return fmt.Errorf("private-file DACL is missing trustee %s", trustee)
+	administratorsSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return fmt.Errorf("create Administrators SID: %w", err)
+	}
+
+	type expectedTrustee struct {
+		name string
+		sid  *windows.SID
+		seen bool
+	}
+	expected := []expectedTrustee{
+		{name: "SYSTEM", sid: systemSID},
+		{name: "Administrators", sid: administratorsSID},
+		{name: "current user", sid: userSID},
+	}
+	const fileAllAccess windows.ACCESS_MASK = windows.STANDARD_RIGHTS_REQUIRED |
+		windows.SYNCHRONIZE | 0x1ff
+
+	for index := uint16(0); index < dacl.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
+			return fmt.Errorf("read private-file DACL entry %d: %w", index, err)
+		}
+		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			return fmt.Errorf("private-file DACL entry %d is not an allow entry", index)
+		}
+		if ace.Header.AceFlags != 0 {
+			return fmt.Errorf("private-file DACL entry %d has unexpected inheritance flags", index)
+		}
+		if ace.Mask != fileAllAccess {
+			return fmt.Errorf("private-file DACL entry %d does not grant full file access", index)
+		}
+
+		trusteeSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		matched := false
+		for trusteeIndex := range expected {
+			if !expected[trusteeIndex].sid.Equals(trusteeSID) {
+				continue
+			}
+			if expected[trusteeIndex].seen {
+				return fmt.Errorf("private-file DACL contains duplicate trustee %s", expected[trusteeIndex].name)
+			}
+			expected[trusteeIndex].seen = true
+			matched = true
+			break
+		}
+		if !matched {
+			return fmt.Errorf("private-file DACL contains an unexpected trustee")
+		}
+	}
+	for _, trustee := range expected {
+		if !trustee.seen {
+			return fmt.Errorf("private-file DACL is missing trustee %s", trustee.name)
 		}
 	}
 	return nil

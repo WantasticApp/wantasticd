@@ -298,6 +298,9 @@ func (d *Device) EnableLocalAccess(explicitRoutes []string) ([]string, error) {
 	if len(sources) == 0 {
 		return nil, errors.New("no private IPv4 overlay source range is configured")
 	}
+	if err := validateLocalAccessSeparation(routes, sources); err != nil {
+		return nil, err
+	}
 	if err := enableLocalAccessSharingOS(tunName, routes, sources); err != nil {
 		return nil, err
 	}
@@ -351,6 +354,25 @@ func localAccessSourceRoutes(routes []string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func validateLocalAccessSeparation(routes, sources []string) error {
+	localPrefixes, err := parseLocalAccessRoutes(routes)
+	if err != nil {
+		return err
+	}
+	sourcePrefixes, err := parseLocalAccessRoutes(sources)
+	if err != nil {
+		return fmt.Errorf("validate overlay source routes: %w", err)
+	}
+	for _, route := range localPrefixes {
+		for _, source := range sourcePrefixes {
+			if route.Overlaps(source) {
+				return fmt.Errorf("local-access route %s overlaps overlay source %s", route, source)
+			}
+		}
+	}
+	return nil
 }
 
 func (d *Device) isServerTUNControlPeer(peerPublicKeyHex string) bool {

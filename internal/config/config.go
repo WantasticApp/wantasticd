@@ -455,6 +455,9 @@ func (c *Config) Validate() error {
 	if _, err := ValidateLocalAccessRoutes(c.LocalAccessRoutes); err != nil {
 		return err
 	}
+	if err := ValidateLocalAccessOverlaySeparation(c.LocalAccessRoutes, c.Server.AllowedIPs); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -488,6 +491,34 @@ func ValidateLocalAccessRoutes(routes []string) ([]string, error) {
 		normalized[i] = prefix.String()
 	}
 	return normalized, nil
+}
+
+// ValidateLocalAccessOverlaySeparation prevents an overlay address from being
+// advertised as though it were behind this device. That would create an
+// ambiguous route and can feed tenant traffic back into its own tunnel.
+func ValidateLocalAccessOverlaySeparation(routes, overlayRoutes []string) error {
+	localRoutes, err := ValidateLocalAccessRoutes(routes)
+	if err != nil {
+		return err
+	}
+	for _, localRoute := range localRoutes {
+		localPrefix := netip.MustParsePrefix(localRoute)
+		for _, rawOverlayRoute := range overlayRoutes {
+			overlayPrefix, parseErr := netip.ParsePrefix(strings.TrimSpace(rawOverlayRoute))
+			if parseErr != nil || !overlayPrefix.Addr().Is4() || overlayPrefix.Bits() == 0 {
+				continue
+			}
+			overlayPrefix = overlayPrefix.Masked()
+			if localPrefix.Overlaps(overlayPrefix) {
+				return fmt.Errorf(
+					"local-access route %s overlaps tenant overlay %s",
+					localPrefix,
+					overlayPrefix,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 // DefaultTunName returns the default tun device name for the platform.

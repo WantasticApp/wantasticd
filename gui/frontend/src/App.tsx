@@ -305,7 +305,7 @@ function Network({ status, routes, setRoutes, busy, run }: { status: StatusData;
     <Setting icon="globe" title="Offer as exit node" detail="Let tenant devices route internet traffic through this device">
       <Switch active={status.offer_exit_node} disabled={!status.configured || !!busy} onClick={() => run('offer', () => SetOfferExitNode(!status.offer_exit_node), status.offer_exit_node ? 'Exit node disabled' : 'Exit node offered')} />
     </Setting>
-    <section className="panel local-panel"><div className="panel-title"><span className="setting-icon"><Icon name="network" /></span><div><h2>Allow local network access</h2><p>Advertise a subnet or exact host. <code>/32</code> is supported.</p></div></div>
+    <section className="panel local-panel"><div className="panel-title"><span className="setting-icon"><Icon name="network" /></span><div><h2>Allow local network access</h2><p>Advertise a LAN subnet or host. Overlay addresses are already reachable; LAN <code>/32</code> is supported.</p></div></div>
       <input className="field" value={routes} onChange={event => setRoutes(event.target.value)} placeholder="192.168.1.0/24, 10.0.0.25/32" />
       <div className="button-row"><button className="primary" disabled={!status.configured || !!busy} onClick={() => run('routes', () => ConfigureLocalAccess(true, parsed), 'Local network routes updated')}>Enable & apply</button>
         <button className="secondary" disabled={!status.configured || !!busy} onClick={() => run('routes-off', () => ConfigureLocalAccess(false, []), 'Local network access disabled')}>Disable</button></div>

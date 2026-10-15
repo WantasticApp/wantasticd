@@ -1,0 +1,26 @@
+version: '3'
+
+includes:
+  common: ../Taskfile.yml
+
+tasks:
+  build:
+    deps: [common:build:frontend, common:generate:icons]
+    cmds:
+      - GOOS={{OS}} GOARCH={{ARCH}} go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.29 generate syso -arch {{.ARCH | default ARCH}} -icon build/windows/icon.ico -manifest build/windows/wails.exe.manifest -info build/windows/info.json -out wails_windows_{{.ARCH | default ARCH}}.syso
+      - go build -tags production{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -H windowsgui {{.WANTASTIC_LDFLAGS}}" -o "{{.BIN_DIR}}/{{.APP_NAME}}.exe" .
+      - cmd: powershell -NoProfile -Command "Remove-Item -Force wails_windows_*.syso"
+        platforms: [windows]
+      - cmd: rm -f wails_windows_*.syso
+        platforms: [darwin, linux]
+    env:
+      GOOS: windows
+      GOARCH: '{{.ARCH | default ARCH}}'
+      CGO_ENABLED: 0
+
+  package:
+    deps: [build]
+
+  run:
+    cmds:
+      - '"{{.BIN_DIR}}/{{.APP_NAME}}.exe"'

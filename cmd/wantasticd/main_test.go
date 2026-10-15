@@ -46,12 +46,8 @@ func TestPersistExternalExitNodeOffer(t *testing.T) {
 	if !loaded.ExitNode.Enabled {
 		t.Fatal("exit-node preference was not persisted")
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("config mode = %o, want 600", info.Mode().Perm())
+	if err := auth.CheckPrivateFilePermissions(path); err != nil {
+		t.Fatalf("config permissions: %v", err)
 	}
 }
 

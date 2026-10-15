@@ -30,7 +30,8 @@ For the headless `wantasticd` daemon and router installation workflow, use the
 </p>
 
 <p align="center">
-  <img src="screenshots/settings.png" alt="Wantastic claim and manual configuration" width="270">
+  <img src="screenshots/settings.png" alt="Wantastic sign-in and advanced setup" width="270">
+  <img src="screenshots/settings-ar.png" alt="Wantastic settings in Arabic with right-to-left layout" width="270">
   <img src="screenshots/loading.png" alt="Wantastic branded loading screen" width="270">
 </p>
 
@@ -38,17 +39,19 @@ For the headless `wantasticd` daemon and router installation workflow, use the
 
 - Wantastic status beside the native system-tray icon
 - connect and disconnect control
-- tenant device list with direct, relay, and offline path status
-- device details, traffic, last handshake, MagicDNS name, and overlay IP
-- short multi-sample device ping visualization
-- stable claim-link generation with automatic connection after claiming
-- manual Wantastic JSON or WireGuard configuration import
-- MagicDNS status and tenant DNS information
-- exit-node offering and selection, gated by peer advertisement
-- opt-in local-network access with private subnet or `/32` host routes
+- device list with direct, protected-relay, and offline status
+- device details, traffic, connection history, private names, and IP addresses
+- a short visual connection check instead of a single ping result
+- one-step browser sign-in followed by automatic connection
+- English, French, Spanish, German, and Arabic with full RTL layout
+- advanced Wantastic JSON or WireGuard configuration import
+- friendly device names backed by MagicDNS
+- internet sharing, available only when the selected device offers it
+- opt-in local-network sharing with private subnet or `/32` host routes
 
-Direct P2P is attempted automatically. When NAT or a firewall prevents a safe
-direct UDP path, the encrypted tenant relay remains the availability fallback.
+A direct device-to-device path is attempted automatically. When NAT or a
+firewall prevents a safe direct UDP path, the encrypted Wantastic relay remains
+the availability fallback.
 
 ## Download
 
@@ -116,24 +119,28 @@ network capabilities. Do not run the desktop webview itself as root.
 
 ## First-time setup
 
-### Claim this device
+### Sign in and connect
 
 1. Open Wantastic from the tray.
 2. Select the settings button in the upper-right corner.
-3. Keep `https://console.wantastic.app` as the server unless you use a trusted
-   self-hosted Wantastic deployment.
-4. Select **Generate link**.
-5. Open the claim page and approve the device in your signed-in tenant.
+3. Select **Sign in**.
+4. Finish signing in on the Wantastic Console page that opens in your browser.
 
-The app keeps the private device key on the computer, watches for the completed
-claim, writes the returned configuration privately, and connects automatically.
-Rotating the key creates a new device identity and should be used only when the
-old identity must be replaced.
+The app opens the correct console page directly, keeps the private device key on
+the computer, waits for browser approval, saves the returned configuration with
+private permissions, and connects automatically. No link or key needs to be
+copied between the app and the browser.
+
+### Language
+
+Open **Settings → Language** and choose English, French, Spanish, German, or
+Arabic. Wantastic remembers the selection, updates the native tray menu, and
+switches the complete window to right-to-left layout for Arabic.
 
 ### Manual configuration
 
-Open **Settings**, paste either a Wantastic JSON configuration or a standard
-WireGuard client configuration, then select **Import & connect**.
+Open **Settings → Advanced setup**, paste either a Wantastic JSON configuration
+or a standard WireGuard client configuration, then select **Import and connect**.
 
 ```ini
 [Interface]
@@ -157,26 +164,26 @@ in an issue, screenshot, commit, or CI log.
 
 - The tray label shows **Online**, **Offline**, **Connecting**, or **Setup**.
 - Selecting the tray icon opens the compact Wantastic window.
-- The tray menu provides connect/disconnect, Devices, Network, Settings, and
-  Quit actions.
+- The tray menu follows the selected language and provides connect/disconnect,
+  Devices, Network, Sign in, Settings, and Quit actions.
 
 ### Devices and ping
 
-The **Devices** view shows all available tenant devices and whether each path is
-direct, relayed, or offline. Select a device to view its address, MagicDNS name,
-last handshake, traffic, and actions. **Ping device** records a short series of
-overlay reachability samples rather than reporting only one packet.
+The **Devices** view shows all available devices and whether each connection is
+direct, protected by the relay, or offline. Select a device to view its address,
+private name, last activity, traffic, and actions. **Check connection** records a
+short series of reachability samples rather than reporting only one packet.
 
 ### Exit nodes
 
-Open **Network** to offer this computer as an exit node. On another device,
-**Use as exit node** is enabled only after that peer has advertised exit-node
-capability. Disabling the offer removes the capability advertisement.
+Open **Network** to share this computer's internet connection. On another
+device, **Use internet through this device** is enabled only when that device is
+actively offering the capability. Turning sharing off removes the offer.
 
 ### Local-network access
 
-**Allow local network access** advertises a private LAN route to devices in the
-same Wantastic tenant. Enter a private subnet or one host:
+**Share local network access** makes a private local route available to devices
+in the same Wantastic network. Enter a private subnet or one host:
 
 ```text
 192.168.50.0/24
@@ -227,7 +234,7 @@ and Windows artifacts for every push to this branch.
 - the desktop webview remains unprivileged
 - IPC listens only on loopback and requires a generated bearer credential
 - browser-originated mutation requests are rejected
-- configuration and claim-key files use private permissions and no-follow checks
+- configuration and device-identity files use private permissions and no-follow checks
 - local-access routes are bounded, normalized, private IPv4 prefixes
 - macOS PF changes are limited to Wantastic's dedicated anchor
 - Windows UI packaging retains the non-elevated `asInvoker` manifest

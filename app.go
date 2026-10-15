@@ -94,14 +94,20 @@ type PingSample struct {
 }
 
 type App struct {
-	ctx        context.Context
-	desktop    *application.App
-	window     application.Window
-	tray       *application.SystemTray
-	trayMenu   *application.Menu
-	trayStatus *application.MenuItem
-	trayIP     *application.MenuItem
-	trayToggle *application.MenuItem
+	ctx          context.Context
+	desktop      *application.App
+	window       application.Window
+	tray         *application.SystemTray
+	trayMenu     *application.Menu
+	trayStatus   *application.MenuItem
+	trayIP       *application.MenuItem
+	trayToggle   *application.MenuItem
+	trayDevices  *application.MenuItem
+	trayNetwork  *application.MenuItem
+	trayOpenApp  *application.MenuItem
+	traySignIn   *application.MenuItem
+	traySettings *application.MenuItem
+	trayQuit     *application.MenuItem
 
 	mu                  sync.RWMutex
 	agt                 *agent.Agent
@@ -115,6 +121,7 @@ type App struct {
 	helperEpoch         uint64
 	helperMarker        string
 	claimConnectPending bool
+	language            string
 
 	waitClaimConfig   claimConfigFetcher
 	fetchClaimConfig  claimConfigFetcher
@@ -125,6 +132,7 @@ type App struct {
 func NewApp(desktop *application.App) *App {
 	return &App{
 		desktop:          desktop,
+		language:         "en",
 		waitClaimConfig:  auth.WaitClaimConfig,
 		fetchClaimConfig: auth.FetchClaimConfig,
 		hashedDeviceID:   auth.HashedDeviceID,
@@ -868,14 +876,15 @@ func (a *App) setWindow(window application.Window) {
 
 func (a *App) setSystemTray(tray *application.SystemTray) {
 	a.tray = tray
-	tray.SetLabel("Offline")
+	text := trayStringsFor(a.language)
+	tray.SetLabel(text.Offline)
 	menu := a.desktop.NewMenu()
-	a.trayStatus = menu.Add("Offline")
+	a.trayStatus = menu.Add(text.Offline)
 	a.trayStatus.SetEnabled(false)
 	a.trayIP = menu.Add("IP: —")
 	a.trayIP.SetEnabled(false)
 	menu.AddSeparator()
-	a.trayToggle = menu.Add("Connect")
+	a.trayToggle = menu.Add(text.Connect)
 	a.trayToggle.OnClick(func(*application.Context) {
 		go func() {
 			if err := a.ToggleVPN(); err != nil {
@@ -883,11 +892,15 @@ func (a *App) setSystemTray(tray *application.SystemTray) {
 			}
 		}()
 	})
-	menu.Add("Devices").OnClick(func(*application.Context) { a.showSection("devices") })
-	menu.Add("Network").OnClick(func(*application.Context) { a.showSection("network") })
-	menu.Add("Open App").OnClick(func(*application.Context) { a.showMainWindow() })
+	a.trayDevices = menu.Add(text.Devices)
+	a.trayDevices.OnClick(func(*application.Context) { a.showSection("devices") })
+	a.trayNetwork = menu.Add(text.Network)
+	a.trayNetwork.OnClick(func(*application.Context) { a.showSection("network") })
+	a.trayOpenApp = menu.Add(text.OpenApp)
+	a.trayOpenApp.OnClick(func(*application.Context) { a.showMainWindow() })
 	menu.AddSeparator()
-	menu.Add("Generate Claim Link").OnClick(func(*application.Context) {
+	a.traySignIn = menu.Add(text.SignIn)
+	a.traySignIn.OnClick(func(*application.Context) {
 		go func() {
 			claim, err := a.GenerateClaimLink("https://console.wantastic.app", false)
 			if err != nil {
@@ -897,9 +910,11 @@ func (a *App) setSystemTray(tray *application.SystemTray) {
 			_ = a.OpenURL(claim.ClaimURL)
 		}()
 	})
-	menu.Add("Settings").OnClick(func(*application.Context) { a.showSection("settings") })
+	a.traySettings = menu.Add(text.Settings)
+	a.traySettings.OnClick(func(*application.Context) { a.showSection("settings") })
 	menu.AddSeparator()
-	menu.Add("Quit Wantastic").OnClick(func(*application.Context) { a.desktop.Quit() })
+	a.trayQuit = menu.Add(text.Quit)
+	a.trayQuit.OnClick(func(*application.Context) { a.desktop.Quit() })
 	a.trayMenu = menu
 	tray.SetMenu(menu)
 }
@@ -913,7 +928,10 @@ func (a *App) updateTray(status *StatusData, statusErr error) {
 	if a.trayMenu == nil || a.trayStatus == nil || a.trayIP == nil || a.trayToggle == nil {
 		return
 	}
-	presentation := makeTrayPresentation(status, statusErr)
+	a.mu.RLock()
+	language := a.language
+	a.mu.RUnlock()
+	presentation := makeTrayPresentationForLanguage(status, statusErr, language)
 	a.tray.SetLabel(presentation.trayLabel)
 	a.trayStatus.SetLabel(presentation.statusTitle)
 	a.trayIP.SetLabel(presentation.ipTitle)
@@ -933,19 +951,24 @@ type trayPresentation struct {
 }
 
 func makeTrayPresentation(status *StatusData, statusErr error) trayPresentation {
-	state := "Offline"
-	toggle := "Connect"
+	return makeTrayPresentationForLanguage(status, statusErr, "en")
+}
+
+func makeTrayPresentationForLanguage(status *StatusData, statusErr error, language string) trayPresentation {
+	text := trayStringsFor(language)
+	state := text.Offline
+	toggle := text.Connect
 	toggleEnabled := false
 	ip := "–"
 	if statusErr == nil && status != nil {
 		toggleEnabled = status.Configured && !status.Starting
 		switch {
 		case status.Starting:
-			state = "Starting"
-			toggle = "Starting…"
+			state = text.Starting
+			toggle = text.StartingAction
 		case status.Running && status.DeviceRunning:
-			state = "Online"
-			toggle = "Disconnect"
+			state = text.Online
+			toggle = text.Disconnect
 		}
 		if len(status.IPs) > 0 && status.IPs[0] != "" {
 			ip = strings.SplitN(status.IPs[0], "/", 2)[0]
@@ -963,6 +986,27 @@ func makeTrayPresentation(status *StatusData, statusErr error) trayPresentation 
 		toggleEnabled: toggleEnabled,
 		tooltip:       tooltip,
 	}
+}
+
+// SetLanguage keeps the native tray menu aligned with the language selected in
+// the desktop window. Unknown locale variants safely fall back to English.
+func (a *App) SetLanguage(language string) {
+	a.mu.Lock()
+	a.language = normalizeDesktopLanguage(language)
+	language = a.language
+	a.mu.Unlock()
+	if a.trayMenu == nil {
+		return
+	}
+	text := trayStringsFor(language)
+	a.trayDevices.SetLabel(text.Devices)
+	a.trayNetwork.SetLabel(text.Network)
+	a.trayOpenApp.SetLabel(text.OpenApp)
+	a.traySignIn.SetLabel(text.SignIn)
+	a.traySettings.SetLabel(text.Settings)
+	a.trayQuit.SetLabel(text.Quit)
+	status, err := a.GetStatus()
+	a.updateTray(status, err)
 }
 
 func (a *App) OpenConsole() { _ = a.desktop.Browser.OpenURL("https://console.wantastic.app") }

@@ -63,7 +63,7 @@ func decodeLocalAccessRoutes(data []byte, headerSize int) ([]netip.Prefix, error
 	for i := 0; i < count; i++ {
 		offset := headerSize + 1 + i*localAccessRouteEntrySize
 		bits := int(data[offset])
-		if bits < 8 || bits > 30 {
+		if bits < 8 || bits > 32 {
 			return nil, fmt.Errorf("invalid local-access IPv4 prefix length: %d", bits)
 		}
 		addr := netip.AddrFrom4([4]byte(data[offset+1 : offset+5]))
@@ -157,7 +157,7 @@ func decodeLocalAccessSnapshot(data []byte) (map[[32]byte][]string, error) {
 		routes := make([]string, 0, count)
 		for range count {
 			bits := int(data[offset])
-			if bits < 8 || bits > 30 {
+			if bits < 8 || bits > 32 {
 				return nil, fmt.Errorf("invalid local-access IPv4 prefix length: %d", bits)
 			}
 			addr := netip.AddrFrom4([4]byte(data[offset+1 : offset+5]))
@@ -178,7 +178,7 @@ func decodeLocalAccessSnapshot(data []byte) (map[[32]byte][]string, error) {
 
 func validLocalAccessPrefix(prefix netip.Prefix) bool {
 	return prefix.IsValid() && prefix.Addr().Is4() && prefix.Addr().IsPrivate() &&
-		prefix.Bits() >= 8 && prefix.Bits() <= 30
+		prefix.Bits() >= 8 && prefix.Bits() <= 32
 }
 
 func parseLocalAccessRoutes(routes []string) ([]netip.Prefix, error) {
@@ -194,7 +194,7 @@ func parseLocalAccessRoutes(routes []string) ([]netip.Prefix, error) {
 		}
 		prefix = prefix.Masked()
 		if !validLocalAccessPrefix(prefix) {
-			return nil, fmt.Errorf("local-access route must be a private IPv4 subnet between /8 and /30: %s", prefix)
+			return nil, fmt.Errorf("local-access route must be a private IPv4 prefix between /8 and /32: %s", prefix)
 		}
 		if _, ok := seen[prefix]; ok {
 			continue

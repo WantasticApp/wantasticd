@@ -142,7 +142,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check if transport
 
-			case MessageTransportType, MessageWUSPType:
+			case MessageTransportType, MessageTUNControlType, MessageWUSPType, MessageP2PControlType:
 
 				// check size
 
@@ -222,41 +222,10 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
-				// Full P2P control message (≥84 bytes P2P header)
-				if len(p2pData) >= 84 {
-					msgData := make([]byte, len(p2pData))
-					copy(msgData, p2pData)
-
-					msg := DecodeP2PMessage(msgData)
-					if client := device.GetP2PClient(); msg != nil && client != nil {
-						client.EnqueueMessage(msg)
-					}
-
-					bufsArrs[i] = device.GetMessageBuffer()
-					bufs[i] = bufsArrs[i][:]
-					continue
-				}
-
 				// Legacy punch message (56 bytes) — old format
 				if len(packet) != MessagePunchSize {
 					continue
 				}
-
-			case MessageTUNControlType:
-				// TUN control coordination for exit-node and export functionality
-				// Format: [4-byte type][payload...]
-				if len(packet) < 8 {
-					continue
-				}
-				tunData := packet[4:]
-				if peer := device.LookupPeerByEndpoint(endpoints[i]); peer != nil && device.tunControlHandler != nil {
-					msgData := make([]byte, len(tunData))
-					copy(msgData, tunData)
-					go device.tunControlHandler(peer, msgData)
-				}
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
-				continue
 
 			default:
 				device.log.Verbosef("Received message with unknown type: %d (len: %d)", msgType, len(packet))
@@ -545,6 +514,30 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
 			switch elem.msgType {
+			case MessageP2PControlType:
+				payload, err := consumeP2PControlPayload(elem.packet)
+				if err != nil {
+					device.log.Verbosef("%v - Dropping malformed P2P control packet: %v", peer, err)
+					continue
+				}
+				msg := DecodeP2PMessage(payload)
+				if client := device.GetP2PClient(); msg != nil && client != nil && client.isCoordinatorPeer(peer) {
+					client.EnqueueMessage(msg)
+				}
+				continue
+			case MessageTUNControlType:
+				payload, err := consumeTUNControlPayload(elem.packet)
+				if err != nil {
+					device.log.Verbosef("%v - Dropping malformed TUN control packet: %v", peer, err)
+					continue
+				}
+				if device.tunControlHandler != nil {
+					// The receive buffer returns to the pool after this batch. Give
+					// asynchronous handlers an owned copy of authenticated plaintext.
+					payloadCopy := append([]byte(nil), payload...)
+					go device.tunControlHandler(peer, payloadCopy)
+				}
+				continue
 			case MessageWUSPType:
 				payload, assembled, err := device.consumeWUSPPayload(peer, elem.packet)
 				if err != nil {

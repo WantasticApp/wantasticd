@@ -1057,12 +1057,18 @@ func (c *P2PClient) sendToServer(msg *P2PMessage) {
 	c.sendP2PMessage(serverPeer, msg)
 }
 
+func (c *P2PClient) isCoordinatorPeer(peer *Peer) bool {
+	if peer == nil {
+		return false
+	}
+	c.mu.RLock()
+	serverKey := c.serverPeerKey
+	c.mu.RUnlock()
+	return !serverKey.IsZero() && serverKey.Equals(peer.handshake.remoteStatic)
+}
+
 func (c *P2PClient) sendP2PMessage(peer *Peer, msg *P2PMessage) {
-	encoded := msg.Encode()
-	packet := make([]byte, 4+len(encoded))
-	binary.LittleEndian.PutUint32(packet[:4], MessageP2PType)
-	copy(packet[4:], encoded)
-	peer.SendBuffers([][]byte{packet})
+	peer.SendP2PControl(msg.Encode())
 }
 
 func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {

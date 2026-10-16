@@ -162,11 +162,10 @@ func (d *Device) Start() error {
 		}
 	}
 
-	// P2P coordination is an authenticated side channel on the configured
-	// WireGuard UDP socket and does not need to wait for an encrypted data
-	// handshake. Starting it immediately removes up to 30 seconds of avoidable
-	// direct-path setup latency. Pass the exact coordinator key so dynamic peers
-	// can never be mistaken for the server.
+	// P2P coordination uses an authenticated WireGuard transport type. Start it
+	// immediately so registration is staged behind the initial handshake. Pass
+	// the exact coordinator key so dynamic peers can never be mistaken for the
+	// server.
 	if d.config.Server.PublicKey == "" {
 		wd.StartP2P()
 	} else {

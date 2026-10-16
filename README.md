@@ -212,8 +212,9 @@ sudo wantasticd connect --config /etc/wantastic --allow-local-access
 `--allow-local-access` discovers directly connected private IPv4 subnets (for
 example, `192.168.1.0/24`), enables forwarding with source NAT, and advertises
 those routes to devices connected to the same Wantastic tenant. It does not
-advertise public, default, host, loopback, point-to-point, or Wantastic tunnel
-routes. The feature is off by default.
+advertise public, default, loopback, point-to-point, or Wantastic tunnel routes.
+Explicit private host routes (`/32`) are accepted by the authenticated route
+protocol. The feature is off by default.
 
 The same flag is accepted by `login` and by the claim-waiting `genkey` flow.
 When used during login or claim, the setting is saved in the generated JSON

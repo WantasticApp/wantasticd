@@ -14,6 +14,7 @@ func TestEncodeLocalAccessAdvertisementRoundTrip(t *testing.T) {
 		"192.168.50.7/24",
 		"10.23.0.0/16",
 		"192.168.50.0/24",
+		"10.23.4.5/32",
 	})
 	if err != nil {
 		t.Fatalf("EncodeLocalAccessAdvertisement() error = %v", err)
@@ -27,6 +28,7 @@ func TestEncodeLocalAccessAdvertisementRoundTrip(t *testing.T) {
 	}
 	want := []netip.Prefix{
 		netip.MustParsePrefix("10.23.0.0/16"),
+		netip.MustParsePrefix("10.23.4.5/32"),
 		netip.MustParsePrefix("192.168.50.0/24"),
 	}
 	if !reflect.DeepEqual(prefixes, want) {
@@ -43,7 +45,6 @@ func TestEncodeLocalAccessAdvertisementRejectsUnsafeRoutes(t *testing.T) {
 	}{
 		{name: "public network", route: "203.0.113.0/24"},
 		{name: "default route", route: "0.0.0.0/0"},
-		{name: "host route", route: "192.168.1.4/32"},
 		{name: "IPv6", route: "fd00::/64"},
 	}
 

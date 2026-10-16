@@ -1,0 +1,10 @@
+[Interface]
+PrivateKey = REPLACE_WITH_LOCAL_PRIVATE_KEY
+Address = 10.0.0.3/32
+DNS = 10.0.0.1
+
+[Peer]
+PublicKey = z7lx3lUh/qFRmsNGlDaVnesZNcBIwMcIWIBOtH17yyk=
+Endpoint = wg.wantastic.local:51820
+AllowedIPs = 10.0.0.0/27
+PersistentKeepalive = 25

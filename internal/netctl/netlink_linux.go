@@ -116,6 +116,41 @@ func (c *linuxController) FirewallDeleteRule(rule FirewallRule) error {
 	return iptablesDelete(bin, rule)
 }
 
+func (c *linuxController) TenantFirewallSet(rules []TenantFirewallRule) error {
+	for _, tenantRule := range rules {
+		for _, remote := range tenantRule.Remote {
+			binary := findIPTablesBinary(remote.Addr().Is6())
+			rule := FirewallRule{
+				Table: "filter",
+				Chain: "INPUT",
+				Args:  []string{"-i", tenantRule.Interface, "-s", remote.String(), "-d", tenantRule.Local.String(), "-j", "ACCEPT"},
+			}
+			if err := iptablesEnsureFirst(binary, rule); err != nil {
+				return fmt.Errorf("install tenant input rule for %s from %s: %w", tenantRule.Local, remote, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *linuxController) TenantFirewallClear(rules []TenantFirewallRule) error {
+	var firstErr error
+	for _, tenantRule := range rules {
+		for _, remote := range tenantRule.Remote {
+			binary := findIPTablesBinary(remote.Addr().Is6())
+			rule := FirewallRule{
+				Table: "filter",
+				Chain: "INPUT",
+				Args:  []string{"-i", tenantRule.Interface, "-s", remote.String(), "-d", tenantRule.Local.String(), "-j", "ACCEPT"},
+			}
+			if err := iptablesDelete(binary, rule); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("remove tenant input rule for %s from %s: %w", tenantRule.Local, remote, err)
+			}
+		}
+	}
+	return firstErr
+}
+
 func (c *linuxController) IPForwardingSet(enabled bool) error {
 	val := "0"
 	if enabled {
@@ -467,6 +502,18 @@ func routeGetDefaultFromProc() (string, netip.Addr, error) {
 }
 
 func findIptablesBinary() string {
+	return findIPTablesBinary(false)
+}
+
+func findIPTablesBinary(ipv6 bool) string {
+	if ipv6 {
+		for _, p := range []string{"/usr/sbin/ip6tables", "/sbin/ip6tables", "/usr/sbin/ip6tables-nft", "/sbin/ip6tables-nft"} {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+		return "ip6tables"
+	}
 	for _, p := range []string{"/usr/sbin/iptables", "/sbin/iptables", "/usr/sbin/iptables-nft", "/sbin/iptables-nft"} {
 		if _, err := os.Stat(p); err == nil {
 			return p
@@ -483,6 +530,15 @@ func iptablesEnsure(binary string, rule FirewallRule) error {
 		return nil
 	}
 	args[2] = "-A"
+	return forkExecWait(binary, args...)
+}
+
+func iptablesEnsureFirst(binary string, rule FirewallRule) error {
+	check := append([]string{"-t", rule.Table, "-C", rule.Chain}, rule.Args...)
+	if exec.Command(binary, check...).Run() == nil {
+		return nil
+	}
+	args := append([]string{"-t", rule.Table, "-I", rule.Chain, "1"}, rule.Args...)
 	return forkExecWait(binary, args...)
 }
 

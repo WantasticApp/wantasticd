@@ -4,9 +4,12 @@
 package netctl
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"strings"
 )
 
 // windowsController uses netsh and WinAPI for network control.
@@ -81,6 +84,57 @@ func (c *windowsController) FirewallEnsureRule(rule FirewallRule) error {
 
 func (c *windowsController) FirewallDeleteRule(rule FirewallRule) error {
 	return fmt.Errorf("Windows firewall not implemented")
+}
+
+func (c *windowsController) TenantFirewallSet(rules []TenantFirewallRule) error {
+	var script strings.Builder
+	script.WriteString("$ErrorActionPreference = 'Stop'\n")
+	for _, rule := range rules {
+		name := tenantFirewallRuleName(rule)
+		remote := make([]string, 0, len(rule.Remote))
+		for _, prefix := range rule.Remote {
+			remote = append(remote, powershellQuote(prefix.String()))
+		}
+		fmt.Fprintf(&script, "$old = Get-NetFirewallRule -Name %s -ErrorAction SilentlyContinue; if ($old) { $old | Remove-NetFirewallRule };\n", powershellQuote(name))
+		fmt.Fprintf(&script,
+			"New-NetFirewallRule -Name %s -DisplayName %s -Group 'Wantastic Agent' -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol Any -LocalAddress %s -RemoteAddress @(%s) -InterfaceAlias %s | Out-Null\n",
+			powershellQuote(name), powershellQuote("Wantastic tenant access "+rule.Local.String()),
+			powershellQuote(rule.Local.String()), strings.Join(remote, ","), powershellQuote(rule.Interface),
+		)
+	}
+	if script.Len() == 0 {
+		return nil
+	}
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script.String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("configure Windows Defender Firewall: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (c *windowsController) TenantFirewallClear(rules []TenantFirewallRule) error {
+	var script strings.Builder
+	script.WriteString("$ErrorActionPreference = 'Stop'\n")
+	for _, rule := range rules {
+		fmt.Fprintf(&script, "$old = Get-NetFirewallRule -Name %s -ErrorAction SilentlyContinue; if ($old) { $old | Remove-NetFirewallRule };\n", powershellQuote(tenantFirewallRuleName(rule)))
+	}
+	if script.Len() == 0 {
+		return nil
+	}
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script.String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("remove Windows Defender Firewall rules: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func tenantFirewallRuleName(rule TenantFirewallRule) string {
+	sum := sha256.Sum256([]byte(rule.Interface + "\x00" + rule.Local.String()))
+	return "WantasticTenant_" + hex.EncodeToString(sum[:8])
+}
+
+func powershellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func (c *windowsController) IPForwardingSet(enabled bool) error {

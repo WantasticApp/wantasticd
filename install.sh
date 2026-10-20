@@ -198,7 +198,10 @@ case "$EXTRACTED_VERSION" in
 esac
 
 # ── install binary (atomic) ───────────────────────────────────────────────────
-if   [ -d "/usr/local/bin" ] && echo "$PATH" | grep -q "/usr/local/bin"; then
+if [ "$OS" = "darwin" ]; then
+  # /usr/bin is protected by SIP on macOS, even when the installer runs as root.
+  INSTALL_DIR="/usr/local/bin"
+elif [ -d "/usr/local/bin" ] && echo "$PATH" | grep -q "/usr/local/bin"; then
   INSTALL_DIR="/usr/local/bin"
 elif [ -d "/usr/bin" ]; then
   INSTALL_DIR="/usr/bin"
@@ -463,6 +466,8 @@ install_service_launchd() {
     <string>${INSTALL_PATH}</string>
     <string>connect</string>
     <string>--config</string><string>${CONFIG_FILE}</string>
+    <!-- A system LaunchDaemon has no GUI session for the tray client. -->
+    <string>--tray=false</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

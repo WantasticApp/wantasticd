@@ -141,6 +141,57 @@ func (c *darwinController) FirewallDeleteRule(rule FirewallRule) error {
 	return fmt.Errorf("pf firewall rules not implemented")
 }
 
+const tenantFirewallAnchor = "com.apple/wantasticd"
+
+func (c *darwinController) TenantFirewallSet(rules []TenantFirewallRule) error {
+	var filter strings.Builder
+	for _, rule := range rules {
+		if !validPFInterfaceName(rule.Interface) || !rule.Local.IsValid() {
+			return fmt.Errorf("invalid tenant firewall interface or local address")
+		}
+		for _, remote := range rule.Remote {
+			remote = remote.Masked()
+			if !remote.IsValid() || remote.Bits() == 0 || remote.Addr().Is6() != rule.Local.Is6() {
+				return fmt.Errorf("invalid tenant firewall prefix %s for %s", remote, rule.Local)
+			}
+			family := "inet"
+			if remote.Addr().Is6() {
+				family = "inet6"
+			}
+			fmt.Fprintf(&filter, "pass in quick on %s %s from %s to %s keep state\n",
+				rule.Interface, family, remote, rule.Local)
+		}
+	}
+	if filter.Len() == 0 {
+		return c.TenantFirewallClear(rules)
+	}
+	cmd := exec.Command("/sbin/pfctl", "-a", tenantFirewallAnchor, "-f", "-")
+	cmd.Stdin = strings.NewReader(filter.String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("load PF tenant allow rules: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (c *darwinController) TenantFirewallClear(_ []TenantFirewallRule) error {
+	if output, err := exec.Command("/sbin/pfctl", "-a", tenantFirewallAnchor, "-F", "rules").CombinedOutput(); err != nil {
+		return fmt.Errorf("clear PF tenant allow rules: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func validPFInterfaceName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == ':') {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *darwinController) IPForwardingSet(enabled bool) error {
 	val := "0"
 	if enabled {

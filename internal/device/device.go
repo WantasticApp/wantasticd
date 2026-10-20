@@ -17,6 +17,7 @@ import (
 
 	"wantastic-agent/internal/config"
 	"wantastic-agent/internal/diaglog"
+	"wantastic-agent/internal/netctl"
 
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
 
@@ -48,9 +49,10 @@ type Device struct {
 	peerHostnames   map[string]string
 
 	// TUN mode fields
-	nativeTun    tun.Device // Native system TUN device (when TUNMode is enabled)
-	originalTun  tun.Device // Original TUN device from wireguard-go
-	systemRoutes []string   // System routes added for TUN mode
+	nativeTun           tun.Device // Native system TUN device (when TUNMode is enabled)
+	originalTun         tun.Device // Original TUN device from wireguard-go
+	systemRoutes        []string   // System routes added for TUN mode
+	tenantFirewallRules []netctl.TenantFirewallRule
 
 	// Exit node routes installed dynamically
 	exitNodeRoutes  []string
@@ -147,18 +149,42 @@ func (d *Device) Start() error {
 	// Add static routes to the OS networking table for the server's AllowedIPs
 	// This ensures responses to pings (and other traffic) correctly route back through the TUN
 	for _, ip := range d.config.Server.AllowedIPs {
-		if ip == "0.0.0.0/0" || ip == "::/0" {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(ip))
+		if err != nil {
+			log.Printf("[TUN] Warning: invalid AllowedIP route %q: %v", ip, err)
+			continue
+		}
+		prefix = prefix.Masked()
+		if prefix.Bits() == 0 {
 			// Skip adding global routes here automatically to avoid infinite routing loops
 			// with the endpoint. Exit nodes handles this explicitly with endpoint exclusions.
 			continue
 		}
-		if err := d.addRoute(ip); err != nil {
-			log.Printf("Warning: failed to add OS route for AllowedIP %s: %v", ip, err)
+		route := prefix.String()
+		if err := d.addRoute(route); err != nil {
+			log.Printf("Warning: failed to add OS route for AllowedIP %s: %v", route, err)
 		} else {
 			// Track it so it doesn't get infinitely added by P2P later
 			d.mu.Lock()
-			d.systemRoutes = append(d.systemRoutes, ip)
+			d.systemRoutes = append(d.systemRoutes, route)
 			d.mu.Unlock()
+		}
+	}
+
+	// Permit traffic addressed to this device's overlay IPs from tenant routes.
+	// Each backend scopes the rule to the current tunnel interface and removes
+	// it during Stop; failures remain non-fatal so firewall policy never prevents
+	// the tunnel from starting or changes unrelated host firewall rules.
+	tenantRules := tenantFirewallRules(d.tunName, d.config.Interface.Addresses, d.config.Server.AllowedIPs)
+	if len(tenantRules) > 0 {
+		err := ctl.TenantFirewallSet(tenantRules)
+		d.mu.Lock()
+		d.tenantFirewallRules = tenantRules
+		d.mu.Unlock()
+		if err != nil {
+			log.Printf("[TUN] Warning: could not configure tenant firewall access: %v", err)
+		} else {
+			log.Printf("[TUN] Configured tenant firewall access on %s for %d tunnel address(es)", d.tunName, len(tenantRules))
 		}
 	}
 
@@ -210,6 +236,7 @@ func (d *Device) Stop() error {
 	wg := d.device
 	td := d.tunDev
 	routes := d.systemRoutes
+	tenantFirewallRules := d.tenantFirewallRules
 	exitRoutes := d.exitNodeRoutes
 	sharedExitNode := d.exitNodeShared
 	localAccessRoutes := d.localAccessRoutes
@@ -217,12 +244,19 @@ func (d *Device) Stop() error {
 	localAccessSources := append([]string(nil), d.localAccessSources...)
 	sharedLocalAccess := d.localAccessShared
 	d.systemRoutes = nil
+	d.tenantFirewallRules = nil
 	d.exitNodeRoutes = nil
 	d.localAccessRoutes = nil
 	d.localAccessByOwner = make(map[[32]byte][]string)
 	d.exitNodePeerKey = [32]byte{}
 	d.exitNodeActive = false
 	d.mu.Unlock()
+
+	if len(tenantFirewallRules) > 0 {
+		if err := ctl.TenantFirewallClear(tenantFirewallRules); err != nil {
+			log.Printf("[TUN] Warning: failed to remove tenant firewall rules: %v", err)
+		}
+	}
 
 	// Remove all OS routes before closing the TUN interface so the
 	// kernel doesn't leave stale entries pointing at a dead utun index.

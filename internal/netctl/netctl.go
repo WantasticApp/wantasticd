@@ -46,6 +46,15 @@ type FirewallRule struct {
 	Args  []string
 }
 
+// TenantFirewallRule allows traffic from configured tenant prefixes to one of
+// this device's tunnel addresses. The interface and both address families are
+// explicit so platform backends can keep the exception scoped to the tunnel.
+type TenantFirewallRule struct {
+	Interface string
+	Local     netip.Addr
+	Remote    []netip.Prefix
+}
+
 // Controller is the unified network control interface.
 // Each platform provides a concrete implementation.
 type Controller interface {
@@ -70,6 +79,8 @@ type Controller interface {
 	// ── Firewall / NAT ──────────────────────────────────────────────────
 	FirewallEnsureRule(rule FirewallRule) error
 	FirewallDeleteRule(rule FirewallRule) error
+	TenantFirewallSet(rules []TenantFirewallRule) error
+	TenantFirewallClear(rules []TenantFirewallRule) error
 	IPForwardingSet(enabled bool) error
 
 	// ── Cleanup ─────────────────────────────────────────────────────────

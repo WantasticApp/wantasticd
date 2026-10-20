@@ -10,6 +10,16 @@ DOWNLOAD_TIMEOUT="${WANTASTIC_UPDATE_DOWNLOAD_TIMEOUT:-300}"
 VERIFY_TIMEOUT="${WANTASTIC_UPDATE_VERIFY_TIMEOUT:-20}"
 SERVICE_MANAGER=""
 
+run_initd() {
+  if [ -x /etc/init.d/wantasticd ]; then
+    /etc/init.d/wantasticd "$1"
+  elif [ -f /etc/init.d/wantasticd ]; then
+    /bin/sh /etc/init.d/wantasticd "$1"
+  else
+    return 1
+  fi
+}
+
 # ── platform ─────────────────────────────────────────────────────────────────
 UNAME_S="$(uname -s)"
 case "$UNAME_S" in
@@ -44,9 +54,9 @@ restart_service() {
     return 0
   fi
   # procd (OpenWrt)
-  if [ -x /etc/init.d/wantasticd ] && command -v procd >/dev/null 2>&1; then
+  if [ -f /etc/init.d/wantasticd ] && command -v procd >/dev/null 2>&1; then
     echo "Restarting via procd…"
-    /etc/init.d/wantasticd restart
+    run_initd restart
     SERVICE_MANAGER="procd"
     return 0
   fi
@@ -58,9 +68,9 @@ restart_service() {
     return 0
   fi
   # generic init.d
-  if [ -x /etc/init.d/wantasticd ]; then
+  if [ -f /etc/init.d/wantasticd ]; then
     echo "Restarting via init.d…"
-    /etc/init.d/wantasticd restart
+    run_initd restart
     SERVICE_MANAGER="initd"
     return 0
   fi
@@ -87,7 +97,17 @@ service_is_running() {
         pidof wantasticd >/dev/null 2>&1
       fi
       ;;
-    initd) /etc/init.d/wantasticd status >/dev/null 2>&1 ;;
+    initd)
+      if run_initd status >/dev/null 2>&1; then
+        return 0
+      fi
+      if command -v ubus >/dev/null 2>&1; then
+        _service_state=$(ubus call service list '{"name":"wantasticd"}' 2>/dev/null || true)
+        echo "$_service_state" | grep -q '"running"[[:space:]]*:[[:space:]]*true'
+      else
+        pidof wantasticd >/dev/null 2>&1
+      fi
+      ;;
     openrc) rc-service wantasticd status >/dev/null 2>&1 ;;
     launchd) launchctl list com.wantastic.wantasticd >/dev/null 2>&1 ;;
     *) return 1 ;;

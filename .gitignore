@@ -12,6 +12,7 @@ gobuild/
 .task/
 tmp/
 node_modules/
+gui/frontend/dist/assets/
 !cmd/wantasticd/tray.go
 cmd/puppeteer
 hosts.txt
@@ -38,3 +39,38 @@ build/windows/*
 !build/windows/info.json
 test.rsc
 device-claim-key.json
+
+# Swift and Xcode output.
+.build/
+DerivedData/
+motion/connection-logo/node_modules/
+motion/connection-logo/out/
+WantasticMac.xcodeproj/
+*.xcarchive/
+*.xcresult/
+*.dSYM/
+
+# Local environment, credentials, and signing material.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+credentials.json
+credentials.*.json
+secrets.json
+secrets.*.json
+service-account*.json
+device-claim-key*.json
+.aws/
+.ssh/
+.netrc
+
+# Local integration configs contain private tunnel keys; keep templates only.
+e2e/docker-compose/configs/*.conf
+!e2e/docker-compose/configs/*.conf.example

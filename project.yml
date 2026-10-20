@@ -1,0 +1,105 @@
+name: WantasticMac
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  bundleIdPrefix: app.wantastic
+packages:
+  WantasticSwift:
+    path: .
+targets:
+  Wantastic:
+    type: application
+    platform: macOS
+    scheme:
+      testTargets:
+        - WantasticMacTests
+    sources:
+      - Sources/WantasticApp
+      - Sources/WantasticTunnel/TunnelController.swift
+      - Sources/WantasticTunnel/SystemExtensionActivator.swift
+      - path: Config/app.wantastic.desktop.local-access-helper.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchDaemons
+    dependencies:
+      - package: WantasticSwift
+        product: WantasticCore
+      - target: WantasticLocalAccessHelper
+        embed: true
+        link: false
+        codeSign: true
+        copy:
+          destination: executables
+      - target: WantasticTunnel
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.wantastic.desktop
+        PRODUCT_NAME: Wantastic
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: Config/Wantastic.entitlements
+        INFOPLIST_KEY_NSSystemExtensionUsageDescription: Wantastic needs a network extension to securely connect this Mac to your Wantastic network.
+        INFOPLIST_KEY_WantasticKeychainAccessGroup: "$(AppIdentifierPrefix)app.wantastic.desktop.shared"
+        ENABLE_APP_SANDBOX: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) WANTASTIC_XCODE_APP"
+  WantasticTunnel:
+    type: system-extension
+    platform: macOS
+    sources:
+      - Sources/WantasticTunnel/PacketFlowRouteSender.swift
+      - Sources/WantasticTunnel/PacketTunnelProvider.swift
+      - Sources/WantasticTunnel/SystemExtensionMain.swift
+      - Sources/WantasticTunnel/TunnelNetworkSettingsBuilder.swift
+      - Sources/WantasticTunnel/WireGuardPeerTransport.swift
+      - Sources/WantasticTunnel/WireGuardUDPConnection.swift
+      - Sources/WantasticTunnel/MacLocalAccessFirewallController.swift
+      - Sources/WantasticTunnel/MacLocalAccessRouteCoordinator.swift
+      - Sources/WantasticTunnel/MacLocalAccessProviderManager.swift
+      - Sources/WantasticTunnel/XPCMacLocalAccessFirewallSystem.swift
+    dependencies:
+      - package: WantasticSwift
+        product: WantasticCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.wantastic.desktop.network-extension
+        PRODUCT_NAME: WantasticNetworkExtension
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Config/WantasticTunnel-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/WantasticTunnel.entitlements
+        INFOPLIST_KEY_WantasticKeychainAccessGroup: "$(AppIdentifierPrefix)app.wantastic.desktop.shared"
+        ENABLE_APP_SANDBOX: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) WANTASTIC_SYSTEM_EXTENSION_ENTRY"
+  WantasticLocalAccessHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/WantasticLocalAccessHelper
+    dependencies:
+      - package: WantasticSwift
+        product: WantasticLocalAccessHelperCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.wantastic.desktop.local-access-helper
+        PRODUCT_NAME: WantasticLocalAccessHelper
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        ENABLE_APP_SANDBOX: NO
+  WantasticMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/WantasticCoreTests
+    dependencies:
+      - package: WantasticSwift
+        product: WantasticCore
+      - package: WantasticSwift
+        product: WantasticTunnel
+      - package: WantasticSwift
+        product: WantasticLocalAccessHelperCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.wantastic.desktop.tests
+        GENERATE_INFOPLIST_FILE: YES

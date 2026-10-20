@@ -1,0 +1,4 @@
+# Managed by Wantastic; remove when the tunnel stops
+domain wantastic
+nameserver 10.255.255.33
+nameserver 1.1.1.1

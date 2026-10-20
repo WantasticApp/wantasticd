@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:wantasticd}",
+            "name": "Debug Wantastic",
+            "target": "Wantastic",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Wantastic"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:wantasticd}",
+            "name": "Release Wantastic",
+            "target": "Wantastic",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Wantastic"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:wantasticd}",
+            "name": "Debug WantasticLocalAccessHelper",
+            "target": "WantasticLocalAccessHelper",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug WantasticLocalAccessHelper"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:wantasticd}",
+            "name": "Release WantasticLocalAccessHelper",
+            "target": "WantasticLocalAccessHelper",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release WantasticLocalAccessHelper"
+        }
+    ]
+}

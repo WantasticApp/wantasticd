@@ -254,6 +254,40 @@ launchctl list | grep wantastic
 launchctl stop com.wantastic.wantasticd
 ```
 
+To stop and remove the system service while keeping the generated key and configuration:
+```sh
+sudo launchctl bootout system /Library/LaunchDaemons/com.wantastic.wantasticd.plist
+sudo rm /Library/LaunchDaemons/com.wantastic.wantasticd.plist
+```
+
+### macOS connectivity troubleshooting
+
+Seeing a laptop in the device list confirms that it registered with the service;
+it does not confirm that its tunnel or routes are working. On the Mac that
+cannot reach a peer, check the daemon, tunnel, logs, and route:
+
+```sh
+/usr/local/bin/wantasticd status
+sudo launchctl print system/com.wantastic.wantasticd
+sudo tail -n 100 /var/log/wantasticd.log
+route -n get <peer-overlay-ip>
+```
+
+The status should report `Running` and `TUN (utun...)`. The route to the peer
+should use a `utun` interface. Look in the log for a recent WireGuard handshake
+and route errors. To restart the service and retry:
+
+```sh
+sudo launchctl kickstart -k system/com.wantastic.wantasticd
+ping <peer-overlay-ip>
+```
+
+If connectivity still fails, collect the command output from both Macs and
+check the peer's firewall and tunnel status. Redact private keys and tokens
+before sharing logs or configuration. Advertising and forwarding this Mac's
+local LAN to tenant peers is currently supported on Linux and OpenWrt, not
+macOS.
+
 ---
 
 ## Supported Platforms

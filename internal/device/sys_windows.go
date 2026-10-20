@@ -31,7 +31,8 @@ func addRouteOS(tunName string, network string) error {
 	if err != nil {
 		return fmt.Errorf("invalid prefix %s: %w", network, err)
 	}
-	log.Printf("[TUN] Adding route %s via %s", network, tunName)
+	prefix = prefix.Masked()
+	log.Printf("[TUN] Adding route %s via %s", prefix, tunName)
 	return ctl.RouteReplace(tunName, prefix)
 }
 
@@ -40,6 +41,7 @@ func removeRouteOS(tunName string, network string) error {
 	if err != nil {
 		return fmt.Errorf("invalid prefix %s: %w", network, err)
 	}
-	log.Printf("[TUN] Removing route %s via %s", network, tunName)
+	prefix = prefix.Masked()
+	log.Printf("[TUN] Removing route %s via %s", prefix, tunName)
 	return ctl.RouteDel(tunName, prefix)
 }

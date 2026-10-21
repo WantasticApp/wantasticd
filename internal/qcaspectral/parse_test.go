@@ -288,3 +288,53 @@ func TestCaptureRefusesForeignRelayScan(t *testing.T) {
 		t.Fatalf("passive relay capture must fail with a reason and leave the scan alone: %v %+v", err, res)
 	}
 }
+
+// Driver buffers are untrusted input: every truncation and byte corruption
+// of a valid report must fail cleanly, never panic.
+func TestParseNetlinkNeverPanicsOnHostileInput(t *testing.T) {
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		bins := bytes.Repeat([]byte{7}, 64)
+		valid := [][]byte{
+			datagram(order, legacyPayload(order, bins), 647, 0),
+			datagram(order, cmnPayload(order, bins, bins), 1745, 0),
+			datagram(order, optimizedPayload(order, bins), 401, 401+len(bins)),
+		}
+		state := uint32(1)
+		for _, base := range valid {
+			for n := 0; n <= len(base); n++ {
+				_, _ = ParseNetlink(base[:n], order)
+			}
+			for i := 0; i < 2000; i++ {
+				mutated := append([]byte(nil), base...)
+				for j := 0; j < 4; j++ {
+					state = state*1664525 + 1013904223
+					mutated[int(state>>8)%len(mutated)] = byte(state >> 24)
+				}
+				_, _ = ParseNetlink(mutated, order)
+			}
+		}
+	}
+}
+
+// On 32-bit agents int(0xffffffff) is -1; the raw count must be bounded first.
+func TestParseNetlinkRejectsHugeOptimizedCount(t *testing.T) {
+	order := binary.LittleEndian
+	p := optimizedPayload(order, []byte{1, 2})
+	order.PutUint32(p[optBinCount:], 0xffffffff)
+	if _, err := ParseNetlink(datagram(order, p, 403, 0), order); !errors.Is(err, ErrUnknownLayout) {
+		t.Fatalf("huge optimized bin count: got %v", err)
+	}
+}
+
+func FuzzParseNetlink(f *testing.F) {
+	order := binary.LittleEndian
+	f.Add(datagram(order, legacyPayload(order, []byte{1, 2, 3}), 647, 0))
+	f.Add(datagram(order, cmnPayload(order, []byte{1, 2}, []byte{3}), 1745, 0))
+	f.Add(datagram(order, optimizedPayload(order, []byte{1, 2}), 401, 403))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		sample, err := ParseNetlink(data, order)
+		if err == nil && len(sample.Bins) > 2048+cmnMaxBinsSec80 {
+			t.Fatalf("unbounded bins: %d", len(sample.Bins))
+		}
+	})
+}

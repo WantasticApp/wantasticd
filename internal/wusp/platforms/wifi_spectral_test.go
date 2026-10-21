@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -177,5 +178,36 @@ func TestSpectralCoordinatorSkipsCaptureForUnsupportedRadios(t *testing.T) {
 	snap := c.snapshotAndTrigger("")
 	if captured || len(snap.Radios) != 1 || snap.Radios[0].Status != "Unsupported" || snap.Radios[0].LastError != "no path" {
 		t.Fatalf("unexpected snapshot %+v captured=%t", snap, captured)
+	}
+}
+
+// The capture goroutine runs outside runCollector; a driver-parsing panic
+// must be contained there instead of crashing the agent, and must release
+// the running flag so later reads can retry.
+func TestSpectralCoordinatorRecoversCapturePanic(t *testing.T) {
+	c := &spectralCoordinator{
+		supported: true,
+		now:       time.Now,
+		discover: func(string) ([]qcaspectral.Radio, error) {
+			return []qcaspectral.Radio{{Interface: "wifi0", Caps: qcaspectral.Caps{Spectral: true}}}, nil
+		},
+		capture: func(context.Context, qcaspectral.Radio, qcaspectral.CaptureOptions) (qcaspectral.Result, error) {
+			panic("malformed driver report")
+		},
+	}
+	c.snapshotAndTrigger("")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		snap := c.snapshotAndTrigger("")
+		if !snap.Capturing {
+			if !strings.Contains(snap.DiscoveryError, "panic") {
+				t.Fatalf("panic not surfaced: %q", snap.DiscoveryError)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("running flag never released after panic")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

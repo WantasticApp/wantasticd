@@ -456,6 +456,13 @@ const (
 	frameVersion = 0x01
 	frameHdrSize = 8
 
+	// maxDecodedPayload caps a decompressed frame/control message. Inputs come
+	// from the network, so the declared raw size must never drive an
+	// unbounded allocation.
+	maxDecodedPayload = 16 << 20
+	// maxValueNesting bounds TagList recursion depth.
+	maxValueNesting = 8
+
 	flagLZ4      = 1 << 0
 	flagDeviceID = 1 << 1
 	flagTS       = 1 << 2
@@ -679,6 +686,11 @@ func (d *Decoder) Decode(data []byte) (*Message, error) {
 		return nil, err
 	}
 
+	// Every field needs at least two bytes, so a count beyond the remaining
+	// input is malformed (and would otherwise panic or over-allocate).
+	if count > uint64(len(r.b)) {
+		return nil, errTruncated
+	}
 	msg.Fields = make([]Field, 0, count)
 	for i := uint64(0); i < count; i++ {
 		f, err := decodeField(r, d.opts.SkipUnknownFields)
@@ -710,7 +722,7 @@ func decodeField(r *rbuf, skipUnknown bool) (*Field, error) {
 			path = p
 		} else {
 			// Future field: we still need to consume value bytes.
-			v, err := decodeValue(r)
+			v, err := decodeValue(r, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -721,14 +733,14 @@ func decodeField(r *rbuf, skipUnknown bool) (*Field, error) {
 		}
 	}
 
-	v, err := decodeValue(r)
+	v, err := decodeValue(r, 0)
 	if err != nil {
 		return nil, err
 	}
 	return &Field{id: id, Path: path, Val: v}, nil
 }
 
-func decodeValue(r *rbuf) (Value, error) {
+func decodeValue(r *rbuf, depth int) (Value, error) {
 	tag, err := r.readByte()
 	if err != nil {
 		return Null(), err
@@ -787,9 +799,16 @@ func decodeValue(r *rbuf) (Value, error) {
 		if err != nil {
 			return Null(), err
 		}
+		// Each item carries at least a tag byte; also bound nesting depth.
+		if cnt > uint64(len(r.b)) {
+			return Null(), errTruncated
+		}
+		if depth >= maxValueNesting {
+			return Null(), errors.New("wusp: list nesting too deep")
+		}
 		items := make([]Value, cnt)
 		for i := range items {
-			items[i], err = decodeValue(r)
+			items[i], err = decodeValue(r, depth+1)
 			if err != nil {
 				return Null(), err
 			}
@@ -845,7 +864,7 @@ func (r *rbuf) readByte() (byte, error) {
 }
 
 func (r *rbuf) readN(n int) ([]byte, error) {
-	if len(r.b) < n {
+	if n < 0 || len(r.b) < n {
 		return nil, io.ErrUnexpectedEOF
 	}
 	v := r.b[:n]
@@ -877,6 +896,9 @@ func (r *rbuf) readBlob() ([]byte, error) {
 	n, err := r.readUvarint()
 	if err != nil {
 		return nil, err
+	}
+	if n > uint64(len(r.b)) {
+		return nil, io.ErrUnexpectedEOF
 	}
 	return r.readN(int(n))
 }
@@ -1038,6 +1060,11 @@ func lz4WriteLen(dst []byte, op int, tok *byte, isHigh bool, length int) int {
 // decompress performs LZ4 block decompression into a pre-sized output buffer.
 // rawSize must equal the original uncompressed length (stored in our frame header).
 func (s *lz4State) decompress(src []byte, rawSize int) ([]byte, error) {
+	// rawSize comes from the wire: cap it, and reject sizes LZ4 cannot reach
+	// from this input (max expansion is ~255x) before allocating.
+	if rawSize < 0 || rawSize > maxDecodedPayload || int64(rawSize) > int64(len(src))*255+64 {
+		return nil, errors.New("wusp/lz4: declared raw size out of range")
+	}
 	dst := make([]byte, rawSize)
 	ip := 0 // read cursor into src
 	op := 0 // write cursor into dst

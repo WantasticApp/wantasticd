@@ -96,6 +96,8 @@ type Device struct {
 		sync.Mutex
 		nextID  atomic.Uint64
 		pending map[wuspFragmentKey]*wuspFragmentAssembly
+		// bytesByPeer is the per-peer memory held by pending assemblies.
+		bytesByPeer map[*Peer]int
 	}
 	p2pMu               sync.Mutex
 	p2pClient           atomic.Pointer[P2PClient]
@@ -324,6 +326,7 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.tun.mtu.Store(int32(mtu))
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.wuspFragments.pending = make(map[wuspFragmentKey]*wuspFragmentAssembly)
+	device.wuspFragments.bytesByPeer = make(map[*Peer]int)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 

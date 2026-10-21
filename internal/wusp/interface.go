@@ -54,6 +54,7 @@ package wusp
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"hash/fnv"
 	"io"
@@ -274,6 +275,9 @@ func ValueToString(v Value) string {
 		return ""
 	case TagMAC:
 		return net.HardwareAddr(v.blob).String()
+	case TagBytes:
+		// hexBinary canonical form; raw bytes are not safe in text sinks.
+		return hex.EncodeToString(v.blob)
 	case TagList:
 		items := v.AsList()
 		parts := make([]string, len(items))

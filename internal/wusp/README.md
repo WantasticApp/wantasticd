@@ -907,6 +907,46 @@ func onWireGuardType8(data []byte) {
 }
 ```
 
+## Spectral Telemetry Extension
+
+`Device.WUSP_SpectralTelemetry.` carries RF spectral scan data from QCA/QSDK
+radios. It is collected natively only by binaries built with
+`CGO_ENABLED=1 -tags qsdk` (see `make build-qsdk`). Every other build, and
+every device without a QCA radio netdev that answers the spectral capability
+ioctl, reports `Status=Unsupported` with no radio rows.
+
+Collection (`internal/qcaspectral`):
+
+- control uses `SIOCGATHPHYERR` / `ath_diag` on `wifiN`, the same path as the
+  vendor `spectraltool`; the `DFS_LAST_IOCTL` base (22 on qca-wifi 10.2, 29 on
+  cmn_dev) is discovered with a read-only capability probe
+- samples are read from `NETLINK_ATHEROS` group 1; the legacy 10.2, cmn_dev and
+  cmn_dev `OPTIMIZED_SAMP_MESSAGE` layouts are decoded, anything else is
+  counted in `DroppedSamples` rather than guessed
+- captures run in the background every 5 minutes for 1.5 s per radio, so a
+  `Get` never waits on RF work
+- when another consumer (athssd, ICM, EACS) already has the scan active, the
+  agent only listens (`Passive=true`) and never starts or stops it
+
+Per radio (`Radio.{i}.`), `BinMax` and `BinAverage` are one byte per FFT bin
+in driver units, aggregated over the whole capture. `SampleBlock` holds up to
+16 recent raw samples in this encoding (`EncodeSpectralSampleBlock` /
+`DecodeSpectralSampleBlock`):
+
+| Field | Encoding |
+| --- | --- |
+| magic, version, flags | `'S' 'B' 0x01 flags` (bit 0: bins delta-coded) |
+| bin count, sample count | uvarint, uvarint |
+| per sample: timestamp | uvarint; absolute for the first sample, then uint32 wrap-aware delta |
+| per sample: rssi, noise floor | zigzag varint each |
+| per sample: max bin index | uvarint |
+| per sample: bins | first sample raw; later samples `(bin - previous) mod 256` when bit 0 is set |
+
+The byte delta is lossless and turns correlated sweeps into mostly zero
+bytes, which the nested-message LZ4 pass then compresses. Binary values
+travel as raw `Bytes` on the wire. `ValueToString` renders them as lowercase
+hex, the hexBinary canonical form.
+
 ## Current Limits
 
 Be aware of the current implementation limits:

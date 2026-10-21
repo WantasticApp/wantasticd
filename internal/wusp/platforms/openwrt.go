@@ -707,10 +707,24 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Enable", radioIndex), wusp.Bool(radioEnabled))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Status", radioIndex), wusp.String(wifiStatusValue(radioEnabled, radio.Up)))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Name", radioIndex), wusp.String(key))
-		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingFrequencyBand", radioIndex), wusp.String(wifiBandFromConfig(radio.Config)))
+		runtime := b.openWrtRadioRuntimeInfo(radio)
+		band := wifiBandFromConfig(radio.Config)
+		if runtime != nil {
+			if observed := tr181BandFromFrequency(runtime.Frequency); observed != "" {
+				band = observed
+			}
+		}
+		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingFrequencyBand", radioIndex), wusp.String(band))
 		channelValue := strings.TrimSpace(configString(radio.Config, "channel"))
 		if channel := configInt(radio.Config, "channel"); channel > 0 {
 			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), wusp.Uint(uint64(channel)))
+		} else if runtime != nil && runtime.Channel > 0 {
+			// TR-181 Channel is the current channel; with channel=auto the
+			// driver's operating channel is the only truthful value.
+			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), wusp.Uint(uint64(runtime.Channel)))
+		}
+		if runtime != nil && runtime.Noise < 0 && runtime.Noise > -130 {
+			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Stats.Noise", radioIndex), wusp.Int(int64(runtime.Noise)))
 		}
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.AutoChannelSupported", radioIndex), wusp.Bool(true))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.AutoChannelEnable", radioIndex), wusp.Bool(strings.EqualFold(channelValue, "auto")))
@@ -725,7 +739,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				break
 			}
 		}
-		b.appendWiFiRadioCapabilities(ctx, msg, key, radioIfName, radioIndex, radio.Config)
+		b.appendWiFiRadioCapabilities(ctx, msg, key, radioIfName, radioIndex, band, radio.Config)
 
 		interfaces := b.reportableWiFiInterfaces(radio)
 
@@ -3726,20 +3740,70 @@ func wifiInterfaceModeIsEndpoint(mode string) bool {
 	}
 }
 
+// wifiBandFromConfig derives the band from UCI when no runtime frequency is
+// available. The hwmode suffix carries the band on QSDK/OpenWrt (11g, 11ng,
+// 11axg, 11beg are 2.4 GHz; 11a, 11na, 11ac, 11axa, 11bea are 5 GHz), so a
+// generation token such as "11be" alone must not imply 6 GHz.
 func wifiBandFromConfig(config map[string]any) string {
-	value := strings.ToLower(firstNonEmpty(configString(config, "band"), configString(config, "hwmode")))
-	switch {
-	case strings.Contains(value, "6g"), strings.Contains(value, "11be"), strings.Contains(value, "11ax6"):
-		return "6GHz"
-	case strings.Contains(value, "60"):
-		return "60GHz"
-	case strings.Contains(value, "5"), strings.Contains(value, "11a"):
-		return "5GHz"
-	case strings.Contains(value, "2"), strings.Contains(value, "11g"), strings.Contains(value, "11b"):
+	band := strings.ToLower(strings.TrimSpace(configString(config, "band")))
+	switch band {
+	case "2g", "2.4g", "2.4ghz":
 		return "2.4GHz"
+	case "5g", "5ghz":
+		return "5GHz"
+	case "6g", "6ghz":
+		return "6GHz"
+	case "60g", "60ghz":
+		return "60GHz"
+	}
+	value := strings.ToLower(strings.TrimSpace(configString(config, "hwmode")))
+	switch {
+	case value == "":
+		return "Unknown"
+	case strings.Contains(value, "60g"), strings.Contains(value, "11ad"):
+		return "60GHz"
+	case strings.Contains(value, "6g"):
+		return "6GHz"
+	case strings.HasSuffix(value, "g"), strings.HasSuffix(value, "11b"):
+		return "2.4GHz"
+	case strings.HasSuffix(value, "a"), strings.Contains(value, "11ac"):
+		return "5GHz"
 	default:
 		return "Unknown"
 	}
+}
+
+func tr181BandFromFrequency(mhz int) string {
+	switch {
+	case mhz >= 2400 && mhz < 2500:
+		return "2.4GHz"
+	case mhz >= 4900 && mhz < 5925:
+		return "5GHz"
+	case mhz >= 5925 && mhz <= 7125:
+		return "6GHz"
+	case mhz >= 57000 && mhz <= 71000:
+		return "60GHz"
+	default:
+		return ""
+	}
+}
+
+// openWrtRadioRuntimeInfo returns live driver state from the first radio
+// interface that reports an operating frequency.
+func (b *OpenWrtBackend) openWrtRadioRuntimeInfo(radio openWrtWirelessRadioStatus) *iwinfo.InterfaceInfo {
+	if b.wifiInfo == nil {
+		return nil
+	}
+	for _, iface := range radio.Interfaces {
+		ifName := strings.TrimSpace(iface.IfName)
+		if ifName == "" {
+			continue
+		}
+		if info, err := b.wifiInfo(ifName); err == nil && info != nil && info.Frequency > 0 {
+			return info
+		}
+	}
+	return nil
 }
 
 func wifiBandwidthFromConfig(config map[string]any) string {
@@ -4206,12 +4270,11 @@ func (b *OpenWrtBackend) readWiFiTxPowerLevels(ctx context.Context, ifName strin
 	return nil
 }
 
-func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *wusp.Message, section, ifName string, radioIndex int, config map[string]any) {
+func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *wusp.Message, section, ifName string, radioIndex int, band string, config map[string]any) {
 	if strings.TrimSpace(ifName) == "" {
 		ifName = b.radioToIfname(section)
 	}
 	base := fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex)
-	band := wifiBandFromConfig(config)
 	operatingStandards := wifiOperatingStandards(config)
 	supportedStandards := append([]string(nil), operatingStandards...)
 	hardwareModes, htModes := b.readOpenWrtWiFiCapabilities(ctx, ifName)

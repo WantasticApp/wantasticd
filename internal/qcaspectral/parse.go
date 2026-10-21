@@ -1,8 +1,9 @@
 // Package qcaspectral collects FFT spectral scan samples from Qualcomm
 // Atheros (QCA/QSDK) WiFi drivers.
 //
-// Control uses the same SIOCGATHPHYERR/ath_diag ioctls as the vendor
-// spectraltool on the radio netdev (wifiN). Samples arrive as SAMP messages
+// Control uses the QCA nl80211 vendor commands (QSDK 11/12 cfg80211 mode) or,
+// on qca-wifi 10.x, the SIOCGATHPHYERR/ath_diag ioctls used by the vendor
+// spectraltool, on the radio netdev (wifiN). Samples arrive as SAMP messages
 // broadcast by the driver on NETLINK_ATHEROS group 1. Three message layouts
 // exist in the field and all are decoded here:
 //
@@ -10,8 +11,8 @@
 //   - qca-cmn: wlan cmn_dev spectral_samp_msg (pri80 + sec80 bins)
 //   - qca-cmn-optimized: cmn_dev built with OPTIMIZED_SAMP_MESSAGE
 //
-// The parser is pure Go so it can be tested on any host; the native control
-// path lives behind the qsdk build tag.
+// Everything is pure Go (no cgo), so every CGO_ENABLED=0 Linux release build
+// carries the collector. testdata/layout.c pins the packed offsets below.
 package qcaspectral
 
 import (

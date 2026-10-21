@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,7 +15,12 @@ import (
 	"time"
 )
 
-var ErrUnsupported = errors.New("qcaspectral: native QCA spectral support is not available")
+var (
+	ErrUnsupported = errors.New("qcaspectral: native QCA spectral support is not available on this platform")
+	// ErrNoRadioNetdev means the host has no QCA radio netdev (wifiN) at all,
+	// which is the only case reported as Unsupported at the model root.
+	ErrNoRadioNetdev = errors.New("no QCA radio netdev (wifiN) found")
+)
 
 // Caps is the driver spectral capability report.
 type Caps struct {
@@ -24,15 +30,24 @@ type Caps struct {
 	Advanced bool
 	// HardwareGeneration is only reported by cmn_dev drivers; 0 when unknown.
 	HardwareGeneration uint32
-	// IoctlBase is the DFS_LAST_IOCTL value the driver answered on.
+	// ControlPath is ControlPathVendor or ControlPathIoctl.
+	ControlPath string
+	// IoctlBase is the DFS_LAST_IOCTL value the ath_diag path answered on.
 	IoctlBase int
+	// VendorTarget is the netdev the nl80211 vendor command answered on.
+	VendorTarget string
+	// DataTransport is TransportNetlink, TransportRelay, or "" when the driver
+	// does not report it.
+	DataTransport string
 }
 
-// Radio is a QCA radio netdev that answered the spectral capability probe.
+// Radio is a QCA radio netdev. ProbeError is set, and Caps.Spectral false,
+// when no control path accepted the spectral capability probe.
 type Radio struct {
-	Interface string
-	MAC       net.HardwareAddr
-	Caps      Caps
+	Interface  string
+	MAC        net.HardwareAddr
+	Caps       Caps
+	ProbeError string
 }
 
 // Result is one capture window on one radio.
@@ -50,8 +65,8 @@ type Result struct {
 
 type driver interface {
 	Probe(ifname string) (Caps, error)
-	IsActive(ifname string, base int) (bool, error)
-	SetScan(ifname string, base int, start bool) error
+	IsActive(ifname string, caps Caps) (bool, error)
+	SetScan(ifname string, caps Caps, start bool) error
 	OpenSamples() (sampleSource, error)
 }
 
@@ -73,26 +88,28 @@ func decodeCaps(raw []byte, base int) (Caps, bool) {
 		}
 	}
 	caps := Caps{
-		PhyDiag:   raw[0] == 1,
-		Radar:     raw[1] == 1,
-		Spectral:  raw[2] == 1,
-		Advanced:  raw[3] == 1,
-		IoctlBase: base,
+		PhyDiag:     raw[0] == 1,
+		Radar:       raw[1] == 1,
+		Spectral:    raw[2] == 1,
+		Advanced:    raw[3] == 1,
+		ControlPath: ControlPathIoctl,
+		IoctlBase:   base,
 	}
 	if !caps.Spectral {
 		return Caps{}, false
 	}
 	if base >= 29 && len(raw) >= 8 {
-		caps.HardwareGeneration = binary.NativeEndian.Uint32(raw[4:8])
+		caps.HardwareGeneration = nativeUint32(raw[4:8])
 	}
 	return caps, true
 }
 
 var qcaRadioName = regexp.MustCompile(`^wifi[0-9]+$`)
 
-// DiscoverRadios probes QCA radio netdevs (wifiN) under netClassDir. Only
-// interfaces named like QCA radio devices are probed; VAPs (athN) and
-// mac80211 interfaces are never touched.
+// DiscoverRadios probes every QCA radio netdev (wifiN) under netClassDir and
+// returns a row for each one, including radios whose probe failed, so the
+// failure reason is visible to the controller. VAPs (athN) are only used as
+// vendor-command targets for their parent radio, never probed on their own.
 func DiscoverRadios(netClassDir string) ([]Radio, error) {
 	if !Supported {
 		return nil, ErrUnsupported
@@ -114,25 +131,27 @@ func discoverRadios(d driver, netClassDir string) ([]Radio, error) {
 			names = append(names, entry.Name())
 		}
 	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%w under %s", ErrNoRadioNetdev, netClassDir)
+	}
 	sort.Slice(names, func(i, j int) bool {
 		if len(names[i]) != len(names[j]) {
 			return len(names[i]) < len(names[j])
 		}
 		return names[i] < names[j]
 	})
-	var radios []Radio
-	var lastErr error
+	radios := make([]Radio, 0, len(names))
 	for _, name := range names {
+		mac, _ := net.ParseMAC(strings.TrimSpace(readFile(filepath.Join(netClassDir, name, "address"))))
+		radio := Radio{Interface: name, MAC: mac}
 		caps, err := d.Probe(name)
 		if err != nil {
-			lastErr = err
-			continue
+			radio.Caps = Caps{ControlPath: ControlPathNone}
+			radio.ProbeError = err.Error()
+		} else {
+			radio.Caps = caps
 		}
-		mac, _ := net.ParseMAC(strings.TrimSpace(readFile(filepath.Join(netClassDir, name, "address"))))
-		radios = append(radios, Radio{Interface: name, MAC: mac, Caps: caps})
-	}
-	if len(radios) == 0 && lastErr != nil {
-		return nil, lastErr
+		radios = append(radios, radio)
 	}
 	return radios, nil
 }
@@ -158,7 +177,7 @@ func Capture(ctx context.Context, radio Radio, opts CaptureOptions) (Result, err
 	return capture(ctx, newDriver(), radio, opts)
 }
 
-func capture(ctx context.Context, d driver, radio Radio, opts CaptureOptions) (Result, error) {
+func capture(ctx context.Context, d driver, radio Radio, opts CaptureOptions) (result Result, err error) {
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -169,8 +188,16 @@ func capture(ctx context.Context, d driver, radio Radio, opts CaptureOptions) (R
 	if opts.MaxSamples <= 0 {
 		opts.MaxSamples = 64
 	}
-	result := Result{Layout: LayoutUnknown, Started: now().UTC()}
-	defer func() { result.Completed = now().UTC() }()
+	result = Result{Layout: LayoutUnknown, Started: now().UTC()}
+	defer func() {
+		result.Completed = now().UTC()
+		if err != nil && result.LastError == "" {
+			result.LastError = err.Error()
+		}
+	}()
+	if !radio.Caps.Spectral {
+		return result, fmt.Errorf("radio %s has no usable spectral control path", radio.Interface)
+	}
 
 	// Open the receiver before starting the scan so the first reports are
 	// not lost.
@@ -180,18 +207,20 @@ func capture(ctx context.Context, d driver, radio Radio, opts CaptureOptions) (R
 	}
 	defer src.Close()
 
-	base := radio.Caps.IoctlBase
-	active, err := d.IsActive(radio.Interface, base)
+	active, err := d.IsActive(radio.Interface, radio.Caps)
 	if err != nil {
 		return result, err
 	}
 	result.Passive = active
+	if active && radio.Caps.DataTransport == TransportRelay {
+		return result, errors.New("another consumer owns the scan with relay (debugfs) transport; netlink samples are not available")
+	}
 	if !active {
-		if err := d.SetScan(radio.Interface, base, true); err != nil {
+		if err := d.SetScan(radio.Interface, radio.Caps, true); err != nil {
 			return result, err
 		}
 		defer func() {
-			if stopErr := d.SetScan(radio.Interface, base, false); stopErr != nil && result.LastError == "" {
+			if stopErr := d.SetScan(radio.Interface, radio.Caps, false); stopErr != nil && result.LastError == "" {
 				result.LastError = stopErr.Error()
 			}
 		}()
@@ -213,7 +242,6 @@ func capture(ctx context.Context, d driver, radio Radio, opts CaptureOptions) (R
 		}
 		datagram, err := src.Recv(int(wait / time.Millisecond))
 		if err != nil {
-			result.LastError = err.Error()
 			return result, err
 		}
 		if len(datagram) == 0 {
@@ -245,6 +273,9 @@ func capture(ctx context.Context, d driver, radio Radio, opts CaptureOptions) (R
 		result.Layout = sample.Layout
 		result.Samples = append(result.Samples, sample)
 	}
+	if len(result.Samples) == 0 && result.LastError == "" {
+		result.LastError = "no spectral SAMP messages arrived on NETLINK_ATHEROS group 1 during the capture window"
+	}
 	return result, nil
 }
 
@@ -267,3 +298,6 @@ func readFile(path string) string {
 	}
 	return string(data)
 }
+
+func nativeUint32(b []byte) uint32 { return binary.NativeEndian.Uint32(b) }
+func nativeUint64(b []byte) uint64 { return binary.NativeEndian.Uint64(b) }

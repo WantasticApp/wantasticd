@@ -2,6 +2,7 @@ package platforms
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -31,11 +32,15 @@ type spectralRadioSnapshot struct {
 }
 
 type spectralSnapshot struct {
-	Supported   bool
-	Capturing   bool
-	Discovered  bool
-	LastCapture time.Time
-	Radios      []spectralRadioSnapshot
+	Supported  bool
+	Capturing  bool
+	Discovered bool
+	// NoRadioNetdev is true when discovery found no wifiN netdev at all, the
+	// only case reported as Unsupported at the model root.
+	NoRadioNetdev  bool
+	DiscoveryError string
+	LastCapture    time.Time
+	Radios         []spectralRadioSnapshot
 }
 
 // spectralCoordinator runs captures in the background so a USP Get only ever
@@ -46,6 +51,7 @@ type spectralCoordinator struct {
 	running      bool
 	nextRun      time.Time
 	discoveredAt time.Time
+	discoveryErr error
 	lastCapture  time.Time
 	radios       []spectralRadioSnapshot
 	now          func() time.Time
@@ -78,6 +84,10 @@ func (c *spectralCoordinator) snapshotAndTrigger(netClassDir string) spectralSna
 		go c.run(netClassDir, rediscover, known)
 	}
 	out := spectralSnapshot{Supported: true, Capturing: c.running, Discovered: !c.discoveredAt.IsZero(), LastCapture: c.lastCapture}
+	if c.discoveryErr != nil {
+		out.DiscoveryError = c.discoveryErr.Error()
+		out.NoRadioNetdev = errors.Is(c.discoveryErr, qcaspectral.ErrNoRadioNetdev)
+	}
 	out.Radios = append(out.Radios, c.radios...)
 	return out
 }
@@ -90,9 +100,14 @@ func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []
 		discovered, err := c.discover(netClassDir)
 		c.mu.Lock()
 		c.discoveredAt = c.now().UTC()
+		c.discoveryErr = err
 		c.mu.Unlock()
 		if err != nil {
 			diaglog.Printf("[USP] spectral_discovery error=%q", err)
+		}
+		for _, radio := range discovered {
+			diaglog.Printf("[USP] spectral_probe interface=%q spectral=%t control_path=%s vendor_target=%q ioctl_base=%d transport=%q error=%q",
+				radio.Interface, radio.Caps.Spectral, radio.Caps.ControlPath, radio.Caps.VendorTarget, radio.Caps.IoctlBase, radio.Caps.DataTransport, radio.ProbeError)
 		}
 		radios = discovered
 	}
@@ -103,6 +118,13 @@ func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []
 	}
 	results := make([]spectralRadioSnapshot, 0, len(radios))
 	for _, radio := range radios {
+		if !radio.Caps.Spectral {
+			results = append(results, spectralRadioSnapshot{
+				Radio: radio, Status: "Unsupported", LastError: radio.ProbeError, CollectedAt: c.now().UTC(),
+				Result: qcaspectral.Result{Layout: qcaspectral.LayoutUnknown},
+			})
+			continue
+		}
 		res, err := c.capture(ctx, radio, qcaspectral.CaptureOptions{
 			Window:     spectralCaptureWindow,
 			MaxSamples: spectralMaxCaptureSamples,
@@ -135,9 +157,9 @@ func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []
 	}
 }
 
-// appendSpectralFields emits Device.WUSP_SpectralTelemetry. Builds without
-// the qsdk tag, and devices with no QCA spectral radio, report Unsupported
-// with no radio rows.
+// appendSpectralFields emits Device.WUSP_SpectralTelemetry. Non-Linux builds
+// and hosts without any QCA radio netdev report Unsupported with no radio
+// rows; every probed wifiN otherwise gets a row carrying its probe outcome.
 func appendSpectralFields(msg *wusp.Message, netClassDir string) error {
 	return appendSpectralSnapshotFields(msg, defaultSpectralCoordinator.snapshotAndTrigger(netClassDir))
 }
@@ -150,7 +172,9 @@ func appendSpectralSnapshotFields(msg *wusp.Message, snap spectralSnapshot) erro
 		appendField(msg, prefix+"RadioNumberOfEntries", wusp.Uint(0))
 		return nil
 	}
-	appendField(msg, prefix+"Implementation", wusp.String("qca.athdiag-netlink"))
+	appendField(msg, prefix+"Implementation", wusp.String("qca.native"))
+	// Always emitted so a cleared error replaces the stored one.
+	appendField(msg, prefix+"DiscoveryError", wusp.String(truncateSpectralError(snap.DiscoveryError)))
 	appendField(msg, prefix+"CaptureIntervalSeconds", wusp.Uint(uint64(spectralCaptureInterval/time.Second)))
 	if !snap.LastCapture.IsZero() {
 		appendField(msg, prefix+"LastCaptureTime", wusp.Time(snap.LastCapture))
@@ -171,6 +195,16 @@ func appendSpectralSnapshotFields(msg *wusp.Message, snap spectralSnapshot) erro
 			appendField(msg, path+"MACAddress", wusp.MAC(radio.Radio.MAC))
 		}
 		appendField(msg, path+"Status", wusp.String(radio.Status))
+		controlPath := radio.Radio.Caps.ControlPath
+		if controlPath == "" {
+			controlPath = qcaspectral.ControlPathNone
+		}
+		appendField(msg, path+"ControlPath", wusp.String(controlPath))
+		transport := radio.Radio.Caps.DataTransport
+		if transport != qcaspectral.TransportNetlink && transport != qcaspectral.TransportRelay {
+			transport = "unknown"
+		}
+		appendField(msg, path+"DataTransport", wusp.String(transport))
 		appendField(msg, path+"AdvancedSpectral", wusp.Bool(radio.Radio.Caps.Advanced))
 		appendField(msg, path+"SampleLayout", wusp.String(string(res.Layout)))
 		appendField(msg, path+"Passive", wusp.Bool(res.Passive))
@@ -208,17 +242,21 @@ func spectralRootStatus(snap spectralSnapshot) string {
 		return "Capturing"
 	}
 	if len(snap.Radios) == 0 {
-		if snap.Discovered {
+		switch {
+		case snap.NoRadioNetdev:
 			return "Unsupported"
+		case snap.DiscoveryError != "":
+			return "Error"
+		default:
+			return "Idle"
 		}
-		return "Idle"
 	}
 	status := "Idle"
 	for _, radio := range snap.Radios {
 		switch radio.Status {
 		case "Ready":
 			return "Ready"
-		case "Error":
+		case "Error", "Unsupported":
 			status = "Error"
 		}
 	}

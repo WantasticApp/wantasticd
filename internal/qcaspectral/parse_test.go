@@ -173,8 +173,8 @@ func (d *fakeDriver) Probe(ifname string) (Caps, error) {
 	}
 	return Caps{}, ErrUnsupported
 }
-func (d *fakeDriver) IsActive(string, int) (bool, error) { return d.active, nil }
-func (d *fakeDriver) SetScan(_ string, _ int, start bool) error {
+func (d *fakeDriver) IsActive(string, Caps) (bool, error) { return d.active, nil }
+func (d *fakeDriver) SetScan(_ string, _ Caps, start bool) error {
 	d.scanCalls = append(d.scanCalls, start)
 	return nil
 }
@@ -255,7 +255,36 @@ func TestDiscoverRadiosProbesOnlyQCARadioNetdevs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(radios) != 2 || radios[0].Interface != "wifi1" || radios[1].Interface != "wifi10" || !bytes.Equal(radios[0].MAC, testMAC) {
+	// Every wifiN gets a row; a failed probe keeps its reason instead of
+	// silently disappearing.
+	if len(radios) != 3 || radios[0].Interface != "wifi1" || radios[1].Interface != "wifi2" || radios[2].Interface != "wifi10" || !bytes.Equal(radios[0].MAC, testMAC) {
 		t.Fatalf("unexpected radios %+v", radios)
+	}
+	if radios[1].Caps.Spectral || radios[1].ProbeError == "" || radios[1].Caps.ControlPath != ControlPathNone {
+		t.Fatalf("failed probe must be reported, got %+v", radios[1])
+	}
+	if _, err := discoverRadios(d, t.TempDir()); !errors.Is(err, ErrNoRadioNetdev) {
+		t.Fatalf("empty net class dir: got %v", err)
+	}
+}
+
+func TestCaptureReportsWhyNothingArrived(t *testing.T) {
+	d := &fakeDriver{}
+	radio := Radio{Interface: "wifi0", MAC: testMAC, Caps: Caps{Spectral: true, ControlPath: ControlPathVendor}}
+	res, err := capture(context.Background(), d, radio, CaptureOptions{Window: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.LastError == "" || res.Completed.IsZero() {
+		t.Fatalf("empty capture must explain itself and record completion: %+v", res)
+	}
+}
+
+func TestCaptureRefusesForeignRelayScan(t *testing.T) {
+	d := &fakeDriver{active: true}
+	radio := Radio{Interface: "wifi0", MAC: testMAC, Caps: Caps{Spectral: true, ControlPath: ControlPathVendor, DataTransport: TransportRelay}}
+	res, err := capture(context.Background(), d, radio, CaptureOptions{Window: 20 * time.Millisecond})
+	if err == nil || res.LastError == "" || len(d.scanCalls) != 0 {
+		t.Fatalf("passive relay capture must fail with a reason and leave the scan alone: %v %+v", err, res)
 	}
 }

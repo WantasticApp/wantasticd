@@ -910,16 +910,22 @@ func onWireGuardType8(data []byte) {
 ## Spectral Telemetry Extension
 
 `Device.WUSP_SpectralTelemetry.` carries RF spectral scan data from QCA/QSDK
-radios. It is collected natively only by binaries built with
-`CGO_ENABLED=1 -tags qsdk` (see `make build-qsdk`). Every other build, and
-every device without a QCA radio netdev that answers the spectral capability
-ioctl, reports `Status=Unsupported` with no radio rows.
+radios. The collector is pure Go, so every Linux build (including the
+`CGO_ENABLED=0` release binaries) carries it. Only hosts without any QCA radio
+netdev (`wifiN`) report `Status=Unsupported`; every probed radio otherwise gets
+a row whose `ControlPath`, `DataTransport`, `Status` and `LastError` explain
+the outcome, and the root `DiscoveryError` explains an empty discovery.
 
 Collection (`internal/qcaspectral`):
 
-- control uses `SIOCGATHPHYERR` / `ath_diag` on `wifiN`, the same path as the
-  vendor `spectraltool`; the `DFS_LAST_IOCTL` base (22 on qca-wifi 10.2, 29 on
+- control first tries the QCA nl80211 vendor commands (`OUI_QCA` 0x001374,
+  `SPECTRAL_SCAN_*` subcommands 154/155/158/160/161 from hostap
+  `qca-vendor.h`) on `wifiN` and then its VAPs, the default on QSDK 11/12
+- it falls back to `SIOCGATHPHYERR` / `ath_diag` on `wifiN`, the qca-wifi 10.x
+  `spectraltool` path; the `DFS_LAST_IOCTL` base (22 on qca-wifi 10.2, 29 on
   cmn_dev) is discovered with a read-only capability probe
+- a radio whose driver reports relay (debugfs) transport is switched to
+  netlink for agent-owned captures and restored afterwards
 - samples are read from `NETLINK_ATHEROS` group 1; the legacy 10.2, cmn_dev and
   cmn_dev `OPTIMIZED_SAMP_MESSAGE` layouts are decoded, anything else is
   counted in `DroppedSamples` rather than guessed

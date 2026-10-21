@@ -586,6 +586,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 		return nil
 	})
 	_ = runCollector("openwrt.wifi.scan", func() error { return appendWiFiScanFields(msg) })
+	_ = runCollector("openwrt.wifi.spectral", func() error { return appendSpectralFields(msg, b.netClassDir) })
 
 	return msg, nil
 }

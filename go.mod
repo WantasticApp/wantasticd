@@ -7,8 +7,11 @@ require (
 	github.com/bgptools/mndp v0.0.0-20231212115012-3273940ea35e
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/getlantern/systray v1.2.2
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/honeybbq/goubus v1.4.0
+	github.com/maltegrosse/go-modemmanager v0.1.4
 	github.com/mdlayher/genetlink v1.3.2
 	github.com/mdlayher/lldp v0.0.0-20150915211757-afd9f83164c5
 	github.com/mdlayher/netlink v1.8.0
@@ -34,12 +37,9 @@ require (
 	github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55 // indirect
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/mdlayher/ethernet v0.0.0-20220221185849-529eae5b6118 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
-	github.com/maltegrosse/go-modemmanager v0.1.4 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/stretchr/testify v1.10.0 // indirect

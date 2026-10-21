@@ -91,6 +91,7 @@ var AllDeviceObjects = concatObjects(
 	WUSPGNSSObjects,
 	WUSPMeshTelemetryObjects,
 	WUSPNetworkTelemetryObjects,
+	WUSPSpectralTelemetryObjects,
 )
 
 // AllDeviceParams is the full WUSP schema registry consumed by the encoder and
@@ -105,6 +106,7 @@ var AllDeviceParams = concat(
 	AllWUSPGNSSParams,
 	AllWUSPMeshTelemetryParams,
 	AllWUSPNetworkTelemetryParams,
+	AllWUSPSpectralTelemetryParams,
 )
 
 // BroadbandDataModels collects the runtime model slices bundled into WUSP.
@@ -180,6 +182,15 @@ var BroadbandDataModels = []BroadbandDataModel{
 		WUSPSourceURL,
 		WUSPNetworkTelemetryObjects,
 		AllWUSPNetworkTelemetryParams,
+	),
+	newBroadbandDataModel(
+		"wusp-spectral-telemetry",
+		"Wantastic WUSP Spectral Telemetry",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPSpectralTelemetryObjects,
+		AllWUSPSpectralTelemetryParams,
 	),
 }
 

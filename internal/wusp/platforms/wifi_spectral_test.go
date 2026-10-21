@@ -89,7 +89,7 @@ func TestSpectralCoordinatorRunsInBackgroundAndRateLimits(t *testing.T) {
 		supported: true,
 		now:       clock,
 		discover: func(string) ([]qcaspectral.Radio, error) {
-			return []qcaspectral.Radio{{Interface: "wifi0"}}, nil
+			return []qcaspectral.Radio{{Interface: "wifi0", Caps: qcaspectral.Caps{Spectral: true, ControlPath: qcaspectral.ControlPathVendor}}}, nil
 		},
 		capture: func(context.Context, qcaspectral.Radio, qcaspectral.CaptureOptions) (qcaspectral.Result, error) {
 			<-release
@@ -122,5 +122,60 @@ func TestSpectralCoordinatorRunsInBackgroundAndRateLimits(t *testing.T) {
 	defer mu.Unlock()
 	if captures != 1 {
 		t.Fatalf("reads inside the capture interval must not recapture, got %d captures", captures)
+	}
+}
+
+func TestAppendSpectralFieldsReportsFailedProbes(t *testing.T) {
+	msg := &wusp.Message{}
+	err := appendSpectralSnapshotFields(msg, spectralSnapshot{
+		Supported:  true,
+		Discovered: true,
+		Radios: []spectralRadioSnapshot{{
+			Radio:     qcaspectral.Radio{Interface: "wifi0", Caps: qcaspectral.Caps{ControlPath: qcaspectral.ControlPathNone}, ProbeError: "cfg80211-vendor: wifi0: operation not supported"},
+			Status:    "Unsupported",
+			LastError: "cfg80211-vendor: wifi0: operation not supported",
+			Result:    qcaspectral.Result{Layout: qcaspectral.LayoutUnknown},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	p := wusp.WUSPSpectralTelemetryPrefix
+	expectString(t, msg, p+"Status", "Error")
+	expectString(t, msg, p+"Radio.1.Status", "Unsupported")
+	expectString(t, msg, p+"Radio.1.ControlPath", "none")
+	expectString(t, msg, p+"Radio.1.DataTransport", "unknown")
+	expectString(t, msg, p+"Radio.1.LastError", "cfg80211-vendor: wifi0: operation not supported")
+}
+
+func TestSpectralRootStatusUnsupportedOnlyWithoutRadioNetdev(t *testing.T) {
+	if got := spectralRootStatus(spectralSnapshot{Discovered: true, NoRadioNetdev: true, DiscoveryError: "no QCA radio netdev"}); got != "Unsupported" {
+		t.Fatalf("no netdev: %s", got)
+	}
+	if got := spectralRootStatus(spectralSnapshot{Discovered: true, DiscoveryError: "permission denied"}); got != "Error" {
+		t.Fatalf("discovery failure: %s", got)
+	}
+}
+
+func TestSpectralCoordinatorSkipsCaptureForUnsupportedRadios(t *testing.T) {
+	captured := false
+	c := &spectralCoordinator{
+		supported: true,
+		now:       time.Now,
+		discover: func(string) ([]qcaspectral.Radio, error) {
+			return []qcaspectral.Radio{{Interface: "wifi0", ProbeError: "no path"}}, nil
+		},
+		capture: func(context.Context, qcaspectral.Radio, qcaspectral.CaptureOptions) (qcaspectral.Result, error) {
+			captured = true
+			return qcaspectral.Result{}, nil
+		},
+	}
+	c.run("", true, nil)
+	snap := c.snapshotAndTrigger("")
+	if captured || len(snap.Radios) != 1 || snap.Radios[0].Status != "Unsupported" || snap.Radios[0].LastError != "no path" {
+		t.Fatalf("unexpected snapshot %+v captured=%t", snap, captured)
 	}
 }

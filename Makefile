@@ -81,14 +81,6 @@ build-all-iwinfo:
 		GOOS=$$(echo $$target | cut -d'/' -f1) GOARCH=$$(echo $$target | cut -d'/' -f2) $(GOBUILD_IWINFO) -o bin/$(BINARY_NAME)-$$(echo $$target | cut -d'/' -f1)-$$(echo $$target | cut -d'/' -f2)-iwinfo $(CMD_PATH); \
 	done
 
-# Build with native QCA spectral scan support (QSDK/qca-wifi radios) on top of
-# libiwinfo. Needs a cross C toolchain for the target, e.g.
-# CC=aarch64-openwrt-linux-musl-gcc GOOS=linux GOARCH=arm64 make build-qsdk
-GOBUILD_QSDK=CGO_ENABLED=1 $(GOCMD) build -tags "iwinfo qsdk" -ldflags=$(LDFLAGS)
-
-build-qsdk:
-	$(GOBUILD_QSDK) -o bin/$(BINARY_NAME)-qsdk $(CMD_PATH)
-
 build-%:
 	@echo "Building for $*"
 	@mkdir -p bin
@@ -142,4 +134,4 @@ adb-wantasticd-update: adb-wantasticd-build
 
 adb-wantasticd: adb-wantasticd-update
 
-.PHONY: all build build-all build-iwinfo build-all-iwinfo build-qsdk clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update adb-wantasticd
+.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update adb-wantasticd

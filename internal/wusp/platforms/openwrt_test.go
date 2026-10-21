@@ -545,7 +545,7 @@ func TestOpenWrtRadioCapabilitiesFromLocalRPCDIWInfo(t *testing.T) {
 	})
 
 	msg := wusp.NewMessage()
-	backend.appendWiFiRadioCapabilities(context.Background(), msg, "radio3", "wlan0", 4, map[string]any{
+	backend.appendWiFiRadioCapabilities(context.Background(), msg, "radio3", "wlan0", 4, "6GHz", map[string]any{
 		"band":   "6g",
 		"htmode": "EHT320",
 	})
@@ -2441,5 +2441,20 @@ func writeNetStats(t *testing.T, netClassDir, iface string, stats map[string]str
 	statsDir := filepath.Join(netClassDir, iface, "statistics")
 	for name, value := range stats {
 		mustWriteFile(t, filepath.Join(statsDir, name), value+"\n")
+	}
+}
+
+func TestWiFiBandFromConfigDoesNotTreatWiFi7AsSixGHz(t *testing.T) {
+	cases := map[string]string{"11beg": "2.4GHz", "11bea": "5GHz", "11axg": "2.4GHz", "11axa": "5GHz", "11ng": "2.4GHz", "11ac": "5GHz", "11be": "Unknown", "11be6g": "6GHz"}
+	for hwmode, want := range cases {
+		if got := wifiBandFromConfig(map[string]any{"hwmode": hwmode}); got != want {
+			t.Fatalf("hwmode %q: got %q want %q", hwmode, got, want)
+		}
+	}
+	if got := wifiBandFromConfig(map[string]any{"band": "6g", "hwmode": "11bea"}); got != "6GHz" {
+		t.Fatalf("explicit band must win, got %q", got)
+	}
+	if tr181BandFromFrequency(5745) != "5GHz" || tr181BandFromFrequency(5955) != "6GHz" || tr181BandFromFrequency(2437) != "2.4GHz" {
+		t.Fatal("frequency band mapping is wrong")
 	}
 }

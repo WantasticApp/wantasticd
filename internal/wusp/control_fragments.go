@@ -12,6 +12,14 @@ const (
 	uspControlFragmentVersion    = 1
 	uspControlFragmentMagic      = 0x54
 	uspControlFragmentHeaderSize = 23
+
+	// MaxUSPControlMessageSize caps a reassembled (and decompressed) control
+	// message. Fragment headers come from the network; without these caps a
+	// single datagram could declare a multi-GiB allocation.
+	MaxUSPControlMessageSize = 16 << 20
+	// MaxUSPControlFragmentCount allows full-size messages even at small
+	// negotiated datagram budgets.
+	MaxUSPControlFragmentCount = 1 << 16
 )
 
 type USPControlFragment struct {
@@ -159,6 +167,9 @@ func ReassembleUSPControlFragments(fragments []USPControlFragment) ([]byte, erro
 		totalSize += len(fragment.Data)
 	}
 
+	if totalSize > MaxUSPControlMessageSize {
+		return nil, fmt.Errorf("%w: control message exceeds %d bytes", ErrUSPTransportMalformed, MaxUSPControlMessageSize)
+	}
 	payload := make([]byte, 0, totalSize)
 	for index, data := range ordered {
 		if data == nil {
@@ -181,6 +192,12 @@ func validateUSPControlFragment(fragment USPControlFragment) error {
 	}
 	if fragment.Count == 0 {
 		return &ValidationError{Reason: "control fragment count required"}
+	}
+	if fragment.Count > MaxUSPControlFragmentCount {
+		return &ValidationError{Reason: "control fragment count too large"}
+	}
+	if fragment.RawSize > MaxUSPControlMessageSize {
+		return &ValidationError{Reason: "control fragment raw size too large"}
 	}
 	if fragment.Index >= fragment.Count {
 		return &ValidationError{Reason: "control fragment index out of range"}

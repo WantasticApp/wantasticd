@@ -95,6 +95,18 @@ func (c *spectralCoordinator) snapshotAndTrigger(netClassDir string) spectralSna
 func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []qcaspectral.Radio) {
 	ctx, cancel := context.WithTimeout(context.Background(), spectralCaptureDeadline)
 	defer cancel()
+	// This runs on its own goroutine, outside runCollector: an unrecovered
+	// panic in driver parsing would take down the whole agent. Recover, log,
+	// and release the running flag so the next Get can retry.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			diaglog.Printf("[USP] spectral_capture panic=%q", fmt.Sprint(recovered))
+			c.mu.Lock()
+			c.running = false
+			c.discoveryErr = fmt.Errorf("spectral capture panic: %v", recovered)
+			c.mu.Unlock()
+		}
+	}()
 
 	if rediscover {
 		discovered, err := c.discover(netClassDir)

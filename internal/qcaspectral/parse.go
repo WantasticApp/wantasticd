@@ -184,10 +184,14 @@ func parseCMN(p []byte, order binary.ByteOrder) (Sample, error) {
 }
 
 func parseOptimized(p []byte, order binary.ByteOrder) (Sample, error) {
-	count := int(order.Uint32(p[optBinCount:]))
-	if count == 0 || count > len(p)-optBins || count > 2048 {
-		return Sample{}, fmt.Errorf("%w: optimized bin count %d", ErrUnknownLayout, count)
+	// Bound the raw uint32 before converting: on 32-bit targets (MIPS/ARM
+	// OpenWrt) int(0xffffffff) is -1, which would pass the checks below and
+	// panic on the slice.
+	raw := order.Uint32(p[optBinCount:])
+	if raw == 0 || raw > 2048 || int(raw) > len(p)-optBins {
+		return Sample{}, fmt.Errorf("%w: optimized bin count %d", ErrUnknownLayout, raw)
 	}
+	count := int(raw)
 	return Sample{
 		Layout:           LayoutCMNOptimized,
 		MAC:              cloneMAC(p[optMAC : optMAC+6]),

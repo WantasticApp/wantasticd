@@ -365,7 +365,7 @@ func (s *netlinkSource) Recv(timeoutMillis int) ([]byte, error) {
 	if n == 0 {
 		return nil, nil
 	}
-	read, _, err := unix.Recvfrom(s.fd, s.buf, unix.MSG_DONTWAIT)
+	read, from, err := unix.Recvfrom(s.fd, s.buf, unix.MSG_DONTWAIT)
 	if err != nil {
 		// ENOBUFS reports an overrun; later samples are still valid.
 		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) || errors.Is(err, unix.ENOBUFS) {
@@ -373,7 +373,17 @@ func (s *netlinkSource) Recv(timeoutMillis int) ([]byte, error) {
 		}
 		return nil, err
 	}
+	// Any local process may unicast to this netlink port; only the kernel
+	// (port id 0) produces genuine driver samples.
+	if !fromKernel(from) {
+		return nil, nil
+	}
 	return s.buf[:read], nil
 }
 
 func (s *netlinkSource) Close() error { return unix.Close(s.fd) }
+
+func fromKernel(from unix.Sockaddr) bool {
+	nl, ok := from.(*unix.SockaddrNetlink)
+	return ok && nl.Pid == 0
+}

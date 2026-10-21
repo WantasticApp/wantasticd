@@ -83,3 +83,31 @@ func TestSpectralBinsSurviveMessageRoundTrip(t *testing.T) {
 		t.Fatalf("ValueToString = %q, want hex", got)
 	}
 }
+
+// Sample blocks arrive from devices: corrupt or truncated input must be
+// rejected without panicking or allocating beyond the declared caps.
+func FuzzDecodeSpectralSampleBlock(f *testing.F) {
+	valid, err := EncodeSpectralSampleBlock([]SpectralSample{
+		{TimestampMicros: 10, RSSI: -60, NoiseFloor: -95, MaxIndex: 3, Bins: []byte{1, 2, 3, 4}},
+		{TimestampMicros: 20, RSSI: -61, NoiseFloor: -96, MaxIndex: 1, Bins: []byte{4, 3, 2, 1}},
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(valid)
+	f.Add([]byte{'S', 'B', 1, 0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x0f})
+	for n := range valid {
+		f.Add(valid[:n])
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		samples, err := DecodeSpectralSampleBlock(data)
+		if err == nil && len(samples) > SpectralMaxSamplesPerBlock {
+			t.Fatalf("decoded %d samples", len(samples))
+		}
+		for _, s := range samples {
+			if len(s.Bins) > SpectralMaxBins {
+				t.Fatalf("decoded %d bins", len(s.Bins))
+			}
+		}
+	})
+}

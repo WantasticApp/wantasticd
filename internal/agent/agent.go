@@ -291,9 +291,9 @@ func (a *Agent) runUpdateChecker(ctx context.Context) {
 	check := func() {
 		latest, err := a.updater.FetchLatestVersion(ctx)
 		if err != nil {
-			if a.config.Verbose {
-				log.Printf("Update check failed: %v", err)
-			}
+			// Always log: a silent failure here leaves devices stuck on old
+			// releases with nothing in the log to explain why.
+			log.Printf("Update check failed; will retry in an hour: %v", err)
 			return
 		}
 		a.performSelfUpdate(ctx, latest)

@@ -97,7 +97,7 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 			case object == "system" && method == "board":
 				return []byte(`{"hostname":"openwrt-ap","model":"Qualcomm IPQ807x","board_name":"plasmacloud,superpod","system":"ARMv8","kernel":"6.6.0","release":{"distribution":"OpenWrt","version":"24.10","target":"qualcommax/ipq807x","description":"OpenWrt 24.10"}}`), nil
 			case object == "system" && method == "info":
-				return []byte(`{"localtime":1700000200,"uptime":4321,"memory":{"total":524288,"free":65536,"available":262144}}`), nil
+				return []byte(`{"localtime":1700000200,"uptime":4321,"memory":{"total":536870912,"free":67108864,"available":268435456}}`), nil
 			case object == "network.interface" && method == "dump":
 				return []byte(`{"interface":[{"interface":"loopback","up":true},{"interface":"lan","up":true},{"interface":"wan","up":false}]}`), nil
 			case object == "network.wireless" && method == "status":
@@ -116,6 +116,9 @@ func TestOpenWrtBackendCollect(t *testing.T) {
 	}
 
 	assertStringField(t, msg, "Device.DeviceInfo.HostName", "openwrt-ap")
+	// ubus reports bytes; TR-181 MemoryStatus is KiB.
+	assertUintField(t, msg, "Device.DeviceInfo.MemoryStatus.Total", 524288)
+	assertUintField(t, msg, "Device.DeviceInfo.MemoryStatus.Free", 262144)
 	assertStringField(t, msg, "Device.DeviceInfo.FriendlyName", "Living Room AP")
 	assertStringField(t, msg, "Device.DeviceInfo.ProvisioningCode", "sp-tag-1")
 	assertStringField(t, msg, "Device.DeviceInfo.ManufacturerOUI", "E05D54")

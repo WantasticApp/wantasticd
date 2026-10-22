@@ -13,7 +13,7 @@ const WUSPSpectralTelemetryPrefix = "Device.WUSP_SpectralTelemetry."
 // fragmented WUSP datagrams after the nested-message LZ4 pass.
 const (
 	SpectralMaxBins            = 2048
-	SpectralMaxSamplesPerBlock = 16
+	SpectralMaxSamplesPerBlock = 64
 	spectralMaxBlockLength     = 4 + 2*binary.MaxVarintLen64 + SpectralMaxSamplesPerBlock*(4*binary.MaxVarintLen64+SpectralMaxBins)
 )
 

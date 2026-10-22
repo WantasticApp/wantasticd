@@ -17,9 +17,15 @@ import (
 
 const (
 	spectralCaptureInterval   = 5 * time.Minute
-	spectralCaptureWindow     = 1500 * time.Millisecond
+	spectralCaptureWindow     = 3 * time.Second
 	spectralCaptureDeadline   = 30 * time.Second
-	spectralMaxCaptureSamples = 64
+	// Enough sweeps for stable max/average/noise statistics across the whole
+	// window; drivers can report hundreds per second, so a small cap would
+	// only cover the first few milliseconds.
+	spectralMaxCaptureSamples = 512
+	// spectralWaterfallBinBudget bounds the waterfall block (rows × bins) so
+	// it stays well under the controller's per-value snapshot limit.
+	spectralWaterfallBinBudget = 32 << 10
 	spectralDiscoveryInterval = 30 * time.Minute
 )
 
@@ -331,11 +337,7 @@ func summarizeSpectralSamples(samples []qcaspectral.Sample) spectralSummary {
 	summary.noiseFloor = int16(noise[len(noise)/2])
 	summary.rssi = int16(rssiSum / len(samples))
 
-	start := len(samples) - wusp.SpectralMaxSamplesPerBlock
-	if start < 0 {
-		start = 0
-	}
-	for _, sample := range samples[start:] {
+	for _, sample := range waterfallSamples(samples, bins) {
 		summary.recent = append(summary.recent, wusp.SpectralSample{
 			TimestampMicros: sample.TimestampMicros,
 			RSSI:            sample.RSSI,
@@ -345,6 +347,29 @@ func summarizeSpectralSamples(samples []qcaspectral.Sample) spectralSummary {
 		})
 	}
 	return summary
+}
+
+// waterfallSamples picks evenly spaced sweeps across the whole capture
+// (always including the newest) so the waterfall shows how the band changed
+// over the window instead of only its last instant.
+func waterfallSamples(samples []qcaspectral.Sample, bins int) []qcaspectral.Sample {
+	rows := wusp.SpectralMaxSamplesPerBlock
+	if bins > 0 && spectralWaterfallBinBudget/bins < rows {
+		rows = spectralWaterfallBinBudget / bins
+	}
+	if len(samples) <= rows {
+		return samples
+	}
+	if rows <= 1 {
+		return samples[len(samples)-1:]
+	}
+	picked := make([]qcaspectral.Sample, rows)
+	last := len(samples) - 1
+	for i := range picked {
+		// Spread indexes from oldest to newest; the final row is the newest.
+		picked[i] = samples[i*last/(rows-1)]
+	}
+	return picked
 }
 
 func truncateSpectralError(s string) string {

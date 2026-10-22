@@ -211,3 +211,21 @@ func TestSpectralCoordinatorRecoversCapturePanic(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestWaterfallSamplesSpanWholeCapture(t *testing.T) {
+	samples := make([]qcaspectral.Sample, 512)
+	for i := range samples {
+		samples[i].TimestampMicros = uint32(i)
+	}
+	picked := waterfallSamples(samples, 256)
+	if len(picked) != wusp.SpectralMaxSamplesPerBlock {
+		t.Fatalf("rows = %d, want %d", len(picked), wusp.SpectralMaxSamplesPerBlock)
+	}
+	if picked[0].TimestampMicros != 0 || picked[len(picked)-1].TimestampMicros != 511 {
+		t.Fatalf("waterfall must span oldest..newest, got %d..%d", picked[0].TimestampMicros, picked[len(picked)-1].TimestampMicros)
+	}
+	// Wide FFTs get fewer rows so the block stays within the value budget.
+	if wide := waterfallSamples(samples, 2048); len(wide)*2048 > spectralWaterfallBinBudget {
+		t.Fatalf("wide waterfall %d rows exceeds budget", len(wide))
+	}
+}

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Wantasticd Self-Update Script
 # Safe atomic binary replacement + service-managed restart.
-# Usage: ./self-update.sh [version] [target-binary-path]
+# Usage: ./self-update.sh [version] [target-binary-path] [downloaded-archive]
+# The agent downloads the archive itself and passes it as the third argument;
+# manual runs fall back to curl, wget or uclient-fetch.
 set -e
 
 BASE_URL="https://get.wantastic.app"
@@ -18,6 +20,35 @@ run_initd() {
   else
     return 1
   fi
+}
+
+# fetch URL DEST — prints the HTTP status (200 on success). BusyBox wget and
+# uclient-fetch do not report a status code, so success maps to 200.
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -sSL \
+      --connect-timeout "$CONNECT_TIMEOUT" \
+      --max-time "$DOWNLOAD_TIMEOUT" \
+      --retry 2 \
+      --retry-delay 2 \
+      --retry-connrefused \
+      -w "%{http_code}" \
+      -o "$2" \
+      "$1"
+    return 0
+  fi
+  for _fetcher in wget uclient-fetch; do
+    if command -v "$_fetcher" >/dev/null 2>&1; then
+      if "$_fetcher" -q -T "$CONNECT_TIMEOUT" -O "$2" "$1" >/dev/null 2>&1 && [ -s "$2" ]; then
+        printf 200
+      else
+        printf 000
+      fi
+      return 0
+    fi
+  done
+  echo "Error: no downloader available (curl, wget or uclient-fetch)" >&2
+  printf 000
 }
 
 # ── platform ─────────────────────────────────────────────────────────────────
@@ -139,6 +170,7 @@ verify_update() {
 main() {
   VERSION="$1"
   TARGET_BIN="$2"
+  ARCHIVE="${3:-}"
 
   # Resolve target binary path
   if [ -z "$TARGET_BIN" ]; then
@@ -153,8 +185,9 @@ main() {
   # Fetch latest version tag if not supplied
   if [ -z "$VERSION" ]; then
     echo "Fetching latest version…"
-    VERSION=$(curl -sSL --connect-timeout "$CONNECT_TIMEOUT" --max-time 30 \
-      "${BASE_URL}/latest" | tr -d '[:space:]')
+    _latest_file=$(mktemp)
+    [ "$(fetch "${BASE_URL}/latest" "$_latest_file")" = "200" ] && VERSION=$(tr -d '[:space:]' < "$_latest_file")
+    rm -f "$_latest_file"
   fi
   [ -z "$VERSION" ] && { echo "Error: could not determine latest version"; exit 1; }
 
@@ -174,21 +207,18 @@ main() {
       ;;
   esac
   DOWNLOAD_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz"
-  echo "Downloading $DOWNLOAD_URL…"
 
   TMP_DIR=$(mktemp -d)
   trap 'rm -rf "$TMP_DIR"' EXIT
 
-  CODE=$(curl -sSL \
-    --connect-timeout "$CONNECT_TIMEOUT" \
-    --max-time "$DOWNLOAD_TIMEOUT" \
-    --retry 2 \
-    --retry-delay 2 \
-    --retry-connrefused \
-    -w "%{http_code}" \
-    -o "$TMP_DIR/pkg.tar.gz" \
-    "$DOWNLOAD_URL")
-  [ "$CODE" = "200" ] || { echo "Error: download failed (HTTP $CODE)"; exit 1; }
+  if [ -n "$ARCHIVE" ] && [ -s "$ARCHIVE" ]; then
+    echo "Using downloaded archive $ARCHIVE"
+    cp "$ARCHIVE" "$TMP_DIR/pkg.tar.gz"
+  else
+    echo "Downloading $DOWNLOAD_URL…"
+    CODE=$(fetch "$DOWNLOAD_URL" "$TMP_DIR/pkg.tar.gz")
+    [ "$CODE" = "200" ] || { echo "Error: download failed (HTTP $CODE)"; exit 1; }
+  fi
 
   tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"
 

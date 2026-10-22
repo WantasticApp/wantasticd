@@ -22,7 +22,13 @@ var updateScript embed.FS
 type Manager struct {
 	currentVersion string
 	httpClient     *http.Client
+	baseURL        string
 }
+
+const defaultReleaseBaseURL = "https://get.wantastic.app"
+
+// maxReleaseArchiveBytes bounds the downloaded release archive.
+const maxReleaseArchiveBytes = 256 << 20
 
 const updateAttemptTimeout = 7 * time.Minute
 
@@ -32,6 +38,7 @@ func NewManager(currentVersion string) *Manager {
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
+		baseURL: defaultReleaseBaseURL,
 	}
 }
 
@@ -41,7 +48,7 @@ func (m *Manager) GetCurrentVersion() string {
 
 // FetchLatestVersion gets the latest version as text from the /latest endpoint
 func (m *Manager) FetchLatestVersion(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://get.wantastic.app/latest", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", m.baseURL+"/latest", nil)
 	if err != nil {
 		return "", err
 	}
@@ -93,9 +100,20 @@ func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath
 		return fmt.Errorf("chmod temp script: %w", err)
 	}
 
+	// Download in Go so the update does not depend on curl, which stock
+	// OpenWrt and many embedded images do not ship.
+	archiveDir, err := os.MkdirTemp("", "wantasticd-update-*")
+	if err != nil {
+		return fmt.Errorf("create download dir: %w", err)
+	}
+	defer os.RemoveAll(archiveDir)
+	archivePath := filepath.Join(archiveDir, "pkg.tar.gz")
+	if err := m.downloadRelease(updateCtx, targetVersion, archivePath); err != nil {
+		return err
+	}
+
 	log.Printf("Running update script for version %s (target: %s)...", targetVersion, binaryPath)
-	// Pass binaryPath as second argument
-	cmd := exec.CommandContext(updateCtx, "/bin/sh", tmpFile.Name(), targetVersion, binaryPath)
+	cmd := exec.CommandContext(updateCtx, "/bin/sh", tmpFile.Name(), targetVersion, binaryPath, archivePath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.WaitDelay = 5 * time.Second
@@ -108,6 +126,66 @@ func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath
 	}
 
 	return nil
+}
+
+// downloadRelease fetches the immutable release archive for this platform,
+// retrying transient failures.
+func (m *Manager) downloadRelease(ctx context.Context, targetVersion, dest string) error {
+	url := m.releaseURL(targetVersion, GetPlatform())
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 5 * time.Second):
+			}
+		}
+		if lastErr = m.downloadOnce(ctx, url, dest); lastErr == nil {
+			return nil
+		}
+		log.Printf("Update download attempt %d failed: %v", attempt+1, lastErr)
+	}
+	return fmt.Errorf("download %s: %w", url, lastErr)
+}
+
+func (m *Manager) downloadOnce(ctx context.Context, url, dest string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %s", resp.Status)
+	}
+	file, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	written, copyErr := io.Copy(file, io.LimitReader(resp.Body, maxReleaseArchiveBytes+1))
+	closeErr := file.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if written > maxReleaseArchiveBytes {
+		return fmt.Errorf("release archive exceeds %d bytes", maxReleaseArchiveBytes)
+	}
+	if written == 0 {
+		return fmt.Errorf("empty release archive")
+	}
+	return nil
+}
+
+func (m *Manager) releaseURL(version, platform string) string {
+	releaseTag, _, _ := strings.Cut(strings.TrimSpace(version), "+")
+	return fmt.Sprintf("%s/%s/wantasticd-%s.tar.gz", m.baseURL, releaseTag, platform)
 }
 
 type releaseVersion struct {
@@ -273,6 +351,5 @@ func GetPlatform() string {
 
 // BuildUpdateURL constructs an update URL for the given version and platform
 func BuildUpdateURL(version, platform string) string {
-	releaseTag, _, _ := strings.Cut(strings.TrimSpace(version), "+")
-	return fmt.Sprintf("https://get.wantastic.app/%s/wantasticd-%s.tar.gz", releaseTag, platform)
+	return (&Manager{baseURL: defaultReleaseBaseURL}).releaseURL(version, platform)
 }

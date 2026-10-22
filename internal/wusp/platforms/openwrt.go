@@ -619,10 +619,11 @@ func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
 		uptimeSeconds = b.readUptimeSeconds()
 	}
 
-	memTotal := systemInfo.Memory.Total
-	memFree := systemInfo.Memory.Available
+	// ubus reports bytes; TR-181 MemoryStatus (and /proc/meminfo) use KiB.
+	memTotal := systemInfo.Memory.Total / 1024
+	memFree := systemInfo.Memory.Available / 1024
 	if memFree == 0 {
-		memFree = systemInfo.Memory.Free
+		memFree = systemInfo.Memory.Free / 1024
 	}
 	if memTotal == 0 || memFree == 0 {
 		fileTotal, fileFree := b.readMemInfo()

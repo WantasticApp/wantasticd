@@ -22,6 +22,8 @@ import (
 type hostState struct {
 	FriendlyName     string `json:"friendly_name,omitempty"`
 	ProvisioningCode string `json:"provisioning_code,omitempty"`
+	// DNSServers is the manual resolver list set from the console.
+	DNSServers []string `json:"dns_servers,omitempty"`
 }
 
 type hostBackend struct {
@@ -136,6 +138,11 @@ func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) er
 		return b.setHostFirewallParam(ctx, path, value)
 	}
 	switch strings.TrimSpace(path) {
+	case wusp.WUSPDNSPrefix + "Servers":
+		if !hostKindSupportsDNSControl(b.kind) {
+			return wusp.ErrUSPPathUnsupported
+		}
+		return b.setDNSServers(ctx, value)
 	case "Device.DeviceInfo.HostName":
 		return b.setHostname(ctx, value.AsString())
 	case "Device.DeviceInfo.FriendlyName":
@@ -324,6 +331,13 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	}
 
 	_ = runCollector("network.interfaces", func() error { collectNetworkInterfacesStatic(msg, b.netClassDir); return nil })
+	if hostKindSupportsDNSControl(b.kind) {
+		_ = runCollector("dns.control", func() error {
+			b.reapplyPersistedDNS(ctx)
+			appendDNSControlFields(msg, cachedDNSControl(ctx))
+			return nil
+		})
+	}
 	_ = runCollector("firewall", func() error { collectHostFirewallStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("cpu", func() error { collectCPUInfoStatic(ctx, b.commandRunner, msg); return nil })
 	_ = runCollector("cellular", func() error { b.collectCellularStatic(msg); return nil })

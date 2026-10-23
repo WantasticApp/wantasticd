@@ -596,6 +596,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 		return nil
 	})
 	_ = runCollector("openwrt.wifi.scan", func() error { return appendWiFiScanFields(msg) })
+	_ = runCollector("openwrt.dns.control", func() error { b.appendOpenWrtDNSControlFields(msg); return nil })
 	_ = runCollector("openwrt.wifi.spectral", func() error { return appendSpectralFields(msg, b.netClassDir) })
 	_ = runCollector("openwrt.wifi.telemetry", func() error { return appendWiFiTelemetryFields(msg, b.netClassDir) })
 	_ = runCollector("openwrt.traffic.telemetry", func() error { return appendTrafficTelemetryFields(msg, b.netClassDir) })

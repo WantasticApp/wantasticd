@@ -301,6 +301,9 @@ func (b *OpenWrtBackend) setOpenWrtServiceParam(ctx context.Context, path string
 	case "Device.DHCPv4.Server.Enable":
 		return b.setAllOpenWrtDHCPPools(ctx, value.AsBool())
 	}
+	if path == wusp.WUSPDNSPrefix+"Servers" {
+		return b.setOpenWrtDNSServers(ctx, value)
+	}
 	if index, ok := indexedServicePath(path, "Device.DNS.Client.Server.", ".DNSServer"); ok {
 		return b.setOpenWrtDNSServer(ctx, index, strings.TrimSpace(wusp.ValueToString(value)))
 	}

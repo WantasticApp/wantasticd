@@ -1012,20 +1012,91 @@ func (c *atController) openATSessionOnPort(port string) (*atSession, func(), err
 		if info, err := os.Stat(cgiAT); err == nil && !info.IsDir() {
 			return &atSession{port: port, cgiAT: cgiAT}, func() {}, nil
 		}
+		// Talk to the bridge directly under microcom's own lock, so the
+		// vendor tools and this agent still take turns; microcom is only the
+		// fallback when the port cannot be opened.
+		f, release, lockErr := openLockedATPort(port)
+		if lockErr == nil {
+			return &atSession{f: f, reader: bufio.NewReader(f)}, release, nil
+		}
 		if microcom, err := exec.LookPath("microcom"); err == nil {
 			return &atSession{port: port, microcom: microcom}, func() {}, nil
 		}
+		return nil, func() {}, lockErr
 	}
-	fd, err := unix.Open(port, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	f, err := openRawATPort(port)
 	if err != nil {
-		return nil, func() {}, fmt.Errorf("open %s: %w", port, err)
+		return nil, func() {}, err
 	}
+	return &atSession{f: f, reader: bufio.NewReader(f)}, func() { _ = f.Close() }, nil
+}
+
+// openRawATPort opens a modem AT tty in raw 8N1 mode at 115200 baud, the
+// line setup sms_tool and microcom apply, so no line discipline echoes,
+// translates CR/LF or eats characters.
+func openRawATPort(port string) (*os.File, error) {
+	fd, err := unix.Open(port, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOCTTY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", port, err)
+	}
+	configureATTTY(fd)
 	f := os.NewFile(uintptr(fd), port)
 	if f == nil {
 		_ = unix.Close(fd)
-		return nil, func() {}, fmt.Errorf("open %s: invalid file descriptor", port)
+		return nil, fmt.Errorf("open %s: invalid file descriptor", port)
 	}
-	return &atSession{f: f, reader: bufio.NewReader(f)}, func() { _ = f.Close() }, nil
+	return f, nil
+}
+
+// configureATTTY applies cfmakeraw plus CLOCAL|CREAD, no flow control and
+// 115200 baud, then drops stale input. Non-tty nodes (and USB ACM ports that
+// ignore the speed) are left as they are.
+func configureATTTY(fd int) {
+	tio, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return
+	}
+	tio.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON | unix.IXOFF | unix.IXANY
+	tio.Oflag &^= unix.OPOST
+	tio.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+	tio.Cflag &^= unix.CSIZE | unix.PARENB | unix.CSTOPB | unix.CRTSCTS | unix.CBAUD
+	tio.Cflag |= unix.CS8 | unix.CLOCAL | unix.CREAD | unix.B115200
+	tio.Cc[unix.VMIN] = 0
+	tio.Cc[unix.VTIME] = 0
+	_ = unix.IoctlSetTermios(fd, unix.TCSETS, tio)
+	_ = unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)
+}
+
+// atLockDir is where microcom and other serial tools keep LCK..<dev> files.
+var atLockDir = "/var/lock"
+
+// openLockedATPort takes the UUCP-style LCK..<dev> lock microcom uses (PID
+// as "%10d\n") and opens the port raw; the release func closes the port and
+// drops the lock.
+func openLockedATPort(port string) (*os.File, func(), error) {
+	lock := filepath.Join(atLockDir, "LCK.."+filepath.Base(port))
+	clearStaleMicrocomLock(lock)
+	locked := false
+	if lf, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); err == nil {
+		_, _ = fmt.Fprintf(lf, "%10d\n", os.Getpid())
+		_ = lf.Close()
+		locked = true
+	} else if errors.Is(err, os.ErrExist) {
+		return nil, nil, fmt.Errorf("%s is in use by another AT client", port)
+	}
+	f, err := openRawATPort(port)
+	if err != nil {
+		if locked {
+			_ = os.Remove(lock)
+		}
+		return nil, nil, err
+	}
+	return f, func() {
+		_ = f.Close()
+		if locked {
+			_ = os.Remove(lock)
+		}
+	}, nil
 }
 
 func (c *atController) openATSessionOnPortWithRetry(port string, attempts int) (*atSession, func(), error) {
@@ -3370,13 +3441,21 @@ func (a *atSession) sendWithTimeout(cmd string, timeout time.Duration) ([]string
 		if pollTimeout < 1 {
 			pollTimeout = 1
 		}
-		fds := []unix.PollFd{{Fd: int32(a.f.Fd()), Events: unix.POLLIN}}
-		n, err := unix.Poll(fds, pollTimeout)
-		if err != nil {
-			return lines, err
-		}
-		if n == 0 {
-			return lines, fmt.Errorf("AT command %q timed out", cmd)
+		// A modem usually answers in one burst; lines already buffered must
+		// be consumed before waiting on the fd again, or poll sleeps until
+		// the deadline on data that has already arrived.
+		if a.reader.Buffered() == 0 {
+			fds := []unix.PollFd{{Fd: int32(a.f.Fd()), Events: unix.POLLIN}}
+			n, err := unix.Poll(fds, pollTimeout)
+			if err != nil {
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+				return lines, err
+			}
+			if n == 0 {
+				return lines, fmt.Errorf("AT command %q timed out", cmd)
+			}
 		}
 		raw, err := a.reader.ReadString('\n')
 		if err != nil {

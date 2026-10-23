@@ -26,6 +26,10 @@ import (
 )
 
 type OpenWrtBackendOptions struct {
+	// WiFiReloadDelay coalesces wireless reloads: radio writes return once
+	// the config is saved and one reload runs after this quiet period.
+	// Negative runs the reload synchronously (tests).
+	WiFiReloadDelay        time.Duration
 	UCIConfigDir           string
 	StatePath              string
 	HostnamePath           string
@@ -64,6 +68,7 @@ type OpenWrtBackendOptions struct {
 }
 
 type OpenWrtBackend struct {
+	wifiReload              wifiReloadCoalescer
 	uciConfigDir            string
 	statePath               string
 	hostnamePath            string
@@ -298,7 +303,12 @@ var _ wusp.DataBackend = (*OpenWrtBackend)(nil)
 
 func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	operationCtx, operationCancel := context.WithCancel(context.Background())
+	reloadDelay := opts.WiFiReloadDelay
+	if reloadDelay == 0 {
+		reloadDelay = defaultWiFiReloadDelay
+	}
 	backend := &OpenWrtBackend{
+		wifiReload:              wifiReloadCoalescer{delay: reloadDelay},
 		uciConfigDir:            coalesceString(opts.UCIConfigDir, "/etc/config"),
 		statePath:               coalesceString(opts.StatePath, defaultWantasticStatePath("usp-openwrt.json")),
 		hostnamePath:            coalesceString(opts.HostnamePath, "/proc/sys/kernel/hostname"),
@@ -2352,6 +2362,26 @@ func (b *OpenWrtBackend) reloadScript(ctx context.Context, script string) error 
 	// no-argument form. This keeps radio writes live without vendor-only APIs.
 	// Init scripts like /etc/init.d/network take "reload" as an argument.
 	if script == "wifi" {
+		if b.wifiReload.delay > 0 {
+			// Return as soon as the config is saved; one coalesced reload
+			// applies every radio change made within the quiet period.
+			b.wifiReload.request(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), wifiReloadTimeout)
+				defer cancel()
+				if err := b.reloadWiFiNow(ctx); err != nil {
+					log.Printf("[USP] wifi reload failed: %v", err)
+				}
+			})
+			return nil
+		}
+		return b.reloadWiFiNow(ctx)
+	}
+	return b.reloadNonWiFiScript(ctx, script)
+}
+
+// reloadWiFiNow reloads the wireless stack synchronously.
+func (b *OpenWrtBackend) reloadWiFiNow(ctx context.Context) error {
+	{
 		var lastErr error
 		for _, command := range []struct {
 			name string
@@ -2369,7 +2399,9 @@ func (b *OpenWrtBackend) reloadScript(ctx context.Context, script string) error 
 		}
 		return lastErr
 	}
+}
 
+func (b *OpenWrtBackend) reloadNonWiFiScript(ctx context.Context, script string) error {
 	if _, err := os.Stat(script); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -3794,14 +3826,23 @@ func wifiInterfaceModeIsEndpoint(mode string) bool {
 func wifiBandFromConfig(config map[string]any) string {
 	band := strings.ToLower(strings.TrimSpace(configString(config, "band")))
 	switch band {
-	case "2g", "2.4g", "2.4ghz":
+	case "2g", "2.4g", "2.4ghz", "1":
 		return "2.4GHz"
-	case "5g", "5ghz":
+	case "5g", "5ghz", "2":
 		return "5GHz"
-	case "6g", "6ghz":
+	case "6g", "6ghz", "3":
+		// QSDK (qcawifi) numbers its bands: 1 = 2.4 GHz, 2 = 5 GHz, 3 = 6 GHz.
 		return "6GHz"
 	case "60g", "60ghz":
 		return "60GHz"
+	}
+	// QSDK 6 GHz radios keep a 5 GHz-style hwmode ("11axa"), so a fixed
+	// channel that only exists on 6 GHz, or a 320 MHz mode, decides it.
+	if channel := configInt(config, "channel"); channel > 0 && sixGHzOnlyChannel(channel) {
+		return "6GHz"
+	}
+	if strings.Contains(strings.ToUpper(configString(config, "htmode")), "320") {
+		return "6GHz"
 	}
 	value := strings.ToLower(strings.TrimSpace(configString(config, "hwmode")))
 	switch {
@@ -3818,6 +3859,21 @@ func wifiBandFromConfig(config map[string]any) string {
 	default:
 		return "Unknown"
 	}
+}
+
+// sixGHzOnlyChannel reports channel numbers valid on 6 GHz (1, 5, … 233)
+// but not on 2.4 GHz (1-14) or 5 GHz (32-177 in steps of 4 from 36/100/149).
+func sixGHzOnlyChannel(channel int) bool {
+	if channel <= 14 || channel > 233 || channel%4 != 1 {
+		return false
+	}
+	switch {
+	case channel >= 36 && channel <= 64 && channel%4 == 0,
+		channel >= 100 && channel <= 144 && channel%4 == 0,
+		channel >= 149 && channel <= 177 && (channel-149)%4 == 0:
+		return false
+	}
+	return true
 }
 
 func tr181BandFromFrequency(mhz int) string {

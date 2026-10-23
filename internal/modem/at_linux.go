@@ -2658,7 +2658,7 @@ func (c *atController) enrichFromNetStats(devicePath string, info *Info) {
 }
 
 func (c *atController) enrichFromUQMI(devicePath string, info *Info) {
-	if info == nil || exec.Command("sh", "-c", "command -v uqmi >/dev/null 2>&1").Run() != nil {
+	if info == nil {
 		return
 	}
 	control := devicePath
@@ -2668,6 +2668,14 @@ func (c *atController) enrichFromUQMI(devicePath string, info *Info) {
 		}
 	}
 	if !strings.Contains(filepath.Base(control), "cdc-wdm") {
+		return
+	}
+	// Native QMUX first; the uqmi CLI is only the fallback for nodes the
+	// native client cannot talk to.
+	if qmuxQuery(control, info) {
+		return
+	}
+	if _, err := exec.LookPath("uqmi"); err != nil {
 		return
 	}
 	if info.Protocol == "sysfs" {
@@ -2697,7 +2705,13 @@ func (c *atController) enrichFromUQMI(devicePath string, info *Info) {
 }
 
 func (c *atController) enrichFromMMCLI(info *Info) {
-	if info == nil || info.IMEI != "" || exec.Command("sh", "-c", "command -v mmcli >/dev/null 2>&1").Run() != nil {
+	if info == nil || info.IMEI != "" {
+		return
+	}
+	if mergeModemManagerInfo(info) {
+		return
+	}
+	if _, err := exec.LookPath("mmcli"); err != nil {
 		return
 	}
 	out, err := exec.Command("mmcli", "-m", "any", "-J").Output()

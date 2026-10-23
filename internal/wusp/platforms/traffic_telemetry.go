@@ -400,9 +400,13 @@ func readOperstate(netClassDir, name string) string {
 	return "Unknown"
 }
 
-// readFirewallRuleCounters reads per-rule counters from iptables-save -c
-// (fw3 / legacy) or, when iptables is absent, nft -j (fw4).
+// readFirewallRuleCounters reads per-rule counters straight from the kernel
+// (legacy iptables tables, else nftables); the iptables-save -c / nft -j CLIs
+// are only a fallback for kernels the native readers cannot query.
 func readFirewallRuleCounters(ctx context.Context) ([]firewallRuleCounter, string) {
+	if rules, source, err := readNativeFirewallRuleCounters(); err == nil {
+		return topFirewallRules(rules), source
+	}
 	if out, err := runBounded(ctx, "iptables-save", "-c"); err == nil && len(out) > 0 {
 		return topFirewallRules(parseIPTablesSaveCounters(string(out))), "iptables"
 	}

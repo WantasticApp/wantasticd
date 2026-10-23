@@ -344,6 +344,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		_ = runCollector("linux.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 		_ = runCollector("linux.wifi.spectral", func() error { return appendSpectralFields(msg, b.netClassDir) })
 		_ = runCollector("linux.wifi.telemetry", func() error { return appendWiFiTelemetryFields(msg, b.netClassDir) })
+		_ = runCollector("linux.traffic.telemetry", func() error { return appendTrafficTelemetryFields(msg, b.netClassDir) })
 	}
 
 	return msg

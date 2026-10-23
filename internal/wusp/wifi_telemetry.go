@@ -87,6 +87,8 @@ var AllWUSPWiFiTelemetryParams = concat(
 		wifiTelemetryParam("Radio.{i}.Driver", TypeString, "Driver family the samples were read from.", Limits{Enums: []string{"mac80211", "qca-wifi", "madwifi", "qcacld", "unknown"}}),
 		wifiTelemetryParam("Radio.{i}.OperatingFrequency", TypeUnsignedInt, "Operating frequency in MHz, 0 when unknown.", Limits{Min: iptr(0)}),
 		wifiTelemetryParam("Radio.{i}.Channel", TypeUnsignedInt, "Operating channel, 0 when unknown.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Radio.{i}.ChannelWidth", TypeUnsignedInt, "Operating channel width in MHz, 0 when unknown.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Radio.{i}.CenterFrequency", TypeUnsignedInt, "Center frequency of the whole operating channel in MHz (nl80211 center_freq1), 0 when the driver does not report it.", Limits{Min: iptr(0)}),
 		wifiTelemetryParam("Radio.{i}.Noise", TypeInt, "Noise floor in dBm, 0 when unknown.", Limits{}),
 		wifiTelemetryParam("Radio.{i}.TransmitPower", TypeInt, "Current transmit power in dBm, 0 when unknown.", Limits{}),
 		wifiTelemetryParam("Radio.{i}.ChannelUtilization", TypeUnsignedInt, "Percentage of airtime the channel was busy during the last interval (nl80211 survey).", Limits{Min: iptr(0), Max: iptr(100)}),

@@ -20,6 +20,9 @@ type RadioLink struct {
 	CoverageClass    int
 	CoverageKnown    bool
 	CoverageDistance int
+	Frequency        int
+	CenterFrequency  int
+	ChannelWidth     int
 }
 
 func VendorAssocList(string) ([]AssocEntry, error) { return nil, errVendorUnsupported }

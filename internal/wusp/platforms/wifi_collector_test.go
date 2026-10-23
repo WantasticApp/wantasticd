@@ -458,3 +458,22 @@ func TestHostMappingLinksStationAndIPv4IPv6Neighbors(t *testing.T) {
 		t.Fatalf("ValidateMessageFast: %v", err)
 	}
 }
+
+func TestWiFiBandFromQSDKConfig(t *testing.T) {
+	for _, tc := range []struct {
+		config map[string]any
+		want   string
+	}{
+		{map[string]any{"hwmode": "11axa", "channel": "129"}, "6GHz"},
+		{map[string]any{"hwmode": "11axa", "band": "3", "channel": "auto"}, "6GHz"},
+		{map[string]any{"hwmode": "11axa", "htmode": "EHT320"}, "6GHz"},
+		{map[string]any{"hwmode": "11axa", "channel": "149"}, "5GHz"},
+		{map[string]any{"hwmode": "11axa", "channel": "36"}, "5GHz"},
+		{map[string]any{"hwmode": "11axg", "channel": "1"}, "2.4GHz"},
+		{map[string]any{"band": "2"}, "5GHz"},
+	} {
+		if got := wifiBandFromConfig(tc.config); got != tc.want {
+			t.Errorf("%v: got %s, want %s", tc.config, got, tc.want)
+		}
+	}
+}

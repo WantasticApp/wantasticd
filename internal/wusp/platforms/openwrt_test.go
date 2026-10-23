@@ -746,7 +746,8 @@ func TestOpenWrtBackendSetRadioUsesCollectedUCISectionName(t *testing.T) {
 
 	var commands []string
 	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
-		UCIConfigDir: configDir,
+		WiFiReloadDelay: -1,
+		UCIConfigDir:    configDir,
 		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
 			commands = append(commands, strings.TrimSpace(name+" "+strings.Join(args, " ")))
 			if name == "ubus" && strings.Join(args, " ") == "call network.wireless status" {

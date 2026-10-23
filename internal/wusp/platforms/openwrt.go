@@ -2374,6 +2374,11 @@ func (b *OpenWrtBackend) reloadScript(ctx context.Context, script string) error 
 
 // reloadWiFiNow reloads the wireless stack synchronously.
 func (b *OpenWrtBackend) reloadWiFiNow(ctx context.Context) error {
+	// netifd's reload over the native ubus socket re-applies wireless config
+	// without forking a shell.
+	if _, err := b.callUbus(ctx, "network", "reload", nil); err == nil {
+		return nil
+	}
 	{
 		var lastErr error
 		for _, command := range []struct {
@@ -2400,6 +2405,16 @@ func (b *OpenWrtBackend) reloadNonWiFiScript(ctx context.Context, script string)
 			return nil
 		}
 		return err
+	}
+	// procd runs the same init action when asked over ubus (rc.init), and
+	// netifd reloads itself natively; the CLI remains the fallback for
+	// images without the rc object.
+	if script == networkReloadScript {
+		if _, err := b.callUbus(ctx, "network", "reload", nil); err == nil {
+			return nil
+		}
+	} else if _, err := b.callUbus(ctx, "rc", "init", map[string]any{"name": filepath.Base(script), "action": "reload"}); err == nil {
+		return nil
 	}
 	_, err := b.commandRunner(ctx, script, "reload")
 	return err

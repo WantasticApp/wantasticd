@@ -612,3 +612,23 @@ func roundSignal(value float64) int {
 	}
 	return int(math.Round(value))
 }
+
+// mergeModemManagerInfo fills identity, registration and signal fields the
+// AT/QMI paths left empty from ModemManager over D-Bus (what mmcli -J reads).
+func mergeModemManagerInfo(info *Info) bool {
+	c := &modemManagerController{}
+	modems, err := c.modemManagerModems()
+	if err != nil || len(modems) == 0 {
+		return false
+	}
+	mmInfo := c.infoFromModemManager(modems[0], "")
+	info.Protocol = firstNonEmpty(info.Protocol, "modemmanager")
+	info.Manufacturer = firstNonEmpty(info.Manufacturer, mmInfo.Manufacturer)
+	info.Model = firstNonEmpty(info.Model, mmInfo.Model)
+	info.Revision = firstNonEmpty(info.Revision, mmInfo.Revision)
+	info.IMEI = firstNonEmpty(info.IMEI, mmInfo.IMEI)
+	info.Operator = firstNonEmpty(info.Operator, mmInfo.Operator)
+	info.Technology = firstKnownTech(info.Technology, mmInfo.Technology)
+	info.Status = firstKnownReg(info.Status, mmInfo.Status)
+	return true
+}

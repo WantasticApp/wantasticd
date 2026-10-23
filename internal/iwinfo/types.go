@@ -86,6 +86,15 @@ type AssocEntry struct {
 	TxFailedKnown      bool
 	RxRateKnown        bool
 	TxRateKnown        bool
+
+	// ExpectedThroughput is the driver rate-control estimate of achievable
+	// goodput towards the station in kbit/s (nl80211 EXPECTED_THROUGHPUT).
+	ExpectedThroughput      uint32
+	ExpectedThroughputKnown bool
+	// AssociationID is the 802.11 AID (0 when unknown); Source names the
+	// collector which produced the entry.
+	AssociationID uint16
+	Source        string
 }
 
 // SurveyEntry represents channel survey / utilization data.

@@ -343,6 +343,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	if hostKindSupportsLinuxWiFi(b.kind) {
 		_ = runCollector("linux.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 		_ = runCollector("linux.wifi.spectral", func() error { return appendSpectralFields(msg, b.netClassDir) })
+		_ = runCollector("linux.wifi.telemetry", func() error { return appendWiFiTelemetryFields(msg, b.netClassDir) })
 	}
 
 	return msg

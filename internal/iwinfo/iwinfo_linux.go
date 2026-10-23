@@ -94,6 +94,14 @@ func GetPHYName(ifname string) (string, error) {
 }
 
 func GetAssocList(ifname string) ([]AssocEntry, error) {
+	// The direct reader adds expected throughput and 64-bit byte counters;
+	// mdlayher/wifi stays as the fallback for kernels it handles better.
+	if entries, err := NL80211Stations(ifname); err == nil {
+		for i := range entries {
+			entries[i].Source = "nl80211"
+		}
+		return entries, nil
+	}
 	nlEntries, err := assocListFromNL80211(ifname)
 	if err == nil {
 		return nlEntries, nil

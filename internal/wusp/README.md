@@ -953,6 +953,59 @@ bytes, which the nested-message LZ4 pass then compresses. Binary values
 travel as raw `Bytes` on the wire. `ValueToString` renders them as lowercase
 hex, the hexBinary canonical form.
 
+## WiFi Telemetry Extension
+
+`Device.WUSP_WiFiTelemetry.` carries per-radio and per-station performance
+with a rolling history of `WiFiHistoryDepth` (30) samples, one per minute.
+A background sampler (`platforms/wifi_telemetry.go`) does the RF reads, so a
+`Get` only returns the last completed sample.
+
+Station sources are merged per MAC; each fills the fields it knows:
+
+- hostapd control socket (`STA-FIRST`/`STA-NEXT`), any socket directory
+- nl80211 `GET_STATION` dump read directly over generic netlink, including
+  `EXPECTED_THROUGHPUT` (rate-control goodput estimate) and 64-bit counters
+- per-MAC nl80211 `GET_STATION` for stations known only by MAC: qcacld SAP
+  (SDX/QCMAP) answers it while returning an empty dump
+- QCA/MadWifi VAPs (`/sys/class/net/athN/parent`): the driver ioctl
+  `IEEE80211_IOCTL_STA_INFO` (`SIOCDEVPRIVATE+6`) as in `wlanconfig list
+  sta`, with `IEEE80211_IOCTL_STA_STATS` counters as in `80211stats`. Records
+  are decoded only when every record matches the MadWifi layout
+  (`isi_len == roundup(118 + isi_ie_len, 4)`); qca-wifi releases change the
+  layout without a version marker, so otherwise the agent parses
+  `wlanconfig <vap> list sta`. QSDK answers nl80211 dumps with an empty list,
+  which used to leave `AssociatedDevice` empty.
+
+Radio data comes from interface counters, the nl80211 survey (channel
+utilization from busy/active time deltas), TX power (nl80211 or
+`SIOCGIWTXPOW`), frequency (nl80211 or `SIOCGIWFREQ`) and noise
+(`/proc/net/wireless`). `ConfiguredDistance` is the ACK/slot timing distance:
+nl80211 coverage class × 450 m, or MadWifi's `distance`/`slottime` sysctls
+(athctrl: 300 m per µs of slot time above 9 µs). Station `EstimatedDistance`
+inverts free-space path loss from TX power, signal and frequency and is
+indicative only.
+
+Throughput is measured from counter deltas between samples. Latency is an
+ICMP echo run (`internal/wifiprobe`, raw socket with an unprivileged
+fallback) to every station whose IPv4 address is in the ARP table: 4 echoes
+per station, all stations probed together.
+
+`Radio.{i}.History` and `Station.{i}.History` use the WiFi history block v1
+(`EncodeWiFiHistoryBlock` / `DecodeWiFiHistoryBlock`):
+
+| Field | Encoding |
+| --- | --- |
+| magic, version, flags | `'W' 'H' 0x01 flags` (bit 0: payload is raw DEFLATE) |
+| sample count, series count | uvarint (≤ 30), uvarint (≤ 16) |
+| metric ids | one byte each, strictly increasing (`WiFiMetric*`) |
+| timestamps | uvarint unix seconds, then uvarint deltas |
+| per series | presence bitmap, then a zigzag varint delta per present sample |
+
+DEFLATE is used only when smaller. The controller merges incoming blocks with
+the stored history of the same row `Alias`
+(`wusp.MergeWiFiTelemetryHistories`), so graphs survive agent restarts while
+storage stays bounded at 30 samples per row.
+
 ## Current Limits
 
 Be aware of the current implementation limits:

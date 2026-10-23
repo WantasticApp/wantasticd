@@ -160,3 +160,27 @@ func isZeroHardwareAddr(value net.HardwareAddr) bool {
 	}
 	return true
 }
+
+// parseHostapdCtrlInterface extracts ctrl_interface directories from a
+// hostapd.conf body. Both "ctrl_interface=/var/run/hostapd" and the
+// "DIR=/var/run/hostapd GROUP=wheel" forms are accepted.
+func parseHostapdCtrlInterface(conf string) []string {
+	var out []string
+	for _, line := range strings.Split(conf, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ctrl_interface=") {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, "ctrl_interface="))
+		for _, field := range strings.Fields(value) {
+			if strings.HasPrefix(field, "DIR=") {
+				value = strings.TrimPrefix(field, "DIR=")
+				break
+			}
+		}
+		if strings.HasPrefix(value, "/") && !strings.Contains(value, "..") {
+			out = append(out, value)
+		}
+	}
+	return out
+}

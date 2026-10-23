@@ -48,13 +48,64 @@ func hostapdSocketPaths(ifName string) []string {
 	for _, root := range []string{"/var/run/hostapd", "/run/hostapd", "/tmp/run/hostapd"} {
 		add(filepath.Join(root, ifName))
 	}
-	for _, pattern := range []string{"/var/run/hostapd*", "/run/hostapd*", "/tmp/run/hostapd*"} {
+	for _, pattern := range []string{"/var/run/hostapd*", "/run/hostapd*", "/tmp/run/hostapd*", "/data/vendor/wifi/hostapd/ctrl*", "/data/misc/wifi/hostapd*"} {
 		roots, _ := filepath.Glob(pattern)
 		for _, root := range roots {
 			add(filepath.Join(root, ifName))
 		}
 	}
+	if len(paths) == 0 {
+		// QCMAP (SDX) and other vendor builds put the control directory
+		// wherever their hostapd.conf says; read it from the running daemons.
+		for _, root := range hostapdConfiguredCtrlDirs() {
+			add(filepath.Join(root, ifName))
+		}
+	}
 	return paths
+}
+
+// hostapdConfiguredCtrlDirs returns ctrl_interface directories from the
+// configuration files of running hostapd processes.
+func hostapdConfiguredCtrlDirs() []string {
+	procs, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	var dirs []string
+	seen := make(map[string]bool)
+	for _, cmdlinePath := range procs {
+		data, err := os.ReadFile(cmdlinePath)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
+		if !strings.HasPrefix(filepath.Base(args[0]), "hostapd") {
+			continue
+		}
+		for _, arg := range args[1:] {
+			if strings.HasPrefix(arg, "-") || !strings.HasSuffix(arg, ".conf") {
+				continue
+			}
+			for _, dir := range parseHostapdCtrlInterface(readSmallFile(arg, 256<<10)) {
+				if !seen[dir] {
+					seen[dir] = true
+					dirs = append(dirs, dir)
+				}
+			}
+		}
+		if len(dirs) >= 8 {
+			break
+		}
+	}
+	return dirs
+}
+
+func readSmallFile(path string, limit int64) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	buf := make([]byte, limit)
+	n, _ := file.Read(buf)
+	return string(buf[:n])
 }
 
 func queryHostapdSocket(remotePath string) ([]AssocEntry, error) {

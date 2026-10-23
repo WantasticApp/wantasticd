@@ -1,6 +1,7 @@
 package platforms
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"net"
@@ -185,6 +186,12 @@ func collectLinuxStations(ctx context.Context, ifName string, commandRunner Comm
 	mergeSuccess("hostapd-control", stations, err)
 	stations, err = iwinfo.GetAssocList(ifName)
 	mergeSuccess("nl80211", stations, err)
+	if stations, err = readVendorAssociations("")(ifName); !errors.Is(err, errNotVendorVAP) {
+		mergeSuccess("vendor", stations, err)
+	}
+	if collection.Succeeded {
+		collection.Stations = enrichStationsPerMAC(ifName, collection.Stations)
+	}
 
 	logWiFiCollectionSummary(ifName, strings.Join(collection.Attempted, ","), collection.Succeeded, len(collection.Stations), collection.Errors)
 	return collection

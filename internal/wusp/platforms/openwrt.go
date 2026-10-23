@@ -587,6 +587,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	})
 	_ = runCollector("openwrt.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 	_ = runCollector("openwrt.wifi.spectral", func() error { return appendSpectralFields(msg, b.netClassDir) })
+	_ = runCollector("openwrt.wifi.telemetry", func() error { return appendWiFiTelemetryFields(msg, b.netClassDir) })
 
 	return msg, nil
 }
@@ -793,7 +794,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				errorsBySource := make([]string, 0, 4)
 				attempted := "none"
 				if ifName != "" {
-					attempted = "device.getStaList,hostapd,iwinfo-ubus,nl80211"
+					attempted = "device.getStaList,hostapd,iwinfo-ubus,nl80211,vendor"
 					stations = append(stations, ubusStations[ifName]...)
 					succeeded = ubusStationsErr == nil
 					if ubusStationsErr != nil {
@@ -806,8 +807,12 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 						{name: "hostapd", read: b.readHostapdAssociations},
 						{name: "iwinfo-ubus", read: b.readIWInfoUBusAssociations},
 						{name: "nl80211", read: b.readIWInfoAssociations},
+						{name: "vendor", read: readVendorAssociations(b.netClassDir)},
 					} {
 						observed, err := source.read(ifName)
+						if errors.Is(err, errNotVendorVAP) {
+							continue
+						}
 						if err != nil {
 							errorsBySource = append(errorsBySource, source.name+": "+err.Error())
 							continue
@@ -817,6 +822,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 					}
 				}
 				if succeeded {
+					stations = enrichStationsPerMAC(ifName, stations)
 					appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(len(stations))))
 					for stationIndex, station := range stations {
 						stationPath := fmt.Sprintf("%sAssociatedDevice.%d.", apPath, stationIndex+1)
@@ -1230,6 +1236,18 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 			}
 			if station.TxNSS == 0 {
 				station.TxNSS = existing.TxNSS
+			}
+			if !assocUint32Known(station.ExpectedThroughputKnown, station.ExpectedThroughput) {
+				station.ExpectedThroughput = existing.ExpectedThroughput
+				station.ExpectedThroughputKnown = existing.ExpectedThroughputKnown
+			}
+			if station.AssociationID == 0 {
+				station.AssociationID = existing.AssociationID
+			}
+			if existing.Source != "" && station.Source != "" && existing.Source != station.Source {
+				station.Source = existing.Source + "+" + station.Source
+			} else if station.Source == "" {
+				station.Source = existing.Source
 			}
 			byMAC[key] = station
 		}

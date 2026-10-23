@@ -309,9 +309,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 
 	if timeState.Known {
 		msg.Set("Device.Time.Enable", wusp.Bool(timeState.Enabled))
-		if !timeState.Enabled {
-			msg.Set("Device.Time.Status", wusp.String("Disabled"))
-		}
+		msg.Set("Device.Time.Status", wusp.String(ntpClientStatus(timeState.Enabled)))
 	}
 	msg.Set("Device.Time.CurrentLocalTime", wusp.Time(now))
 	if localTimeZone != "" {

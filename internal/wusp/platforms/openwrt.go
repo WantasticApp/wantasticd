@@ -64,6 +64,7 @@ type OpenWrtBackendOptions struct {
 	WiFiHWModeList         func(string) (*iwinfo.HWModes, error)
 	WiFiHTModeList         func(string) ([]string, error)
 	WiFiTxPowerLevels      func(context.Context, string) []int
+	WiFiWiphy              func(string) (*iwinfo.Wiphy, error)
 	Now                    func() time.Time
 }
 
@@ -101,6 +102,7 @@ type OpenWrtBackend struct {
 	wifiHWModeList          func(string) (*iwinfo.HWModes, error)
 	wifiHTModeList          func(string) ([]string, error)
 	wifiTxPowerLevels       func(context.Context, string) []int
+	wifiWiphy               wiphyCache
 	cellular                *cellularMonitor
 	now                     func() time.Time
 	easyMeshOperationMu     sync.RWMutex
@@ -345,6 +347,7 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 		wifiHWModeList:          opts.WiFiHWModeList,
 		wifiHTModeList:          opts.WiFiHTModeList,
 		wifiTxPowerLevels:       opts.WiFiTxPowerLevels,
+		wifiWiphy:               wiphyCache{read: opts.WiFiWiphy},
 		cellular:                newCellularMonitor(),
 		now:                     opts.Now,
 	}
@@ -663,10 +666,7 @@ func (b *OpenWrtBackend) collectSnapshot(ctx context.Context) openWrtSnapshot {
 		b.readUCIValue(ctx, "system", "system", "zonename"),
 	)
 	timeEnabled, timeClientCount, timeServerCount := b.readTimeSettings(ctx)
-	timeStatus := ""
-	if !timeEnabled {
-		timeStatus = "Disabled"
-	}
+	timeStatus := ntpClientStatus(timeEnabled)
 
 	return openWrtSnapshot{
 		state:              state,
@@ -721,13 +721,15 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Enable", radioIndex), wusp.Bool(radioEnabled))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Status", radioIndex), wusp.String(wifiStatusValue(radioEnabled, radio.Up)))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Name", radioIndex), wusp.String(key))
-		runtime := b.openWrtRadioRuntimeInfo(radio)
+		runtime := b.openWrtRadioRuntimeInfo(key, radio)
 		if runtime != nil {
 			for _, iface := range radio.Interfaces {
 				recordObservedRadio(iface.IfName, runtime)
 			}
 		}
-		band := wifiBandFromConfig(radio.Config)
+		radioIfName := b.radioNetdev(key, radio)
+		wiphy := b.wifiWiphy.get(radioIfName)
+		band := wifiBandFromWiphy(wifiBandFromConfig(radio.Config), wiphy)
 		if runtime != nil {
 			if observed := tr181BandFromFrequency(runtime.Frequency); observed != "" {
 				band = observed
@@ -751,12 +753,6 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingChannelBandwidth", radioIndex), wusp.String(bandwidth))
 		if bandwidth != "Unknown" && bandwidth != "Auto" {
 			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.CurrentOperatingChannelBandwidth", radioIndex), wusp.String(bandwidth))
-		}
-		radioIfName := ""
-		for _, iface := range radio.Interfaces {
-			if radioIfName = strings.TrimSpace(iface.IfName); radioIfName != "" {
-				break
-			}
 		}
 		b.appendWiFiRadioCapabilities(ctx, msg, key, radioIfName, radioIndex, band, radio.Config)
 
@@ -1611,14 +1607,10 @@ func (b *OpenWrtBackend) setTimeEnabled(ctx context.Context, enabled bool) error
 	if enabled {
 		value = "1"
 	}
+	// "enabled" is the NTP client; "enable_server" would also turn the router
+	// into an NTP server for the LAN, which this switch must not change.
 	section := b.resolveUCISectionRef("system", "timeserver")
-	if err := b.setUCIOption(ctx, "system", section, "enabled", value, false, ""); err != nil {
-		return err
-	}
-	if err := b.setUCIOption(ctx, "system", section, "enable_server", value, true, systemReloadScript); err != nil {
-		return err
-	}
-	return nil
+	return b.setUCIOption(ctx, "system", section, "enabled", value, true, ntpReloadScript)
 }
 
 // setWiFiParam handles writable WiFi instance paths like:
@@ -2998,6 +2990,12 @@ func (b *OpenWrtBackend) readOpenWrtWiFiCapabilities(ctx context.Context, ifName
 		mergeWiFiHWModes(hwModes, parseWiFiHWModes(rpcCapabilities.HWModes))
 		htModes = mergeWiFiHTModes(htModes, rpcCapabilities.HTModes)
 	}
+	// nl80211 wiphy bands are authoritative for cfg80211 drivers (including
+	// qca-wifi in cfg80211 mode, whose netdevs lack the sysfs cap files).
+	if wiphy := b.wifiWiphy.get(ifName); wiphy != nil {
+		mergeWiFiHWModes(hwModes, wiphyHWModes(wiphy))
+		htModes = mergeWiFiHTModes(htModes, wiphyHTModes(wiphy))
+	}
 	if !hasAnyWiFiHWMode(hwModes) {
 		hwModes = nil
 	}
@@ -3901,7 +3899,7 @@ func (b *OpenWrtBackend) currentRadioChannel(section string) int {
 	if !ok {
 		return 0
 	}
-	if info := b.openWrtRadioRuntimeInfo(radio); info != nil {
+	if info := b.openWrtRadioRuntimeInfo(section, radio); info != nil {
 		if info.Channel > 0 {
 			return info.Channel
 		}
@@ -3910,9 +3908,16 @@ func (b *OpenWrtBackend) currentRadioChannel(section string) int {
 	return 0
 }
 
-func (b *OpenWrtBackend) openWrtRadioRuntimeInfo(radio openWrtWirelessRadioStatus) *iwinfo.InterfaceInfo {
+func (b *OpenWrtBackend) openWrtRadioRuntimeInfo(section string, radio openWrtWirelessRadioStatus) *iwinfo.InterfaceInfo {
 	if b.wifiInfo == nil {
 		return nil
+	}
+	if !radioHasIfName(radio) {
+		// qcawifi's wireless status often lists no ifnames; its VAPs name the
+		// radio in /sys/class/net/<vap>/parent.
+		if ifName := b.vendorRadioNetdev(section); ifName != "" {
+			radio.Interfaces = append(append([]openWrtWirelessIfaceStatus(nil), radio.Interfaces...), openWrtWirelessIfaceStatus{IfName: ifName})
+		}
 	}
 	for _, iface := range radio.Interfaces {
 		ifName := strings.TrimSpace(iface.IfName)
@@ -4423,10 +4428,9 @@ func (b *OpenWrtBackend) readWiFiTxPowerLevels(ctx context.Context, ifName strin
 	if b.wifiTxPowerLevels != nil {
 		return b.wifiTxPowerLevels(ctx, ifName)
 	}
-	// Neither nl80211 nor stock netifd exposes the discrete vendor calibration
-	// table portably. Keep this unknown instead of invoking iwinfo or inventing
-	// percentage choices.
-	return nil
+	// The regulatory/hardware limit from nl80211 bounds the settable range;
+	// offer a few useful steps below it rather than every dBm value.
+	return wiphyTxPowerLevels(b.wifiWiphy.get(ifName), b.currentFrequency(ifName))
 }
 
 func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *wusp.Message, section, ifName string, radioIndex int, band string, config map[string]any) {
@@ -4449,8 +4453,20 @@ func (b *OpenWrtBackend) appendWiFiRadioCapabilities(ctx context.Context, msg *w
 		appendField(msg, base+"OperatingStandards", wifiStringList(operatingStandards))
 	}
 
+	wiphy := b.wifiWiphy.get(ifName)
+	if bandModes := wiphyBandHTModes(wiphy, band); len(bandModes) > 0 {
+		// Widths are per band: a dual-band radio's 5 GHz 160 MHz must not be
+		// offered while it operates on 2.4 GHz.
+		htModes = bandModes
+	}
 	bandwidths := wifiSupportedBandwidths(htModes, wifiBandwidthFromConfig(config))
 	appendField(msg, base+"SupportedOperatingChannelBandwidths", wifiStringList(bandwidths))
+	if wiphy != nil {
+		appendField(msg, base+"SupportedFrequencyBands", wifiStringList(wiphy.BandNames()))
+		if channels := wiphyChannelList(wiphy, band); len(channels) > 0 {
+			appendField(msg, base+"PossibleChannels", wifiStringList(channels))
+		}
+	}
 
 	levels := b.readWiFiTxPowerLevels(ctx, ifName)
 	percentages := txPowerSupportedPercentages(levels)
@@ -4490,6 +4506,9 @@ func (b *OpenWrtBackend) radioToIfname(section string) string {
 				return ifName
 			}
 		}
+	}
+	if ifName := b.vendorRadioNetdev(section); ifName != "" {
+		return ifName
 	}
 	// Fallback: align a conventional radioN UCI section with phyN in sysfs.
 	targetPhy := strings.Replace(strings.TrimSpace(section), "radio", "phy", 1)

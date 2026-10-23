@@ -37,3 +37,5 @@ func VendorConfiguredDistance(string) (int, string, bool) { return 0, "", false 
 
 func WextFrequency(string) (int, bool) { return 0, false }
 func WextTxPower(string) (int, bool)   { return 0, false }
+
+func NL80211Wiphy(string) (*Wiphy, error) { return nil, errVendorUnsupported }

@@ -524,6 +524,12 @@ func (b *OpenWrtBackend) RunEasyMeshConsoleAction(ctx context.Context, action st
 	if !ok {
 		return "", fmt.Errorf("unsupported EasyMesh console action %q", action)
 	}
+	if action == "RefreshTopology" {
+		if err := b.refreshEasyMeshTopologyClean(ctx); err != nil {
+			return "", fmt.Errorf("run EasyMesh %s: %w", action, err)
+		}
+		return "EasyMesh topology rebuilt from live discovery", nil
+	}
 	output, err := b.easyMeshConsole.Run(ctx, command)
 	if err != nil {
 		return "", fmt.Errorf("run EasyMesh %s: %w", action, err)

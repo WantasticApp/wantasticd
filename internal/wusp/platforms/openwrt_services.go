@@ -266,7 +266,7 @@ func (b *OpenWrtBackend) appendOpenWrtTimeClientFields(msg *wusp.Message) {
 	}
 	appendField(msg, "Device.Time.ClientNumberOfEntries", wusp.Uint(1))
 	appendField(msg, "Device.Time.Client.1.Enable", wusp.Bool(enabled))
-	appendField(msg, "Device.Time.Client.1.Status", wusp.String(map[bool]string{true: "Unsynchronized", false: "Disabled"}[enabled]))
+	appendField(msg, "Device.Time.Client.1.Status", wusp.String(ntpClientStatus(enabled)))
 	appendField(msg, "Device.Time.Client.1.Alias", wusp.String("system-ntp"))
 	appendField(msg, "Device.Time.Client.1.Mode", wusp.String("Unicast"))
 	appendField(msg, "Device.Time.Client.1.Port", wusp.Uint(123))

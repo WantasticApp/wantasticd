@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -156,6 +158,38 @@ func openWrtWiFiInterfaceMatch(ifName string, wifiInterfaces map[string]bool) bo
 		}
 	}
 	return false
+}
+
+// lldpLinkMedium classifies the port an LLDP frame arrived on: "Wi-Fi" for
+// radio interfaces (including qca-wifi VAPs that wireless status does not
+// list), "Ethernet" only for a real wired port, and "" when the frame came in
+// on a bridge, whose ingress port (often a Wi-Fi backhaul) is unknown.
+func lldpLinkMedium(netClassDir, ifName string, wifiInterfaces map[string]bool) string {
+	ifName = strings.TrimSpace(ifName)
+	if ifName == "" || strings.ContainsAny(ifName, "/ \t") {
+		return ""
+	}
+	if openWrtWiFiInterfaceMatch(ifName, wifiInterfaces) {
+		return "Wi-Fi"
+	}
+	base := filepath.Join(netClassDir, ifName)
+	for _, marker := range []string{"phy80211", "wireless", "parent"} {
+		if _, err := os.Stat(filepath.Join(base, marker)); err == nil {
+			return "Wi-Fi"
+		}
+	}
+	for _, prefix := range []string{"ath", "wlan", "wifi", "mld"} {
+		if strings.HasPrefix(ifName, prefix) {
+			return "Wi-Fi"
+		}
+	}
+	if _, err := os.Stat(base); err != nil {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(base, "bridge")); err == nil {
+		return ""
+	}
+	return "Ethernet"
 }
 
 func lldpHostReferences(msg *wusp.Message) map[string]string {

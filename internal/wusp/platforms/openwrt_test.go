@@ -1973,8 +1973,9 @@ func TestOpenWrtBackendSetAndDelete(t *testing.T) {
 	if !strings.Contains(systemText, "option enabled '1'") {
 		t.Fatalf("system config missing time enabled='1':\n%s", systemText)
 	}
-	if !strings.Contains(systemText, "option enable_server '1'") {
-		t.Fatalf("system config missing time enable_server='1':\n%s", systemText)
+	// Enabling the NTP client must not turn on the LAN NTP server.
+	if !strings.Contains(systemText, "option enable_server '0'") {
+		t.Fatalf("time enable changed enable_server:\n%s", systemText)
 	}
 
 	// /etc/config/firewall didn't exist before — Set(Device.Firewall.Enable)

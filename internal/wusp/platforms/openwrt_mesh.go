@@ -84,6 +84,9 @@ func (b *OpenWrtBackend) appendOpenWrtMeshTopology(ctx context.Context, msg *wus
 	if consoleAvailable && role == "Agent" && consoleSnapshot.Topology != nil {
 		topo.root = consoleSnapshot.Topology
 	}
+	if consoleAvailable {
+		b.pruneEasyMeshGhostsLive(ctx, topo.root)
+	}
 	b.enrichOpenWrtMeshEvidence(topo.root, linkdiscovery.DefaultSnapshot())
 	appendMeshSnapshot(msg, meshSnapshot{
 		protocol:       topo.protocol,
@@ -1124,9 +1127,9 @@ func (b *OpenWrtBackend) enrichOpenWrtMeshEvidence(root *meshNode, discovery lin
 		if remote == nil || remote == local {
 			continue
 		}
-		linkType := "Ethernet"
-		if openWrtWiFiInterfaceMatch(neighbor.LocalInterface, wifiInterfaces) {
-			linkType = "Wi-Fi"
+		linkType := lldpLinkMedium(b.netClassDir, neighbor.LocalInterface, wifiInterfaces)
+		if linkType == "" {
+			continue
 		}
 		if meshNodeReferencesParent(local, remote) {
 			local.linkType, local.linkIface, local.discovery = linkType, neighbor.LocalInterface, "LLDP"

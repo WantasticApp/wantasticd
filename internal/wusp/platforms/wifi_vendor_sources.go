@@ -42,8 +42,13 @@ func isVendorWiFiVAP(netClassDir, ifName string) bool {
 	if !strings.HasPrefix(ifName, "ath") {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(netClassDir, ifName, "phy80211"))
-	return err != nil
+	if _, err := os.Stat(filepath.Join(netClassDir, ifName, "phy80211")); err != nil {
+		return true
+	}
+	// QSDK in cfg80211 mode links athN to a phy but keeps the qca-wifi radio
+	// netdevs (wifiN); its nl80211 station dump is still empty.
+	radios, _ := filepath.Glob(filepath.Join(netClassDir, "wifi[0-9]*"))
+	return len(radios) > 0
 }
 
 func readVendorAssociations(netClassDir string) func(string) ([]iwinfo.AssocEntry, error) {

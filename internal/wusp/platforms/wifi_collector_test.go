@@ -308,6 +308,30 @@ func TestOpenWrtRuntimeDiscoversWiFiInterfaceFromSysfs(t *testing.T) {
 	}
 }
 
+func TestOpenWrtVendorRadioUpFromVAPOperstate(t *testing.T) {
+	root := t.TempDir()
+	netClass := filepath.Join(root, "sys", "class", "net")
+	for _, dir := range []string{"wifi0", "ath0"} {
+		if err := os.MkdirAll(filepath.Join(netClass, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(netClass, "ath0", "parent"), []byte("wifi0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(netClass, "ath0", "operstate"), []byte("up\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{NetClassDir: netClass})
+	// netifd reports the qcawifi radio as not up, as on QSDK.
+	radios := backend.enrichWirelessRuntime(map[string]openWrtWirelessRadioStatus{
+		"wifi0": {Interfaces: []openWrtWirelessIfaceStatus{{Section: "wlan0", IfName: "ath0", Configured: true}}},
+	})
+	if !radios["wifi0"].Up || !radios["wifi0"].Interfaces[0].Up {
+		t.Fatalf("vendor radio with an up VAP must be Up: %+v", radios["wifi0"])
+	}
+}
+
 func TestDecodeIWInfoAssociationsTracksKnownZero(t *testing.T) {
 	stations := decodeIWInfoAssociations([]byte(`{"results":[{
 		"mac":"02:00:00:00:00:01","signal":-52,"noise":-95,

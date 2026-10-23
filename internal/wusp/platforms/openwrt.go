@@ -588,6 +588,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	_ = runCollector("openwrt.wifi.scan", func() error { return appendWiFiScanFields(msg) })
 	_ = runCollector("openwrt.wifi.spectral", func() error { return appendSpectralFields(msg, b.netClassDir) })
 	_ = runCollector("openwrt.wifi.telemetry", func() error { return appendWiFiTelemetryFields(msg, b.netClassDir) })
+	_ = runCollector("openwrt.traffic.telemetry", func() error { return appendTrafficTelemetryFields(msg, b.netClassDir) })
 
 	return msg, nil
 }
@@ -1644,6 +1645,11 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 				return b.setUCIOption(ctx, "wireless", section, "channel", "auto", true, wirelessReloadScript)
 			}
 			if strings.EqualFold(b.readUCIValue(ctx, "wireless", section, "channel"), "auto") {
+				// Switching to manual pins the channel the radio is operating
+				// on now, so the change never moves clients.
+				if channel := b.currentRadioChannel(section); channel > 0 {
+					return b.setUCIOption(ctx, "wireless", section, "channel", strconv.Itoa(channel), true, wirelessReloadScript)
+				}
 				return fmt.Errorf("wusp openwrt radio channel must be selected before automatic channel selection can be disabled")
 			}
 			return nil
@@ -2674,6 +2680,12 @@ func (b *OpenWrtBackend) enrichWirelessRuntime(radios map[string]openWrtWireless
 			ifName := strings.TrimSpace(radio.Interfaces[index].IfName)
 			if ifName != "" {
 				known[ifName] = true
+				if _, ok := discovered[ifName]; !ok && isVendorWiFiVAP(b.netClassDir, ifName) {
+					// qca-wifi/MadWifi VAPs are invisible to nl80211 and
+					// netifd often reports their radio as not up; the VAP's
+					// own operstate is the runtime evidence.
+					radio.Interfaces[index].Up = b.runtimeInterfaceUp(ifName)
+				}
 				if runtime, ok := discovered[ifName]; ok {
 					radio.Interfaces[index].Up = b.runtimeInterfaceUp(ifName)
 					if radio.Interfaces[index].Config == nil {
@@ -2683,6 +2695,16 @@ func (b *OpenWrtBackend) enrichWirelessRuntime(radios map[string]openWrtWireless
 						radio.Interfaces[index].Config["mode"] = runtime.Mode
 					}
 				}
+			}
+		}
+		// A radio is up when any of its interfaces is up, or when the vendor
+		// radio netdev named after the UCI section (wifiN) is up.
+		for _, iface := range radio.Interfaces {
+			radio.Up = radio.Up || iface.Up
+		}
+		if !radio.Up && strings.HasPrefix(key, "wifi") && iwinfo.VendorRadioParent(b.netClassDir, key) == "" {
+			if _, err := os.Stat(filepath.Join(b.netClassDir, key)); err == nil {
+				radio.Up = b.runtimeInterfaceUp(key)
 			}
 		}
 		radios[key] = radio
@@ -3809,6 +3831,22 @@ func tr181BandFromFrequency(mhz int) string {
 
 // openWrtRadioRuntimeInfo returns live driver state from the first radio
 // interface that reports an operating frequency.
+// currentRadioChannel returns the operating channel of the UCI radio
+// section, or 0 when the driver does not report it.
+func (b *OpenWrtBackend) currentRadioChannel(section string) int {
+	radio, ok := b.openWrtWirelessRadios()[section]
+	if !ok {
+		return 0
+	}
+	if info := b.openWrtRadioRuntimeInfo(radio); info != nil {
+		if info.Channel > 0 {
+			return info.Channel
+		}
+		return wifiChannelFromFrequency(info.Frequency)
+	}
+	return 0
+}
+
 func (b *OpenWrtBackend) openWrtRadioRuntimeInfo(radio openWrtWirelessRadioStatus) *iwinfo.InterfaceInfo {
 	if b.wifiInfo == nil {
 		return nil
@@ -3819,6 +3857,45 @@ func (b *OpenWrtBackend) openWrtRadioRuntimeInfo(radio openWrtWirelessRadioStatu
 			continue
 		}
 		if info, err := b.wifiInfo(ifName); err == nil && info != nil && info.Frequency > 0 {
+			return info
+		}
+	}
+	// qca-wifi/MadWifi VAPs have no phy80211 link, so the sysfs/nl80211 reader
+	// above fails; the wireless-extensions ioctls still report the operating
+	// frequency, which is what an "auto" channel resolves to.
+	var runtimeFrequency map[string]int
+	if interfaces, err := iwinfo.RuntimeInterfaces(); err == nil {
+		runtimeFrequency = make(map[string]int, len(interfaces))
+		for _, iface := range interfaces {
+			if iface.Frequency > 0 {
+				runtimeFrequency[iface.Name] = iface.Frequency
+			}
+		}
+	}
+	for _, iface := range radio.Interfaces {
+		ifName := strings.TrimSpace(iface.IfName)
+		if ifName == "" {
+			continue
+		}
+		frequency, ok := runtimeFrequency[ifName], runtimeFrequency[ifName] > 0
+		if !ok && isVendorWiFiVAP(b.netClassDir, ifName) {
+			frequency, ok = iwinfo.WextFrequency(ifName)
+		}
+		if ok {
+			info := &iwinfo.InterfaceInfo{Name: ifName, Frequency: frequency, Channel: wifiChannelFromFrequency(frequency)}
+			if noise, ok := iwinfo.WirelessNoise(ifName); ok {
+				info.Noise = noise
+			} else if survey, err := iwinfo.GetSurvey(ifName); err == nil {
+				for _, entry := range survey {
+					if entry.InUse && entry.Noise < 0 {
+						info.Noise = int(entry.Noise)
+						break
+					}
+				}
+			}
+			if power, ok := iwinfo.WextTxPower(ifName); ok {
+				info.TxPower = power
+			}
 			return info
 		}
 	}

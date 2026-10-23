@@ -82,6 +82,8 @@ type wifiTelemetryRadio struct {
 	Name            string
 	Driver          string
 	Frequency       int
+	CenterFrequency int
+	ChannelWidth    int
 	Noise           int
 	TxPower         int
 	Utilization     int
@@ -288,6 +290,10 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 	for _, radio := range radiosByName {
 		ifname := radio.Interfaces[0]
 		if link, err := deps.radioLink(ifname); err == nil {
+			if link.Frequency > 0 && radio.Frequency == 0 {
+				radio.Frequency = link.Frequency
+			}
+			radio.CenterFrequency, radio.ChannelWidth = link.CenterFrequency, link.ChannelWidth
 			if link.TxPowerKnown {
 				radio.TxPower = link.TxPowerDBM
 			}
@@ -729,6 +735,8 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 		appendField(msg, path+"Driver", wusp.String(driver))
 		appendField(msg, path+"OperatingFrequency", wusp.Uint(uint64(max(radio.Frequency, 0))))
 		appendField(msg, path+"Channel", wusp.Uint(uint64(max(wifiChannelFromFrequency(radio.Frequency), 0))))
+		appendField(msg, path+"ChannelWidth", wusp.Uint(uint64(max(radio.ChannelWidth, 0))))
+		appendField(msg, path+"CenterFrequency", wusp.Uint(uint64(max(radio.CenterFrequency, 0))))
 		appendField(msg, path+"Noise", wusp.Int(int64(radio.Noise)))
 		appendField(msg, path+"TransmitPower", wusp.Int(int64(radio.TxPower)))
 		if radio.UtilKnown {
@@ -911,6 +919,10 @@ func discoverWiFiTelemetryVAPs(netClassDir string) []wifiTelemetryVAP {
 			}
 			if parent := iwinfo.VendorRadioParent(netClassDir, iface.Name); parent != "" {
 				vap.Radio, vap.Vendor, vap.Driver = parent, true, "qca-wifi"
+			} else if isVendorWiFiVAP(netClassDir, iface.Name) {
+				// QSDK cfg80211 mode: the VAP has a phy link but is still a
+				// qca-wifi VAP whose nl80211 station dump stays empty.
+				vap.Vendor, vap.Driver = true, "qca-wifi"
 			}
 			byName[iface.Name] = vap
 		}

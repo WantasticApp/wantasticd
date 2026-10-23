@@ -121,6 +121,9 @@ type RadioLink struct {
 	CoverageClass    int  // IEEE 802.11 coverage class (0-255)
 	CoverageKnown    bool //
 	CoverageDistance int  // one-way distance in metres implied by CoverageClass
+	Frequency        int  // primary 20 MHz channel in MHz
+	CenterFrequency  int  // center of the whole operating channel in MHz
+	ChannelWidth     int  // operating channel width in MHz (80+80 reported as 160)
 }
 
 // NL80211RadioLink reads the current TX power (GET_INTERFACE) and coverage
@@ -154,6 +157,12 @@ func NL80211RadioLink(ifname string) (RadioLink, error) {
 			switch ad.Type() {
 			case unix.NL80211_ATTR_WIPHY:
 				out.PHY = int(ad.Uint32())
+			case unix.NL80211_ATTR_WIPHY_FREQ:
+				out.Frequency = int(ad.Uint32())
+			case unix.NL80211_ATTR_CENTER_FREQ1:
+				out.CenterFrequency = int(ad.Uint32())
+			case unix.NL80211_ATTR_CHANNEL_WIDTH:
+				out.ChannelWidth = nl80211WidthMHz(ad.Uint32())
 			case unix.NL80211_ATTR_WIPHY_TX_POWER_LEVEL:
 				// mBm; 0 means the driver did not report a level.
 				if mbm := int32(ad.Uint32()); mbm > 0 {
@@ -303,4 +312,24 @@ func decodeNL80211Rate(ad *netlink.AttributeDecoder) (uint32, int8, uint8) {
 		rate = rate16
 	}
 	return rate * 100, mcs, nss
+}
+
+func nl80211WidthMHz(width uint32) int {
+	switch width {
+	case unix.NL80211_CHAN_WIDTH_20_NOHT, unix.NL80211_CHAN_WIDTH_20:
+		return 20
+	case unix.NL80211_CHAN_WIDTH_40:
+		return 40
+	case unix.NL80211_CHAN_WIDTH_80:
+		return 80
+	case unix.NL80211_CHAN_WIDTH_80P80, unix.NL80211_CHAN_WIDTH_160:
+		return 160
+	case unix.NL80211_CHAN_WIDTH_320:
+		return 320
+	case unix.NL80211_CHAN_WIDTH_10:
+		return 10
+	case unix.NL80211_CHAN_WIDTH_5:
+		return 5
+	}
+	return 0
 }

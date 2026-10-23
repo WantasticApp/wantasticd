@@ -711,6 +711,11 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Status", radioIndex), wusp.String(wifiStatusValue(radioEnabled, radio.Up)))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Name", radioIndex), wusp.String(key))
 		runtime := b.openWrtRadioRuntimeInfo(radio)
+		if runtime != nil {
+			for _, iface := range radio.Interfaces {
+				recordObservedRadio(iface.IfName, runtime)
+			}
+		}
 		band := wifiBandFromConfig(radio.Config)
 		if runtime != nil {
 			if observed := tr181BandFromFrequency(runtime.Frequency); observed != "" {
@@ -824,6 +829,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				}
 				if succeeded {
 					stations = enrichStationsPerMAC(ifName, stations)
+					recordObservedStations(ifName, stations)
 					appendField(msg, apPath+"AssociatedDeviceNumberOfEntries", wusp.Uint(uint64(len(stations))))
 					for stationIndex, station := range stations {
 						stationPath := fmt.Sprintf("%sAssociatedDevice.%d.", apPath, stationIndex+1)

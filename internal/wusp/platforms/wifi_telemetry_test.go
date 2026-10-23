@@ -171,3 +171,16 @@ func TestParseProcNetARP(t *testing.T) {
 		t.Fatalf("unexpected %v", got)
 	}
 }
+
+func TestWiFiTelemetryUsesStationsObservedByCollector(t *testing.T) {
+	mac, _ := net.ParseMAC("0a:4a:c6:92:4b:c9")
+	recordObservedStations("zz-test0", []iwinfo.AssocEntry{{MAC: mac, Signal: -70, SignalKnown: true, Source: "hostapd-ubus"}})
+	recordObservedRadio("zz-test0", &iwinfo.InterfaceInfo{Noise: -91, TxPower: 28, Frequency: 5745})
+	stations := collectWiFiTelemetryStations(t.TempDir(), wifiTelemetryVAP{Name: "zz-test0", Radio: "phy2"})
+	if len(stations) != 1 || stations[0].MAC.String() != mac.String() {
+		t.Fatalf("collector stations not merged: %+v", stations)
+	}
+	if seen, ok := observedRadio("zz-test0"); !ok || seen.Noise != -91 || seen.TxPower != 28 {
+		t.Fatalf("radio facts not cached: %+v", seen)
+	}
+}

@@ -318,6 +318,23 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 		if radio.Noise == 0 && deps.noise != nil {
 			radio.Noise, _ = deps.noise(ifname)
 		}
+		// Fall back to what the Device.WiFi collector observed on any of
+		// the radio's interfaces (OpenWrt ubus/iwinfo, vendor readers).
+		for _, name := range radio.Interfaces {
+			seen, ok := observedRadio(name)
+			if !ok {
+				continue
+			}
+			if radio.Noise == 0 && seen.Noise < 0 && seen.Noise > -130 {
+				radio.Noise = seen.Noise
+			}
+			if radio.TxPower == 0 && seen.TxPower > 0 && seen.TxPower <= 40 {
+				radio.TxPower = seen.TxPower
+			}
+			if radio.Frequency == 0 && seen.Frequency > 0 {
+				radio.Frequency = seen.Frequency
+			}
+		}
 	}
 
 	// Station enrichment: IPs, throughput, distance.
@@ -917,6 +934,11 @@ func discoverWiFiTelemetryVAPs(netClassDir string) []wifiTelemetryVAP {
 				Frequency: iface.Frequency,
 				Driver:    nl80211DriverFamily(netClassDir, iface.Name),
 			}
+			if vap.Driver == "qcacld" && hasQCARadioNetdevs(netClassDir) {
+				// QSDK (qca-wifi) shares the "wlan" module name with qcacld;
+				// its wifiN radio netdevs tell them apart.
+				vap.Driver = "qca-wifi"
+			}
 			if parent := iwinfo.VendorRadioParent(netClassDir, iface.Name); parent != "" {
 				vap.Radio, vap.Vendor, vap.Driver = parent, true, "qca-wifi"
 			} else if isVendorWiFiVAP(netClassDir, iface.Name) {
@@ -997,6 +1019,7 @@ func collectWiFiTelemetryStations(netClassDir string, vap wifiTelemetryVAP) []iw
 			stations = mergeWiFiAssociations(stations, observed)
 		}
 	}
+	stations = mergeWiFiAssociations(observedStations(vap.Name), stations)
 	return enrichStationsPerMAC(vap.Name, stations)
 }
 
@@ -1064,4 +1087,9 @@ func parseProcNetARP(scanner *bufio.Scanner) map[string]netip.Addr {
 		out[strings.ToLower(mac.String())] = ip
 	}
 	return out
+}
+
+func hasQCARadioNetdevs(netClassDir string) bool {
+	radios, _ := filepath.Glob(filepath.Join(netClassDir, "wifi[0-9]*"))
+	return len(radios) > 0
 }

@@ -191,6 +191,7 @@ func collectLinuxStations(ctx context.Context, ifName string, commandRunner Comm
 	}
 	if collection.Succeeded {
 		collection.Stations = enrichStationsPerMAC(ifName, collection.Stations)
+		recordObservedStations(ifName, collection.Stations)
 	}
 
 	logWiFiCollectionSummary(ifName, strings.Join(collection.Attempted, ","), collection.Succeeded, len(collection.Stations), collection.Errors)

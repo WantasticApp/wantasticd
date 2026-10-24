@@ -96,6 +96,7 @@ type OpenWrtBackend struct {
 	easyMeshStableDuration  time.Duration
 	easyMeshCommandTimeout  time.Duration
 	easyMeshConsole         easyMeshConsole
+	meshConsole             meshConsoleGate
 	commandRunner           func(context.Context, string, ...string) ([]byte, error)
 	wifiAssocList           func(string) ([]iwinfo.AssocEntry, error)
 	wifiInfo                func(string) (*iwinfo.InterfaceInfo, error)

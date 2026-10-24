@@ -395,7 +395,7 @@ func (b *OpenWrtBackend) enrichEasyMeshConsoleTreeHostnames(
 	if !easyMeshTopologyHasUnnamedNodes(snapshot.Topology) {
 		return
 	}
-	output, err := b.easyMeshConsole.Run(ctx, easyMeshConsoleTopologyTree)
+	output, err := b.consoleRead(ctx, easyMeshConsoleTopologyTree, meshTreeMaxAge)
 	if err != nil {
 		return
 	}
@@ -530,7 +530,7 @@ func (b *OpenWrtBackend) RunEasyMeshConsoleAction(ctx context.Context, action st
 		}
 		return "EasyMesh topology rebuilt from live discovery", nil
 	}
-	output, err := b.easyMeshConsole.Run(ctx, command)
+	output, err := b.consoleRun(ctx, command)
 	if err != nil {
 		return "", fmt.Errorf("run EasyMesh %s: %w", action, err)
 	}
@@ -539,7 +539,7 @@ func (b *OpenWrtBackend) RunEasyMeshConsoleAction(ctx context.Context, action st
 	// the controller's WUSP channel instead of introducing a second poller.
 	statusOutput := output
 	if command != easyMeshConsoleDetailedStatus {
-		statusOutput, err = b.easyMeshConsole.Run(ctx, easyMeshConsoleDetailedStatus)
+		statusOutput, err = b.consoleRun(ctx, easyMeshConsoleDetailedStatus)
 		if err != nil {
 			return "", fmt.Errorf("refresh EasyMesh topology after %s: %w", action, err)
 		}

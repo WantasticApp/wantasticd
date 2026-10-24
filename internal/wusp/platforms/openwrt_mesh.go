@@ -116,7 +116,7 @@ func (b *OpenWrtBackend) readEasyMeshConsoleSnapshot(ctx context.Context) (easyM
 	if b == nil || b.easyMeshConsole == nil {
 		return easyMeshConsoleSnapshot{}, false
 	}
-	output, err := b.easyMeshConsole.Run(ctx, easyMeshConsoleDetailedStatus)
+	output, err := b.consoleRead(ctx, easyMeshConsoleDetailedStatus, meshStatusMaxAge)
 	if err != nil {
 		return easyMeshConsoleSnapshot{}, false
 	}
@@ -454,7 +454,7 @@ func (b *OpenWrtBackend) setEasyMeshTopologyRequestGate(ctx context.Context, ena
 		command = easyMeshConsoleEnableTopologyRequests
 		expected = "ToptReq:ON"
 	}
-	output, err := b.easyMeshConsole.Run(ctx, command)
+	output, err := b.consoleRun(ctx, command)
 	if err != nil {
 		return err
 	}

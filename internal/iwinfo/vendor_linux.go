@@ -63,13 +63,11 @@ func VendorAssocList(ifname string) ([]AssocEntry, error) {
 	if !noiseKnown {
 		noise = nominalNoiseFloor
 	}
+	// The qca nl80211 vendor path (QCAVendorStationRecords) is deliberately
+	// not used here: it is a SET_WIFI_CONFIGURATION command whose generic
+	// command numbering is driver-build specific, and an unverified number
+	// must never be sent to a production radio on every poll.
 	buf, err := vendorStaInfo(ifname)
-	if err != nil {
-		// cfg80211-mode qca-wifi answers over its nl80211 vendor command.
-		if blocks, vendorErr := QCAVendorStationRecords(ifname); vendorErr == nil {
-			buf, err = joinStationBlocks(blocks), nil
-		}
-	}
 	if err == nil {
 		entries, decodeErr := decodeMadwifiStaInfo(buf, noise, noiseKnown)
 		if decodeErr == nil {

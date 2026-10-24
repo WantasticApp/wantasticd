@@ -55,13 +55,18 @@ type wifiScanCoordinator struct {
 	now    func() time.Time
 	active func(context.Context, string) ([]iwinfo.ScanEntry, error)
 	cached func(string) ([]iwinfo.ScanEntry, error)
+	// passive reads only the kernel's scan cache. An active scan takes the
+	// radio off-channel; on a mesh relay the selected station interface is
+	// the backhaul uplink, so timed active scans dropped EasyMesh nodes.
+	passive bool
 }
 
 var defaultWiFiScanCoordinator = &wifiScanCoordinator{
-	states: make(map[int]*wifiScanState),
-	now:    time.Now,
-	active: iwinfo.ActiveScan,
-	cached: iwinfo.CachedScan,
+	states:  make(map[int]*wifiScanState),
+	now:     time.Now,
+	active:  iwinfo.ActiveScan,
+	cached:  iwinfo.CachedScan,
+	passive: true,
 }
 
 func (c *wifiScanCoordinator) snapshotsAndTrigger(interfaces []iwinfo.WirelessInterface) []wifiPHYScanSnapshot {
@@ -154,9 +159,15 @@ func (c *wifiScanCoordinator) scanPHY(phy int, ifName string, own map[string]boo
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), wifiScanDeadline)
-	entries, err := c.active(ctx, ifName)
-	cancel()
+	var entries []iwinfo.ScanEntry
+	var err error
+	if c.passive {
+		entries, err = c.cached(ifName)
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), wifiScanDeadline)
+		entries, err = c.active(ctx, ifName)
+		cancel()
+	}
 	var surveyByFrequency map[int]iwinfo.SurveyEntry
 	if err == nil {
 		if survey, surveyErr := iwinfo.GetSurvey(ifName); surveyErr == nil {

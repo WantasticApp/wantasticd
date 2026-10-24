@@ -106,7 +106,7 @@ func (b *OpenWrtBackend) pruneEasyMeshGhostsLive(ctx context.Context, root *mesh
 	if b == nil || b.easyMeshConsole == nil || !easyMeshHasGhostCandidates(root) {
 		return
 	}
-	output, err := b.easyMeshConsole.Run(ctx, easyMeshConsoleTopologyTree)
+	output, err := b.consoleRead(ctx, easyMeshConsoleTopologyTree, meshTreeMaxAge)
 	if err != nil {
 		return
 	}
@@ -119,7 +119,7 @@ func (b *OpenWrtBackend) pruneEasyMeshGhostsLive(ctx context.Context, root *mesh
 // instead of merging into it, which clears departed devices.
 func (b *OpenWrtBackend) refreshEasyMeshTopologyClean(ctx context.Context) error {
 	for _, command := range []easyMeshConsoleCommand{easyMeshConsoleDiscovery, easyMeshConsoleNotification} {
-		if _, err := b.easyMeshConsole.Run(ctx, command); err != nil {
+		if _, err := b.consoleRun(ctx, command); err != nil {
 			return err
 		}
 	}
@@ -134,6 +134,7 @@ func (b *OpenWrtBackend) refreshEasyMeshTopologyClean(ctx context.Context) error
 	if observer == nil {
 		return nil
 	}
+	b.consoleInvalidate() // rebuild from the console as it is now
 	patch := wusp.NewMessage()
 	b.appendOpenWrtMeshTopology(ctx, patch)
 	observer(patch)

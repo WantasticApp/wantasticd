@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	spectralCaptureInterval   = 5 * time.Minute
-	spectralCaptureWindow     = 3 * time.Second
-	spectralCaptureDeadline   = 30 * time.Second
+	spectralCaptureInterval = 5 * time.Minute
+	spectralCaptureWindow   = 3 * time.Second
+	spectralCaptureDeadline = 30 * time.Second
 	// Enough sweeps for stable max/average/noise statistics across the whole
 	// window; drivers can report hundreds per second, so a small cap would
 	// only cover the first few milliseconds.
@@ -26,7 +26,7 @@ const (
 	// spectralWaterfallBinBudget bounds the waterfall block (rows × bins) so
 	// it stays well under the controller's per-value snapshot limit.
 	spectralWaterfallBinBudget = 32 << 10
-	spectralDiscoveryInterval = 30 * time.Minute
+	spectralDiscoveryInterval  = 30 * time.Minute
 )
 
 type spectralRadioSnapshot struct {
@@ -63,6 +63,11 @@ type spectralCoordinator struct {
 	now          func() time.Time
 	discover     func(string) ([]qcaspectral.Radio, error)
 	capture      func(context.Context, qcaspectral.Radio, qcaspectral.CaptureOptions) (qcaspectral.Result, error)
+	// passive disables timed captures. Activating spectral scan takes radio
+	// time from traffic and its private ioctl IDs move between qca-wifi
+	// releases, so production never starts one on a timer (it disrupted
+	// EasyMesh backhauls); only snapshots of earlier data are reported.
+	passive bool
 }
 
 var defaultSpectralCoordinator = &spectralCoordinator{
@@ -70,6 +75,7 @@ var defaultSpectralCoordinator = &spectralCoordinator{
 	now:       time.Now,
 	discover:  qcaspectral.DiscoverRadios,
 	capture:   qcaspectral.Capture,
+	passive:   true,
 }
 
 func (c *spectralCoordinator) snapshotAndTrigger(netClassDir string) spectralSnapshot {
@@ -79,7 +85,7 @@ func (c *spectralCoordinator) snapshotAndTrigger(netClassDir string) spectralSna
 	now := c.now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.running && (c.nextRun.IsZero() || !now.Before(c.nextRun)) {
+	if !c.passive && !c.running && (c.nextRun.IsZero() || !now.Before(c.nextRun)) {
 		c.running = true
 		c.nextRun = now.Add(spectralCaptureInterval)
 		rediscover := c.discoveredAt.IsZero() || now.Sub(c.discoveredAt) >= spectralDiscoveryInterval

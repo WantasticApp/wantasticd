@@ -405,3 +405,170 @@ func wiphyFromChannels(channels []WiphyChannel) *Wiphy {
 	}
 	return w
 }
+
+// ── Self-calibrated STA_INFO decoding for qca-wifi ──────────────────────────
+//
+// qca-wifi keeps madwifi's ioctl but not its struct: fields are widened,
+// reordered and, in 12.x, MLO/11be fields are appended, so records are
+// longer than madwifi's and differ between builds. Only the leading u16
+// isi_len (the full record length) is stable; the telemetry library in
+// QSDK walks the buffer with it. Without the header, field offsets are
+// learned by lining up one raw buffer with the same stations as printed by
+// wlanconfig, keeping an offset only when it is the single one that agrees
+// for every station.
+
+type vendorStaLayout struct {
+	macOff, aidOff, rssiOff, idleOff, txRateOff, rxRateOff int
+}
+
+// usable reports whether the layout carries enough to replace wlanconfig.
+func (l vendorStaLayout) usable() bool {
+	return l.macOff >= 0 && l.rssiOff >= 0 && (l.txRateOff >= 0 || l.rxRateOff >= 0)
+}
+
+// splitStaRecords walks variable-length records by their u16 length.
+func splitStaRecords(buf []byte) [][]byte {
+	var out [][]byte
+	for off := 0; off+16 <= len(buf); {
+		n := int(binary.NativeEndian.Uint16(buf[off:]))
+		if n == 0 {
+			break
+		}
+		if n < 16 || off+n > len(buf) {
+			return nil
+		}
+		out = append(out, buf[off:off+n])
+		off += n
+	}
+	return out
+}
+
+func near(a, b, tolerance int) bool { return a-b <= tolerance && b-a <= tolerance }
+
+// calibrateStaLayout learns field offsets from raw records and the same
+// stations parsed from wlanconfig (noise is what that parse added to RSSI).
+func calibrateStaLayout(buf []byte, ref []AssocEntry, noise int) (vendorStaLayout, bool) {
+	layout := vendorStaLayout{-1, -1, -1, -1, -1, -1}
+	records := splitStaRecords(buf)
+	if len(records) == 0 || len(records) != len(ref) {
+		return layout, false
+	}
+	minLen := len(records[0])
+	for _, r := range records {
+		minLen = min(minLen, len(r))
+	}
+	byMAC := map[string]AssocEntry{}
+	for _, e := range ref {
+		byMAC[e.MAC.String()] = e
+	}
+	// MAC: the one offset where every record holds a distinct listed MAC.
+	matched := make([]AssocEntry, len(records))
+	for off := 2; off+6 <= minLen && layout.macOff < 0; off++ {
+		seen := map[string]bool{}
+		ok := true
+		for i, r := range records {
+			mac := net.HardwareAddr(r[off : off+6]).String()
+			e, found := byMAC[mac]
+			if !found || seen[mac] {
+				ok = false
+				break
+			}
+			seen[mac] = true
+			matched[i] = e
+		}
+		if ok {
+			layout.macOff = off
+		}
+	}
+	if layout.macOff < 0 {
+		return layout, false
+	}
+	ne := binary.NativeEndian
+	unique := func(width int, accept func(r []byte, e AssocEntry, off int) bool, known func(AssocEntry) bool) int {
+		found := -1
+		for off := 2; off+width <= minLen; off++ {
+			if off+width > layout.macOff && off < layout.macOff+6 {
+				continue
+			}
+			ok, evidence := true, 0
+			for i, r := range records {
+				if !known(matched[i]) {
+					continue
+				}
+				evidence++
+				if !accept(r, matched[i], off) {
+					ok = false
+					break
+				}
+			}
+			if !ok || evidence == 0 {
+				continue
+			}
+			if found >= 0 {
+				return -1 // ambiguous
+			}
+			found = off
+		}
+		return found
+	}
+	layout.aidOff = unique(2, func(r []byte, e AssocEntry, off int) bool {
+		return ne.Uint16(r[off:])&0x3fff == e.AssociationID
+	}, func(e AssocEntry) bool { return e.AssociationID != 0 })
+	layout.rssiOff = unique(1, func(r []byte, e AssocEntry, off int) bool {
+		return near(int(r[off]), int(e.Signal)-noise, 1)
+	}, func(e AssocEntry) bool { return e.SignalKnown })
+	layout.idleOff = unique(2, func(r []byte, e AssocEntry, off int) bool {
+		return near(int(ne.Uint16(r[off:])), int(e.Inactive/1000), 1)
+	}, func(e AssocEntry) bool { return e.InactiveKnown && e.Inactive >= 3000 })
+	rate := func(r []byte, want uint32, off int) bool {
+		v := ne.Uint32(r[off:])
+		return v > 0 && near(int(v), int(want), 1000)
+	}
+	layout.txRateOff = unique(4, func(r []byte, e AssocEntry, off int) bool { return rate(r, e.TxRate, off) },
+		func(e AssocEntry) bool { return e.TxRateKnown && e.TxRate > 0 })
+	layout.rxRateOff = unique(4, func(r []byte, e AssocEntry, off int) bool { return rate(r, e.RxRate, off) },
+		func(e AssocEntry) bool { return e.RxRateKnown && e.RxRate > 0 })
+	return layout, layout.usable()
+}
+
+// decodeCalibratedStaInfo decodes records with a learned layout.
+func decodeCalibratedStaInfo(buf []byte, l vendorStaLayout, noise int, noiseKnown bool) ([]AssocEntry, bool) {
+	records := splitStaRecords(buf)
+	if records == nil && len(buf) >= 16 && binary.NativeEndian.Uint16(buf) != 0 {
+		return nil, false
+	}
+	ne := binary.NativeEndian
+	out := make([]AssocEntry, 0, len(records))
+	for _, r := range records {
+		if l.macOff+6 > len(r) {
+			return nil, false
+		}
+		mac := net.HardwareAddr(append([]byte(nil), r[l.macOff:l.macOff+6]...))
+		if !validStationMAC(mac) {
+			return nil, false
+		}
+		e := AssocEntry{MAC: mac, Source: "qca-ioctl", RxMCS: -1, TxMCS: -1}
+		if l.aidOff >= 0 && l.aidOff+2 <= len(r) {
+			e.AssociationID = ne.Uint16(r[l.aidOff:]) & 0x3fff
+		}
+		if l.rssiOff >= 0 && l.rssiOff < len(r) {
+			if rssi := int(r[l.rssiOff]); rssi > 0 && rssi < 128 {
+				e.Signal, e.SignalKnown = vendorClampInt8(noise+rssi), true
+			}
+		}
+		if noiseKnown {
+			e.Noise, e.NoiseKnown = vendorClampInt8(noise), true
+		}
+		if l.idleOff >= 0 && l.idleOff+2 <= len(r) {
+			e.Inactive, e.InactiveKnown = uint32(ne.Uint16(r[l.idleOff:]))*1000, true
+		}
+		if l.txRateOff >= 0 && l.txRateOff+4 <= len(r) {
+			e.TxRate, e.TxRateKnown = ne.Uint32(r[l.txRateOff:]), true
+		}
+		if l.rxRateOff >= 0 && l.rxRateOff+4 <= len(r) {
+			e.RxRate, e.RxRateKnown = ne.Uint32(r[l.rxRateOff:]), true
+		}
+		out = append(out, e)
+	}
+	return out, true
+}

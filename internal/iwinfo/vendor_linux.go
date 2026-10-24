@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -63,6 +64,12 @@ func VendorAssocList(ifname string) ([]AssocEntry, error) {
 		noise = nominalNoiseFloor
 	}
 	buf, err := vendorStaInfo(ifname)
+	if err != nil {
+		// cfg80211-mode qca-wifi answers over its nl80211 vendor command.
+		if blocks, vendorErr := QCAVendorStationRecords(ifname); vendorErr == nil {
+			buf, err = joinStationBlocks(blocks), nil
+		}
+	}
 	if err == nil {
 		entries, decodeErr := decodeMadwifiStaInfo(buf, noise, noiseKnown)
 		if decodeErr == nil {
@@ -73,11 +80,64 @@ func VendorAssocList(ifname string) ([]AssocEntry, error) {
 		}
 		err = decodeErr
 	}
+	// qca-wifi: decode with offsets learned from an earlier wlanconfig run,
+	// so routine polls need no fork.
+	if buf != nil {
+		if layout, ok := staLayouts.get(ifname); ok {
+			if entries, ok := decodeCalibratedStaInfo(buf, layout, noise, noiseKnown); ok {
+				return entries, nil
+			}
+			staLayouts.drop(ifname)
+		}
+	}
 	entries, cliErr := wlanconfigStations(ifname, noise, noiseKnown)
 	if cliErr == nil {
+		if buf != nil {
+			if layout, ok := calibrateStaLayout(buf, entries, noise); ok {
+				staLayouts.put(ifname, layout)
+			}
+		}
 		return entries, nil
 	}
 	return nil, fmt.Errorf("sta_info ioctl: %v; wlanconfig: %v", err, cliErr)
+}
+
+// staLayoutTTL bounds how long a learned layout is trusted before it is
+// checked against wlanconfig again (driver reloads, firmware updates).
+const staLayoutTTL = 10 * time.Minute
+
+type staLayoutCache struct {
+	mu      sync.Mutex
+	entries map[string]staLayoutEntry
+}
+
+type staLayoutEntry struct {
+	layout vendorStaLayout
+	at     time.Time
+}
+
+var staLayouts = &staLayoutCache{entries: map[string]staLayoutEntry{}}
+
+func (c *staLayoutCache) get(ifname string) (vendorStaLayout, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[ifname]
+	if !ok || time.Since(e.at) > staLayoutTTL {
+		return vendorStaLayout{}, false
+	}
+	return e.layout, true
+}
+
+func (c *staLayoutCache) put(ifname string, l vendorStaLayout) {
+	c.mu.Lock()
+	c.entries[ifname] = staLayoutEntry{layout: l, at: time.Now()}
+	c.mu.Unlock()
+}
+
+func (c *staLayoutCache) drop(ifname string) {
+	c.mu.Lock()
+	delete(c.entries, ifname)
+	c.mu.Unlock()
 }
 
 func vendorStaInfo(ifname string) ([]byte, error) {

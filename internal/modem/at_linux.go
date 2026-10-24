@@ -380,13 +380,28 @@ func (c *atController) Connect(devicePath, apn string) error {
 	if _, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+CGDCONT=1,\"IPV4V6\",\"%s\"", escapeATString(apn)), 8); err != nil {
 		return err
 	}
+	send := c.atSenderFor(devicePath)
+	if style := detectQuectelNetdev(send); style != quectelNetdevNone {
+		return quectelNetdevConnect(send, style, 1, 15*time.Second)
+	}
 	_, err := c.sendATCommand(devicePath, "AT+CGACT=1,1", 15)
 	return err
 }
 
 func (c *atController) Disconnect(devicePath string) error {
+	send := c.atSenderFor(devicePath)
+	if style := detectQuectelNetdev(send); style != quectelNetdevNone {
+		return quectelNetdevDisconnect(send, style, 1)
+	}
 	_, err := c.sendATCommand(devicePath, "AT+CGACT=0,1", 15)
 	return err
+}
+
+// atSenderFor sends single commands without retries (probes must fail fast).
+func (c *atController) atSenderFor(devicePath string) atSender {
+	return func(cmd string, timeoutSeconds int) ([]string, error) {
+		return c.sendATCommandWithRetry(devicePath, cmd, timeoutSeconds, 1)
+	}
 }
 
 func (c *atController) SetFunctionality(devicePath, mode string) error {

@@ -3,6 +3,7 @@ package iwinfo
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -156,5 +157,66 @@ func TestDecodeVendorChanInfoLayouts(t *testing.T) {
 	}
 	if decodeVendorChanInfo(make([]byte, 64)) != nil {
 		t.Fatal("empty table decoded")
+	}
+}
+
+// qcaRecord builds a qca-like ieee80211req_sta_info: wider and reordered
+// fields, an appended MLO block and trailing IEs, walked by isi_len.
+func qcaRecord(mac string, aid uint16, rssi uint8, idle uint16, tx, rx uint32, ies int) []byte {
+	const fixed = 168
+	n := (fixed + ies + 3) &^ 3
+	r := make([]byte, n)
+	binary.NativeEndian.PutUint16(r[0:], uint16(n))
+	binary.NativeEndian.PutUint16(r[2:], 5180)
+	binary.NativeEndian.PutUint32(r[4:], 0x00010003) // flags
+	r[11] = rssi
+	hw, _ := net.ParseMAC(mac)
+	copy(r[16:], hw)
+	binary.NativeEndian.PutUint16(r[44:], 0xc000|aid)
+	binary.NativeEndian.PutUint32(r[60:], tx)
+	binary.NativeEndian.PutUint32(r[64:], rx)
+	binary.NativeEndian.PutUint16(r[120:], idle)
+	copy(r[150:], hw) // MLD address equal to the link address
+	return r
+}
+
+const qcaWlanconfig = `ADDR               AID CHAN TXRATE RXRATE RSSI MINRSSI MAXRSSI IDLE  TXSEQ  RXSEQ  CAPS XCAPS ACAPS     ERP    STATE MAXRATE(DOT11) HTCAPS            VHTCAPS ASSOCTIME    IEs   MODE RXNSS TXNSS PSMODE
+aa:bb:cc:00:00:01    3   36   866M   780M   41      30      55    4      0  65535   EPSs  BRP          0       b              0      AWPM     gpsSRs     0       00:12:31 RSN WME IEEE80211_MODE_11AC_VHT80  2 2   0
+aa:bb:cc:00:00:02    7   36   390M   433M   27      20      40   12      0  65535   EPSs  BRP          0       b              0      AWPM     gpsSRs     0       01:02:03 RSN WME IEEE80211_MODE_11AC_VHT80  1 1   1
+`
+
+func TestCalibratedQCAStaInfo(t *testing.T) {
+	noise := -95
+	buf := append(qcaRecord("aa:bb:cc:00:00:01", 3, 41, 4, 866700, 780000, 22),
+		qcaRecord("aa:bb:cc:00:00:02", 7, 27, 12, 390000, 433300, 40)...)
+	if _, err := decodeMadwifiStaInfo(buf, noise, true); err == nil {
+		t.Fatal("madwifi decoder accepted a qca layout")
+	}
+	ref := ParseWlanconfigStations(qcaWlanconfig, noise, true)
+	layout, ok := calibrateStaLayout(buf, ref, noise)
+	if !ok || layout.macOff != 16 || layout.aidOff != 44 || layout.rssiOff != 11 || layout.txRateOff != 60 || layout.rxRateOff != 64 || layout.idleOff != 120 {
+		t.Fatalf("layout=%+v ok=%v", layout, ok)
+	}
+
+	// A later poll: values moved, the layout still decodes them.
+	later := append(qcaRecord("aa:bb:cc:00:00:02", 7, 30, 1, 433300, 520000, 40),
+		qcaRecord("aa:bb:cc:00:00:01", 3, 44, 0, 1200900, 866700, 22)...)
+	entries, ok := decodeCalibratedStaInfo(later, layout, noise, true)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("entries=%+v", entries)
+	}
+	if e := entries[1]; e.MAC.String() != "aa:bb:cc:00:00:01" || e.AssociationID != 3 || e.Signal != -51 || e.TxRate != 1200900 || e.RxRate != 866700 {
+		t.Fatalf("decoded=%+v", e)
+	}
+}
+
+func TestCalibrationNeedsUnambiguousEvidence(t *testing.T) {
+	// One station whose RSSI byte also appears elsewhere: ambiguous, so the
+	// caller keeps using wlanconfig rather than guessing.
+	rec := qcaRecord("aa:bb:cc:00:00:01", 3, 41, 4, 866700, 780000, 0)
+	rec[90] = 41
+	ref := ParseWlanconfigStations(strings.Split(qcaWlanconfig, "\n")[0]+"\n"+strings.Split(qcaWlanconfig, "\n")[1]+"\n", -95, true)
+	if layout, ok := calibrateStaLayout(rec, ref, -95); ok {
+		t.Fatalf("ambiguous evidence calibrated: %+v", layout)
 	}
 }

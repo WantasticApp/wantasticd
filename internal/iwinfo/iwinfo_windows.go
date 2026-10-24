@@ -11,18 +11,22 @@ import (
 	"strings"
 )
 
-// TODO: Replace netsh parsing with direct wlanapi.dll syscalls for:
-//   - WlanOpenHandle / WlanEnumInterfaces / WlanGetAvailableNetworkList
-//   - WlanQueryInterface for RSSI, channel, PHY type
-//   - WlanGetNetworkBssList for station data
-// For now, uses netsh as a portable fallback.
+// The Native Wifi API (wlanapi.dll, see wlanapi_windows.go) answers first;
+// netsh parsing remains for systems where the WLAN AutoConfig service is
+// not running.
 
 func Available(ifname string) bool {
+	if _, ok := wlanInterfaceAvailable(ifname); ok {
+		return true
+	}
 	out, _ := exec.Command("netsh", "wlan", "show", "interfaces").CombinedOutput()
 	return strings.Contains(string(out), ifname) || strings.Contains(string(out), "Wi-Fi")
 }
 
 func GetInfo(ifname string) (*InterfaceInfo, error) {
+	if info, err := wlanGetInfo(ifname); err == nil {
+		return info, nil
+	}
 	out, err := exec.Command("netsh", "wlan", "show", "interfaces").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("netsh wlan: %w", err)
@@ -61,6 +65,9 @@ func GetInfo(ifname string) (*InterfaceInfo, error) {
 }
 
 func GetHWModeList(ifname string) (*HWModes, error) {
+	if modes, err := wlanGetHWModes(ifname); err == nil {
+		return modes, nil
+	}
 	out, err := exec.Command("netsh", "wlan", "show", "drivers").CombinedOutput()
 	if err != nil {
 		return nil, err

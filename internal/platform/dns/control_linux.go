@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"wantastic-agent/internal/platform/systemd"
 )
 
 var (
@@ -96,6 +98,9 @@ func SetServers(ctx context.Context, servers []string) error {
 			if err := writeFile(resolvedDropIn, []byte(body), 0o644); err != nil {
 				return err
 			}
+		}
+		if err := systemd.ReloadOrTryRestartUnit(ctx, "systemd-resolved.service"); err == nil {
+			return nil
 		}
 		if _, err := runCommand(ctx, "", "systemctl", "try-reload-or-restart", "systemd-resolved"); err != nil {
 			_, err = runCommand(ctx, "", "systemctl", "restart", "systemd-resolved")

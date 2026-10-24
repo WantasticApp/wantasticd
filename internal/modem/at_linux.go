@@ -1245,7 +1245,9 @@ func configureATTTY(fd int) {
 	tio.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
 	tio.Cflag &^= unix.CSIZE | unix.PARENB | unix.CSTOPB | unix.CRTSCTS | unix.CBAUD
 	tio.Cflag |= unix.CS8 | unix.CLOCAL | unix.CREAD | unix.B115200
-	tio.Cc[unix.VMIN] = 0
+	// VMIN=1 as cfmakeraw: reads block for at least one byte (callers poll
+	// first). VMIN=0 makes an idle read return 0, which Go reports as EOF.
+	tio.Cc[unix.VMIN] = 1
 	tio.Cc[unix.VTIME] = 0
 	_ = unix.IoctlSetTermios(fd, unix.TCSETS, tio)
 	_ = unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)

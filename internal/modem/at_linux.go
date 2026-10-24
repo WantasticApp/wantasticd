@@ -567,6 +567,11 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 			return nil
 		}
 	}
+	if port := c.directATPort(devicePath); port != "" {
+		if err := c.sendSMSPDU(port, phoneNumber, message); !errors.Is(err, errNoDirectATSession) {
+			return err
+		}
+	}
 	if smsToolAvailable() {
 		if !smsToolSendSupportsMessage(message) {
 			return fmt.Errorf("SMS bridge unavailable and sms_tool send cannot safely send multiline or spaced messages")
@@ -584,6 +589,11 @@ func (c *atController) ListSMS(devicePath string) (string, error) {
 	smsOperationMu.Lock()
 	defer smsOperationMu.Unlock()
 
+	if port := c.directATPort(devicePath); port != "" {
+		if payload, err := c.listSMSPDU(port); err == nil {
+			return payload, nil
+		}
+	}
 	if smsToolAvailable() {
 		out, err := runSMSToolSMS(25*time.Second, "-j", "recv")
 		if err != nil {
@@ -617,6 +627,20 @@ func (c *atController) DeleteSMS(devicePath string, index string) error {
 	defer smsOperationMu.Unlock()
 
 	index = strings.TrimSpace(index)
+	if port := c.directATPort(devicePath); port != "" && !strings.EqualFold(index, "all") {
+		// Inbox rows listed natively carry storage:index[,index] for every
+		// part of a joined message.
+		storage, indexes, err := parseSMSDeleteTarget(index)
+		if err != nil {
+			return err
+		}
+		for _, idx := range indexes {
+			if _, err := c.sendATCommand(devicePath, fmt.Sprintf(`AT+CMGF=0;+CPMS="%s";+CMGD=%d`, storage, idx), 15); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if smsToolAvailable() {
 		out, err := runSMSToolSMS(20*time.Second, "delete", index)
 		if err != nil {
@@ -651,6 +675,151 @@ func (c *atController) DeleteSMS(devicePath string, index string) error {
 	}
 	_, err = c.sendATCommand(devicePath, fmt.Sprintf(`AT+CMGF=1;+CPMS="%s";+CMGD=%d`, storage, idx), 15)
 	return err
+}
+
+// errNoDirectATSession means the AT port is only reachable through a vendor
+// CGI or microcom, which cannot carry the interactive AT+CMGS exchange.
+var errNoDirectATSession = errors.New("no direct AT session")
+
+// directATPort returns the AT port when the agent can hold it open itself
+// (not the SDX bridge that is owned by the vendor CGI).
+func (c *atController) directATPort(devicePath string) string {
+	port := c.findATPort(devicePath)
+	if port == "" {
+		return ""
+	}
+	if filepath.Base(port) == "ttyOUT2" {
+		if info, err := os.Stat("/usrdata/simpleadmin/www/cgi-bin/get_atcommand"); err == nil && !info.IsDir() {
+			return ""
+		}
+	}
+	return port
+}
+
+func (c *atController) withDirectATSession(port string, fn func(*atSession) error) error {
+	at, closeFn, err := c.openATSessionOnPortWithRetry(port, 3)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+	if at.f == nil {
+		return errNoDirectATSession
+	}
+	_, _ = at.sendWithTimeout("AT", time.Second)
+	return fn(at)
+}
+
+// sendSMSPDU sends message in PDU mode, as many concatenated parts as it
+// needs. A failure after the first part is reported, never retried, so a
+// recipient never receives duplicates.
+func (c *atController) sendSMSPDU(port, number, message string) error {
+	pdus, err := encodeSMSSubmit(number, message)
+	if err != nil {
+		return err
+	}
+	return c.withDirectATSession(port, func(at *atSession) error {
+		if _, err := at.sendWithTimeout("AT+CMGF=0", 3*time.Second); err != nil {
+			return fmt.Errorf("SMS PDU mode unavailable: %w", err)
+		}
+		for i, pdu := range pdus {
+			if err := at.submitPDU(pdu, 60*time.Second); err != nil {
+				return fmt.Errorf("SMS part %d of %d: %w", i+1, len(pdus), err)
+			}
+		}
+		return nil
+	})
+}
+
+func (c *atController) listSMSPDU(port string) (string, error) {
+	messages := []smsInboxMessage{}
+	var failures []string
+	err := c.withDirectATSession(port, func(at *atSession) error {
+		for _, storage := range []string{"SM", "ME"} {
+			lines, err := at.sendWithTimeout(fmt.Sprintf(`AT+CMGF=0;+CPMS="%s";+CMGL=4`, storage), 12*time.Second)
+			if err != nil {
+				failures = append(failures, storage+": "+err.Error())
+				continue
+			}
+			messages = append(messages, joinSMSPDUs(storage, parseCMGLPDUs(lines))...)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(messages) == 0 && len(failures) == 2 {
+		return "", fmt.Errorf("list SMS failed: %s", strings.Join(failures, "; "))
+	}
+	payload, err := json.Marshal(messages)
+	return string(payload), err
+}
+
+// submitPDU runs one AT+CMGS exchange: command, wait for the "> " prompt,
+// then the hex PDU terminated by Ctrl-Z, and the final result.
+func (a *atSession) submitPDU(pdu smsSubmitPDU, timeout time.Duration) error {
+	if a.f == nil {
+		return errNoDirectATSession
+	}
+	if _, err := a.f.Write([]byte(fmt.Sprintf("AT+CMGS=%d\r", pdu.length))); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var seen strings.Builder
+	for !strings.Contains(seen.String(), ">") {
+		if err := a.waitReadable(deadline); err != nil {
+			return fmt.Errorf("no SMS prompt: %w", err)
+		}
+		b, err := a.reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		seen.WriteByte(b)
+		if atOutputError(seen.String()) {
+			return fmt.Errorf("modem refused SMS: %s", strings.TrimSpace(seen.String()))
+		}
+	}
+	if _, err := a.f.Write([]byte(pdu.hex + "\x1a")); err != nil {
+		return err
+	}
+	deadline = time.Now().Add(timeout)
+	for {
+		if err := a.waitReadable(deadline); err != nil {
+			return fmt.Errorf("SMS send %w", err)
+		}
+		raw, err := a.reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line := strings.TrimSpace(raw)
+		switch {
+		case line == "OK":
+			return nil
+		case line == "ERROR" || strings.HasPrefix(line, "+CMS ERROR") || strings.HasPrefix(line, "+CME ERROR"):
+			return fmt.Errorf("modem rejected SMS: %s", line)
+		}
+	}
+}
+
+// waitReadable returns once input is buffered or the fd is readable.
+func (a *atSession) waitReadable(deadline time.Time) error {
+	for a.reader.Buffered() == 0 {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errors.New("timed out")
+		}
+		fds := []unix.PollFd{{Fd: int32(a.f.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, int(remaining/time.Millisecond)+1)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return err
+		}
+		if n > 0 {
+			return nil
+		}
+	}
+	return nil
 }
 
 func runSMSToolSMS(timeout time.Duration, args ...string) ([]byte, error) {

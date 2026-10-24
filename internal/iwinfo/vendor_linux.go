@@ -39,6 +39,9 @@ import (
 const (
 	ioctlStaStats = unix.SIOCDEVPRIVATE + 5
 	ioctlStaInfo  = unix.SIOCDEVPRIVATE + 6
+	// IEEE80211_IOCTL_GETCHANINFO (SIOCIWFIRSTPRIV+13), as wlanconfig's
+	// "list chan" issues it.
+	ioctlGetChanInfo = 0x8BE0 + 13
 
 	staInfoBufferSize = 24 * 1024 // wlanconfig.c list_stations
 
@@ -330,4 +333,30 @@ func WextTxPower(ifname string) (int, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+// VendorWiphy reads the regulatory channel table of a madwifi/qca-wifi VAP
+// (wlanconfig athN list chan) for radios that do not answer nl80211.
+func VendorWiphy(ifname string) (*Wiphy, error) {
+	if !validIfName(ifname) {
+		return nil, fmt.Errorf("invalid interface name %q", ifname)
+	}
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+	buf := make([]byte, 32*1024)
+	n, err := iwreqData(fd, ifname, ioctlGetChanInfo, buf)
+	if err != nil {
+		return nil, err
+	}
+	if n <= 0 || n > len(buf) {
+		n = len(buf)
+	}
+	channels := decodeVendorChanInfo(buf[:n])
+	if len(channels) == 0 {
+		return nil, fmt.Errorf("unrecognised channel table from %s", ifname)
+	}
+	return wiphyFromChannels(channels), nil
 }

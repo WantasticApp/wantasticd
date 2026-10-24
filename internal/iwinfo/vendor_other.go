@@ -39,3 +39,5 @@ func WextFrequency(string) (int, bool) { return 0, false }
 func WextTxPower(string) (int, bool)   { return 0, false }
 
 func NL80211Wiphy(string) (*Wiphy, error) { return nil, errVendorUnsupported }
+
+func VendorWiphy(string) (*Wiphy, error) { return nil, errVendorUnsupported }

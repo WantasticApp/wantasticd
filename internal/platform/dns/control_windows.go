@@ -4,6 +4,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -31,6 +32,9 @@ func defaultIfIndex(ctx context.Context) (int, error) {
 }
 
 func ReadControl(ctx context.Context) ControlState {
+	if st, err := nativeReadControl(); err == nil {
+		return st
+	}
 	index, err := defaultIfIndex(ctx)
 	if err != nil {
 		return ControlState{Method: "windows-dnsclient", Reason: err.Error()}
@@ -48,6 +52,9 @@ func ReadControl(ctx context.Context) ControlState {
 func SetServers(ctx context.Context, servers []string) error {
 	servers, err := NormalizeServers(servers)
 	if err != nil {
+		return err
+	}
+	if err := nativeSetServers(servers); !errors.Is(err, errNativeUnavailable) {
 		return err
 	}
 	index, err := defaultIfIndex(ctx)

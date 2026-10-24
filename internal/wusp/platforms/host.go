@@ -16,6 +16,7 @@ import (
 
 	"wantastic-agent/internal/linkdiscovery"
 	modemPkg "wantastic-agent/internal/modem"
+	"wantastic-agent/internal/platform/systemd"
 	"wantastic-agent/internal/wusp"
 )
 
@@ -1905,6 +1906,9 @@ func (b *hostBackend) setHostname(ctx context.Context, hostname string) error {
 		}
 		return nil
 	default:
+		if err := systemd.SetHostname(ctx, hostname); err == nil {
+			return nil
+		}
 		if _, err := b.commandRunner(ctx, "hostnamectl", "set-hostname", hostname); err == nil {
 			return nil
 		}
@@ -1939,6 +1943,9 @@ func (b *hostBackend) setTimeEnabled(ctx context.Context, enabled bool) error {
 		_, err := b.commandRunner(ctx, "settings", "put", "global", "auto_time", value)
 		return err
 	default:
+		if err := systemd.SetNTP(ctx, enabled); err == nil {
+			return nil
+		}
 		value := "false"
 		if enabled {
 			value = "true"
@@ -1965,6 +1972,9 @@ func (b *hostBackend) setTimeZone(ctx context.Context, timezone string) error {
 		_, err := b.commandRunner(ctx, "setprop", "persist.sys.timezone", timezone)
 		return err
 	default:
+		if err := systemd.SetTimezone(ctx, timezone); err == nil {
+			return nil
+		}
 		_, err := b.commandRunner(ctx, "timedatectl", "set-timezone", timezone)
 		return err
 	}

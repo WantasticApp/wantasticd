@@ -39,7 +39,7 @@ func (c *wiphyCache) get(name string) *iwinfo.Wiphy {
 	}
 	read := c.read
 	if read == nil {
-		read = iwinfo.NL80211Wiphy
+		read = readWiphy
 	}
 	wiphy, err := read(name)
 	if err != nil {
@@ -50,6 +50,20 @@ func (c *wiphyCache) get(name string) *iwinfo.Wiphy {
 	}
 	c.entries[name] = wiphyCacheEntry{wiphy: wiphy, at: time.Now()}
 	return wiphy
+}
+
+// readWiphy asks nl80211 first and, for madwifi/qca-wifi VAPs without a
+// cfg80211 wiphy, falls back to the driver's regulatory channel table
+// (IEEE80211_IOCTL_GETCHANINFO, what wlanconfig "list chan" prints).
+func readWiphy(name string) (*iwinfo.Wiphy, error) {
+	wiphy, err := iwinfo.NL80211Wiphy(name)
+	if err == nil {
+		return wiphy, nil
+	}
+	if vendor, vendorErr := iwinfo.VendorWiphy(name); vendorErr == nil {
+		return vendor, nil
+	}
+	return nil, err
 }
 
 func radioHasIfName(radio openWrtWirelessRadioStatus) bool {

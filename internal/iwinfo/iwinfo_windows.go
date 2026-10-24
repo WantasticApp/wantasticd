@@ -124,7 +124,7 @@ func GetHTMode(ifname string) (string, error) {
 	}
 }
 
-func GetPHYName(ifname string) (string, error) { return ifname, nil }
+func GetPHYName(ifname string) (string, error)         { return ifname, nil }
 func GetAssocList(ifname string) ([]AssocEntry, error) { return nil, nil }
-func GetSurvey(ifname string) ([]SurveyEntry, error) { return nil, nil }
-func Close() {}
+func GetSurvey(ifname string) ([]SurveyEntry, error)   { return nil, nil }
+func Close()                                           {}

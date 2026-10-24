@@ -322,3 +322,86 @@ func vendorClampInt8(value int) int8 {
 	}
 	return int8(value)
 }
+
+// decodeVendorChanInfo decodes the IEEE80211_IOCTL_GETCHANINFO reply
+// (struct ieee80211req_chaninfo: a channel count, then ic_chans[]). madwifi
+// uses 8-byte entries {freq u16, flags u16, ieee u8, maxregpower s8, ...};
+// qca-wifi releases widen the flags to 64 bits and append fields, which
+// moves the array to an 8-byte boundary and changes the entry size. The
+// layout is therefore inferred: the first header offset and entry size for
+// which every entry's IEEE channel matches its frequency wins. The
+// regulatory maximum power follows the channel number in all known layouts.
+func decodeVendorChanInfo(buf []byte) []WiphyChannel {
+	if len(buf) < 12 {
+		return nil
+	}
+	count := int(binary.NativeEndian.Uint32(buf))
+	if count < 3 || count > 255 {
+		return nil
+	}
+	for _, header := range []int{4, 8} {
+		for stride := 8; stride <= 64; stride++ {
+			if header+count*stride > len(buf) {
+				break
+			}
+			for ieeeOff := 2; ieeeOff < stride-1; ieeeOff++ {
+				channels, ok := vendorChanLayout(buf, header, stride, ieeeOff, count)
+				if ok {
+					return channels
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func vendorChanLayout(buf []byte, header, stride, ieeeOff, count int) ([]WiphyChannel, bool) {
+	out := make([]WiphyChannel, 0, count)
+	distinct := map[int]bool{}
+	for i := 0; i < count; i++ {
+		entry := buf[header+i*stride:]
+		freq := int(binary.NativeEndian.Uint16(entry))
+		channel := FrequencyChannel(freq)
+		if channel == 0 || int(entry[ieeeOff]) != channel {
+			return nil, false
+		}
+		distinct[freq] = true
+		power := int(int8(entry[ieeeOff+1]))
+		if power < 1 || power > 40 {
+			power = 0
+		}
+		out = append(out, WiphyChannel{Channel: channel, Frequency: freq, MaxPowerDBM: power})
+	}
+	// A real table lists distinct channels; a repeated pattern means the
+	// stride is a multiple of the real one.
+	return out, len(distinct) == count
+}
+
+// wiphyFromChannels groups a flat channel table into bands.
+func wiphyFromChannels(channels []WiphyChannel) *Wiphy {
+	byBand := map[string]*WiphyBand{}
+	var order []string
+	for _, ch := range channels {
+		band := ""
+		switch {
+		case ch.Frequency < 2500:
+			band = "2.4GHz"
+		case ch.Frequency < 5925:
+			band = "5GHz"
+		default:
+			band = "6GHz"
+		}
+		if byBand[band] == nil {
+			byBand[band] = &WiphyBand{Band: band}
+			order = append(order, band)
+		}
+		byBand[band].Channels = append(byBand[band].Channels, ch)
+	}
+	w := &Wiphy{Index: -1}
+	for _, name := range []string{"2.4GHz", "5GHz", "6GHz"} {
+		if b := byBand[name]; b != nil {
+			w.Bands = append(w.Bands, *b)
+		}
+	}
+	return w
+}

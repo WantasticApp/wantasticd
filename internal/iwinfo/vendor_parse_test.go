@@ -121,3 +121,40 @@ func TestParseHostapdCtrlInterface(t *testing.T) {
 		t.Fatalf("unexpected %v", got)
 	}
 }
+
+func buildChanInfo(header, stride, ieeeOff int, freqs []int, power int8) []byte {
+	buf := make([]byte, header+255*stride)
+	binary.NativeEndian.PutUint32(buf, uint32(len(freqs)))
+	for i, f := range freqs {
+		e := buf[header+i*stride:]
+		binary.NativeEndian.PutUint16(e, uint16(f))
+		e[ieeeOff] = byte(FrequencyChannel(f))
+		e[ieeeOff+1] = byte(power)
+	}
+	return buf
+}
+
+func TestDecodeVendorChanInfoLayouts(t *testing.T) {
+	sixGHz := []int{5955, 5975, 5995, 6115, 6135, 6415}
+	for _, layout := range []struct{ header, stride, ieee int }{
+		{4, 8, 4},   // madwifi
+		{8, 24, 11}, // qca-wifi with u64 flags + flagext
+		{8, 32, 11},
+	} {
+		w := wiphyFromChannels(decodeVendorChanInfo(buildChanInfo(layout.header, layout.stride, layout.ieee, sixGHz, 24)))
+		if len(w.Bands) != 1 || w.Bands[0].Band != "6GHz" || len(w.Bands[0].Channels) != len(sixGHz) {
+			t.Fatalf("layout %+v: %+v", layout, w)
+		}
+		if ch := w.Bands[0].Channels[0]; ch.Channel != 1 || ch.MaxPowerDBM != 24 {
+			t.Fatalf("layout %+v first=%+v", layout, ch)
+		}
+	}
+	dual := []int{2412, 2437, 2462, 5180, 5500, 5745}
+	w := wiphyFromChannels(decodeVendorChanInfo(buildChanInfo(4, 8, 4, dual, 20)))
+	if len(w.Bands) != 2 || w.Bands[0].Band != "2.4GHz" || w.Bands[1].Band != "5GHz" {
+		t.Fatalf("dual=%+v", w)
+	}
+	if decodeVendorChanInfo(make([]byte, 64)) != nil {
+		t.Fatal("empty table decoded")
+	}
+}

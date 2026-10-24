@@ -46,11 +46,14 @@ type hostBackend struct {
 	onuReleasePath        string
 	netClassDir           string
 	commandRunner         CommandRunner
-	cellular              *cellularMonitor
-	now                   func() time.Time
-	linkSetUp             func(string) error
-	linkSetDown           func(string) error
-	linkSetMTU            func(string, int) error
+	// useSystemd allows systemd's D-Bus services; off when a test injects
+	// its own command runner, so tests never touch the real system.
+	useSystemd  bool
+	cellular    *cellularMonitor
+	now         func() time.Time
+	linkSetUp   func(string) error
+	linkSetDown func(string) error
+	linkSetMTU  func(string, int) error
 }
 
 type timeState struct {
@@ -116,6 +119,7 @@ func newHostBackend(kind Kind, opts Options) *hostBackend {
 	}
 	if backend.commandRunner == nil {
 		backend.commandRunner = defaultCommandRunner
+		backend.useSystemd = true
 	}
 	if backend.now == nil {
 		backend.now = time.Now
@@ -1906,7 +1910,7 @@ func (b *hostBackend) setHostname(ctx context.Context, hostname string) error {
 		}
 		return nil
 	default:
-		if err := systemd.SetHostname(ctx, hostname); err == nil {
+		if b.useSystemd && systemd.SetHostname(ctx, hostname) == nil {
 			return nil
 		}
 		if _, err := b.commandRunner(ctx, "hostnamectl", "set-hostname", hostname); err == nil {
@@ -1943,7 +1947,7 @@ func (b *hostBackend) setTimeEnabled(ctx context.Context, enabled bool) error {
 		_, err := b.commandRunner(ctx, "settings", "put", "global", "auto_time", value)
 		return err
 	default:
-		if err := systemd.SetNTP(ctx, enabled); err == nil {
+		if b.useSystemd && systemd.SetNTP(ctx, enabled) == nil {
 			return nil
 		}
 		value := "false"
@@ -1972,7 +1976,7 @@ func (b *hostBackend) setTimeZone(ctx context.Context, timezone string) error {
 		_, err := b.commandRunner(ctx, "setprop", "persist.sys.timezone", timezone)
 		return err
 	default:
-		if err := systemd.SetTimezone(ctx, timezone); err == nil {
+		if b.useSystemd && systemd.SetTimezone(ctx, timezone) == nil {
 			return nil
 		}
 		_, err := b.commandRunner(ctx, "timedatectl", "set-timezone", timezone)

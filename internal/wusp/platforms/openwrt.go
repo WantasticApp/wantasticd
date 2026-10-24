@@ -575,7 +575,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	}
 	appendField(msg, "Device.Firewall.Type", wusp.String("Stateful"))
 	_ = runCollector("openwrt.firewall", func() error { b.appendFirewallFields(msg); return nil })
-	_ = runCollector("openwrt.wifi", func() error { b.appendWiFiFields(ctx, msg); return nil })
+	runBudgetedCollector(ctx, "openwrt.wifi", 4*time.Second, msg, b.appendWiFiFields)
 
 	// Network interface details via getifaddrs (pure Go)
 	_ = runCollector("openwrt.network.interfaces", func() error { collectNetworkInterfacesStatic(msg, b.netClassDir); return nil })
@@ -592,8 +592,8 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	_ = runCollector("openwrt.cellular.config", func() error { b.appendOpenWrtCellularConfig(msg); return nil })
 	_ = runCollector("openwrt.gnss", func() error { collectGPSStatic(msg); return nil })
 	_ = runCollector("openwrt.mesh.runtime", func() error { collectMeshStatic(msg); return nil })
-	_ = runCollector("openwrt.mesh.topology", func() error { b.appendOpenWrtMeshTopology(ctx, msg); return nil })
-	_ = runCollector("openwrt.mesh.config", func() error { b.appendOpenWrtMeshConfig(ctx, msg); return nil })
+	runBudgetedCollector(ctx, "openwrt.mesh.topology", 3*time.Second, msg, b.appendOpenWrtMeshTopology)
+	runBudgetedCollector(ctx, "openwrt.mesh.config", 2*time.Second, msg, b.appendOpenWrtMeshConfig)
 	_ = runCollector("openwrt.link.discovery", func() error {
 		appendLinkDiscoveryFields(msg, linkdiscovery.DefaultSnapshot(), b.openWrtWiFiInterfaceSet())
 		return nil

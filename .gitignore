@@ -75,3 +75,6 @@ device-claim-key*.json
 
 # Integration configs contain local keys; publish only placeholder templates.
 !e2e/docker-compose/configs/*.conf.example
+docs/settopo.sh
+.gitignore
+docs/help.md

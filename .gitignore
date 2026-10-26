@@ -8,6 +8,7 @@ tmp/wantastic_install/wantasticd.tar.gz
 vendor/
 gobuild/
 .gocache/
+hide/
 .gotmp/
 tmp/
 !cmd/wantasticd/tray.go
@@ -78,3 +79,4 @@ device-claim-key*.json
 docs/settopo.sh
 .gitignore
 docs/help.md
+.wrangler/cache/wrangler-account.json

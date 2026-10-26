@@ -1448,7 +1448,10 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 				host.interfaceType = hostInterfaceType(neighbor.InterfaceName)
 			}
 			host.layer3Interface = interfacePaths[neighbor.InterfaceName]
-			host.active = host.active || neighbor.Active
+			// Active means present now (TR-181): a current association, or a
+			// neighbour the kernel confirmed recently. STALE entries linger
+			// after a host leaves, so they only supply addresses.
+			host.active = host.active || neighborConfirmedReachable(neighbor.State)
 		}
 	} else {
 		logCollectorError("openwrt.hosts.rtnetlink", err)
@@ -1469,7 +1472,6 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 			host.hostname = strings.TrimSpace(fields[3])
 		}
 		host.addressSource = "DHCP"
-		host.active = true
 		expiry, err := strconv.ParseInt(fields[0], 10, 64)
 		switch {
 		case err != nil:
@@ -1505,8 +1507,8 @@ func (b *OpenWrtBackend) collectLANHosts(wifiHosts map[string]string) []*openWrt
 		if host.layer3Interface == "" {
 			host.layer3Interface = interfacePaths[fields[5]]
 		}
-		flags, _ := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(fields[2]), "0x"), 16, 32)
-		host.active = host.active || flags&0x2 != 0
+		// The ARP "complete" flag stays set long after the host has gone, so
+		// /proc/net/arp supplies addresses only; presence comes from rtnetlink.
 	}
 
 	mergeMNDPHosts(hosts, linkdiscovery.DefaultSnapshot())

@@ -13,3 +13,5 @@ type linuxNeighborObservation struct {
 }
 
 func readRouteNeighbors() ([]linuxNeighborObservation, error) { return nil, nil }
+
+func neighborConfirmedReachable(uint16) bool { return false }

@@ -109,3 +109,10 @@ func parseRouteNeighborMessage(data []byte, ifNameByIndex map[int]string) (linux
 		Active:        state&(unix.NUD_FAILED|unix.NUD_INCOMPLETE) == 0 && state != unix.NUD_NONE,
 	}, true, nil
 }
+
+// neighborConfirmedReachable reports whether the kernel confirmed the
+// neighbour recently (REACHABLE, or DELAY/PROBE while it re-confirms). STALE
+// and PERMANENT entries say nothing about the host being there now.
+func neighborConfirmedReachable(state uint16) bool {
+	return state&(unix.NUD_REACHABLE|unix.NUD_DELAY|unix.NUD_PROBE) != 0
+}

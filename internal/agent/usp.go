@@ -983,6 +983,36 @@ func supportedCellularOperate(operation string) bool {
 	}
 }
 
+// Cellular operations talk to the modem and can outlast the 5 s control
+// deadline: an AT+CMGL over the vendor CGI bridge, a CMGS waiting for the
+// network, a CFUN cycle. The operation therefore runs on its own; when it
+// finishes inside cellularOperateBudget the reply carries the result,
+// otherwise the reply says it is still running and the result is patched
+// into the cache and pushed as ValueChange notifications when it lands.
+// Before, an overrun returned a deadline error and the finished inbox was
+// discarded, so ListSMS never loaded on slow bridges.
+const cellularOperateBudget = 3500 * time.Millisecond
+
+// Headroom kept under the request deadline for encoding and the reply.
+const cellularOperateReplyMargin = 750 * time.Millisecond
+
+type cellularOperateFlight struct {
+	done chan struct{}
+	msg  *wusp.Message
+}
+
+var cellularOperateFlights = struct {
+	sync.Mutex
+	running map[string]*cellularOperateFlight
+}{running: map[string]*cellularOperateFlight{}}
+
+// cellularOperateJoinable reports read-only operations a repeated request
+// may share instead of queueing a second modem pass behind the first (the
+// controller retries after ~6 s).
+func cellularOperateJoinable(operation string) bool {
+	return operation == "ListSMS" || operation == "RefreshGNSS"
+}
+
 func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, input *wusp.Message) (*wusp.Message, error) {
 	const prefix = "Device.WUSP_CellularControl.Interface."
 	rest := strings.TrimPrefix(cmd, prefix)
@@ -995,18 +1025,74 @@ func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, inpu
 		return nil, wusp.ErrUSPPathUnsupported
 	}
 	operation := strings.TrimSuffix(parts[1], "()")
-	if operation == parts[1] || operation == "" {
+	if operation == parts[1] || operation == "" || !supportedCellularOperate(operation) {
 		return nil, wusp.ErrUSPPathUnsupported
 	}
 
+	key := fmt.Sprintf("%d.%s", index, operation)
+	cellularOperateFlights.Lock()
+	flight, running := cellularOperateFlights.running[key]
+	if !running || !cellularOperateJoinable(operation) {
+		flight = &cellularOperateFlight{done: make(chan struct{})}
+		if cellularOperateJoinable(operation) {
+			cellularOperateFlights.running[key] = flight
+		}
+		go func() {
+			status, output, inbox := cellularOperateRunner(index, operation, input)
+			msg := r.cachedCellularOperateStatus(index, status, output, inbox)
+			cellularOperateFlights.Lock()
+			if cellularOperateFlights.running[key] == flight {
+				delete(cellularOperateFlights.running, key)
+			}
+			flight.msg = msg
+			cellularOperateFlights.Unlock()
+			close(flight.done)
+		}()
+	}
+	cellularOperateFlights.Unlock()
+
+	wait := cellularOperateBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline) - cellularOperateReplyMargin; remaining < wait {
+			wait = max(remaining, 0)
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-flight.done:
+		cellularOperateFlights.Lock()
+		msg := flight.msg
+		cellularOperateFlights.Unlock()
+		return msg, nil
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	log.Printf("[USP] Cellular %s still running after %s; result follows as ValueChange", operation, wait.Round(time.Millisecond))
+	output := operation + " is still running on the modem; the result is pushed when it completes"
+	if operation == "ListSMS" {
+		// Keep showing the last inbox meanwhile instead of an empty one.
+		inboxPath := fmt.Sprintf("%s%d.SMSInboxJSON", prefix, index)
+		return cellularOperateStatus(index, "Success", "SMS inbox is loading; the refreshed inbox is pushed when ready", r.cachedString(inboxPath)), nil
+	}
+	return cellularOperateStatus(index, "Idle", output, ""), nil
+}
+
+// cellularOperateRunner is replaced in tests.
+var cellularOperateRunner = runCellularOperate
+
+// runCellularOperate performs one modem operation and returns the
+// LastCommandStatus, LastCommandOutput and (for ListSMS) the inbox JSON.
+func runCellularOperate(index int, operation string, input *wusp.Message) (string, string, string) {
 	ctl := modemPkg.New()
 	defer ctl.Close()
 	control, ok := ctl.(modemPkg.ControlController)
 	if !ok {
-		return r.cachedCellularOperateStatus(index, "Error", "cellular control backend is not available", ""), nil
+		return "Error", "cellular control backend is not available", ""
 	}
 	devicePath := cellularOperateDevicePath(ctl, input, index)
 	var output string
+	var err error
 
 	switch operation {
 	case "SetFunctionality":
@@ -1046,30 +1132,22 @@ func (r *uspRuntime) handleCellularOperate(ctx context.Context, cmd string, inpu
 		err = control.SendSMS(devicePath, phone, message)
 		output = "SMS sent"
 	case "ListSMS":
-		output, err = control.ListSMS(devicePath)
-		if output == "" {
-			output = "[]"
+		var inbox string
+		inbox, err = control.ListSMS(devicePath)
+		if err == nil {
+			return "Success", "SMS inbox refreshed", capSMSInboxJSON(firstNonEmpty(inbox, "[]"), wusp.WUSPSMSInboxMaxLength)
 		}
 	case "DeleteSMS":
 		index := cellularInputString(input, "DeleteIndex", "SMSIndex", "Index")
 		err = control.DeleteSMS(devicePath, index)
 		output = "SMS deleted"
 	default:
-		return nil, wusp.ErrUSPPathUnsupported
-	}
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+		return "Error", "unsupported cellular operation " + operation, ""
 	}
 	if err != nil {
-		return r.cachedCellularOperateStatus(index, "Error", err.Error(), ""), nil
+		return "Error", err.Error(), ""
 	}
-	if operation == "ListSMS" {
-		return r.cachedCellularOperateStatus(index, "Success", "SMS inbox refreshed", output), nil
-	}
-	return r.cachedCellularOperateStatus(index, "Success", output, ""), nil
+	return "Success", output, ""
 }
 
 func cellularOperateDevicePath(ctl modemPkg.Controller, input *wusp.Message, index int) string {
@@ -1115,6 +1193,9 @@ func cellularInputInt(input *wusp.Message, fallback int, names ...string) int {
 }
 
 func cellularOperateStatus(index int, status, output, smsInbox string) *wusp.Message {
+	// The controller decodes replies strictly; an output over the schema
+	// limit would fail the whole reply, so keep it within bounds.
+	output = truncateUTF8(output, wusp.WUSPCellularCommandOutputMaxLength)
 	msg := wusp.NewMessage()
 	prefix := fmt.Sprintf("Device.WUSP_CellularControl.Interface.%d.", index)
 	msg.Set(prefix+"LastCommandStatus", wusp.String(status))

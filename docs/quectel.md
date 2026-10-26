@@ -192,9 +192,18 @@ location API instead of forcing the AT session off.
 SMS read/send/delete remain USP `Operate` actions. The preferred service is QMI
 WMS. This image also supplies working AT/CGI flows:
 
-- list: configure text mode/storage and issue `AT+CMGL="ALL"`;
+- list: `AT+CMGF=0;+CPMS="<SM|ME>";+CMGL=4` (PDU mode) through the bridge,
+  decoded and multi-part joined natively; the previous `AT+CMGF` mode is
+  restored afterwards because `send_sms` and the web console assume text
+  mode. Text mode (`AT+CMGL="ALL"`) is only a fallback: it cannot join
+  concatenated parts and its replies are ambiguous;
 - delete: `AT+CMGD=<index>`;
 - send: the installed `send_sms` bridge, which handles the `CMGS` prompt.
+
+`ListSMS` can take longer than the 5 s control deadline on this bridge. The
+agent answers within the deadline with the last known inbox and pushes the
+refreshed `SMSInboxJSON` as a ValueChange when the listing completes. The
+inbox is capped to the 16 KiB schema limit, keeping the newest messages.
 
 Phone numbers and message content are operation inputs and must not appear in
 normal telemetry or logs.
@@ -260,7 +269,7 @@ When both LTE and NR carriers are present, publish NR mode as NSA even if
 | USP operation/value | AT command | Notes |
 |---|---|---|
 | storage capacity/used | `AT+CPMS?` | Maps to `SMS.Storage` capacity and availability |
-| list messages | `AT+CMGF=1`, select storage with `AT+CPMS`, then `AT+CMGL="ALL"` | Preserve message index for later delete; normalize output for the USP result |
+| list messages | `AT+CMGF=0;+CPMS="SM";+CMGL=4`, then `"ME"` | PDU mode; restore the prior `AT+CMGF` mode; text-mode `AT+CMGL="ALL"` only as fallback |
 | delete one message | `AT+CMGD=<index>` | Index must be a positive decimal value returned by list |
 | delete all messages | `AT+CMGD=,4` | Destructive; expose only through an explicitly authorized USP operation |
 | send message | `AT+CMGF=1`, `AT+CMGS="<number>"`, body, Ctrl-Z | Use QMI WMS first; AT fallback must handle the interactive prompt and CMS errors |

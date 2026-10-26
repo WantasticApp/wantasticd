@@ -49,6 +49,7 @@ coverage*.html
 test-results/
 playwright-report/
 *.log
+.env
 __pycache__/
 *.py[cod]
 .pytest_cache/

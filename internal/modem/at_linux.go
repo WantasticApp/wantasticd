@@ -167,53 +167,7 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	info.CollectedAt = time.Now()
 	_, _ = at.sendWithTimeout("AT", time.Second)
 
-	// Identity
-	if lines := at.send("ATI"); len(lines) > 0 {
-		info.Model = strings.Join(lines, " ")
-	}
-	if lines := at.send("AT+CGMI"); len(lines) > 0 {
-		info.Manufacturer = lines[0]
-	}
-	if lines := at.send("AT+CGMM"); len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
-		info.Model = strings.TrimSpace(lines[0])
-	}
-	if lines := at.send("AT+CGMR"); len(lines) > 0 {
-		info.Revision = lines[0]
-	}
-	if lines := at.send("AT+GSN"); len(lines) > 0 {
-		info.IMEI = strings.TrimSpace(lines[0])
-	} else if lines := at.send("AT+CGSN"); len(lines) > 0 {
-		info.IMEI = strings.TrimSpace(lines[0])
-	}
-	if lines := at.send("AT+CIMI"); len(lines) > 0 {
-		info.IMSI = strings.TrimSpace(lines[0])
-	}
-	if lines := at.send("AT+CCID"); len(lines) > 0 {
-		val := lines[0]
-		if strings.HasPrefix(val, "+CCID:") {
-			val = strings.TrimSpace(strings.TrimPrefix(val, "+CCID:"))
-		}
-		info.ICCID = digitsOnly(val)
-	} else if lines := at.send("AT+ICCID"); len(lines) > 0 {
-		info.ICCID = digitsOnly(parseColonValue(lines[0]))
-	}
-	if lines := at.send("AT+CNUM"); len(lines) > 0 {
-		// +CNUM: "","+1234567890",129
-		if strings.Contains(lines[0], ",") {
-			parts := strings.Split(lines[0], ",")
-			if len(parts) >= 2 {
-				info.MSISDN = strings.Trim(parts[1], "\"")
-			}
-		}
-	}
-
-	// Signal
-	info.Signal = c.parseSignal(at)
-
-	// Registration + operator
-	c.parseRegistration(at, info)
-
-	// SIM status
+	// SIM state first: it decides whether the cached SIM identity is valid.
 	if lines := at.send("AT+CPIN?"); len(lines) > 0 {
 		for _, line := range lines {
 			if !strings.HasPrefix(strings.TrimSpace(line), "+CPIN:") {
@@ -229,6 +183,58 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 			break
 		}
 	}
+
+	// Identity rarely changes, and on the vendor CGI bridge every command is
+	// a fork of the CGI plus microcom; re-reading eight identity commands
+	// every minute was the bulk of the sweep. Cache it per port.
+	if !applyCachedATIdentity(port, info) {
+		if lines := at.send("ATI"); len(lines) > 0 {
+			info.Model = strings.Join(lines, " ")
+		}
+		if lines := at.send("AT+CGMI"); len(lines) > 0 {
+			info.Manufacturer = lines[0]
+		}
+		if lines := at.send("AT+CGMM"); len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
+			info.Model = strings.TrimSpace(lines[0])
+		}
+		if lines := at.send("AT+CGMR"); len(lines) > 0 {
+			info.Revision = lines[0]
+		}
+		if lines := at.send("AT+GSN"); len(lines) > 0 {
+			info.IMEI = strings.TrimSpace(lines[0])
+		} else if lines := at.send("AT+CGSN"); len(lines) > 0 {
+			info.IMEI = strings.TrimSpace(lines[0])
+		}
+		if lines := at.send("AT+CIMI"); len(lines) > 0 {
+			info.IMSI = strings.TrimSpace(lines[0])
+		}
+		if lines := at.send("AT+CCID"); len(lines) > 0 {
+			val := lines[0]
+			if strings.HasPrefix(val, "+CCID:") {
+				val = strings.TrimSpace(strings.TrimPrefix(val, "+CCID:"))
+			}
+			info.ICCID = digitsOnly(val)
+		} else if lines := at.send("AT+ICCID"); len(lines) > 0 {
+			info.ICCID = digitsOnly(parseColonValue(lines[0]))
+		}
+		if lines := at.send("AT+CNUM"); len(lines) > 0 {
+			// +CNUM: "","+1234567890",129
+			if strings.Contains(lines[0], ",") {
+				parts := strings.Split(lines[0], ",")
+				if len(parts) >= 2 {
+					info.MSISDN = strings.Trim(parts[1], "\"")
+				}
+			}
+		}
+
+		storeATIdentity(port, info)
+	}
+
+	// Signal
+	info.Signal = c.parseSignal(at)
+
+	// Registration + operator
+	c.parseRegistration(at, info)
 
 	// Data connection info
 	if lines := at.send("AT+CGPADDR"); len(lines) > 0 {
@@ -338,6 +344,62 @@ func (c *atController) GetInfo(devicePath string) (*Info, error) {
 	return info, nil
 }
 
+// Modem identity changes only with SetIMEI or a firmware flash; SIM identity
+// with the SIM, so it is also dropped whenever the SIM state changes.
+const (
+	atModemIdentityTTL = 30 * time.Minute
+	atSIMIdentityTTL   = 10 * time.Minute
+)
+
+type atIdentity struct {
+	model, manufacturer, revision, imei string
+	imsi, iccid, msisdn                 string
+	simStatus                           SIMStatus
+	at                                  time.Time
+}
+
+var atIdentityCache sync.Map // port -> atIdentity
+
+func applyCachedATIdentity(port string, info *Info) bool {
+	value, ok := atIdentityCache.Load(port)
+	if !ok {
+		return false
+	}
+	id := value.(atIdentity)
+	age := time.Since(id.at)
+	if age >= atModemIdentityTTL || age >= atSIMIdentityTTL || id.simStatus != info.SIMStatus {
+		return false
+	}
+	info.Model = firstNonEmpty(id.model, info.Model)
+	info.Manufacturer = firstNonEmpty(id.manufacturer, info.Manufacturer)
+	info.Revision = firstNonEmpty(id.revision, info.Revision)
+	info.IMEI = firstNonEmpty(id.imei, info.IMEI)
+	info.IMSI = firstNonEmpty(id.imsi, info.IMSI)
+	info.ICCID = firstNonEmpty(id.iccid, info.ICCID)
+	info.MSISDN = firstNonEmpty(id.msisdn, info.MSISDN)
+	return true
+}
+
+func storeATIdentity(port string, info *Info) {
+	if info.IMEI == "" && info.Model == "" {
+		return // nothing answered; ask again next sweep
+	}
+	atIdentityCache.Store(port, atIdentity{
+		model: info.Model, manufacturer: info.Manufacturer, revision: info.Revision, imei: info.IMEI,
+		imsi: info.IMSI, iccid: info.ICCID, msisdn: info.MSISDN,
+		simStatus: info.SIMStatus, at: time.Now(),
+	})
+}
+
+// invalidateATIdentity forgets cached identity after a control operation
+// that changes it (IMEI write, SIM slot switch, radio reset).
+func invalidateATIdentity() {
+	atIdentityCache.Range(func(key, _ any) bool {
+		atIdentityCache.Delete(key)
+		return true
+	})
+}
+
 func hasLTEAndNRCarriers(carriers []CarrierInfo) bool {
 	var lte, nr bool
 	for _, carrier := range carriers {
@@ -405,6 +467,7 @@ func (c *atController) atSenderFor(devicePath string) atSender {
 }
 
 func (c *atController) SetFunctionality(devicePath, mode string) error {
+	defer invalidateATIdentity()
 	value, err := functionalityATValue(mode)
 	if err != nil {
 		return err
@@ -417,6 +480,7 @@ func (c *atController) SetSIMSlot(devicePath string, slot int) error {
 	if slot < 1 || slot > 4 {
 		return fmt.Errorf("SIM slot must be between 1 and 4")
 	}
+	defer invalidateATIdentity()
 	if _, err := c.sendATCommand(devicePath, "AT+CFUN=0", 30); err != nil {
 		return err
 	}
@@ -432,6 +496,7 @@ func (c *atController) SetIMEI(devicePath, imei string) error {
 	if len(imei) != 15 {
 		return fmt.Errorf("IMEI must contain exactly 15 digits")
 	}
+	defer invalidateATIdentity()
 	_, err := c.sendATCommand(devicePath, fmt.Sprintf("AT+EGMR=1,7,\"%s\"", imei), 15)
 	return err
 }
@@ -551,16 +616,9 @@ func (c *atController) SendSMS(devicePath string, phoneNumber, message string) e
 	smsOperationMu.Lock()
 	defer smsOperationMu.Unlock()
 
-	phoneNumber = strings.TrimSpace(phoneNumber)
-	message = sanitizeOutgoingSMSText(message)
-	if phoneNumber == "" || message == "" {
-		return fmt.Errorf("phone number and message are required")
-	}
-	if !validSMSPhoneNumber(phoneNumber) {
-		return fmt.Errorf("invalid SMS phone number")
-	}
-	if len(message) > 1600 {
-		return fmt.Errorf("SMS message exceeds 1600 bytes")
+	phoneNumber, message, err := validateOutgoingSMS(phoneNumber, message)
+	if err != nil {
+		return err
 	}
 	const sendBridge = "/usrdata/simpleadmin/www/cgi-bin/send_sms"
 	if filepath.Base(c.findATPort(devicePath)) == "ttyOUT2" {
@@ -604,10 +662,18 @@ func (c *atController) ListSMS(devicePath string) (string, error) {
 	smsOperationMu.Lock()
 	defer smsOperationMu.Unlock()
 
-	if port := c.directATPort(devicePath); port != "" {
-		if payload, err := c.listSMSPDU(port); err == nil {
+	// PDU mode first on every transport, the vendor CGI bridge included:
+	// listing is a plain command/response exchange (only CMGS needs the
+	// interactive prompt). Text mode cannot be parsed reliably: multi-part
+	// messages arrive unjoined, a body line reading "OK" ends the reply,
+	// lines starting with "+" or "AT" are lost and UCS2 numbers stay hex.
+	var pduErr error
+	if port := c.findATPort(devicePath); port != "" {
+		payload, err := c.listSMSPDU(port)
+		if err == nil {
 			return payload, nil
 		}
+		pduErr = err
 	}
 	if smsToolAvailable() {
 		out, err := runSMSToolSMS(25*time.Second, "-j", "recv")
@@ -631,6 +697,9 @@ func (c *atController) ListSMS(devicePath string) (string, error) {
 		messages = append(messages, parsed...)
 	}
 	if len(messages) == 0 && len(failures) == 2 {
+		if pduErr != nil {
+			failures = append([]string{"PDU: " + pduErr.Error()}, failures...)
+		}
 		return "", fmt.Errorf("list SMS failed: %s", strings.Join(failures, "; "))
 	}
 	payload, err := json.Marshal(messages)
@@ -745,28 +814,57 @@ func (c *atController) sendSMSPDU(port, number, message string) error {
 	})
 }
 
+// smsListTimeout bounds one AT+CMGL per storage; a full 255-slot ME store
+// at 115200 baud reads in well under this.
+const smsListTimeout = 12 * time.Second
+
 func (c *atController) listSMSPDU(port string) (string, error) {
-	messages := []smsInboxMessage{}
-	var failures []string
-	err := c.withDirectATSession(port, func(at *atSession) error {
-		for _, storage := range []string{"SM", "ME"} {
-			lines, err := at.sendWithTimeout(fmt.Sprintf(`AT+CMGF=0;+CPMS="%s";+CMGL=4`, storage), 12*time.Second)
-			if err != nil {
-				failures = append(failures, storage+": "+err.Error())
-				continue
-			}
-			messages = append(messages, joinSMSPDUs(storage, parseCMGLPDUs(lines))...)
-		}
-		return nil
-	})
+	at, closeFn, err := c.openATSessionOnPortWithRetry(port, 3)
 	if err != nil {
 		return "", err
 	}
-	if len(messages) == 0 && len(failures) == 2 {
+	defer closeFn()
+	if at.f != nil {
+		_, _ = at.sendWithTimeout("AT", time.Second)
+	}
+	// Other clients on a shared bridge (the vendor send_sms CGI, sms_tool,
+	// web consoles) may assume text mode; put the modem back as found.
+	previousMode := ""
+	if lines, err := at.sendWithTimeout("AT+CMGF?", 2*time.Second); err == nil {
+		previousMode = parseCMGFMode(lines)
+	}
+	messages := []smsInboxMessage{}
+	var failures []string
+	for _, storage := range []string{"SM", "ME"} {
+		lines, err := at.sendWithTimeout(fmt.Sprintf(`AT+CMGF=0;+CPMS="%s";+CMGL=4`, storage), smsListTimeout)
+		if err != nil {
+			failures = append(failures, storage+": "+err.Error())
+			continue
+		}
+		messages = append(messages, joinSMSPDUs(storage, parseCMGLPDUs(lines))...)
+	}
+	if previousMode != "" && previousMode != "0" {
+		_, _ = at.sendWithTimeout("AT+CMGF="+previousMode, 2*time.Second)
+	}
+	if len(failures) == 2 {
 		return "", fmt.Errorf("list SMS failed: %s", strings.Join(failures, "; "))
 	}
+	sortSMSInbox(messages)
 	payload, err := json.Marshal(messages)
 	return string(payload), err
+}
+
+func parseCMGFMode(lines []string) string {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "+CMGF:") {
+			mode := strings.TrimSpace(strings.TrimPrefix(line, "+CMGF:"))
+			if mode == "0" || mode == "1" {
+				return mode
+			}
+		}
+	}
+	return ""
 }
 
 // submitPDU runs one AT+CMGS exchange: command, wait for the "> " prompt,
@@ -1118,6 +1216,22 @@ func smsToolSendSupportsMessage(value string) bool {
 	return !strings.ContainsAny(value, " \t\n")
 }
 
+// validateOutgoingSMS normalizes and checks SendSMS inputs for every backend.
+func validateOutgoingSMS(phoneNumber, message string) (string, string, error) {
+	phoneNumber = strings.TrimSpace(phoneNumber)
+	message = sanitizeOutgoingSMSText(message)
+	if phoneNumber == "" || message == "" {
+		return "", "", fmt.Errorf("phone number and message are required")
+	}
+	if !validSMSPhoneNumber(phoneNumber) {
+		return "", "", fmt.Errorf("invalid SMS phone number")
+	}
+	if len(message) > 1600 {
+		return "", "", fmt.Errorf("SMS message exceeds 1600 bytes")
+	}
+	return phoneNumber, message, nil
+}
+
 func validSMSPhoneNumber(value string) bool {
 	for i, r := range value {
 		if r == '+' && i == 0 {
@@ -1199,20 +1313,59 @@ func (c *atController) openATSessionOnPort(port string) (*atSession, func(), err
 		// Talk to the bridge directly under microcom's own lock, so the
 		// vendor tools and this agent still take turns; microcom is only the
 		// fallback when the port cannot be opened.
-		f, release, lockErr := openLockedATPort(port)
+		session, release, lockErr := openExclusiveATSession(port)
 		if lockErr == nil {
-			return &atSession{f: f, reader: bufio.NewReader(f)}, release, nil
+			return session, release, nil
 		}
 		if microcom, err := exec.LookPath("microcom"); err == nil {
 			return &atSession{port: port, microcom: microcom}, func() {}, nil
 		}
 		return nil, func() {}, lockErr
 	}
-	f, err := openRawATPort(port)
+	return openExclusiveATSession(port)
+}
+
+// atPortWait bounds how long a session waits for another session of this
+// agent on the same port (the minute collector sweep takes a few seconds).
+var atPortWait = 20 * time.Second
+
+// atPortLocks serializes whole AT sessions per port inside the agent. The
+// cellular collector, GNSS refresh and an SMS operation each read replies
+// off the tty; two concurrent sessions steal each other's lines, which is
+// how a CMGL listing came back partial or interleaved with QENG output.
+var atPortLocks sync.Map // port -> chan struct{} (capacity 1)
+
+func lockATPort(port string, wait time.Duration) (func(), error) {
+	value, _ := atPortLocks.LoadOrStore(port, make(chan struct{}, 1))
+	sem := value.(chan struct{})
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-sem }) }, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("%s is busy with another AT session", port)
+	}
+}
+
+// openExclusiveATSession holds the port for the whole session: the agent's
+// own per-port lock first, then the UUCP LCK..<dev> file microcom, minicom
+// and similar tools honour, so other well-behaved AT clients take turns too.
+func openExclusiveATSession(port string) (*atSession, func(), error) {
+	unlock, err := lockATPort(port, atPortWait)
 	if err != nil {
 		return nil, func() {}, err
 	}
-	return &atSession{f: f, reader: bufio.NewReader(f)}, func() { _ = f.Close() }, nil
+	f, release, err := openLockedATPort(port)
+	if err != nil {
+		unlock()
+		return nil, func() {}, err
+	}
+	return &atSession{f: f, reader: bufio.NewReader(f)}, func() {
+		release()
+		unlock()
+	}, nil
 }
 
 // openRawATPort opens a modem AT tty in raw 8N1 mode at 115200 baud, the
@@ -3721,6 +3874,11 @@ func cgiATResponseMatches(raw, cmd string) bool {
 func isBridgeReadOnlyATCommand(cmd string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(cmd))
 	if upper == "AT" || upper == "ATI" || strings.HasSuffix(upper, "?") {
+		return true
+	}
+	// Listing SMS, with the CMGF/CPMS selection it carries, is idempotent;
+	// a repeat only drains a stale reply. CMGD/CMGS never qualify.
+	if strings.Contains(upper, "+CMGL=") || upper == "AT+CMGF=0" || upper == "AT+CMGF=1" {
 		return true
 	}
 	for _, prefix := range []string{

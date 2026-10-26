@@ -1,10 +1,25 @@
 // Package modem provides cross-platform cellular modem monitoring and control.
 //
-// Platform implementations:
+// Backend selection on Linux (default pure-Go build, CGO_ENABLED=0):
 //
-//	Linux:   libqmi CGo (-tags qmi), libmbim CGo (-tags mbim), AT commands fallback
-//	OpenWrt: uqmi CLI + AT commands
-//	All:     AT commands over serial/USB (universal fallback)
+//  1. ModemManager over D-Bus, when the daemon runs and lists the modem.
+//     Discover returns its object paths; info, data calls and SMS
+//     (Modem.Messaging) go through it so the agent never talks AT on a port
+//     ModemManager owns. Quectel-only controls (QUIMSLOT, EGMR, GNSS) use the
+//     modem's own AT port resolved from the ModemManager object.
+//  2. Native QMI (QMUX framing over /dev/cdc-wdm*, qmux_linux.go) for
+//     registration, signal and data settings on qmi_wwan modems; uqmi when
+//     installed.
+//  3. AT commands: the Quectel SDX vendor bridge (/dev/ttyOUT2 through the
+//     simpleadmin get_atcommand/send_sms CGIs, or microcom), else a raw
+//     /dev/ttyUSB*, ttyACM*, at_mdm*, at_usb* port. Each session holds a
+//     per-port lock in the agent and the UUCP LCK..<dev> file, so collector,
+//     GNSS and SMS sessions never interleave replies. SMS uses PDU mode
+//     (warthog618/sms) with multi-part joining; sms_tool is a fallback.
+//
+// CGo builds can link libqmi-glib (-tags qmi) or libmbim-glib (-tags mbim)
+// instead; QTI's libqmi_cci on the Quectel module is a different ABI (see
+// docs/quectel.md).
 //
 // Maps to TR-181 Device.Cellular.* data model for WUSP integration.
 package modem

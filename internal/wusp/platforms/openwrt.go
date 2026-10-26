@@ -70,6 +70,7 @@ type OpenWrtBackendOptions struct {
 
 type OpenWrtBackend struct {
 	wifiReload              wifiReloadCoalescer
+	cellularInfo            cellularInfoCache
 	uciConfigDir            string
 	statePath               string
 	hostnamePath            string

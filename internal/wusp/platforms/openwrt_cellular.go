@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/wusp"
@@ -86,6 +88,77 @@ func (b *OpenWrtBackend) appendOpenWrtCellularConfig(msg *wusp.Message) {
 	msg.Set("Device.Cellular.AccessPointNumberOfEntries", wusp.Uint(apnIdx))
 }
 
+// cellularInfoTTL matches the cellular monitor's sweep interval. Every Get
+// runs the UCI cellular config collector, and a live GetInfo is a full AT
+// sweep (some 30 commands, each a CGI+microcom fork on bridged modems), so
+// the per-Get cost and the modem port contention came from here.
+const cellularInfoTTL = time.Minute
+
+type cachedCellularInfo struct {
+	info       *modemPkg.Info
+	err        error
+	at         time.Time
+	refreshing bool
+}
+
+// cellularInfoCache memoizes GetInfo per device path. A stale entry is
+// served while one background refresh runs; only a cold miss queries the
+// modem inline.
+type cellularInfoCache struct {
+	mu      sync.Mutex
+	entries map[string]*cachedCellularInfo
+}
+
+func (c *cellularInfoCache) get(ctl modemPkg.Controller, devicePath string) (*modemPkg.Info, error) {
+	c.mu.Lock()
+	if c.entries == nil {
+		c.entries = map[string]*cachedCellularInfo{}
+	}
+	entry, ok := c.entries[devicePath]
+	if ok && (time.Since(entry.at) < cellularInfoTTL || entry.refreshing) {
+		info, err := cloneCellularInfo(entry.info), entry.err
+		c.mu.Unlock()
+		return info, err
+	}
+	if ok {
+		entry.refreshing = true
+		info, err := cloneCellularInfo(entry.info), entry.err
+		c.mu.Unlock()
+		go func() {
+			fresh := newModemController()
+			if fresh == nil {
+				c.store(devicePath, nil, fmt.Errorf("cellular controller is unavailable"))
+				return
+			}
+			defer fresh.Close()
+			info, err := fresh.GetInfo(devicePath)
+			c.store(devicePath, info, err)
+		}()
+		return info, err
+	}
+	c.mu.Unlock()
+	info, err := ctl.GetInfo(devicePath)
+	c.store(devicePath, info, err)
+	return cloneCellularInfo(info), err
+}
+
+func (c *cellularInfoCache) store(devicePath string, info *modemPkg.Info, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = map[string]*cachedCellularInfo{}
+	}
+	c.entries[devicePath] = &cachedCellularInfo{info: cloneCellularInfo(info), err: err, at: time.Now()}
+}
+
+func cloneCellularInfo(info *modemPkg.Info) *modemPkg.Info {
+	if info == nil {
+		return nil
+	}
+	clone := *info
+	return &clone
+}
+
 func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, section openWrtUCISection) (*modemPkg.Info, string) {
 	if ctl == nil {
 		return nil, ""
@@ -94,7 +167,7 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 	var statsOnly *modemPkg.Info
 	var statsOnlyPath string
 	for _, candidate := range candidates {
-		info, err := ctl.GetInfo(candidate)
+		info, err := b.cellularInfo.get(ctl, candidate)
 		if err != nil {
 			logCollectorError("openwrt.cellular.info."+candidate, err)
 			continue
@@ -122,7 +195,7 @@ func (b *OpenWrtBackend) collectOpenWrtCellularInfo(ctl modemPkg.Controller, sec
 			if _, ok := seen[candidate]; ok {
 				continue
 			}
-			info, err := ctl.GetInfo(candidate)
+			info, err := b.cellularInfo.get(ctl, candidate)
 			if err != nil {
 				logCollectorError("openwrt.cellular.info."+candidate, err)
 				continue

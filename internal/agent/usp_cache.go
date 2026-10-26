@@ -72,6 +72,16 @@ func (c *persistentDataModelCache) Collect(ctx context.Context, paths ...string)
 	return subsetCachedMessage(msg, paths...), nil
 }
 
+// Value returns one cached parameter without triggering a collection.
+func (c *persistentDataModelCache) Value(path string) (wusp.Value, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.msg == nil {
+		return wusp.Value{}, false
+	}
+	return c.msg.Get(path)
+}
+
 func (c *persistentDataModelCache) Set(ctx context.Context, path string, value wusp.Value) error {
 	if err := c.backend.Set(ctx, path, value); err != nil {
 		return err

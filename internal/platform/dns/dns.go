@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -143,10 +145,28 @@ func ApplyTunnel(ctx context.Context, servers []string) Result {
 	}
 	if result.Changed {
 		log.Printf("DNS: applied %s via %s: %v", result.Reason, result.Method, result.Servers)
-	} else if result.Skipped {
-		log.Printf("DNS: skipped (%s)", result.Reason)
+	} else if result.Skipped && logTunnelSkipOnce(result.Reason) {
+		log.Printf("DNS: tunnel DNS not written (%s)", result.Reason)
 	}
 	return result
+}
+
+var lastTunnelSkip struct {
+	mu     sync.Mutex
+	reason string
+}
+
+// logTunnelSkipOnce reports a skip reason only when it changes: ApplyTunnel
+// re-runs every two minutes and an unchanged, intended skip (a DNS manager
+// owns resolv.conf) is not news.
+func logTunnelSkipOnce(reason string) bool {
+	lastTunnelSkip.mu.Lock()
+	defer lastTunnelSkip.mu.Unlock()
+	if lastTunnelSkip.reason == reason {
+		return false
+	}
+	lastTunnelSkip.reason = reason
+	return true
 }
 
 func desiredServers(req Request, existing []string) []string {
@@ -209,9 +229,27 @@ func sameServers(a, b []string) bool {
 	return true
 }
 
+// manualMarker records the console's manual resolver list inside the file
+// itself, so the reported Mode/Servers follow what is really in effect: a
+// DHCP client or vendor daemon that rewrites the file drops the marker, and
+// the agent's own periodic tunnel rewrites carry it over.
+const manualMarker = "# wantasticd-manual:"
+
+// controlReason is the header reason for a console-applied manual list.
+const controlReason = "DNS control"
+
 func writeResolvFile(path string, servers []string, reason string) (Result, error) {
+	return writeResolvFileManual(path, servers, reason, readManualMarker(path))
+}
+
+// writeResolvFileManual writes servers to path, recording manual (the
+// console's list, empty for automatic) in the file. A symlinked resolv.conf
+// (OE/QTI images link it into /var/run or /run) is written through so the
+// link and the volatile design survive; only a dangling link whose target
+// directory is gone is replaced by a regular file.
+func writeResolvFileManual(path string, servers []string, reason string, manual []string) (Result, error) {
 	existing := readResolvNameservers(path)
-	if sameServers(existing, servers) {
+	if sameServers(existing, servers) && sameServers(readManualMarker(path), manual) {
 		return Result{Method: "resolv.conf", Reason: "already current", Servers: servers}, nil
 	}
 
@@ -222,6 +260,12 @@ func writeResolvFile(path string, servers []string, reason string) (Result, erro
 		b.WriteString(reason)
 	}
 	b.WriteByte('\n')
+	if len(manual) > 0 {
+		b.WriteString(manualMarker)
+		b.WriteByte(' ')
+		b.WriteString(strings.Join(manual, " "))
+		b.WriteByte('\n')
+	}
 	for _, server := range servers {
 		b.WriteString("nameserver ")
 		b.WriteString(server)
@@ -229,15 +273,68 @@ func writeResolvFile(path string, servers []string, reason string) (Result, erro
 	}
 	b.WriteString("options timeout:1 attempts:1\n")
 
-	if fi, err := lstatPath(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		if target, err := os.Readlink(path); err == nil && !isManagedResolvTarget(target) {
-			_ = removePath(path)
-		}
-	}
-	if err := writeFile(path, []byte(b.String()), 0o644); err != nil {
-		return Result{}, fmt.Errorf("write %s: %w", path, err)
+	target := resolvWriteTarget(path)
+	if err := writeFile(target, []byte(b.String()), 0o644); err != nil {
+		return Result{}, describeWriteError(target, err)
 	}
 	return Result{Changed: true, Method: "resolv.conf", Reason: reason, Servers: servers}, nil
+}
+
+// resolvWriteTarget returns the file a write to path must go to: path itself,
+// or the target of a symlinked resolv.conf.
+func resolvWriteTarget(path string) string {
+	fi, err := lstatPath(path)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return path
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	link, err := os.Readlink(path)
+	if err != nil {
+		return path
+	}
+	if !filepath.IsAbs(link) {
+		link = filepath.Join(filepath.Dir(path), link)
+	}
+	if st, err := os.Stat(filepath.Dir(link)); err == nil && st.IsDir() {
+		return link
+	}
+	_ = removePath(path)
+	return path
+}
+
+// describeWriteError makes a read-only root filesystem obvious instead of a
+// bare EROFS.
+func describeWriteError(path string, err error) error {
+	if errors.Is(err, syscall.EROFS) {
+		return fmt.Errorf("write %s: read-only filesystem; remount it read-write or manage DNS through the platform resolver: %w", path, err)
+	}
+	return fmt.Errorf("write %s: %w", path, err)
+}
+
+// readManualMarker returns the console's manual list recorded in path. Files
+// written by older agents carry only the DNS-control header; their nameserver
+// lines are the manual list.
+func readManualMarker(path string) []string {
+	data, err := readFile(path)
+	if err != nil {
+		return nil
+	}
+	legacy := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, manualMarker) {
+			return strings.Fields(strings.TrimPrefix(line, manualMarker))
+		}
+		if line == "# Managed by wantasticd for "+controlReason {
+			legacy = true
+		}
+	}
+	if legacy {
+		return readResolvNameservers(path)
+	}
+	return nil
 }
 
 func isManagedResolvTarget(target string) bool {

@@ -25,6 +25,9 @@ type hostState struct {
 	ProvisioningCode string `json:"provisioning_code,omitempty"`
 	// DNSServers is the manual resolver list set from the console.
 	DNSServers []string `json:"dns_servers,omitempty"`
+	// NTPServers is the NTP server list set from the console; re-applied
+	// where the client keeps it only on its command line.
+	NTPServers []string `json:"ntp_servers,omitempty"`
 }
 
 type hostBackend struct {
@@ -48,12 +51,15 @@ type hostBackend struct {
 	commandRunner         CommandRunner
 	// useSystemd allows systemd's D-Bus services; off when a test injects
 	// its own command runner, so tests never touch the real system.
-	useSystemd  bool
-	cellular    *cellularMonitor
-	now         func() time.Time
-	linkSetUp   func(string) error
-	linkSetDown func(string) error
-	linkSetMTU  func(string, int) error
+	useSystemd bool
+	// ntp detects the NTP client; nil with an injected command runner.
+	ntp            *ntpEnv
+	ntpReapplyOnce sync.Once
+	cellular       *cellularMonitor
+	now            func() time.Time
+	linkSetUp      func(string) error
+	linkSetDown    func(string) error
+	linkSetMTU     func(string, int) error
 }
 
 type timeState struct {
@@ -120,6 +126,7 @@ func newHostBackend(kind Kind, opts Options) *hostBackend {
 	if backend.commandRunner == nil {
 		backend.commandRunner = defaultCommandRunner
 		backend.useSystemd = true
+		backend.ntp = defaultNTPEnv()
 	}
 	if backend.now == nil {
 		backend.now = time.Now
@@ -158,11 +165,19 @@ func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) er
 		return b.updateState(func(state *hostState) {
 			state.ProvisioningCode = value.AsString()
 		})
-	case "Device.Time.Enable":
+	case "Device.Time.Enable", "Device.Time.Client.1.Enable":
 		return b.setTimeEnabled(ctx, value.AsBool())
+	case "Device.Time.Client.1.Servers":
+		if !hostKindSupportsNTPControl(b.kind) {
+			return wusp.ErrUSPPathUnsupported
+		}
+		return b.setNTPServers(ctx, value)
 	case "Device.Time.LocalTimeZone":
 		return b.setTimeZone(ctx, value.AsString())
 	default:
+		if index, ok := ntpServerIndex(strings.TrimSpace(path)); ok && hostKindSupportsNTPControl(b.kind) {
+			return b.setNTPServerIndex(ctx, index, wusp.ValueToString(value))
+		}
 		return wusp.ErrUSPPathUnsupported
 	}
 }
@@ -257,7 +272,13 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	hostname := b.readHostname(ctx)
 	friendlyName := firstNonEmpty(state.FriendlyName, hostname)
 	memTotal, memFree := b.readMemory(ctx)
+	ntpClient := b.ntpClient()
 	timeState := b.readTimeEnabled(ctx)
+	if !timeState.Known && ntpClient.Kind != "" {
+		// No timedated (busybox/QTI images, chrony, ntpd): the client
+		// daemon running is what "enabled" means there.
+		timeState.Enabled, timeState.Known = ntpClient.Running, true
+	}
 	localTimeZone := b.readLocalTimeZone(ctx)
 	ipv6Enabled, ipv6Known := b.readIPv6Enabled(ctx)
 
@@ -319,6 +340,10 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	msg.Set("Device.Time.CurrentLocalTime", wusp.Time(now))
 	if localTimeZone != "" {
 		msg.Set("Device.Time.LocalTimeZone", wusp.String(localTimeZone))
+	}
+	if ntpClient.Kind != "" {
+		b.reapplyPersistedNTP(ctx, ntpClient)
+		appendNTPClientFields(msg, timeState.Enabled, ntpClient.Servers)
 	}
 
 	msg.Set("Device.IP.IPv4Capable", wusp.Bool(true))
@@ -1947,7 +1972,15 @@ func (b *hostBackend) setTimeEnabled(ctx context.Context, enabled bool) error {
 		_, err := b.commandRunner(ctx, "settings", "put", "global", "auto_time", value)
 		return err
 	default:
+		client := b.ntpClient()
+		if client.Kind != "" && client.Kind != ntpClientTimesyncd {
+			// timedated's SetNTP only drives systemd-timesyncd.
+			return b.setNTPServiceEnabled(ctx, client, enabled)
+		}
 		if b.useSystemd && systemd.SetNTP(ctx, enabled) == nil {
+			if b.ntp != nil {
+				b.ntp.invalidate()
+			}
 			return nil
 		}
 		value := "false"
@@ -1955,6 +1988,9 @@ func (b *hostBackend) setTimeEnabled(ctx context.Context, enabled bool) error {
 			value = "true"
 		}
 		_, err := b.commandRunner(ctx, "timedatectl", "set-ntp", value)
+		if err != nil && client.Kind == ntpClientTimesyncd {
+			return b.setNTPServiceEnabled(ctx, client, enabled)
+		}
 		return err
 	}
 }

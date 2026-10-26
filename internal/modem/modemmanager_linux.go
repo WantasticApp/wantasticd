@@ -91,20 +91,23 @@ func (c *modemManagerController) Disconnect(devicePath string) error {
 	return nil
 }
 
+// Quectel-only controls have no ModemManager API; they go to the modem's
+// own AT port (resolved from the ModemManager object when it manages it)
+// rather than whichever tty a fallback probe finds first.
 func (c *modemManagerController) SetFunctionality(devicePath, mode string) error {
-	return c.at.SetFunctionality(devicePath, mode)
+	return c.at.SetFunctionality(c.atDevicePathForModemManager(devicePath), mode)
 }
 
 func (c *modemManagerController) SetSIMSlot(devicePath string, slot int) error {
-	return c.at.SetSIMSlot(devicePath, slot)
+	return c.at.SetSIMSlot(c.atDevicePathForModemManager(devicePath), slot)
 }
 
 func (c *modemManagerController) SetIMEI(devicePath, imei string) error {
-	return c.at.SetIMEI(devicePath, imei)
+	return c.at.SetIMEI(c.atDevicePathForModemManager(devicePath), imei)
 }
 
 func (c *modemManagerController) SetAPNProfile(devicePath string, profile int, pdpType, apn string) error {
-	return c.at.SetAPNProfile(devicePath, profile, pdpType, apn)
+	return c.at.SetAPNProfile(c.atDevicePathForModemManager(devicePath), profile, pdpType, apn)
 }
 
 func (c *modemManagerController) SetGNSS(devicePath string, enabled bool) error {
@@ -115,15 +118,26 @@ func (c *modemManagerController) GetGNSS(devicePath string) (*GNSSInfo, error) {
 	return c.at.GetGNSS(c.atDevicePathForModemManager(devicePath))
 }
 
+// SMS goes through ModemManager's Messaging API whenever it manages the
+// modem, and over AT only when it does not.
 func (c *modemManagerController) SendSMS(devicePath, phoneNumber, message string) error {
+	if modem, ok := c.modemForPath(devicePath); ok {
+		return modemManagerSendSMS(modem.GetObjectPath(), phoneNumber, message)
+	}
 	return c.at.SendSMS(devicePath, phoneNumber, message)
 }
 
 func (c *modemManagerController) ListSMS(devicePath string) (string, error) {
+	if modem, ok := c.modemForPath(devicePath); ok {
+		return modemManagerListSMS(modem.GetObjectPath())
+	}
 	return c.at.ListSMS(devicePath)
 }
 
 func (c *modemManagerController) DeleteSMS(devicePath, index string) error {
+	if modem, ok := c.modemForPath(devicePath); ok {
+		return modemManagerDeleteSMS(modem.GetObjectPath(), index)
+	}
 	return c.at.DeleteSMS(devicePath, index)
 }
 

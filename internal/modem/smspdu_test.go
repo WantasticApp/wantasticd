@@ -63,9 +63,14 @@ func TestParseAndJoinCMGL(t *testing.T) {
 	lines = append(lines, "+CMGL: 10,1,,12", "ZZ-not-hex")
 
 	messages := joinSMSPDUs("SM", parseCMGLPDUs(lines))
-	if len(messages) != 2 {
+	if len(messages) != 3 {
 		t.Fatalf("messages=%+v", messages)
 	}
+	// An undecodable slot stays listed (so it can be deleted) with an error.
+	if bad := messages[1]; bad.Index != "10" || bad.Error == "" || bad.Body != "" {
+		t.Fatalf("undecodable=%+v", bad)
+	}
+	messages = append(messages[:1], messages[2:]...)
 	if strings.TrimPrefix(messages[0].Number, "+") != "7535" || messages[0].Index != "9" || messages[0].Status != "REC UNREAD" || messages[0].Body != "Votre forfait expire demain" {
 		t.Fatalf("single=%+v", messages[0])
 	}
@@ -86,5 +91,71 @@ func TestParseSMSDeleteTarget(t *testing.T) {
 		if _, _, err := parseSMSDeleteTarget(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// submitPDU builds a stored outgoing message the way a modem keeps it after
+// AT+CMGW or a sent CMGS: empty SMSC field then an SMS-SUBMIT TPDU.
+func storedSubmitPDU(t *testing.T, to, text string) string {
+	t.Helper()
+	pdus, err := encodeSMSSubmit(to, text)
+	if err != nil || len(pdus) != 1 {
+		t.Fatalf("encode: %v", err)
+	}
+	return pdus[0].hex
+}
+
+func TestParseCMGLSkipsURCsAndDecodesStoredSubmit(t *testing.T) {
+	deliver := deliverPDUs(t, "+212633333333", "Facture disponible")[0]
+	lines := []string{
+		"+CPMS: 3,50,3,50,3,50",
+		"+CMGL: 1,1,,30",
+		"+CMTI: \"SM\",4", // URC between header and PDU
+		deliver,
+		"+QIND: \"csq\",20,99",
+		"+CMGL: 2,3,,25",
+		storedSubmitPDU(t, "+212644444444", "Reboot scheduled"),
+		"+CMGL: 3,0,,30", // PDU line lost: must not swallow the next header
+		"+CMGL: 4,0,,30",
+		deliver,
+	}
+	entries := parseCMGLPDUs(lines)
+	if len(entries) != 4 {
+		t.Fatalf("entries=%d %+v", len(entries), entries)
+	}
+	messages := joinSMSPDUs("SM", entries)
+	byIndex := map[string]smsInboxMessage{}
+	for _, msg := range messages {
+		byIndex[msg.Index] = msg
+	}
+	if got := byIndex["1"]; got.Body != "Facture disponible" || got.Number != "+212633333333" || got.Status != "REC READ" {
+		t.Fatalf("deliver after URC=%+v", got)
+	}
+	if got := byIndex["2"]; got.Body != "Reboot scheduled" || got.Number != "+212644444444" || got.Status != "STO SENT" || got.Time != "" {
+		t.Fatalf("stored submit=%+v", got)
+	}
+	if got := byIndex["3"]; got.Error == "" {
+		t.Fatalf("missing PDU should be reported, got %+v", got)
+	}
+	if got := byIndex["4"]; got.Body != "Facture disponible" || got.Status != "REC UNREAD" {
+		t.Fatalf("row after a lost PDU=%+v", got)
+	}
+}
+
+func TestParseCMGLEmptyStorage(t *testing.T) {
+	if entries := parseCMGLPDUs([]string{"+CPMS: 0,50,0,50,0,50"}); len(entries) != 0 {
+		t.Fatalf("entries=%+v", entries)
+	}
+}
+
+func TestSortSMSInboxOldestFirst(t *testing.T) {
+	messages := []smsInboxMessage{
+		{Index: "9", Time: "2026-10-26T10:00:00+01:00"},
+		{Index: "2"},
+		{Index: "4", Time: "2026-10-25T08:00:00+00:00"},
+	}
+	sortSMSInbox(messages)
+	if messages[0].Index != "2" || messages[1].Index != "4" || messages[2].Index != "9" {
+		t.Fatalf("order=%+v", messages)
 	}
 }

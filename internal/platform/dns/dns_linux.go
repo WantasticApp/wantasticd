@@ -6,7 +6,6 @@ package dns
 import (
 	"context"
 	"fmt"
-	"os"
 )
 
 func Apply(ctx context.Context, req Request) (Result, error) {
@@ -30,39 +29,17 @@ func Apply(ctx context.Context, req Request) (Result, error) {
 		return writeResolvFile(resolvConfPath, servers, req.Reason)
 	}
 
+	// Plain and symlinked-volatile files are written (through the link); a
+	// local dnsmasq stub file is too, as before, and IncludeExisting keeps the
+	// stub in the list. Managers that regenerate the file are left alone.
 	manager := detectLinuxDNSManager()
-	if manager != "plain-file" {
+	if manager != managerPlainFile && manager != managerVolatileFile && manager != managerDnsmasq {
 		return Result{
 			Skipped: true,
 			Method:  manager,
-			Reason:  fmt.Sprintf("%s manages DNS; set WANTASTIC_DNS_MODE=force-file to override", manager),
+			Reason:  fmt.Sprintf("%s manages /etc/resolv.conf; device DNS is controlled through it (Device.WUSP_DNS), set WANTASTIC_DNS_MODE=force-file to override", manager),
 			Servers: servers,
 		}, nil
 	}
 	return writeResolvFile(resolvConfPath, servers, req.Reason)
-}
-
-func detectLinuxDNSManager() string {
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		return "openwrt-uci"
-	}
-	if commandAvailable("resolvectl") || commandAvailable("systemd-resolve") {
-		if fi, err := lstatPath(resolvConfPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if target, err := os.Readlink(resolvConfPath); err == nil && isManagedResolvTarget(target) {
-				return "systemd-resolved"
-			}
-		}
-	}
-	if commandAvailable("nmcli") {
-		return "networkmanager"
-	}
-	if commandAvailable("resolvconf") {
-		return "resolvconf"
-	}
-	if fi, err := lstatPath(resolvConfPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		if target, err := os.Readlink(resolvConfPath); err == nil && isManagedResolvTarget(target) {
-			return "managed-resolv.conf"
-		}
-	}
-	return "plain-file"
 }

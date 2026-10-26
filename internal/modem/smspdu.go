@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/warthog618/sms"
 	"github.com/warthog618/sms/encoding/tpdu"
@@ -49,23 +50,30 @@ type smsInboxMessage struct {
 	Number  string `json:"number,omitempty"`
 	Time    string `json:"time,omitempty"`
 	Body    string `json:"body,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 type smsPDUEntry struct {
 	index  int
 	status string
 	tpdu   *tpdu.TPDU
+	// err is set when the stored PDU could not be decoded. The row is still
+	// listed (with its storage index) so it can be deleted from the console
+	// instead of silently filling the SIM.
+	err error
 }
 
 var cmglStatus = map[string]string{"0": "REC UNREAD", "1": "REC READ", "2": "STO UNSENT", "3": "STO SENT"}
 
 // parseCMGLPDUs reads AT+CMGL=4 output in PDU mode: a "+CMGL: idx,stat,,len"
-// line followed by the hex PDU (SMSC field included).
+// line followed by the hex PDU (SMSC field included). Unsolicited result
+// codes the modem interleaves (+CMTI, +QIND, RDY, ...) are skipped while
+// looking for the PDU, so a URC never shifts every later message.
 func parseCMGLPDUs(lines []string) []smsPDUEntry {
 	var out []smsPDUEntry
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, "+CMGL:") || i+1 >= len(lines) {
+		if !strings.HasPrefix(line, "+CMGL:") {
 			continue
 		}
 		fields := strings.Split(strings.TrimSpace(strings.TrimPrefix(line, "+CMGL:")), ",")
@@ -73,22 +81,76 @@ func parseCMGLPDUs(lines []string) []smsPDUEntry {
 		if err != nil || index <= 0 {
 			continue
 		}
-		status := ""
+		stat := ""
 		if len(fields) > 1 {
-			status = cmglStatus[strings.TrimSpace(fields[1])]
+			stat = strings.TrimSpace(fields[1])
 		}
-		raw, err := hex.DecodeString(strings.TrimSpace(lines[i+1]))
-		i++
-		if err != nil || len(raw) < 1 || len(raw) < 1+int(raw[0]) {
-			continue
+		pduLine := ""
+		for j := i + 1; j < len(lines); j++ {
+			candidate := strings.TrimSpace(lines[j])
+			if strings.HasPrefix(candidate, "+CMGL:") {
+				break
+			}
+			if isHexPDU(candidate) {
+				pduLine = candidate
+				i = j
+				break
+			}
 		}
-		pdu, err := sms.Unmarshal(raw[1+int(raw[0]):], sms.AsMT)
-		if err != nil {
-			continue
-		}
-		out = append(out, smsPDUEntry{index: index, status: status, tpdu: pdu})
+		entry := smsPDUEntry{index: index, status: cmglStatus[stat]}
+		entry.tpdu, entry.err = decodeStoredPDU(pduLine, stat)
+		out = append(out, entry)
 	}
 	return out
+}
+
+func isHexPDU(value string) bool {
+	if len(value) < 4 || len(value)%2 != 0 {
+		return false
+	}
+	for _, r := range value {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeStoredPDU strips the SMSC field and unmarshals the TPDU. Stored
+// outgoing messages (stat 2/3) are SMS-SUBMIT and must be decoded in the
+// mobile-originated direction, or their MTI reads as a SUBMIT-REPORT.
+func decodeStoredPDU(pduLine, stat string) (*tpdu.TPDU, error) {
+	if pduLine == "" {
+		return nil, fmt.Errorf("missing PDU")
+	}
+	raw, err := hex.DecodeString(pduLine)
+	if err != nil {
+		return nil, fmt.Errorf("invalid PDU hex: %w", err)
+	}
+	if len(raw) < 1 || len(raw) < 1+int(raw[0]) {
+		return nil, fmt.Errorf("truncated PDU")
+	}
+	direction := sms.AsMT
+	if stat == "2" || stat == "3" {
+		direction = sms.AsMO
+	}
+	pdu, err := sms.Unmarshal(raw[1+int(raw[0]):], direction)
+	if err != nil {
+		return nil, fmt.Errorf("decode PDU: %w", err)
+	}
+	return pdu, nil
+}
+
+// smsPeerNumber is the sender of a received message or the recipient of a
+// stored outgoing one.
+func smsPeerNumber(pdu *tpdu.TPDU) string {
+	if pdu == nil {
+		return ""
+	}
+	if pdu.SmsType() == tpdu.SmsSubmit {
+		return pdu.DA.Number()
+	}
+	return pdu.OA.Number()
 }
 
 // joinSMSPDUs decodes entries into inbox rows, joining concatenated parts
@@ -108,30 +170,39 @@ func joinSMSPDUs(storage string, entries []smsPDUEntry) []smsInboxMessage {
 			segments[i] = part.tpdu
 			indexes[i] = strconv.Itoa(part.index)
 		}
-		body, err := sms.Decode(segments)
-		if err != nil {
-			return
-		}
 		first := parts[0]
 		msg := smsInboxMessage{
 			Storage: storage,
 			Index:   strings.Join(indexes, ","),
 			Status:  first.status,
-			Number:  first.tpdu.OA.Number(),
-			Body:    normalizeSMSBody(string(body)),
 		}
-		if !first.tpdu.SCTS.IsZero() {
+		if first.tpdu == nil {
+			msg.Error = first.err.Error()
+			out = append(out, msg)
+			return
+		}
+		msg.Number = smsPeerNumber(first.tpdu)
+		if body, err := sms.Decode(segments); err == nil {
+			msg.Body = normalizeSMSBody(string(body))
+		} else {
+			msg.Error = "decode text: " + err.Error()
+		}
+		if first.tpdu.SmsType() == tpdu.SmsDeliver && !first.tpdu.SCTS.IsZero() {
 			msg.Time = first.tpdu.SCTS.Format("2006-01-02T15:04:05-07:00")
 		}
 		out = append(out, msg)
 	}
 	for _, entry := range entries {
+		if entry.tpdu == nil {
+			emit([]smsPDUEntry{entry})
+			continue
+		}
 		segments, seqno, mref, ok := entry.tpdu.ConcatInfo()
 		if !ok || segments <= 1 {
 			emit([]smsPDUEntry{entry})
 			continue
 		}
-		key := fmt.Sprintf("%s|%d|%d", entry.tpdu.OA.Number(), mref, segments)
+		key := fmt.Sprintf("%s|%d|%d|%d", smsPeerNumber(entry.tpdu), entry.tpdu.SmsType(), mref, segments)
 		g := groups[key]
 		if g == nil {
 			g = &group{parts: map[int]smsPDUEntry{}, segments: segments}
@@ -160,6 +231,28 @@ func joinSMSPDUs(storage string, entries []smsPDUEntry) []smsInboxMessage {
 		}
 	}
 	return out
+}
+
+// sortSMSInbox orders rows oldest first by service-centre time, keeping the
+// storage order for rows without one (stored drafts, undecodable PDUs), so a
+// size-capped inbox keeps the newest messages at the end.
+func sortSMSInbox(messages []smsInboxMessage) {
+	sort.SliceStable(messages, func(i, j int) bool {
+		ti, okI := parseSMSInboxTime(messages[i].Time)
+		tj, okJ := parseSMSInboxTime(messages[j].Time)
+		if okI != okJ {
+			return !okI
+		}
+		return okI && ti.Before(tj)
+	})
+}
+
+func parseSMSInboxTime(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006-01-02T15:04:05-07:00", value)
+	return t, err == nil
 }
 
 // parseSMSDeleteTarget accepts "SM:3", "ME:3,4,5" or "7" (SIM storage).

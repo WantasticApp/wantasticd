@@ -2,6 +2,13 @@ package wusp
 
 const WUSPCellularControlPrefix = "Device.WUSP_CellularControl."
 
+// Schema limits the agent must respect when filling operation results; the
+// controller rejects a reply carrying a longer value.
+const (
+	WUSPSMSInboxMaxLength              = 16384
+	WUSPCellularCommandOutputMaxLength = 4096
+)
+
 var WUSPCellularControlObjects = []Object{
 	{Path: WUSPCellularControlPrefix, SinceVersion: "1.0"},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.", MultiInstance: true, SinceVersion: "1.0"},
@@ -25,7 +32,7 @@ var AllWUSPCellularControlParams = []Param{
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMS.PhoneNumber", Type: TypeString, Access: WriteOnly, SinceVersion: "1.0", Description: "Destination number supplied to SendSMS.", Limits: Limits{MaxLength: 32}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMS.Message", Type: TypeString, Access: WriteOnly, SinceVersion: "1.0", Description: "Message body supplied to SendSMS.", Limits: Limits{MaxLength: 1600}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMS.DeleteIndex", Type: TypeString, Access: WriteOnly, SinceVersion: "1.0", Description: "Message index or all supplied to DeleteSMS.", Limits: Limits{MaxLength: 16}},
-	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMSInboxJSON", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "JSON SMS inbox payload returned by sms_tool -j recv.", Limits: Limits{MaxLength: 16384}},
+	{Path: WUSPCellularControlPrefix + "Interface.{i}.SMSInboxJSON", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "JSON SMS inbox payload returned by sms_tool -j recv.", Limits: Limits{MaxLength: WUSPSMSInboxMaxLength}},
 	{Path: WUSPCellularControlPrefix + "Interface.{i}.LastCommandStatus", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Status of the most recent cellular control operation.", Limits: Limits{Enums: []string{"Idle", "Success", "Error"}}},
-	{Path: WUSPCellularControlPrefix + "Interface.{i}.LastCommandOutput", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Short output or error from the most recent cellular control operation.", Limits: Limits{MaxLength: 4096}},
+	{Path: WUSPCellularControlPrefix + "Interface.{i}.LastCommandOutput", Type: TypeString, Access: ReadOnly, SinceVersion: "1.0", Description: "Short output or error from the most recent cellular control operation.", Limits: Limits{MaxLength: WUSPCellularCommandOutputMaxLength}},
 }

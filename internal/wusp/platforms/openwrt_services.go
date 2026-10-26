@@ -260,6 +260,14 @@ func parseOpenWrtLeaseSeconds(value string) (int64, bool) {
 func (b *OpenWrtBackend) appendOpenWrtTimeClientFields(msg *wusp.Message) {
 	servers := b.readUCIList("system", "timeserver", "server")
 	enabled := parseOpenWrtBool(b.readUCIOption("system", "timeserver", "enabled"), true)
+	// Legacy NTPServer1..5 mirror the same UCI list as Client.1.Servers.
+	for i := 1; i <= ntpMaxServers; i++ {
+		server := ""
+		if i <= len(servers) {
+			server = strings.TrimSpace(servers[i-1])
+		}
+		appendField(msg, fmt.Sprintf("Device.Time.NTPServer%d", i), wusp.String(server))
+	}
 	if len(servers) == 0 && !enabled {
 		appendField(msg, "Device.Time.ClientNumberOfEntries", wusp.Uint(0))
 		return
@@ -298,6 +306,16 @@ func (b *OpenWrtBackend) setOpenWrtServiceParam(ctx context.Context, path string
 		return b.setTimeEnabled(ctx, value.AsBool())
 	case "Device.Time.Client.1.Servers":
 		return b.setOpenWrtTimeServers(ctx, value)
+	}
+	if index, ok := ntpServerIndex(path); ok {
+		servers := replaceNTPServerAt(b.readUCIList("system", "timeserver", "server"), index, wusp.ValueToString(value))
+		values := make([]wusp.Value, 0, len(servers))
+		for _, server := range servers {
+			values = append(values, wusp.String(server))
+		}
+		return b.setOpenWrtTimeServers(ctx, wusp.List(values...))
+	}
+	switch path {
 	case "Device.DHCPv4.Server.Enable":
 		return b.setAllOpenWrtDHCPPools(ctx, value.AsBool())
 	}

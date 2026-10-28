@@ -603,6 +603,14 @@ func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
 		tunName = "wantastic0"
 	}
 
+	// Fit the tunnel to the link that reaches the hub (lower only).
+	if linkMTU, outerIPv6 := hubLinkMTU(d.config.Server.Endpoint, d.config.Server.Port); linkMTU > 0 {
+		if mtu := effectiveTunnelMTU(d.config.Interface.MTU, linkMTU, outerIPv6); mtu != d.config.Interface.MTU {
+			log.Printf("Tunnel MTU %d -> %d to fit the %d-byte link to the hub", d.config.Interface.MTU, mtu, linkMTU)
+			d.config.Interface.MTU = mtu
+		}
+	}
+
 	// Create native TUN device
 	nativeTun, err := tun.CreateTUN(tunName, d.config.Interface.MTU)
 	if err != nil {

@@ -288,6 +288,18 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.val = endpoint
 }
 
+// EnableRoaming lets the peer's endpoint follow the source of its
+// authenticated packets again (the device may freeze endpoints at creation).
+// Direct P2P peers need it: when a NAT rebinds, the remote's packets keep
+// arriving from the new mapping and replies must follow, or the direct path
+// is black-holed until it goes stale. Only packets that decrypt under this
+// peer's session can move the endpoint, so it cannot be spoofed.
+func (peer *Peer) EnableRoaming() {
+	peer.endpoint.Lock()
+	peer.endpoint.disableRoaming = false
+	peer.endpoint.Unlock()
+}
+
 func (peer *Peer) markEndpointSrcForClearing() {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()

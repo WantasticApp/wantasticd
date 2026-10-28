@@ -1160,6 +1160,7 @@ func (c *P2PClient) prepareDirectPeer(pubKey NoisePublicKey, assignedIP net.IP, 
 		return fmt.Errorf("configure direct candidate %s: %w", endpointAddr, err)
 	}
 	if wgPeer := c.device.LookupPeer(pubKey); wgPeer != nil {
+		wgPeer.EnableRoaming()
 		wgPeer.SendKeepalive()
 	}
 	return nil

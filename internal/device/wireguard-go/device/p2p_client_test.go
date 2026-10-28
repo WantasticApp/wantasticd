@@ -1,6 +1,7 @@
 package device
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"net/netip"
@@ -275,15 +276,25 @@ func testNoisePrivateKey(seed byte) NoisePrivateKey {
 	return key
 }
 
+func testNoisePublicKey(seed byte) NoisePublicKey {
+	key := testNoisePrivateKey(seed)
+	return key.publicKey()
+}
+
 func newAtomicInt64() *atomic.Int64 {
 	return new(atomic.Int64)
 }
 
 func testPeerListPayload(peerID uint32) []byte {
+	return testPeerListPayloadWithKey(peerID, NoisePublicKey{})
+}
+
+func testPeerListPayloadWithKey(peerID uint32, publicKey NoisePublicKey) []byte {
 	payload := make([]byte, 4+78)
 	binary.BigEndian.PutUint32(payload[:4], 1)
 	offset := 4
 	binary.BigEndian.PutUint32(payload[offset:], peerID)
+	copy(payload[offset+4:], publicKey[:])
 	copy(payload[offset+36:], net.ParseIP("192.168.88.20").To16())
 	binary.BigEndian.PutUint16(payload[offset+52:], 51820)
 	copy(payload[offset+54:], net.ParseIP("203.0.113.20").To16())
@@ -292,4 +303,315 @@ func testPeerListPayload(peerID uint32) []byte {
 	payload[offset+73] = 1
 	copy(payload[offset+74:offset+78], net.ParseIP("10.255.255.41").To4())
 	return payload
+}
+
+func newTestDiscoveryClient() *P2PClient {
+	return &P2PClient{
+		device:   &Device{log: NewLogger(LogLevelSilent, "")},
+		peers:    make(map[uint32]*DiscoveredPeer),
+		sessions: make(map[uint32]*P2PSession),
+	}
+}
+
+// A coordinator restart renumbers peers. The stale ID must go, or the
+// destination index picks either entry for the same VPN IP and punch
+// requests to the dead ID are silently dropped by the coordinator.
+func TestHandlePeerListDropsRenumberedPeerID(t *testing.T) {
+	key := testNoisePublicKey(0x41)
+	for range 50 {
+		client := newTestDiscoveryClient()
+		client.handlePeerList(&P2PMessage{Payload: testPeerListPayloadWithKey(1003, key)})
+		client.handlePeerList(&P2PMessage{Payload: testPeerListPayloadWithKey(1010, key)})
+		if len(client.peers) != 1 || client.peers[1010] == nil {
+			t.Fatalf("peers after renumbering = %v, want only ID 1010", client.peers)
+		}
+		if got := client.destinations.Load().byIP[netip.MustParseAddr("10.255.255.41")].peerID; got != 1010 {
+			t.Fatalf("destination index uses ID %d, want 1010", got)
+		}
+		if got := client.peerKeyIndex[key]; got != 1010 {
+			t.Fatalf("key index = %d, want 1010", got)
+		}
+		if !client.reregister.Load() {
+			t.Fatalf("renumbering did not schedule a re-registration")
+		}
+	}
+}
+
+func TestHandlePeerListRenumberKeepsDirectPath(t *testing.T) {
+	key := testNoisePublicKey(0x42)
+	client := newTestDiscoveryClient()
+	client.handlePeerList(&P2PMessage{Payload: testPeerListPayloadWithKey(1003, key)})
+	established := time.Now().Add(-time.Minute)
+	client.peers[1003].State = P2PStateEstablished
+	client.peers[1003].EstablishedAt = established
+	session := &P2PSession{TargetID: 1003, Nonce: [8]byte{1}, done: make(chan struct{})}
+	client.sessions[1003] = session
+	client.sessionByNonce = map[[8]byte]*P2PSession{session.Nonce: session}
+
+	client.handlePeerList(&P2PMessage{Payload: testPeerListPayloadWithKey(1010, key)})
+	peer := client.peers[1010]
+	if len(client.peers) != 1 || peer == nil || peer.ID != 1010 {
+		t.Fatalf("peers after renumbering = %v", client.peers)
+	}
+	if peer.State != P2PStateEstablished || !peer.EstablishedAt.Equal(established) {
+		t.Fatalf("direct path state lost on renumbering: %v", peer.State)
+	}
+	if len(client.sessions) != 0 || len(client.sessionByNonce) != 0 {
+		t.Fatalf("session for the stale ID survived")
+	}
+	select {
+	case <-session.done:
+	default:
+		t.Fatalf("session for the stale ID was not stopped")
+	}
+}
+
+func TestHandlePeerListRenumberRestartsTryingAttempt(t *testing.T) {
+	key := testNoisePublicKey(0x43)
+	client := newTestDiscoveryClient()
+	client.handlePeerList(&P2PMessage{Payload: testPeerListPayloadWithKey(1003, key)})
+	client.peers[1003].State = P2PStateTrying
+	client.handlePeerList(&P2PMessage{Payload: testPeerListPayloadWithKey(1010, key)})
+	if peer := client.peers[1010]; peer == nil || peer.State != P2PStateDiscovered {
+		t.Fatalf("attempt against the stale ID was not reset: %#v", peer)
+	}
+	if _, ok := client.destinations.Load().byIP[netip.MustParseAddr("10.255.255.41")]; !ok {
+		t.Fatalf("renumbered peer is not eligible for a new attempt")
+	}
+}
+
+func TestForgetUnlistedPeers(t *testing.T) {
+	client := newTestDiscoveryClient()
+	client.attemptGates = make(map[uint32]*atomic.Int64)
+	now := time.Now()
+	old := now.Add(-p2pPeerForgetAfter - time.Minute)
+	client.peers[1] = &DiscoveredPeer{ID: 1, State: P2PStateDiscovered, LastSeen: old}
+	client.peers[2] = &DiscoveredPeer{ID: 2, State: P2PStateFailed, LastSeen: old}
+	client.peers[3] = &DiscoveredPeer{ID: 3, State: P2PStateEstablished, LastSeen: old}
+	client.peers[4] = &DiscoveredPeer{ID: 4, State: P2PStateTrying, LastSeen: old}
+	client.peers[5] = &DiscoveredPeer{ID: 5, State: P2PStateDiscovered, LastSeen: now}
+	client.attemptGates[1] = new(atomic.Int64)
+
+	client.mu.Lock()
+	changed := client.forgetUnlistedPeersLocked(now)
+	client.mu.Unlock()
+	if !changed {
+		t.Fatalf("no peers forgotten")
+	}
+	for _, id := range []uint32{1, 2} {
+		if client.peers[id] != nil {
+			t.Fatalf("unlisted peer %d was kept", id)
+		}
+	}
+	for _, id := range []uint32{3, 4, 5} {
+		if client.peers[id] == nil {
+			t.Fatalf("peer %d was forgotten", id)
+		}
+	}
+	if client.attemptGates[1] != nil {
+		t.Fatalf("attempt gate of a forgotten peer was kept")
+	}
+}
+
+func TestRegisterDue(t *testing.T) {
+	client := newTestDiscoveryClient()
+	now := time.Now()
+	if !client.registerDue(now) {
+		t.Fatalf("unregistered client is not due")
+	}
+	client.myID = 7
+	client.lastRegister.Store(now.UnixNano())
+	if client.registerDue(now) {
+		t.Fatalf("fresh registration is due again")
+	}
+	client.reregister.Store(true)
+	if !client.registerDue(now) || client.registerDue(now) {
+		t.Fatalf("candidate change must trigger exactly one registration")
+	}
+	if !client.registerDue(now.Add(p2pReregisterInterval)) {
+		t.Fatalf("registration is not refreshed periodically")
+	}
+}
+
+func TestInitiatesHandshakeBreaksTie(t *testing.T) {
+	low, high := testNoisePublicKey(0x10), testNoisePublicKey(0x20)
+	if bytes.Compare(low[:], high[:]) > 0 {
+		low, high = high, low
+	}
+	a := &P2PClient{myPublicKey: low}
+	b := &P2PClient{myPublicKey: high}
+	if !a.initiatesHandshake(high) || b.initiatesHandshake(low) {
+		t.Fatalf("exactly the lower key must initiate")
+	}
+}
+
+func TestPrepareDirectPeerOnlyLowerKeyStartsHandshake(t *testing.T) {
+	pair := genTestPair(t, false)
+	client := NewP2PClient(pair[0].dev)
+	defer client.Close()
+	client.serverPeerKey = mustSinglePeer(t, pair[0].dev).handshake.remoteStatic
+
+	for seed := byte(0x50); seed < 0x58; seed++ {
+		key := testNoisePublicKey(seed)
+		if err := client.prepareDirectPeer(key, net.IPv4(10, 0, 0, seed).To4(), "127.0.0.1:55555"); err != nil {
+			t.Fatalf("prepare direct peer: %v", err)
+		}
+		peer := pair[0].dev.LookupPeer(key)
+		if peer == nil {
+			t.Fatalf("direct candidate was not configured")
+		}
+		keepalive := peer.persistentKeepaliveInterval.Load() != 0
+		if want := client.initiatesHandshake(key); keepalive != want {
+			t.Fatalf("keepalive (handshake start) = %v, want %v", keepalive, want)
+		}
+		if err := client.startDirectKeepalive(key); err != nil || peer.persistentKeepaliveInterval.Load() != 25 {
+			t.Fatalf("fallback keepalive not enabled: %v", err)
+		}
+		pair[0].dev.RemovePeer(key)
+		if err := client.startDirectKeepalive(key); err != nil || pair[0].dev.LookupPeer(key) != nil {
+			t.Fatalf("fallback keepalive recreated a removed peer: %v", err)
+		}
+	}
+}
+
+func TestPunchRelayJoinsYoungSessionWithSecondNonce(t *testing.T) {
+	pair := genTestPair(t, false)
+	client := NewP2PClient(pair[0].dev)
+	defer client.Close()
+	remote := testNoisePublicKey(0x61)
+	relay := func(nonce byte) *P2PMessage {
+		m := &P2PMessage{Subtype: P2PSubtypePunchRelay, TargetID: 9, Nonce: [8]byte{nonce}}
+		copy(m.PublicKey[:], remote[:])
+		m.SetObservedAddr(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 41641})
+		m.Payload = AppendP2PCandidatePayload(net.IPv4(10, 0, 0, 9).To4(), nil)
+		return m
+	}
+
+	client.handlePunchRelay(relay(1))
+	client.handlePunchRelay(relay(2))
+	client.mu.RLock()
+	session := client.sessions[9]
+	first, second := client.sessionByNonce[[8]byte{1}], client.sessionByNonce[[8]byte{2}]
+	client.mu.RUnlock()
+	if session == nil || first != session || second != session || session.Nonce != [8]byte{1} {
+		t.Fatalf("second relay did not join the young session")
+	}
+	if !session.acceptsNonce([8]byte{1}) || !session.acceptsNonce([8]byte{2}) || session.acceptsNonce([8]byte{3}) {
+		t.Fatalf("session accepts the wrong nonces")
+	}
+
+	// An older session is replaced, and all of its nonces are forgotten.
+	client.mu.Lock()
+	session.createdAt = time.Now().Add(-p2pNonceGrace - time.Second)
+	client.mu.Unlock()
+	client.handlePunchRelay(relay(3))
+	client.mu.RLock()
+	replaced := client.sessions[9]
+	_, oldFirst := client.sessionByNonce[[8]byte{1}]
+	_, oldSecond := client.sessionByNonce[[8]byte{2}]
+	client.mu.RUnlock()
+	if replaced == session || replaced.Nonce != [8]byte{3} || oldFirst || oldSecond {
+		t.Fatalf("stale session nonces survived replacement")
+	}
+	select {
+	case <-session.done:
+	default:
+		t.Fatalf("replaced session was not stopped")
+	}
+}
+
+func TestFilterLocalCandidates(t *testing.T) {
+	ifaces := []p2pLocalInterface{
+		{name: "lo0", flags: net.FlagUp | net.FlagLoopback, ips: []net.IP{net.ParseIP("127.0.0.1")}},
+		{name: "en0", flags: net.FlagUp, ips: []net.IP{
+			net.ParseIP("192.168.1.20"),
+			net.ParseIP("fe80::1"),
+			net.ParseIP("2001:db8::1"),
+			net.ParseIP("2001:db8::2"),
+			net.ParseIP("2001:db8::3"),
+		}},
+		{name: "en1", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.1.2.3"), net.ParseIP("169.254.3.4")}},
+		{name: "en2", flags: 0, ips: []net.IP{net.ParseIP("10.9.9.9")}},
+		{name: "utun4", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.200.0.1")}},
+		{name: "tailscale0", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.201.0.1")}},
+		{name: "wg0", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.202.0.1")}},
+		{name: "ppp0", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.203.0.1")}},
+		{name: "ipsec0", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.204.0.1")}},
+		{name: "bridge100", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.205.0.1")}},
+		{name: "wantastic", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.206.0.1")}},
+		{name: "en3", flags: net.FlagUp, ips: []net.IP{net.ParseIP("100.100.1.1")}},
+	}
+	got := filterLocalCandidates(net.ParseIP("10.1.2.3").To4(), ifaces, "wantastic", 51820)
+	var names []string
+	for _, candidate := range got {
+		names = append(names, candidate.String())
+	}
+	want := []string{"10.1.2.3:51820", "192.168.1.20:51820", "[2001:db8::1]:51820", "[2001:db8::2]:51820"}
+	if len(names) != len(want) {
+		t.Fatalf("candidates = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("candidates = %v, want %v", names, want)
+		}
+	}
+
+	// A default route through another tunnel is not announced.
+	got = filterLocalCandidates(net.ParseIP("10.200.0.1").To4(), ifaces, "wantastic", 51820)
+	if len(got) == 0 || got[0].String() != "192.168.1.20:51820" {
+		t.Fatalf("tunnel default-route address announced: %v", got)
+	}
+}
+
+func TestPunchRelayForEstablishedPeerReturnsToRelay(t *testing.T) {
+	pair := genTestPair(t, false)
+	client := NewP2PClient(pair[0].dev)
+	defer client.Close()
+	destination := pair[1].ip.AsSlice()
+	relayPeer := pair[0].dev.allowedips.Lookup(destination)
+	client.serverPeerKey = relayPeer.handshake.remoteStatic
+
+	directKey := testNoisePublicKey(0x71)
+	assignedIP := net.IP(destination)
+	if err := client.prepareDirectPeer(directKey, assignedIP, "127.0.0.1:55555"); err != nil {
+		t.Fatalf("prepare direct peer: %v", err)
+	}
+	if err := client.activateDirectPeer(directKey, assignedIP); err != nil {
+		t.Fatalf("activate direct peer: %v", err)
+	}
+	client.mu.Lock()
+	client.peers[5] = &DiscoveredPeer{
+		ID: 5, PublicKey: directKey, AssignedIP: assignedIP, P2PCapable: true,
+		State: P2PStateEstablished, EstablishedAt: time.Now(), RelayPeer: relayPeer,
+	}
+	client.mu.Unlock()
+	relay := &P2PMessage{Subtype: P2PSubtypePunchRelay, TargetID: 5, Nonce: [8]byte{7}}
+	copy(relay.PublicKey[:], directKey[:])
+	relay.SetObservedAddr(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 5), Port: 41641})
+	relay.Payload = AppendP2PCandidatePayload(assignedIP, nil)
+
+	client.handlePunchRelay(relay)
+	client.mu.RLock()
+	state := client.peers[5].State
+	client.mu.RUnlock()
+	if state != P2PStateEstablished || pair[0].dev.LookupPeer(directKey) == nil {
+		t.Fatalf("relay racing a fresh promotion tore it down")
+	}
+
+	client.mu.Lock()
+	client.peers[5].EstablishedAt = time.Now().Add(-time.Minute)
+	client.mu.Unlock()
+	client.handlePunchRelay(relay)
+	client.mu.RLock()
+	state, session := client.peers[5].State, client.sessions[5]
+	client.mu.RUnlock()
+	if state != P2PStateTrying || session == nil {
+		t.Fatalf("established peer ignored the relay: state=%v", state)
+	}
+	if pair[0].dev.LookupPeer(directKey) != nil {
+		t.Fatalf("direct peer kept after the peer started punching again")
+	}
+	if got := pair[0].dev.allowedips.Lookup(destination); got != relayPeer {
+		t.Fatalf("relay route was not restored")
+	}
 }

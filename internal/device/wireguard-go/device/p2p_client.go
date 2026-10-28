@@ -1,12 +1,14 @@
 package device
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,9 +32,29 @@ const (
 	p2pPunchWorkers        = 4
 	p2pPromotionWorkers    = 2
 	p2pAttemptGateInterval = 2 * time.Second
-	p2pHandshakeTimeout    = 8 * time.Second
+	p2pHandshakeTimeout    = 20 * time.Second
 	p2pHandshakePoll       = 50 * time.Millisecond
 	p2pDirectStaleAfter    = 4 * time.Minute
+
+	// p2pPeerForgetAfter drops discovery entries the coordinator stopped
+	// listing; it lists peers seen within 5 minutes.
+	p2pPeerForgetAfter = 10 * time.Minute
+	// p2pReregisterInterval re-announces candidates so a restarted
+	// coordinator relearns them without waiting for an ID change.
+	p2pReregisterInterval = 60 * time.Second
+	// p2pPunchReplyInterval rate-limits answers to authenticated punches.
+	p2pPunchReplyInterval = 100 * time.Millisecond
+	// p2pResponderFallback is how long the side that waits for the peer's
+	// handshake initiation waits before initiating itself.
+	p2pResponderFallback = 3 * time.Second
+	// p2pNonceGrace is the window in which a second relay for the same peer
+	// (both sides asked at once) joins the running session instead of
+	// restarting it.
+	p2pNonceGrace = 2 * time.Second
+	// p2pEstablishedRelayGrace ignores a relay that races the promotion it
+	// belongs to; a later relay means the peer lost the direct path.
+	p2pEstablishedRelayGrace = 5 * time.Second
+	p2pMaxIPv6Candidates     = 2
 )
 
 type P2PClient struct {
@@ -43,6 +65,7 @@ type P2PClient struct {
 	// announce a changed set.
 	extraCandidates atomic.Pointer[[]net.UDPAddr]
 	reregister      atomic.Bool
+	lastRegister    atomic.Int64
 
 	myID          uint32
 	myPublicKey   NoisePublicKey
@@ -126,6 +149,18 @@ type P2PSession struct {
 	Promoting      bool
 	done           chan struct{}
 	doneOnce       sync.Once
+
+	// altNonce is the nonce of a second relay for the same pair that arrived
+	// within p2pNonceGrace; punches carrying it are accepted too.
+	altNonce    [8]byte
+	hasAltNonce bool
+	createdAt   time.Time
+	promotedAt  time.Time
+	lastReply   time.Time
+}
+
+func (s *P2PSession) acceptsNonce(nonce [8]byte) bool {
+	return nonce == s.Nonce || (s.hasAltNonce && nonce == s.altNonce)
 }
 
 type p2pDestinationIndex struct {
@@ -328,39 +363,118 @@ func (c *P2PClient) getDefaultLocalIP() net.IP {
 	return nil
 }
 
-func (c *P2PClient) collectLocalCandidates(port int) []net.UDPAddr {
-	candidates := make([]net.UDPAddr, 0, 4)
-	if ip := c.getDefaultLocalIP(); ip != nil {
-		appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
-	}
+// p2pLocalInterface is the subset of an interface candidate collection needs.
+type p2pLocalInterface struct {
+	name  string
+	flags net.Flags
+	ips   []net.IP
+}
 
+// p2pSkippedInterfacePrefixes are tunnels and bridges whose addresses are
+// unreachable for a peer on another network: announcing them only spends
+// punch targets.
+var p2pSkippedInterfacePrefixes = []string{"utun", "ipsec", "ppp", "bridge", "tailscale", "wg"}
+
+var p2pSharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+func (c *P2PClient) collectLocalCandidates(port int) []net.UDPAddr {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return candidates
+		return nil
 	}
+	local := make([]p2pLocalInterface, 0, len(ifaces))
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
+		entry := p2pLocalInterface{name: iface.Name, flags: iface.Flags}
 		for _, addr := range addrs {
-			var ip net.IP
 			switch v := addr.(type) {
 			case *net.IPNet:
-				ip = v.IP
+				entry.ips = append(entry.ips, v.IP)
 			case *net.IPAddr:
-				ip = v.IP
+				entry.ips = append(entry.ips, v.IP)
 			}
-			if !isUsefulLocalCandidateIP(ip) {
-				continue
+		}
+		local = append(local, entry)
+	}
+	return filterLocalCandidates(c.getDefaultLocalIP(), local, c.tunName(), port)
+}
+
+func (c *P2PClient) tunName() string {
+	if c.device == nil || c.device.tun.device == nil {
+		return ""
+	}
+	name, err := c.device.tun.device.Name()
+	if err != nil {
+		return ""
+	}
+	return name
+}
+
+// filterLocalCandidates keeps addresses a peer could plausibly reach: the
+// default-route address first (when it belongs to an eligible interface),
+// then other interface addresses, with at most p2pMaxIPv6Candidates IPv6.
+func filterLocalCandidates(defaultIP net.IP, ifaces []p2pLocalInterface, ownTun string, port int) []net.UDPAddr {
+	eligible := make([]net.IP, 0, 4)
+	for _, iface := range ifaces {
+		if iface.flags&net.FlagUp == 0 || iface.flags&net.FlagLoopback != 0 || isSkippedCandidateInterface(iface.name, ownTun) {
+			continue
+		}
+		for _, ip := range iface.ips {
+			if isUsefulLocalCandidateIP(ip) {
+				eligible = append(eligible, ip)
 			}
-			appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
 		}
 	}
+
+	candidates := make([]net.UDPAddr, 0, 4)
+	if defaultIP != nil {
+		for _, ip := range eligible {
+			if ip.Equal(defaultIP) {
+				appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
+				break
+			}
+		}
+	}
+	ipv6 := 0
+	for _, candidate := range candidates {
+		if candidate.IP.To4() == nil {
+			ipv6++
+		}
+	}
+	for _, ip := range eligible {
+		if ip.To4() == nil {
+			if ipv6 >= p2pMaxIPv6Candidates {
+				continue
+			}
+			before := len(candidates)
+			appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
+			if len(candidates) > before {
+				ipv6++
+			}
+			continue
+		}
+		appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
+	}
 	return candidates
+}
+
+func isSkippedCandidateInterface(name, ownTun string) bool {
+	if name == "" {
+		return false
+	}
+	if ownTun != "" && name == ownTun {
+		return true
+	}
+	lower := strings.ToLower(name)
+	for _, prefix := range p2pSkippedInterfacePrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isUsefulLocalCandidateIP(ip net.IP) bool {
@@ -375,7 +489,15 @@ func isUsefulLocalCandidateIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	return !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast()
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	// Carrier-grade NAT and overlay (Tailscale-style) space is never a path
+	// another site can reach directly.
+	if addr, ok := netip.AddrFromSlice(ip); ok && p2pSharedAddressSpace.Contains(addr.Unmap()) {
+		return false
+	}
+	return true
 }
 
 // SetExtraCandidates replaces the extra reachable addresses (e.g. a router
@@ -415,7 +537,25 @@ func (c *P2PClient) register() {
 	msg.SetLocalAddr(&localAddr)
 
 	c.device.log.Verbosef("[P2P] Registering with server using local=%v candidates=%d", localAddr, len(candidates))
+	c.lastRegister.Store(time.Now().UnixNano())
 	c.sendToServer(msg)
+}
+
+// registerDue reports whether the maintenance loop should register again:
+// until the coordinator assigned an ID, when the candidate set changed, and
+// periodically so a restarted coordinator relearns LAN and port-mapped
+// candidates (Register is idempotent on the hub).
+func (c *P2PClient) registerDue(now time.Time) bool {
+	c.mu.RLock()
+	myID := c.myID
+	c.mu.RUnlock()
+	if myID == 0 {
+		return true
+	}
+	if c.reregister.Swap(false) {
+		return true
+	}
+	return now.Sub(time.Unix(0, c.lastRegister.Load())) >= p2pReregisterInterval
 }
 
 func (c *P2PClient) HandleMessage(msg *P2PMessage) {
@@ -432,11 +572,15 @@ func (c *P2PClient) HandleMessage(msg *P2PMessage) {
 
 func (c *P2PClient) handleRegisterAck(msg *P2PMessage) {
 	c.mu.Lock()
+	previousID := c.myID
 	c.myID = msg.TargetID
 	c.observedAddr = normalizeUDPAddr(msg.ObservedAddr())
 	observedAddr := c.observedAddr
 	c.mu.Unlock()
 
+	if previousID != 0 && previousID != msg.TargetID {
+		c.device.log.Verbosef("[P2P] Coordinator renumbered this device %d -> %d (coordinator restart)", previousID, msg.TargetID)
+	}
 	c.device.log.Verbosef("[P2P] Registered with server. My ID: %d observed=%v", msg.TargetID, observedAddr)
 	c.requestPeerList()
 }
@@ -467,6 +611,7 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 	if c.attemptGates == nil {
 		c.attemptGates = make(map[uint32]*atomic.Int64)
 	}
+	renumbered := false
 	offset := 4
 	for i := uint32(0); i < count; i++ {
 		peerID := binary.BigEndian.Uint32(msg.Payload[offset:])
@@ -482,6 +627,17 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		})
 		assignedIP := append(net.IP(nil), msg.Payload[offset+74:offset+78]...)
 
+		// Do not let a recycled ID silently replace an active authenticated
+		// session. A later maintenance refresh can rediscover it safely.
+		if peer := c.peers[peerID]; peer != nil && !peer.PublicKey.IsZero() && !publicKey.IsZero() &&
+			!peer.PublicKey.Equals(publicKey) && (peer.State == P2PStateTrying || peer.State == P2PStateEstablished) {
+			offset += 78
+			continue
+		}
+		if c.renumberPeerLocked(publicKey, peerID) {
+			renumbered = true
+		}
+
 		peer, ok := c.peers[peerID]
 		if !ok {
 			peer = &DiscoveredPeer{
@@ -490,13 +646,6 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 				LastUsed: now,
 			}
 			c.peers[peerID] = peer
-		}
-		// Do not let a recycled ID silently replace an active authenticated
-		// session. A later maintenance refresh can rediscover it safely.
-		if !peer.PublicKey.IsZero() && !publicKey.IsZero() && !peer.PublicKey.Equals(publicKey) &&
-			(peer.State == P2PStateTrying || peer.State == P2PStateEstablished) {
-			offset += 78
-			continue
 		}
 
 		peer.PublicKey = publicKey
@@ -509,13 +658,79 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		if _, ok := c.attemptGates[peerID]; !ok {
 			c.attemptGates[peerID] = new(atomic.Int64)
 		}
+		if !publicKey.IsZero() {
+			c.peerKeyIndex[publicKey] = peerID
+		}
 		offset += 78
 	}
 
 	c.rebuildIndexesLocked()
 	c.mu.Unlock()
 
+	if renumbered {
+		// Peers moving to new IDs means the coordinator restarted and lost
+		// our candidates as well.
+		c.reregister.Store(true)
+	}
 	c.device.log.Verbosef("[P2P] Discovered %d peers", count)
+}
+
+// renumberPeerLocked moves the entry known for publicKey to newID when the
+// coordinator assigned that key a new ID (it renumbers after a restart or an
+// idle expiry). The stale ID is dropped: punch requests to it would be
+// silently discarded by the coordinator, and two entries for one VPN IP make
+// the destination index pick either. An established direct path survives the
+// move because the WireGuard peer is keyed by public key, not coordinator ID.
+func (c *P2PClient) renumberPeerLocked(publicKey NoisePublicKey, newID uint32) bool {
+	if publicKey.IsZero() {
+		return false
+	}
+	oldID, ok := c.peerKeyIndex[publicKey]
+	if !ok || oldID == newID {
+		return false
+	}
+	old := c.peers[oldID]
+	delete(c.peerKeyIndex, publicKey)
+	if old == nil || !old.PublicKey.Equals(publicKey) {
+		return false
+	}
+	c.discardSessionLocked(oldID)
+	if replaced := c.peers[newID]; replaced != nil {
+		c.discardSessionLocked(newID)
+	}
+	delete(c.peers, oldID)
+	if old.State == P2PStateTrying {
+		// The attempt was addressed to the stale ID; let traffic start a new
+		// one against the current ID.
+		old.State = P2PStateDiscovered
+	}
+	old.ID = newID
+	c.peers[newID] = old
+	if gate := c.attemptGates[oldID]; gate != nil {
+		c.attemptGates[newID] = gate
+		delete(c.attemptGates, oldID)
+	}
+	c.peerKeyIndex[publicKey] = newID
+	c.device.log.Verbosef("[P2P] Peer %d renumbered to %d by the coordinator", oldID, newID)
+	return true
+}
+
+// forgetUnlistedPeersLocked drops discovery entries the coordinator has not
+// listed for p2pPeerForgetAfter. Active attempts and direct paths are left to
+// their own timeouts.
+func (c *P2PClient) forgetUnlistedPeersLocked(now time.Time) bool {
+	changed := false
+	for id, peer := range c.peers {
+		if peer.State == P2PStateTrying || peer.State == P2PStateEstablished ||
+			peer.LastSeen.IsZero() || now.Sub(peer.LastSeen) <= p2pPeerForgetAfter {
+			continue
+		}
+		c.discardSessionLocked(id)
+		delete(c.peers, id)
+		delete(c.attemptGates, id)
+		changed = true
+	}
+	return changed
 }
 
 // rebuildIndexesLocked publishes immutable lookup tables for packet-path
@@ -679,14 +894,37 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 	if c.peerKeyIndex == nil {
 		c.peerKeyIndex = make(map[NoisePublicKey]uint32)
 	}
+	if existing := c.peers[targetID]; !relayedPubKey.IsZero() &&
+		(existing == nil || existing.PublicKey.IsZero() || existing.PublicKey.Equals(relayedPubKey)) {
+		c.renumberPeerLocked(relayedPubKey, targetID)
+	}
 	peer, ok := c.peers[targetID]
 	if !ok {
 		peer = &DiscoveredPeer{ID: targetID, P2PCapable: true}
 		c.peers[targetID] = peer
 	}
+	peer.LastSeen = now
+
+	var teardown *p2pDirectTeardown
 	if peer.State == P2PStateEstablished {
-		c.mu.Unlock()
-		return
+		// A relay racing the promotion it belongs to (both sides asked at
+		// once) is noise. A later one means the peer lost the direct path
+		// and is punching again: answering from a direct peer it no longer
+		// reaches would leave both sides stuck, so return to the relay and
+		// join the new attempt.
+		if now.Sub(peer.EstablishedAt) < p2pEstablishedRelayGrace ||
+			(!relayedPubKey.IsZero() && !peer.PublicKey.Equals(relayedPubKey)) {
+			c.mu.Unlock()
+			return
+		}
+		teardown = &p2pDirectTeardown{
+			publicKey:  peer.PublicKey,
+			assignedIP: append(net.IP(nil), peer.AssignedIP...),
+			relayPeer:  peer.RelayPeer,
+		}
+		peer.Endpoint = nil
+		peer.RelayPeer = nil
+		peer.State = P2PStateTrying
 	}
 
 	if !relayedPubKey.IsZero() {
@@ -723,6 +961,28 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		c.device.log.Errorf("[P2P] Refusing punch relay that targets the coordinator key")
 		return
 	}
+
+	// When both sides request a punch at once the coordinator relays twice,
+	// possibly with different nonces, and the two relays may arrive in either
+	// order on each side. Keep the young session running and accept the
+	// second nonce as well, so whichever nonce the peer settles on still
+	// authenticates here.
+	if current := c.sessions[targetID]; teardown == nil && current != nil &&
+		now.Sub(current.createdAt) < p2pNonceGrace && current.TargetPubKey.Equals(peer.PublicKey) {
+		if current.Nonce != msg.Nonce && !(current.hasAltNonce && current.altNonce == msg.Nonce) {
+			if current.hasAltNonce {
+				delete(c.sessionByNonce, current.altNonce)
+			}
+			current.altNonce = msg.Nonce
+			current.hasAltNonce = true
+			c.sessionByNonce[current.altNonce] = current
+		}
+		peer.LastUsed = now
+		c.mu.Unlock()
+		c.device.log.Verbosef("[P2P] Punch relay for target %d joined the running attempt", targetID)
+		return
+	}
+
 	if len(msg.Payload) >= net.IPv4len {
 		assignedIP := append(net.IP(nil), msg.Payload[:net.IPv4len]...)
 		if !assignedIP.Equal(net.IPv4zero) {
@@ -743,22 +1003,25 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		ObservedAddr:   peer.ObservedAddr,
 		CandidateAddrs: append([]net.UDPAddr(nil), peer.CandidateAddrs...),
 		AssignedIP:     append(net.IP(nil), peer.AssignedIP...),
+		createdAt:      now,
 		done:           make(chan struct{}),
 	}
 	copy(session.Nonce[:], msg.Nonce[:])
-	if previous := c.sessions[targetID]; previous != nil {
-		delete(c.sessionByNonce, previous.Nonce)
-		previous.signalDone()
-	}
+	c.discardSessionLocked(targetID)
 	c.sessions[targetID] = session
 	c.sessionByNonce[session.Nonce] = session
 	c.peerKeyIndex[peer.PublicKey] = targetID
 	c.rebuildIndexesLocked()
 	c.mu.Unlock()
 
+	if teardown != nil {
+		c.device.log.Verbosef("[P2P] Peer %d is punching again; leaving the direct path for the relay", targetID)
+		c.teardownDirect(*teardown)
+	}
+
 	targets := buildPunchTargets(session)
 	c.device.log.Verbosef("[P2P] Punch relay target=%d observed=%v local=%v candidates=%d targets=%d",
-		targetID, peer.ObservedAddr, peer.LocalAddr, len(peer.CandidateAddrs), len(targets))
+		targetID, session.ObservedAddr, session.LocalAddr, len(session.CandidateAddrs), len(targets))
 
 	job := p2pPunchJob{
 		peerID:  targetID,
@@ -771,9 +1034,29 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		failed := c.failPunchSessionIfCurrentLocked(peer, session, time.Now())
 		c.mu.Unlock()
 		if failed {
-			c.device.log.Verbosef("[P2P] Punch relay for peer %d could not be scheduled", peer.ID)
+			c.device.log.Verbosef("[P2P] Punch relay for peer %d could not be scheduled", targetID)
 		}
 	}
+}
+
+// p2pDirectTeardown is what is needed to drop a direct WireGuard peer and
+// hand its VPN address back to the relay, outside c.mu.
+type p2pDirectTeardown struct {
+	publicKey  NoisePublicKey
+	assignedIP net.IP
+	relayPeer  *Peer
+}
+
+func (c *P2PClient) teardownDirect(t p2pDirectTeardown) {
+	if t.publicKey.IsZero() {
+		return
+	}
+	c.device.RemovePeer(t.publicKey)
+	relayPeer := t.relayPeer
+	if relayPeer == nil {
+		relayPeer = c.relayPeerForIP(t.assignedIP)
+	}
+	c.restoreRelayRoute(t.assignedIP, relayPeer)
 }
 
 func (c *P2PClient) parsePunchTargets(targets []net.UDPAddr) []conn.Endpoint {
@@ -810,31 +1093,45 @@ func (c *P2PClient) punchWorker() {
 }
 
 func (c *P2PClient) holePunch(job p2pPunchJob) {
-	ctx, cancel := context.WithTimeout(c.ctx, p2pPunchTimeout)
-	defer cancel()
-
+	deadline := time.Now().Add(p2pPunchTimeout)
 	buffers := [][]byte{job.packet}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for round := 0; ; round++ {
 		select {
-		case <-ctx.Done():
-			c.mu.Lock()
-			peer := c.peers[job.peerID]
-			if c.failPunchSessionIfCurrentLocked(peer, job.session, time.Now()) {
-				c.device.log.Verbosef("[P2P] Punch timeout for peer %d after %d targets — retry in ~%s",
-					job.peerID, len(job.targets), p2pRetryDelay(peer.PunchAttempts))
-			}
-			c.mu.Unlock()
+		case <-c.ctx.Done():
 			return
 		case <-job.session.done:
 			return
 		case <-timer.C:
-			for _, target := range job.targets {
-				_ = c.device.net.bind.Send(buffers, target)
-			}
-			timer.Reset(p2pPunchInterval(round))
 		}
+
+		if now := time.Now(); now.After(deadline) {
+			c.mu.Lock()
+			if job.session.Promoting {
+				// Keep punching while the handshake is validated: the peer may
+				// still need a punch to authenticate this side, and the open
+				// NAT mapping carries the handshake. Validation always ends
+				// (and stops this loop) before the extended deadline.
+				deadline = job.session.promotedAt.Add(p2pHandshakeTimeout + time.Second)
+				c.mu.Unlock()
+				if now.After(deadline) {
+					return
+				}
+			} else {
+				peer := c.peers[job.peerID]
+				if c.failPunchSessionIfCurrentLocked(peer, job.session, now) {
+					c.device.log.Verbosef("[P2P] Punch timeout for peer %d after %d targets — retry in ~%s",
+						job.peerID, len(job.targets), p2pRetryDelay(peer.PunchAttempts))
+				}
+				c.mu.Unlock()
+				return
+			}
+		}
+		for _, target := range job.targets {
+			_ = c.device.net.bind.Send(buffers, target)
+		}
+		timer.Reset(p2pPunchInterval(round))
 	}
 }
 
@@ -854,8 +1151,7 @@ func (c *P2PClient) failPunchSessionIfCurrentLocked(peer *DiscoveredPeer, sessio
 	peer.LastUsed = now
 	peer.PunchAttempts++
 	c.setRetryGateLocked(peer)
-	delete(c.sessions, peer.ID)
-	delete(c.sessionByNonce, session.Nonce)
+	c.forgetSessionLocked(peer.ID, session)
 	session.signalDone()
 	c.rebuildIndexesLocked()
 	return true
@@ -1010,22 +1306,29 @@ func (c *P2PClient) verifyPunchPacket(packet []byte, session *P2PSession) bool {
 	if len(packet) != 41 || packet[0] != P2PSubtypePunchPacket {
 		return false
 	}
-
 	var nonce [8]byte
 	copy(nonce[:], packet[1:9])
-	if nonce != session.Nonce {
+	if !session.acceptsNonce(nonce) {
 		return false
 	}
+	return c.verifyPunchMAC(packet, session.TargetPubKey)
+}
 
+// verifyPunchMAC checks the punch MAC, keyed by the static-static shared
+// secret, over the nonce the packet carries.
+func (c *P2PClient) verifyPunchMAC(packet []byte, targetPubKey NoisePublicKey) bool {
+	if len(packet) != 41 || packet[0] != P2PSubtypePunchPacket {
+		return false
+	}
 	c.device.staticIdentity.RLock()
-	ss, err := c.device.staticIdentity.privateKey.sharedSecret(session.TargetPubKey)
+	ss, err := c.device.staticIdentity.privateKey.sharedSecret(targetPubKey)
 	c.device.staticIdentity.RUnlock()
 	if err != nil {
 		return false
 	}
 
 	mac, _ := blake2s.New256(ss[:])
-	mac.Write(nonce[:])
+	mac.Write(packet[1:9])
 	sum := mac.Sum(nil)
 	return subtle.ConstantTimeCompare(sum, packet[9:]) == 1
 }
@@ -1101,15 +1404,17 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 	c.mu.RLock()
 	session := c.sessionByNonce[nonce]
 	var peer *DiscoveredPeer
-	if session != nil && c.sessions[session.TargetID] == session {
+	var targetPubKey NoisePublicKey
+	if session != nil && c.sessions[session.TargetID] == session && session.acceptsNonce(nonce) {
 		peer = c.peers[session.TargetID]
+		targetPubKey = session.TargetPubKey
 	}
 	c.mu.RUnlock()
 	if session == nil || peer == nil {
 		return
 	}
 
-	if !c.verifyPunchPacket(packet, session) {
+	if !c.verifyPunchMAC(packet, targetPubKey) {
 		return
 	}
 
@@ -1118,35 +1423,51 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	now := time.Now()
 	c.mu.Lock()
 	peer = c.peers[session.TargetID]
-	if peer == nil || c.sessions[session.TargetID] != session || peer.State == P2PStateEstablished || session.Promoting {
+	if peer == nil || c.sessions[session.TargetID] != session || peer.State == P2PStateEstablished {
 		c.mu.Unlock()
 		return
 	}
-	session.Established = true // authenticated punch path is bidirectional
-	session.Promoting = true
-	session.signalDone()
-	peer.LastUsed = time.Now()
-	job := p2pPromotionJob{
-		peerID:     peer.ID,
-		session:    session,
-		publicKey:  peer.PublicKey,
-		assignedIP: append(net.IP(nil), peer.AssignedIP...),
-		endpoint:   endpoint,
-		startedAt:  time.Now(),
+	peer.LastUsed = now
+	// Answer every authenticated punch, rate-limited: a single answer is
+	// lost as easily as any punch, and the peer cannot authenticate this
+	// side (and prepare its WireGuard peer) until one arrives.
+	reply := now.Sub(session.lastReply) >= p2pPunchReplyInterval
+	if reply {
+		session.lastReply = now
+	}
+	startPromotion := !session.Promoting
+	var job p2pPromotionJob
+	if startPromotion {
+		// The punch loop keeps running until validation ends.
+		session.Established = true // authenticated punch path is bidirectional
+		session.Promoting = true
+		session.promotedAt = now
+		job = p2pPromotionJob{
+			peerID:     peer.ID,
+			session:    session,
+			publicKey:  peer.PublicKey,
+			assignedIP: append(net.IP(nil), peer.AssignedIP...),
+			endpoint:   endpoint,
+			startedAt:  now,
+		}
 	}
 	c.mu.Unlock()
+
+	if reply {
+		outer := make([]byte, 4+len(packet))
+		binary.LittleEndian.PutUint32(outer[:4], MessageP2PType)
+		copy(outer[4:], packet)
+		_ = c.device.net.bind.Send([][]byte{outer}, endpoint)
+	}
+	if !startPromotion {
+		return
+	}
 	job.relayPeer = c.relayPeerForIP(job.assignedIP)
 
 	c.device.log.Verbosef("[P2P] Authenticated punch from %v (ID %d); validating WireGuard handshake", addr, job.peerID)
-	// One response proves the return path to a peer that only received our
-	// packet. Promoting suppresses response loops on duplicate punches.
-	outer := make([]byte, 4+len(packet))
-	binary.LittleEndian.PutUint32(outer[:4], MessageP2PType)
-	copy(outer[4:], packet)
-	_ = c.device.net.bind.Send([][]byte{outer}, endpoint)
-
 	if err := c.prepareDirectPeer(job.publicKey, job.assignedIP, endpoint.DstToString()); err != nil {
 		c.failDirectPromotion(job, err)
 		return
@@ -1158,6 +1479,15 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 	default:
 		c.failDirectPromotion(job, fmt.Errorf("promotion queue full"))
 	}
+}
+
+// initiatesHandshake breaks the tie between two peers that authenticate each
+// other at the same moment: only the side with the lower public key starts
+// the WireGuard handshake, so the two initiations do not cross and replace
+// each other's handshake state. The other side answers, and initiates only
+// as a fallback after p2pResponderFallback.
+func (c *P2PClient) initiatesHandshake(remote NoisePublicKey) bool {
+	return bytes.Compare(c.myPublicKey[:], remote[:]) < 0
 }
 
 func (c *P2PClient) prepareDirectPeer(pubKey NoisePublicKey, assignedIP net.IP, endpointAddr string) error {
@@ -1173,16 +1503,30 @@ func (c *P2PClient) prepareDirectPeer(pubKey NoisePublicKey, assignedIP net.IP, 
 
 	// Deliberately install no allowed_ip yet. Relay routing remains active
 	// until promotionWorker observes a fresh authenticated WireGuard handshake.
-	conf := fmt.Sprintf("public_key=%x\nreplace_allowed_ips=true\nendpoint=%s\npersistent_keepalive_interval=25\n",
-		pubKey[:], endpointAddr)
+	// Turning persistent keepalive on sends a keepalive at once, which starts
+	// the handshake, so the waiting side leaves it off until later.
+	initiate := c.initiatesHandshake(pubKey)
+	conf := fmt.Sprintf("public_key=%x\nreplace_allowed_ips=true\nendpoint=%s\n", pubKey[:], endpointAddr)
+	if initiate {
+		conf += "persistent_keepalive_interval=25\n"
+	}
 	if err := c.device.IpcSet(conf); err != nil {
 		return fmt.Errorf("configure direct candidate %s: %w", endpointAddr, err)
 	}
 	if wgPeer := c.device.LookupPeer(pubKey); wgPeer != nil {
 		wgPeer.EnableRoaming()
-		wgPeer.SendKeepalive()
+		if initiate {
+			wgPeer.SendKeepalive()
+		}
 	}
 	return nil
+}
+
+// startDirectKeepalive turns persistent keepalive on for a direct candidate;
+// if it was off this sends a keepalive, which initiates a handshake when no
+// session exists yet.
+func (c *P2PClient) startDirectKeepalive(pubKey NoisePublicKey) error {
+	return c.device.IpcSet(fmt.Sprintf("public_key=%x\nupdate_only=true\npersistent_keepalive_interval=25\n", pubKey[:]))
 }
 
 func (c *P2PClient) promotionWorker() {
@@ -1201,6 +1545,8 @@ func (c *P2PClient) validateAndPromote(job p2pPromotionJob) {
 	defer timer.Stop()
 	ticker := time.NewTicker(p2pHandshakePoll)
 	defer ticker.Stop()
+	initiate := c.initiatesHandshake(job.publicKey)
+	fallbackAt := job.startedAt.Add(p2pResponderFallback)
 
 	for {
 		select {
@@ -1212,6 +1558,15 @@ func (c *P2PClient) validateAndPromote(job p2pPromotionJob) {
 		case <-ticker.C:
 			wgPeer := c.device.LookupPeer(job.publicKey)
 			if wgPeer == nil || wgPeer.lastHandshakeNano.Load() < job.startedAt.UnixNano() {
+				if !initiate && wgPeer != nil && time.Now().After(fallbackAt) {
+					// The peer's initiation never arrived (it may not have
+					// authenticated us yet); initiate from this side.
+					initiate = true
+					c.device.log.Verbosef("[P2P] No handshake from peer %d yet; initiating", job.peerID)
+					if err := c.startDirectKeepalive(job.publicKey); err != nil {
+						c.device.log.Verbosef("[P2P] Direct keepalive for peer %d: %v", job.peerID, err)
+					}
+				}
 				continue
 			}
 
@@ -1241,13 +1596,13 @@ func (c *P2PClient) validateAndPromote(job p2pPromotionJob) {
 				peer.EstablishedAt = now
 				peer.LastUsed = now
 				peer.PunchAttempts = 0
-				delete(c.sessions, job.peerID)
-				delete(c.sessionByNonce, job.session.Nonce)
+				c.forgetSessionLocked(job.peerID, job.session)
 				c.rebuildIndexesLocked()
 			} else {
 				removeObsoleteCandidate = true
 			}
 			c.mu.Unlock()
+			job.session.signalDone()
 			if removeObsoleteCandidate {
 				c.device.RemovePeer(job.publicKey)
 				c.restoreRelayRoute(job.assignedIP, job.relayPeer)
@@ -1299,7 +1654,9 @@ func (c *P2PClient) activateDirectPeer(pubKey NoisePublicKey, assignedIP net.IP)
 	if ip4 == nil || assignedIP.Equal(net.IPv4zero) {
 		return fmt.Errorf("cannot activate direct peer without assigned IPv4 address")
 	}
-	conf := fmt.Sprintf("public_key=%x\nallowed_ip=%s/32\n", pubKey[:], ip4.String())
+	// Keepalive is on for both sides once the path is live (the waiting side
+	// left it off during validation).
+	conf := fmt.Sprintf("public_key=%x\nallowed_ip=%s/32\npersistent_keepalive_interval=25\n", pubKey[:], ip4.String())
 	if err := c.device.IpcSet(conf); err != nil {
 		return fmt.Errorf("activate direct route: %w", err)
 	}
@@ -1319,8 +1676,7 @@ func (c *P2PClient) failDirectPromotion(job p2pPromotionJob, cause error) {
 		peer.LastUsed = time.Now()
 		peer.PunchAttempts++
 		c.setRetryGateLocked(peer)
-		delete(c.sessions, job.peerID)
-		delete(c.sessionByNonce, job.session.Nonce)
+		c.forgetSessionLocked(job.peerID, job.session)
 		c.rebuildIndexesLocked()
 		removeCandidate = true
 	}
@@ -1347,25 +1703,19 @@ func (c *P2PClient) maintenanceLoop() {
 		c.mu.RLock()
 		myID := c.myID
 		c.mu.RUnlock()
-		if myID == 0 {
+		if c.registerDue(time.Now()) {
 			c.register()
-			continue
 		}
-		if c.reregister.Swap(false) {
-			c.register()
+		if myID == 0 {
+			continue
 		}
 
 		c.requestPeerList()
 
-		type staleDirectPeer struct {
-			publicKey  NoisePublicKey
-			assignedIP net.IP
-			relayPeer  *Peer
-		}
-		var removeDirect []staleDirectPeer
-		indexesChanged := false
+		var removeDirect []p2pDirectTeardown
 		c.mu.Lock()
 		now := time.Now()
+		indexesChanged := c.forgetUnlistedPeersLocked(now)
 		for id, peer := range c.peers {
 			switch peer.State {
 			case P2PStateTrying:
@@ -1389,7 +1739,7 @@ func (c *P2PClient) maintenanceLoop() {
 					peer.LastUsed = now
 					peer.PunchAttempts++
 					c.setRetryGateLocked(peer)
-					removeDirect = append(removeDirect, staleDirectPeer{
+					removeDirect = append(removeDirect, p2pDirectTeardown{
 						publicKey:  peer.PublicKey,
 						assignedIP: append(net.IP(nil), peer.AssignedIP...),
 						relayPeer:  peer.RelayPeer,
@@ -1404,8 +1754,7 @@ func (c *P2PClient) maintenanceLoop() {
 		c.mu.Unlock()
 
 		for _, stale := range removeDirect {
-			c.device.RemovePeer(stale.publicKey)
-			c.restoreRelayRoute(stale.assignedIP, stale.relayPeer)
+			c.teardownDirect(stale)
 		}
 		if dropped := c.droppedControl.Swap(0); dropped > 0 {
 			c.device.log.Verbosef("[P2P] Dropped %d control datagrams while the bounded queue was full", dropped)
@@ -1421,9 +1770,20 @@ func (c *P2PClient) discardSessionLocked(peerID uint32) {
 	if session == nil {
 		return
 	}
-	delete(c.sessions, peerID)
-	delete(c.sessionByNonce, session.Nonce)
+	c.forgetSessionLocked(peerID, session)
 	session.signalDone()
+}
+
+func (c *P2PClient) forgetSessionLocked(peerID uint32, session *P2PSession) {
+	if c.sessions[peerID] == session {
+		delete(c.sessions, peerID)
+	}
+	if c.sessionByNonce[session.Nonce] == session {
+		delete(c.sessionByNonce, session.Nonce)
+	}
+	if session.hasAltNonce && c.sessionByNonce[session.altNonce] == session {
+		delete(c.sessionByNonce, session.altNonce)
+	}
 }
 
 func (c *P2PClient) GetEndpointForPeer(pk NoisePublicKey) conn.Endpoint {

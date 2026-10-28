@@ -212,6 +212,7 @@ func (d *Device) Start() error {
 		wd.StartP2P(serverKey)
 	}
 	d.startPortMapping(wd)
+	go allowInboundThroughAppFirewall()
 
 	// Diagnostic: dump device state after Up() to verify configuration
 	if ipcState, err := wd.IpcGet(); err == nil {
@@ -842,6 +843,9 @@ func (d *Device) GetDetailedPeers() []PeerInfo {
 				if info.AssignedIP == "" {
 					info.AssignedIP = assignedIP
 				}
+				if info.Endpoint == "" {
+					info.Endpoint = p2pObservedEndpoint(dp)
+				}
 				if info.Hostname == "" {
 					info.Hostname = d.getPeerHostname(pubHex)
 				}
@@ -851,6 +855,7 @@ func (d *Device) GetDetailedPeers() []PeerInfo {
 					PublicKey:  pubHex,
 					AssignedIP: assignedIP,
 					Hostname:   d.getPeerHostname(pubHex),
+					Endpoint:   p2pObservedEndpoint(dp),
 					IsP2P:      true,
 					P2PState:   stateStr,
 				}
@@ -867,6 +872,16 @@ func (d *Device) GetDetailedPeers() []PeerInfo {
 		return peerInfoSortLess(infos[i], infos[j])
 	})
 	return infos
+}
+
+// p2pObservedEndpoint is the peer's public address as the coordinator sees
+// it, shown while no direct WireGuard endpoint exists yet.
+func p2pObservedEndpoint(dp *wgdevice.DiscoveredPeer) string {
+	addr := dp.ObservedAddr
+	if addr.Port <= 0 || addr.IP == nil || addr.IP.IsUnspecified() {
+		return ""
+	}
+	return addr.String()
 }
 
 func (d *Device) getPeerHostname(publicKey string) string {

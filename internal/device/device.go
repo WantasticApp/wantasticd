@@ -2,6 +2,7 @@ package device
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"wantastic-agent/internal/config"
 	"wantastic-agent/internal/diaglog"
 	"wantastic-agent/internal/netctl"
+	"wantastic-agent/internal/portmap"
 
 	wgdevice "wantastic-agent/internal/device/wireguard-go/device"
 
@@ -36,6 +38,10 @@ type Device struct {
 	mu      sync.RWMutex
 	running bool
 	stopCh  chan struct{}
+
+	// Router port mapping for direct P2P (see startPortMapping).
+	portMapCancel context.CancelFunc
+	portMapDone   chan struct{}
 
 	tunName     string
 	addedRoutes []string
@@ -205,6 +211,7 @@ func (d *Device) Start() error {
 		}
 		wd.StartP2P(serverKey)
 	}
+	d.startPortMapping(wd)
 
 	// Diagnostic: dump device state after Up() to verify configuration
 	if ipcState, err := wd.IpcGet(); err == nil {
@@ -232,6 +239,9 @@ func (d *Device) Stop() error {
 		return nil
 	}
 	d.running = false
+	d.mu.Unlock()
+	d.stopPortMapping()
+	d.mu.Lock()
 
 	wg := d.device
 	td := d.tunDev
@@ -292,6 +302,53 @@ func (d *Device) Stop() error {
 }
 
 func (d *Device) Close() error { return d.Stop() }
+
+// startPortMapping asks the local router to forward the WireGuard port and
+// advertises the public address as a direct-connection candidate, so peers
+// can reach this device even where hole punching alone fails.
+func (d *Device) startPortMapping(wd *wgdevice.Device) {
+	if d.config.DisablePortMapping {
+		return
+	}
+	client := wd.GetP2PClient()
+	port := wd.ListenPort()
+	if client == nil || port == 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	d.mu.Lock()
+	d.portMapCancel, d.portMapDone = cancel, done
+	d.mu.Unlock()
+	mapper := portmap.New(port, func(external netip.AddrPort) {
+		if !external.IsValid() {
+			client.SetExtraCandidates(nil)
+			return
+		}
+		client.SetExtraCandidates([]net.UDPAddr{*net.UDPAddrFromAddrPort(external)})
+	})
+	go func() {
+		defer close(done)
+		mapper.Run(ctx)
+	}()
+}
+
+// stopPortMapping removes the router mapping, waiting briefly so it is gone
+// before the process exits.
+func (d *Device) stopPortMapping() {
+	d.mu.Lock()
+	cancel, done := d.portMapCancel, d.portMapDone
+	d.portMapCancel, d.portMapDone = nil, nil
+	d.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+	}
+}
 
 func (d *Device) applyConfig() error {
 	privHex, err := base64ToHex(d.config.PrivateKey)

@@ -38,6 +38,12 @@ const (
 type P2PClient struct {
 	device *Device
 
+	// extraCandidates are reachable addresses found outside the interface
+	// list (a router port mapping); reregister asks the maintenance loop to
+	// announce a changed set.
+	extraCandidates atomic.Pointer[[]net.UDPAddr]
+	reregister      atomic.Bool
+
 	myID          uint32
 	myPublicKey   NoisePublicKey
 	serverPeerKey NoisePublicKey
@@ -372,12 +378,25 @@ func isUsefulLocalCandidateIP(ip net.IP) bool {
 	return !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast()
 }
 
+// SetExtraCandidates replaces the extra reachable addresses (e.g. a router
+// port mapping) and announces them on the next maintenance tick.
+func (c *P2PClient) SetExtraCandidates(addrs []net.UDPAddr) {
+	copied := append([]net.UDPAddr(nil), addrs...)
+	c.extraCandidates.Store(&copied)
+	c.reregister.Store(true)
+}
+
 func (c *P2PClient) register() {
 	c.device.net.RLock()
 	port := int(c.device.net.port)
 	c.device.net.RUnlock()
 
 	candidates := c.collectLocalCandidates(port)
+	if extra := c.extraCandidates.Load(); extra != nil {
+		for _, candidate := range *extra {
+			appendPunchCandidate(&candidates, candidate, nil)
+		}
+	}
 	var localAddr net.UDPAddr
 	if len(candidates) > 0 {
 		localAddr = candidates[0]
@@ -1331,6 +1350,9 @@ func (c *P2PClient) maintenanceLoop() {
 		if myID == 0 {
 			c.register()
 			continue
+		}
+		if c.reregister.Swap(false) {
+			c.register()
 		}
 
 		c.requestPeerList()

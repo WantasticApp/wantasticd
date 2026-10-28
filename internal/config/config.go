@@ -79,8 +79,11 @@ type Config struct {
 	// other devices in the same tenant. It is opt-in because it changes the
 	// host from an overlay endpoint into a subnet router.
 	AllowLocalAccess bool `json:"allow_local_access"`
-	Verbose          bool `json:"verbose"`
-	AutoUpdate       bool `json:"auto_update"`
+	// DisablePortMapping stops the agent from asking the local router
+	// (NAT-PMP / UPnP) to open its WireGuard port for direct connections.
+	DisablePortMapping bool `json:"disable_port_mapping,omitempty"`
+	Verbose            bool `json:"verbose"`
+	AutoUpdate         bool `json:"auto_update"`
 
 	filePath   string // path this config was loaded from; not serialised
 	HandoffURL string // confirmation URL returned by register; not serialised

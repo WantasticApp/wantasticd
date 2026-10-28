@@ -372,6 +372,13 @@ func (device *Device) StartP2P(serverKeys ...NoisePublicKey) {
 	device.log.Verbosef("[P2P] Client subsystem started")
 }
 
+// ListenPort returns the UDP port the device is bound to (0 before Up).
+func (device *Device) ListenPort() uint16 {
+	device.net.RLock()
+	defer device.net.RUnlock()
+	return device.net.port
+}
+
 // GetP2PClient returns the P2P client instance if started
 func (device *Device) GetP2PClient() *P2PClient {
 	return device.p2pClient.Load()

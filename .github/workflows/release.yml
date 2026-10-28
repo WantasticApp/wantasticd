@@ -12,6 +12,9 @@ concurrency:
   group: wantasticd-release
   cancel-in-progress: false
 
+env:
+  GO_VERSION: '1.25.12'
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -19,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25.12'
+          go-version: ${{ env.GO_VERSION }}
       - name: Test
         env:
           CGO_ENABLED: 0
@@ -28,11 +31,37 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go vet -tags nosystray ./...
+      - name: Vet Windows (tray build)
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+        run: go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
       - name: Validate installers
-        run: sh -n install.sh scripts/install.sh internal/update/self-update.sh
+        run: |
+          sh -n install.sh scripts/install.sh internal/update/self-update.sh
+          pwsh -NoProfile -Command '
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }'
+
+  # macOS builds need cgo (Cocoa menu-bar app), so they build and are tested
+  # on macOS, isolated from the cross-compiled matrix.
+  quality-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Vet and test (tray build)
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
 
   create-release:
-    needs: quality
+    needs: [quality, quality-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,12 +71,13 @@ jobs:
         run: |
           gh release view ${{ github.ref_name }} || gh release create ${{ github.ref_name }} --title "${{ github.ref_name }}" --generate-notes --verify-tag
 
-  release:
+  build:
     needs: create-release
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        goos: [linux, darwin, windows]
+        goos: [linux, windows]
         goarch: [amd64, arm64]
         include:
           - goos: linux
@@ -73,152 +103,199 @@ jobs:
           - goos: linux
             goarch: riscv64
           - goos: linux
-            goarch: s390x 
+            goarch: s390x
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
-      with:
-        go-version: '1.25.12'
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-    - name: Install dependencies (Linux only)
-      if: matrix.goos == 'linux'
-      run: |
-        sudo apt-get update && sudo apt-get install -y \
-          git gcc libc6-dev
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+${SHA} -X wantastic-agent/pkg/version.Commit=${SHA} -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          TAGS=""
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then
+            # The Windows tray is pure Go (no cgo), so Windows keeps it.
+            LDFLAGS="$LDFLAGS -H=windowsgui"
+            EXT=".exe"
+          else
+            # Linux targets are headless routers/servers.
+            TAGS="nosystray"
+          fi
+          go build -v -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o "wantasticd${EXT}" ./cmd/wantasticd
 
-    - name: Build
-      run: |
-        export GOOS=${{ matrix.goos }}
-        export GOARCH=${{ matrix.goarch }}
-        export CGO_ENABLED=0
-        TAGS="nosystray"
-        
-        LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.Commit=$(git rev-parse --short HEAD) -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          LDFLAGS="$LDFLAGS -H=windowsgui"
-        fi
-        EXT=""
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          EXT=".exe"
-        fi
-        go build -v -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/wantasticd
+      - name: Compress binary
+        run: |
+          sudo apt-get update && sudo apt-get install -y upx-ucl
+          BIN=wantasticd
+          [ "${{ matrix.goos }}" = "windows" ] && BIN=wantasticd.exe
+          upx -9 --best "$BIN" || echo "UPX compression failed for ${{ matrix.goos }}/${{ matrix.goarch }}, continuing without compression"
 
-    - name: Compress Binary
-      if: matrix.goos != 'darwin'
-      run: |
-        sudo apt-get update && sudo apt-get install -y upx-ucl
-        EXT=""
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          EXT=".exe"
-        fi
-        BINARY_NAME="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
-        upx -9 --best "${BINARY_NAME}" || echo "UPX compression failed for ${{ matrix.goarch }}, continuing without compression"
+      - name: Package
+        run: |
+          mkdir -p dist
+          NAME="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "dist/${NAME}.zip" wantasticd.exe README.md
+          else
+            tar -czvf "dist/${NAME}.tar.gz" wantasticd README.md
+          fi
 
-    - name: Package
-      run: |
-        EXT=""
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          EXT=".exe"
-        fi
-        BINARY_NAME="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
-        # Rename to a generic name for the archive
-        cp "${BINARY_NAME}" wantasticd${EXT}
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          zip "wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip" wantasticd${EXT} README.md
-        else
-          tar -czvf "wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" wantasticd README.md
-        fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
 
+  build-darwin:
+    needs: create-release
+    # Apple silicon runner; the Intel build is cross-compiled with clang.
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [arm64, amd64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-    - name: Create Version File
-      run: echo "${{ github.ref_name }}+$(git rev-parse --short HEAD)" > latest
+      - name: Build (cgo, menu-bar app)
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          # Go 1.25 supports macOS 12 and later.
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+        run: |
+          CLANG_ARCH=arm64
+          [ "$GOARCH" = "amd64" ] && CLANG_ARCH=x86_64
+          export CC="clang -arch ${CLANG_ARCH}"
+          export CGO_CFLAGS="-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CGO_LDFLAGS="-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          SHA=$(git rev-parse --short HEAD)
+          LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+${SHA} -X wantastic-agent/pkg/version.Commit=${SHA} -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          go build -v -trimpath -ldflags="$LDFLAGS" -o wantasticd ./cmd/wantasticd
 
-    - name: Upload Release Asset
-      run: |
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          ASSET="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
-        else
-          ASSET="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
-        fi
-        # Delete existing asset if present (idempotent re-runs)
-        gh release delete-asset ${{ github.ref_name }} "$ASSET" -y 2>/dev/null || true
-        gh release upload ${{ github.ref_name }} "$ASSET"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Sign and verify
+        run: |
+          # Apple silicon refuses to run unsigned code; ad-hoc sign both builds.
+          codesign --force --sign - --identifier app.wantastic.wantasticd wantasticd
+          codesign --verify --verbose=2 wantasticd
+          WANT=arm64
+          [ "${{ matrix.goarch }}" = "amd64" ] && WANT=x86_64
+          ARCHS=$(lipo -archs wantasticd)
+          echo "archs: $ARCHS"
+          [ "$ARCHS" = "$WANT" ] || { echo "expected $WANT"; exit 1; }
+          # Only system libraries: a Homebrew dylib would not exist on users' Macs.
+          otool -L wantasticd
+          if otool -L wantasticd | tail -n +2 | grep -vE '^\s*(/usr/lib/|/System/Library/)'; then
+            echo "non-system library linked"; exit 1
+          fi
+          otool -l wantasticd | grep -A4 LC_BUILD_VERSION | grep minos
 
-    - name: Prepare R2 Upload
-      run: |
-        mkdir -p r2_upload
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          cp wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.zip r2_upload/
-        else
-          cp wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz r2_upload/
-        fi
-        cp latest r2_upload/
+      - name: Smoke test
+        run: |
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            ./wantasticd version | grep -F "${{ github.ref_name }}"
+          elif arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 ./wantasticd version | grep -F "${{ github.ref_name }}"
+          else
+            echo "Rosetta unavailable on this runner; skipping the Intel smoke test"
+          fi
 
-    - name: Check tag is still newest
-      id: newest-tag
-      run: |
-        git fetch --tags --force
-        NEWEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
-        if [ "$NEWEST_TAG" = "${{ github.ref_name }}" ]; then
-          echo "is_newest=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "is_newest=false" >> "$GITHUB_OUTPUT"
-          echo "Skipping latest-channel upload because $NEWEST_TAG supersedes ${{ github.ref_name }}"
-        fi
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czvf "dist/wantasticd-darwin-${{ matrix.goarch }}.tar.gz" wantasticd README.md
 
-    - name: Upload to R2 (Versioned)
-      uses: ryand56/r2-upload-action@latest
-      with:
-        r2-account-id: ${{ secrets.R2_ACCOUNT }}
-        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-        r2-secret-access-key: ${{ secrets.R2_SECRET }}
-        r2-bucket: ${{ secrets.R2_BUCKET }}
-        source-dir: r2_upload
-        destination-dir: ${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
 
-    - name: Upload to R2 (Latest)
-      if: steps.newest-tag.outputs.is_newest == 'true'
-      uses: ryand56/r2-upload-action@latest
-      with:
-        r2-account-id: ${{ secrets.R2_ACCOUNT }}
-        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-        r2-secret-access-key: ${{ secrets.R2_SECRET }}
-        r2-bucket: ${{ secrets.R2_BUCKET }}
-        source-dir: r2_upload
-        destination-dir: latest
-
-  upload-utils:
-    needs: [release]
+  # Publish only after every platform built, so the "latest" marker never
+  # points agents at a release whose archive for their platform is missing.
+  publish:
+    needs: [build, build-darwin]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Prepare Root Upload
-      run: |
-        mkdir -p root_upload
-        cp install.sh root_upload/
-        echo "${{ github.ref_name }}+$(git rev-parse --short HEAD)" > root_upload/latest
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Check tag is still newest
-      id: newest-tag
-      run: |
-        git fetch --tags --force
-        NEWEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
-        if [ "$NEWEST_TAG" = "${{ github.ref_name }}" ]; then
-          echo "is_newest=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "is_newest=false" >> "$GITHUB_OUTPUT"
-          echo "Skipping root latest marker because $NEWEST_TAG supersedes ${{ github.ref_name }}"
-        fi
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
-    - name: Upload Root Artifacts to R2
-      if: steps.newest-tag.outputs.is_newest == 'true'
-      uses: ryand56/r2-upload-action@latest
-      with:
-        r2-account-id: ${{ secrets.R2_ACCOUNT }}
-        r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-        r2-secret-access-key: ${{ secrets.R2_SECRET }}
-        r2-bucket: ${{ secrets.R2_BUCKET }}
-        source-dir: root_upload
-        destination-dir: ./
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -l dist
+          gh release upload ${{ github.ref_name }} dist/* --clobber
+
+      - name: Version marker
+        run: echo "${{ github.ref_name }}+$(git rev-parse --short HEAD)" > dist/latest
+
+      - name: Check tag is still newest
+        id: newest-tag
+        run: |
+          git fetch --tags --force
+          NEWEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
+          if [ "$NEWEST_TAG" = "${{ github.ref_name }}" ]; then
+            echo "is_newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_newest=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping latest-channel upload because $NEWEST_TAG supersedes ${{ github.ref_name }}"
+          fi
+
+      - name: Upload to R2 (versioned)
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: dist
+          destination-dir: ${{ github.ref_name }}
+
+      - name: Upload to R2 (latest channel)
+        if: steps.newest-tag.outputs.is_newest == 'true'
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: dist
+          destination-dir: latest
+
+      - name: Prepare root files
+        if: steps.newest-tag.outputs.is_newest == 'true'
+        run: |
+          mkdir -p root_upload
+          cp install.sh install.ps1 root_upload/
+          cp dist/latest root_upload/latest
+
+      # Last: agents poll this marker, and everything it points at is now live.
+      - name: Upload root files to R2
+        if: steps.newest-tag.outputs.is_newest == 'true'
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: root_upload
+          destination-dir: ./

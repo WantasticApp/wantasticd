@@ -1,11 +1,14 @@
 # Wantastic Agent — Windows Install Script
 # Registers wantasticd as a Windows Service via sc.exe (no extra dependencies).
+# The menu-bar (notification area) app starts for every user at logon; pass
+# -NoTray to skip it.
 # Usage:
 #   irm https://get.wantastic.app/install.ps1 | iex
-#   .\install.ps1 -Token <TOKEN>
+#   .\install.ps1 -Token <TOKEN> [-NoTray]
 
 param(
-    [string]$Token = ""
+    [string]$Token = "",
+    [switch]$NoTray
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +18,8 @@ $InstallDir  = Join-Path $env:ProgramFiles "Wantastic"
 $InstallPath = Join-Path $InstallDir "wantasticd.exe"
 $ConfigDir   = "C:\ProgramData\Wantastic"
 $ConfigFile  = Join-Path $ConfigDir "config.conf"
+$RunKey      = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+$TrayValue   = "Wantastic"
 
 function Invoke-ScChecked {
     param(
@@ -40,6 +45,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     Write-Warning "Administrator privileges required. Re-launching elevated…"
     $args = if ($Token) { "-Token `"$Token`"" } else { "" }
+    if ($NoTray) { $args += " -NoTray" }
     Start-Process powershell -Verb RunAs `
         -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $args"
     exit 0
@@ -60,7 +66,11 @@ if (-not $Version) { Write-Error "Could not determine latest version."; exit 1 }
 Write-Host "Version: $Version"
 
 # ── download ──────────────────────────────────────────────────────────────────
-$BinaryUrl = "$BaseUrl/latest/wantasticd-windows-${GoArch}.zip"
+# Immutable per-release path: /latest/ can stay cached at the edge after the
+# version marker has moved on.
+$ReleaseTag = ($Version -split '\+')[0]
+if ($ReleaseTag -notmatch '^[A-Za-z0-9._-]+$') { Write-Error "Invalid release version: $Version"; exit 1 }
+$BinaryUrl = "$BaseUrl/$ReleaseTag/wantasticd-windows-${GoArch}.zip"
 $TempDir   = Join-Path $env:TEMP "wantasticd_install_$(Get-Random)"
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 $ZipPath = Join-Path $TempDir "wantasticd.zip"
@@ -86,9 +96,17 @@ if ($svc -and $svc.Status -eq "Running") {
     Stop-Service -Name $ServiceName -Force
     Start-Sleep -Seconds 2
 }
+# Tray apps run the same .exe; Windows will not replace an image in use.
+Get-Process -Name "wantasticd" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 
 New-Item -ItemType Directory -Force -Path $InstallDir  | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigDir   | Out-Null
+# Keep the previous build for manual rollback, like self-update does.
+if (Test-Path $InstallPath) {
+    Copy-Item -Path $InstallPath -Destination "$InstallPath.previous" -Force
+}
+Remove-Item -Force -ErrorAction SilentlyContinue "$InstallPath.new", "$InstallPath.failed"
 Copy-Item -Path $ExtractedBin.FullName -Destination $InstallPath -Force
 Remove-Item -Recurse -Force $TempDir
 Write-Host "Installed to $InstallPath"
@@ -103,7 +121,8 @@ $env:PATH = "$env:PATH;$InstallDir"
 
 # ── login ─────────────────────────────────────────────────────────────────────
 Write-Host "`n=== Logging in ==="
-$loginArgs = @("login")
+# --no-connect: save the configuration and exit; the service connects.
+$loginArgs = @("login", "--no-connect")
 if ($Token) { $loginArgs += @("--token", $Token) }
 
 $loginResult = Start-Process -FilePath $InstallPath -ArgumentList $loginArgs `
@@ -137,7 +156,8 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 }
 
 # sc.exe create — binPath must include all arguments quoted as a single string
-$binPath = "`"$InstallPath`" connect --config `"$ConfigFile`""
+# The service runs in session 0 with no desktop; the tray is a per-user app.
+$binPath = "`"$InstallPath`" connect --config `"$ConfigFile`" --tray=false"
 Invoke-ScChecked `
     -Arguments @("create", $ServiceName, "binPath=", $binPath, "start=", "auto", "DisplayName=", "Wantastic Overlay Networking") `
     -Action "create the Windows service"
@@ -171,6 +191,20 @@ if ($LASTEXITCODE -ne 0 -or $serviceConfig -notmatch "AUTO_START") {
 }
 
 Write-Host "`nwantasticd $Version is installed and running as a Windows Service." -ForegroundColor Green
+
+# ── tray app ──────────────────────────────────────────────────────────────────
+if ($NoTray) {
+    Remove-ItemProperty -Path $RunKey -Name $TrayValue -ErrorAction SilentlyContinue
+    Write-Host "Tray app disabled (-NoTray)."
+} else {
+    Set-ItemProperty -Path $RunKey -Name $TrayValue -Value "`"$InstallPath`" tray"
+    try {
+        Start-Process -FilePath $InstallPath -ArgumentList "tray" -WindowStyle Hidden
+        Write-Host "Tray app started; it also starts at every logon."
+    } catch {
+        Write-Host "Tray app registered; it starts at the next logon."
+    }
+}
 
 Write-Host "`nUseful commands:"
 Write-Host "  sc.exe query   $ServiceName   — check status"

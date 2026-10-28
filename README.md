@@ -57,7 +57,19 @@ To run the P2P end-to-end test suite:
 ### Linux & macOS — one-liner
 
 ```sh
-curl -sSL https://get.wantastic.app/install.sh | sh
+curl -sSL https://get.wantastic.app/install.sh | sh          # Linux
+curl -fsSL https://get.wantastic.app/install.sh | sudo sh    # macOS (Intel and Apple silicon)
+```
+
+On macOS the daemon runs as a LaunchDaemon and the menu-bar app starts for
+every user at login (LaunchAgent `com.wantastic.tray`). Pass `--no-tray` to skip
+the menu-bar app. The installer picks the native build on Apple silicon even
+from a Rosetta shell, and logs go to `/Library/Logs/Wantastic/wantasticd.log`.
+
+To uninstall (keeps the configuration unless `--purge` is given):
+
+```sh
+curl -fsSL https://get.wantastic.app/install.sh | sudo sh -s -- --uninstall [--purge]
 ```
 
 The installer automatically:
@@ -191,8 +203,15 @@ You can pre-write this file to an SD card before first boot — the installer **
 # Connect using config file
 wantasticd connect --config /etc/wantastic
 
-# Check connection status
-wantasticd status
+# Connection status (version, addresses, server, traffic, peers)
+wantasticd status [--json]
+
+# Peers with path (direct/relay), endpoint, last handshake and traffic;
+# --ping adds a latency column
+wantasticd peers [--ping] [--json]
+
+# Ping peers over the tunnel (all peers when no target is given)
+wantasticd ping [-c 4] [-i 250ms] [-W 1s] [hostname|vpn-ip|pubkey-prefix ...]
 
 # Login interactively
 wantasticd login
@@ -250,15 +269,18 @@ systemctl stop wantasticd
 
 **macOS (launchd)**
 ```sh
-launchctl list | grep wantastic
-launchctl stop com.wantastic.wantasticd
+sudo launchctl print system/com.wantastic.wantasticd
+sudo launchctl kickstart -k system/com.wantastic.wantasticd   # restart
 ```
 
-To stop and remove the system service while keeping the generated key and configuration:
-```sh
-sudo launchctl bootout system /Library/LaunchDaemons/com.wantastic.wantasticd.plist
-sudo rm /Library/LaunchDaemons/com.wantastic.wantasticd.plist
-```
+To stop and remove the service while keeping the generated key and
+configuration, run the installer with `--uninstall` (see Installation).
+
+**Updates** are applied by the daemon itself (or `sudo wantasticd update`):
+the new build is verified before it replaces the old one, the service is
+restarted, and if it does not come back healthy the previous build is
+restored. The previous build is kept as `wantasticd.previous` next to the
+binary.
 
 ### macOS connectivity troubleshooting
 
@@ -269,7 +291,7 @@ cannot reach a peer, check the daemon, tunnel, logs, and route:
 ```sh
 /usr/local/bin/wantasticd status
 sudo launchctl print system/com.wantastic.wantasticd
-sudo tail -n 100 /var/log/wantasticd.log
+sudo tail -n 100 /Library/Logs/Wantastic/wantasticd.log   # installs before 1.0.50: /var/log/wantasticd.log
 route -n get <peer-overlay-ip>
 ```
 

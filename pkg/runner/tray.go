@@ -14,6 +14,7 @@ import (
 
 	"wantastic-agent/internal/agent"
 	"wantastic-agent/internal/device"
+	"wantastic-agent/pkg/version"
 
 	"github.com/getlantern/systray"
 )
@@ -38,9 +39,43 @@ type peerMenuEntry struct {
 	CopyText string
 }
 
+// trayClient talks to the daemon's local IPC API. Every call is bounded so a
+// wedged daemon can never freeze the menu.
+var trayClient = &http.Client{Timeout: 3 * time.Second}
+
+func ipcURL(path string) string {
+	return "http://127.0.0.1:" + agent.GetIPCPort() + path
+}
+
+func postIPC(path string) {
+	resp, err := trayClient.Post(ipcURL(path), "application/json", nil)
+	if err != nil {
+		log.Printf("tray: %s: %v", path, err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func fetchStatus() (*agent.StatusResponse, error) {
+	resp, err := trayClient.Get(ipcURL("/api/status"))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %s", resp.Status)
+	}
+	var st agent.StatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
 // RunSystray starts the system tray GUI and handles user interactions via IPC.
 // It blocks until the systray is quit.
 func RunSystray(ctx context.Context, cancel context.CancelFunc) {
+	watch := newBinaryWatch()
 	systray.Run(
 		func() { // onReady
 			systray.SetTitle("W")
@@ -71,12 +106,80 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mToggleExit := systray.AddMenuItem("Enable Exit Node", "Allow others to route through this device")
 
 			systray.AddSeparator()
+			mVersion := systray.AddMenuItem("Version "+version.Version, "Installed version")
+			mVersion.Disable()
 			mQuit := systray.AddMenuItem("Quit", "Exit Tray")
+
+			// Toggle clicks refresh from their own goroutines; the peer menu
+			// groups are not safe for concurrent updates.
+			var refreshMu sync.Mutex
+			refresh := func() {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				st, err := fetchStatus()
+				if err != nil {
+					mStatus.SetTitle("Status: Daemon not running")
+					mToggleOnOff.Disable()
+					mToggleExit.Disable()
+					return
+				}
+				mToggleOnOff.Enable()
+				mToggleExit.Enable()
+
+				statusText := "Offline"
+				if st.Running {
+					statusText = "Online"
+				}
+				mStatus.SetTitle(fmt.Sprintf("Status: %s", statusText))
+
+				ipText := "N/A"
+				if len(st.IPs) > 0 {
+					ipText = st.IPs[0]
+				}
+				mIP.SetTitle(fmt.Sprintf("IP: %s", ipText))
+
+				pubKeyText := "N/A"
+				if len(st.PubKey) > 8 {
+					pubKeyText = st.PubKey[:8]
+				}
+				mPubKey.SetTitle(fmt.Sprintf("PubKey: %s...", pubKeyText))
+
+				mStats.SetTitle(fmt.Sprintf("Traffic: ↓ %s / ↑ %s", trayBytes(st.RxBytes), trayBytes(st.TxBytes)))
+
+				p2pEntries, relayEntries := buildPeerMenuEntries(st.Peers)
+				p2pCount := len(p2pEntries)
+				relayCount := len(relayEntries)
+				mPeers.SetTitle(fmt.Sprintf("Peers: %d (P2P: %d, Relay: %d)", len(st.Peers), p2pCount, relayCount))
+				mP2PPeers.SetTitle(fmt.Sprintf("P2P Peers: %d", p2pCount))
+				mRelayPeers.SetTitle(fmt.Sprintf("Relay Peers: %d", relayCount))
+				syncPeerMenuGroup(p2pMenu, p2pEntries)
+				syncPeerMenuGroup(relayMenu, relayEntries)
+
+				if st.Running {
+					mToggleOnOff.SetTitle("Disconnect")
+				} else {
+					mToggleOnOff.SetTitle("Connect")
+				}
+
+				if st.ExitNode {
+					mToggleExit.Check()
+				} else {
+					mToggleExit.Uncheck()
+				}
+
+				// The daemon moved to a new build and our binary on disk was
+				// replaced: restart onto it so the menu matches the daemon.
+				if st.Version != "" && st.Version != version.Version && watch.replaced() {
+					log.Printf("tray: daemon runs %s, tray %s; restarting on the updated binary", st.Version, version.Version)
+					watch.restart()
+				}
+			}
 
 			// Handler loop for tray updates and interactions
 			go func() {
-				ticker := time.NewTicker(10 * time.Second)
+				ticker := time.NewTicker(5 * time.Second)
 				defer ticker.Stop()
+				refresh()
 
 				for {
 					select {
@@ -90,62 +193,13 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						return
 
 					case <-mToggleOnOff.ClickedCh:
-						go http.Post("http://127.0.0.1:9034/api/state/toggle", "application/json", nil)
+						go func() { postIPC("/api/state/toggle"); refresh() }()
 
 					case <-mToggleExit.ClickedCh:
-						go http.Post("http://127.0.0.1:9034/api/exitnode/toggle", "application/json", nil)
+						go func() { postIPC("/api/exitnode/toggle"); refresh() }()
 
 					case <-ticker.C:
-						// Fetch latest status via local API
-						resp, err := http.Get("http://127.0.0.1:9034/api/status")
-						if err != nil {
-							continue
-						}
-						var st agent.StatusResponse
-						if err := json.NewDecoder(resp.Body).Decode(&st); err == nil {
-							// Update Menu Items
-							statusText := "Offline"
-							if st.Running {
-								statusText = "Online"
-							}
-							mStatus.SetTitle(fmt.Sprintf("Status: %s", statusText))
-
-							ipText := "N/A"
-							if len(st.IPs) > 0 {
-								ipText = st.IPs[0]
-							}
-							mIP.SetTitle(fmt.Sprintf("IP: %s", ipText))
-
-							pubKeyText := "N/A"
-							if len(st.PubKey) > 8 {
-								pubKeyText = st.PubKey[:8]
-							}
-							mPubKey.SetTitle(fmt.Sprintf("PubKey: %s...", pubKeyText))
-
-							mStats.SetTitle(fmt.Sprintf("Traffic: %v / %v", st.RxBytes, st.TxBytes))
-
-							p2pEntries, relayEntries := buildPeerMenuEntries(st.Peers)
-							p2pCount := len(p2pEntries)
-							relayCount := len(relayEntries)
-							mPeers.SetTitle(fmt.Sprintf("Peers: %d (P2P: %d, Relay: %d)", len(st.Peers), p2pCount, relayCount))
-							mP2PPeers.SetTitle(fmt.Sprintf("P2P Peers: %d", p2pCount))
-							mRelayPeers.SetTitle(fmt.Sprintf("Relay Peers: %d", relayCount))
-							syncPeerMenuGroup(p2pMenu, p2pEntries)
-							syncPeerMenuGroup(relayMenu, relayEntries)
-
-							if st.Running {
-								mToggleOnOff.SetTitle("Disconnect")
-							} else {
-								mToggleOnOff.SetTitle("Connect")
-							}
-
-							if st.ExitNode {
-								mToggleExit.Check()
-							} else {
-								mToggleExit.Uncheck()
-							}
-						}
-						resp.Body.Close()
+						refresh()
 					}
 				}
 			}()
@@ -154,6 +208,19 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			log.Println("Systray finished")
 		},
 	)
+}
+
+func trayBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func newPeerMenuGroup(parent *systray.MenuItem, emptyTitle string) *peerMenuGroup {

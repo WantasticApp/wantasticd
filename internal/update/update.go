@@ -23,6 +23,8 @@ type Manager struct {
 	currentVersion string
 	httpClient     *http.Client
 	baseURL        string
+	// Output, when set, receives the installer's output (interactive CLI).
+	Output io.Writer
 }
 
 const defaultReleaseBaseURL = "https://get.wantastic.app"
@@ -71,34 +73,16 @@ func (m *Manager) FetchLatestVersion(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
-// RunUpdateScript executes the embedded self-update.sh script
+// RunUpdateScript downloads the release for this platform and installs it.
+// The swap, service restart, health check and rollback run in a process
+// detached from this one (see install), because restarting the service ends
+// this process: an attached child would die with it half-way through.
 func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath string) error {
 	// The agent context normally lives for the lifetime of the process. Give the
-	// external downloader its own deadline so a stalled update can never pin the
-	// update worker indefinitely.
+	// download its own deadline so a stalled update can never pin the update
+	// worker indefinitely.
 	updateCtx, cancel := context.WithTimeout(ctx, updateAttemptTimeout)
 	defer cancel()
-
-	scriptContent, err := updateScript.ReadFile("self-update.sh")
-	if err != nil {
-		return fmt.Errorf("read embedded script: %w", err)
-	}
-
-	tmpFile, err := os.CreateTemp("", "self-update-*.sh")
-	if err != nil {
-		return fmt.Errorf("create temp script: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.Write(scriptContent); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("write temp script: %w", err)
-	}
-	tmpFile.Close()
-
-	if err := os.Chmod(tmpFile.Name(), 0755); err != nil {
-		return fmt.Errorf("chmod temp script: %w", err)
-	}
 
 	// Download in Go so the update does not depend on curl, which stock
 	// OpenWrt and many embedded images do not ship.
@@ -106,26 +90,12 @@ func (m *Manager) RunUpdateScript(ctx context.Context, targetVersion, binaryPath
 	if err != nil {
 		return fmt.Errorf("create download dir: %w", err)
 	}
-	defer os.RemoveAll(archiveDir)
-	archivePath := filepath.Join(archiveDir, "pkg.tar.gz")
+	archivePath := filepath.Join(archiveDir, "pkg"+archiveExt(GetPlatform()))
 	if err := m.downloadRelease(updateCtx, targetVersion, archivePath); err != nil {
+		os.RemoveAll(archiveDir)
 		return err
 	}
-
-	log.Printf("Running update script for version %s (target: %s)...", targetVersion, binaryPath)
-	cmd := exec.CommandContext(updateCtx, "/bin/sh", tmpFile.Name(), targetVersion, binaryPath, archivePath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.WaitDelay = 5 * time.Second
-
-	if err := cmd.Run(); err != nil {
-		if updateCtx.Err() != nil {
-			return fmt.Errorf("update attempt timed out after %s: %w", updateAttemptTimeout, updateCtx.Err())
-		}
-		return fmt.Errorf("execute update script: %w", err)
-	}
-
-	return nil
+	return m.install(ctx, updateCtx, targetVersion, binaryPath, archiveDir, archivePath)
 }
 
 // downloadRelease fetches the immutable release archive for this platform,
@@ -185,7 +155,15 @@ func (m *Manager) downloadOnce(ctx context.Context, url, dest string) error {
 
 func (m *Manager) releaseURL(version, platform string) string {
 	releaseTag, _, _ := strings.Cut(strings.TrimSpace(version), "+")
-	return fmt.Sprintf("%s/%s/wantasticd-%s.tar.gz", m.baseURL, releaseTag, platform)
+	return fmt.Sprintf("%s/%s/wantasticd-%s%s", m.baseURL, releaseTag, platform, archiveExt(platform))
+}
+
+// archiveExt is the release archive type: Windows ships .zip, the rest .tar.gz.
+func archiveExt(platform string) string {
+	if strings.HasPrefix(platform, "windows-") {
+		return ".zip"
+	}
+	return ".tar.gz"
 }
 
 type releaseVersion struct {
@@ -346,7 +324,7 @@ func (m *Manager) restart() error {
 
 // GetPlatform returns the current OS and architecture for update URLs
 func GetPlatform() string {
-	return fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s-%s", runtime.GOOS, releaseArch())
 }
 
 // BuildUpdateURL constructs an update URL for the given version and platform

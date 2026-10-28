@@ -56,12 +56,23 @@ func TestSelfUpdateVerifiesAndRollsBackFailedService(t *testing.T) {
 		`ubus call service list`,
 		`"running"[[:space:]]*:[[:space:]]*true`,
 		"verify_update",
-		"wantasticd.previous",
+		`BACKUP="${TARGET_BIN}.previous"`,
 		"wantasticd.rollback",
+		"launchctl kickstart -k",
+		"prepare_darwin_binary",
 		"restoring previous binary",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("self-update script missing %q", required)
 		}
+	}
+}
+
+func TestReleaseURLUsesZipOnWindows(t *testing.T) {
+	if got, want := BuildUpdateURL("v1.2.3+abc", "windows-amd64"), "https://get.wantastic.app/v1.2.3/wantasticd-windows-amd64.zip"; got != want {
+		t.Fatalf("BuildUpdateURL() = %q, want %q", got, want)
+	}
+	if got, want := BuildUpdateURL("v1.2.3", "darwin-arm64"), "https://get.wantastic.app/v1.2.3/wantasticd-darwin-arm64.tar.gz"; got != want {
+		t.Fatalf("BuildUpdateURL() = %q, want %q", got, want)
 	}
 }

@@ -11,6 +11,11 @@ CONNECT_TIMEOUT="${WANTASTIC_UPDATE_CONNECT_TIMEOUT:-15}"
 DOWNLOAD_TIMEOUT="${WANTASTIC_UPDATE_DOWNLOAD_TIMEOUT:-300}"
 VERIFY_TIMEOUT="${WANTASTIC_UPDATE_VERIFY_TIMEOUT:-20}"
 SERVICE_MANAGER=""
+LAUNCHD_LABEL="com.wantastic.wantasticd"
+TRAY_LABEL="com.wantastic.tray"
+TRAY_PLIST="/Library/LaunchAgents/${TRAY_LABEL}.plist"
+NO_TRAY_MARKER="/Library/Application Support/Wantastic/no-tray"
+OLD_PID=""
 
 run_initd() {
   if [ -x /etc/init.d/wantasticd ]; then
@@ -60,7 +65,13 @@ case "$UNAME_S" in
 esac
 
 case "$(uname -m)" in
-  x86_64)         ARCH="amd64"    ;;
+  x86_64)
+    ARCH="amd64"
+    # A shell under Rosetta reports x86_64 on Apple silicon; install native.
+    if [ "$OS" = "darwin" ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      ARCH="arm64"
+    fi
+    ;;
   aarch64|arm64)  ARCH="arm64"    ;;
   armv7*|armv6*)  ARCH="arm"      ;;
   i386|i686)      ARCH="386"      ;;
@@ -76,7 +87,21 @@ esac
 # ── service restart ───────────────────────────────────────────────────────────
 # After the binary is replaced on disk the running process keeps its old inode.
 # We ask the service manager to restart so a fresh exec picks up the new binary.
+launchd_pid() {
+  launchctl print "system/$LAUNCHD_LABEL" 2>/dev/null | awk '$1 == "pid" { print $3; exit }'
+}
+
 restart_service() {
+  # launchd (macOS). Checked first so a stray /etc/init.d entry cannot shadow
+  # it. kickstart -k replaces the job in one step; stop/start raced KeepAlive.
+  if [ "$OS" = "darwin" ] && command -v launchctl >/dev/null 2>&1 &&
+     launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+    echo "Restarting via launchd…"
+    OLD_PID=$(launchd_pid)
+    launchctl kickstart -k "system/$LAUNCHD_LABEL"
+    SERVICE_MANAGER="launchd"
+    return 0
+  fi
   # systemd
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wantasticd 2>/dev/null; then
     echo "Restarting via systemd…"
@@ -103,14 +128,6 @@ restart_service() {
     echo "Restarting via init.d…"
     run_initd restart
     SERVICE_MANAGER="initd"
-    return 0
-  fi
-  # launchd (macOS)
-  if [ "$OS" = "darwin" ] && command -v launchctl >/dev/null 2>&1; then
-    echo "Restarting via launchctl…"
-    launchctl stop  com.wantastic.wantasticd 2>/dev/null || true
-    launchctl start com.wantastic.wantasticd
-    SERVICE_MANAGER="launchd"
     return 0
   fi
   echo "Error: no supported service manager found; refusing an unverifiable update"
@@ -140,7 +157,12 @@ service_is_running() {
       fi
       ;;
     openrc) rc-service wantasticd status >/dev/null 2>&1 ;;
-    launchd) launchctl list com.wantastic.wantasticd >/dev/null 2>&1 ;;
+    launchd)
+      # "launchctl list" succeeds for a loaded but crashed job; require a
+      # running process that is not the one we replaced.
+      _pid=$(launchd_pid)
+      [ -n "$_pid" ] && [ "$_pid" != "$OLD_PID" ] && kill -0 "$_pid" 2>/dev/null
+      ;;
     *) return 1 ;;
   esac
 }
@@ -152,6 +174,49 @@ binary_reports_version() {
     *"$_expected"*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# macOS kills unsigned arm64 binaries and refuses quarantined ones.
+prepare_darwin_binary() {
+  [ "$OS" = "darwin" ] || return 0
+  xattr -d com.apple.quarantine "$1" 2>/dev/null || true
+  if ! codesign -v "$1" >/dev/null 2>&1; then
+    codesign -f -s - "$1" >/dev/null 2>&1 || echo "Warning: could not ad-hoc sign $1"
+  fi
+}
+
+# The menu-bar app runs per user from the same binary. Install its agent when
+# missing (installs from before the tray existed) and restart it on the new
+# binary, unless the admin opted out with the no-tray marker.
+refresh_darwin_tray() {
+  [ "$SERVICE_MANAGER" = "launchd" ] || return 0
+  [ -f "$NO_TRAY_MARKER" ] && return 0
+  if [ ! -f "$TRAY_PLIST" ]; then
+    mkdir -p /Library/LaunchAgents 2>/dev/null || return 0
+    cat > "$TRAY_PLIST" <<PLIST || return 0
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${TRAY_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${TARGET_BIN}</string><string>tray</string></array>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict></plist>
+PLIST
+    chmod 644 "$TRAY_PLIST"
+    echo "Installed menu-bar agent $TRAY_PLIST"
+  fi
+  _uid=$(stat -f %u /dev/console 2>/dev/null || true)
+  case "$_uid" in ""|0) return 0 ;; esac
+  if launchctl print "gui/$_uid/$TRAY_LABEL" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$_uid/$TRAY_LABEL" >/dev/null 2>&1 || true
+  else
+    launchctl bootstrap "gui/$_uid" "$TRAY_PLIST" >/dev/null 2>&1 || true
+  fi
 }
 
 verify_update() {
@@ -209,7 +274,9 @@ main() {
   DOWNLOAD_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz"
 
   TMP_DIR=$(mktemp -d)
-  trap 'rm -rf "$TMP_DIR"' EXIT
+  # WANTASTIC_UPDATE_WORKDIR is the agent's download directory (holding this
+  # script and the archive); the agent may have exited, so clean it here too.
+  trap 'rm -rf "$TMP_DIR" ${WANTASTIC_UPDATE_WORKDIR:+"$WANTASTIC_UPDATE_WORKDIR"}' EXIT
 
   if [ -n "$ARCHIVE" ] && [ -s "$ARCHIVE" ]; then
     echo "Using downloaded archive $ARCHIVE"
@@ -230,6 +297,7 @@ main() {
   [ -n "$NEW_BIN" ] || { echo "Error: binary not found in archive"; ls -la "$TMP_DIR"; exit 1; }
 
   chmod +x "$NEW_BIN"
+  prepare_darwin_binary "$NEW_BIN"
 
   # Refuse a corrupt archive, wrong architecture, or incorrectly-versioned
   # build before touching the running installation.
@@ -249,11 +317,20 @@ main() {
   # the service manager on restart.
   DEST_DIR="$(dirname "$TARGET_BIN")"
   STAGING="${DEST_DIR}/.wantasticd.update.$$"
-  BACKUP="$TMP_DIR/wantasticd.previous"
+  # Kept next to the binary after a successful update for manual rollback;
+  # each update replaces it, so backups never accumulate.
+  BACKUP="${TARGET_BIN}.previous"
 
-  [ ! -f "$TARGET_BIN" ] || cp -p "$TARGET_BIN" "$BACKUP"
+  # Leftovers from an update that was killed half-way.
+  rm -f "${DEST_DIR}"/.wantasticd.update.* "${DEST_DIR}"/.wantasticd.rollback.* 2>/dev/null || true
+  if [ -f "$TARGET_BIN" ]; then
+    { cp -p "$TARGET_BIN" "${BACKUP}.tmp" && mv -f "${BACKUP}.tmp" "$BACKUP"; } ||
+      { echo "Error: cannot back up $TARGET_BIN"; exit 1; }
+  fi
   cp "$NEW_BIN" "$STAGING" || { echo "Error: cannot write to $DEST_DIR (check permissions)"; exit 1; }
   chmod +x "$STAGING"
+  # Always a new inode, never an in-place overwrite: macOS caches code
+  # signatures per vnode and kills a binary whose pages change underneath.
   mv -f "$STAGING" "$TARGET_BIN"
   echo "Binary updated: $TARGET_BIN"
 
@@ -269,6 +346,7 @@ main() {
     fi
     exit 1
   fi
+  refresh_darwin_tray
   echo "Update complete — running version: $VERSION"
 }
 

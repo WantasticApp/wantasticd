@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -49,10 +49,17 @@ func main() {
 		handleConnect()
 	case "status":
 		handleStatus()
+	case "peers":
+		handlePeers()
+	case "ping":
+		handlePing()
 	case "tray":
 		handleTray()
 	case "update":
 		handleUpdate()
+	case "update-finish":
+		// Internal: Windows restart helper started by a self-update.
+		os.Exit(update.Finish(os.Args[2:]))
 	case "version":
 		printVersion()
 	default:
@@ -322,6 +329,7 @@ func handleLogin() {
 	dev := loginCmd.Bool("dev", false, "Use local dev portal (https://"+auth.DefaultOAuth2DevDomain+")")
 	autoUpdateFlags := registerAutoUpdateFlags(loginCmd, "Enable automatic self-updates after login (default on)", "Disable automatic self-updates after login")
 	localAccess := registerLocalAccessFlag(loginCmd)
+	noConnect := loginCmd.Bool("no-connect", false, "Save the configuration and exit without connecting (installers start the service instead)")
 	loginCmd.Parse(os.Args[2:])
 	autoUpdate := autoUpdateFlags.Enabled()
 
@@ -368,6 +376,9 @@ func handleLogin() {
 		log.Fatalf("Failed to save configuration: %v", err)
 	}
 	log.Println("Configuration saved to", configPath)
+	if *noConnect {
+		return
+	}
 
 	// Auto-connect after successful login.
 	// On headless/embedded devices (OpenWrt), login is typically the only
@@ -606,6 +617,11 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 
 	log.Printf("Wantastic agent started successfully")
 	log.Printf("Mode: System TUN (%s)", cfg.Interface.TUNName)
+	if !useTray {
+		// The service itself never shows a tray; make sure the per-user
+		// menu-bar app is installed (macOS installs from older releases).
+		runner.EnsureTrayAgent()
+	}
 
 	go func() {
 		select {
@@ -659,33 +675,7 @@ func handleTray() {
 }
 
 func handleStatus() {
-	resp, err := http.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/api/status")
-	if err != nil {
-		fmt.Println("Status: Offline (Daemon is not running or not reachable)")
-		return
-	}
-	defer resp.Body.Close()
-
-	var status struct {
-		TUNMode     bool   `json:"tun_mode"`
-		TUNName     string `json:"tun_name"`
-		Running     bool   `json:"running"`
-		LocalAccess bool   `json:"local_access"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		fmt.Printf("Status: Error parsing response: %v\n", err)
-		return
-	}
-
-	state := "Stopped"
-	if status.Running {
-		state = "Running"
-	}
-	modeStr := "Userspace"
-	if status.TUNMode {
-		modeStr = fmt.Sprintf("TUN (%s)", status.TUNName)
-	}
-	fmt.Printf("Status: %s\nMode: %s\nLocal access: %t\n", state, modeStr, status.LocalAccess)
+	os.Exit(runStatus(os.Args[2:], os.Stdout))
 }
 
 func handleUpdate() {
@@ -693,6 +683,7 @@ func handleUpdate() {
 	defer cancel()
 
 	mgr := update.NewManager(version.Version)
+	mgr.Output = os.Stdout
 	latest, err := mgr.FetchLatestVersion(ctx)
 	if err != nil {
 		log.Fatalf("Failed to fetch latest version: %v", err)
@@ -712,43 +703,21 @@ func handleUpdate() {
 	if err != nil {
 		log.Fatalf("Failed to determine executable path: %v", err)
 	}
+	// Replace the real file, not a symlink pointing at it.
+	if resolved, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolved
+	}
 	if err := mgr.RunUpdateScript(ctx, latest, execPath); err != nil {
 		log.Fatalf("Update failed: %v", err)
 	}
 }
 
 func handlePeers() {
-	resp, err := http.Get("http://127.0.0.1:" + agent.GetIPCPort() + "/peers")
-	if err != nil {
-		log.Fatalf("Failed to reach daemon: %v", err)
-	}
-	defer resp.Body.Close()
+	os.Exit(runPeers(os.Args[2:], os.Stdout))
+}
 
-	var data struct {
-		Peers []struct {
-			IP       string `json:"ip"`
-			Hostname string `json:"hostname"`
-			OS       string `json:"os"`
-			Alive    bool   `json:"alive"`
-		} `json:"peers"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Fatalf("Failed to decode discovery results: %v", err)
-	}
-
-	fmt.Printf("%-18s %-20s %-25s\n", "IP ADDRESS", "HOSTNAME", "OS / DEVICE TYPE")
-	fmt.Println(strings.Repeat("-", 65))
-	for _, p := range data.Peers {
-		hostname := p.Hostname
-		if hostname == "" {
-			hostname = "unknown"
-		}
-		osInfo := p.OS
-		if osInfo == "" {
-			osInfo = "unknown"
-		}
-		fmt.Printf("%-18s %-20s %-25s\n", p.IP, hostname, osInfo)
-	}
+func handlePing() {
+	os.Exit(runPing(os.Args[2:], os.Stdout))
 }
 
 func printUsage() {
@@ -757,6 +726,10 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  genkey     Generate a fixed device claim key and QR URL")
 	fmt.Fprintln(os.Stderr, "  login      Authenticate and configure client")
 	fmt.Fprintln(os.Stderr, "  connect    Connect using a configuration file")
+	fmt.Fprintln(os.Stderr, "  status     Show tunnel state, addresses, traffic and peer counts (--json)")
+	fmt.Fprintln(os.Stderr, "  peers      List peers with path, endpoint, handshake and traffic (--ping, --json)")
+	fmt.Fprintln(os.Stderr, "  ping       Ping peers over the tunnel: ping [-c N] [-i 250ms] [-W 1s] [target...]")
+	fmt.Fprintln(os.Stderr, "  tray       Run the system tray client")
 	fmt.Fprintln(os.Stderr, "  update     Self-update to the latest version")
 	fmt.Fprintln(os.Stderr, "  version    Show version information")
 	fmt.Fprintln(os.Stderr, "\nEnvironment Variables:")

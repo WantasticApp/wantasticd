@@ -1,8 +1,11 @@
 package platforms
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"os/exec"
+	"strings"
 )
 
 // logCollectorError records a source-specific collection failure while allowing
@@ -27,4 +30,11 @@ func runCollector(name string, collect func() error) (err error) {
 		return nil
 	}
 	return collect()
+}
+
+// isMissingTool reports whether err only says a command is not installed
+// (macOS and Windows have no iptables-save). Such a source has nothing to
+// collect on this host, which is not worth a warning every minute.
+func isMissingTool(err error) bool {
+	return err != nil && (errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found"))
 }

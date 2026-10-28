@@ -2,6 +2,8 @@ package platforms
 
 import (
 	"errors"
+	"fmt"
+	"os/exec"
 	"testing"
 )
 
@@ -20,5 +22,18 @@ func TestRunCollectorContinuesAfterErrorAndPanic(t *testing.T) {
 	}
 	if continued != 3 {
 		t.Fatalf("continued=%d want 3", continued)
+	}
+}
+
+func TestIsMissingToolOnlyMatchesAbsentCommands(t *testing.T) {
+	notFound := &exec.Error{Name: "iptables-save", Err: exec.ErrNotFound}
+	if !isMissingTool(fmt.Errorf("iptables-save : %w", notFound)) {
+		t.Fatal("a wrapped not-found error must count as a missing tool")
+	}
+	if !isMissingTool(errors.New(`iptables-save : exec: "iptables-save": executable file not found in $PATH`)) {
+		t.Fatal("the flattened message must count as a missing tool")
+	}
+	if isMissingTool(errors.New("iptables-save: permission denied")) || isMissingTool(nil) {
+		t.Fatal("real failures must still be reported")
 	}
 }

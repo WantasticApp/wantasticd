@@ -26,7 +26,9 @@ func collectHostFirewallStatic(ctx context.Context, runner CommandRunner, msg *w
 	}
 	raw, err := runner(ctx, "iptables-save")
 	if err != nil {
-		logCollectorError("firewall.iptables-save", err)
+		if !isMissingTool(err) {
+			logCollectorError("firewall.iptables-save", err)
+		}
 		return
 	}
 	if len(raw) == 0 {

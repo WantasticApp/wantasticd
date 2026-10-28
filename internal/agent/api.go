@@ -8,16 +8,19 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"strconv"
 	"time"
 
 	"wantastic-agent/internal/device"
+	"wantastic-agent/pkg/version"
 )
 
 // APIServer represents the local IPC server for the systray and CLI
 type APIServer struct {
 	agent  *Agent
 	server *http.Server
+	// peers returns the live peer table; replaced in tests.
+	peers func() []device.PeerInfo
 }
 
 // NewAPIServer creates a new API Server instance
@@ -26,11 +29,15 @@ func NewAPIServer(a *Agent) *APIServer {
 	s := &APIServer{
 		agent: a,
 	}
+	if a != nil && a.device != nil {
+		s.peers = a.device.GetDetailedPeers
+	}
 
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
+	mux.HandleFunc("/api/ping", s.handlePing)
 
 	s.server = &http.Server{
 		Addr:    "127.0.0.1:9034",
@@ -69,8 +76,10 @@ func (s *APIServer) Start() error {
 
 	// Share selected port for local tray & cli clients
 	os.Setenv("WTC_IPC_PORT", fmt.Sprintf("%d", port))
-	portFile := filepath.Join(os.TempDir(), "wantasticd_ipc_port")
-	os.WriteFile(portFile, []byte(fmt.Sprintf("%d", port)), 0644)
+	portFile := ipcPortFile()
+	if err := writePortFile(portFile, []byte(fmt.Sprintf("%d", port))); err != nil {
+		log.Printf("IPC API: could not write port file %s: %v", portFile, err)
+	}
 
 	log.Printf("Starting local IPC API on %s", s.server.Addr)
 
@@ -104,7 +113,17 @@ type StatusResponse struct {
 	RxBytes       uint64            `json:"rx_bytes"`
 	TxBytes       uint64            `json:"tx_bytes"`
 	Peers         []device.PeerInfo `json:"peers"`
+
+	Version        string `json:"version,omitempty"`
+	Commit         string `json:"commit,omitempty"`
+	ServerEndpoint string `json:"server_endpoint,omitempty"`
+	StartedAt      int64  `json:"started_at,omitempty"`
+	UptimeSec      int64  `json:"uptime_sec,omitempty"`
+	AutoUpdate     bool   `json:"auto_update"`
 }
+
+// processStart approximates daemon start for uptime reporting.
+var processStart = time.Now()
 
 func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -131,6 +150,18 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		RxBytes:       rx,
 		TxBytes:       tx,
 		Peers:         s.agent.device.GetDetailedPeers(),
+
+		Version:    version.Version,
+		Commit:     version.Commit,
+		StartedAt:  processStart.Unix(),
+		UptimeSec:  int64(time.Since(processStart).Seconds()),
+		AutoUpdate: s.agent.config.AutoUpdate,
+	}
+	if srv := s.agent.config.Server; srv.Endpoint != "" {
+		status.ServerEndpoint = srv.Endpoint
+		if srv.Port > 0 {
+			status.ServerEndpoint = net.JoinHostPort(srv.Endpoint, strconv.Itoa(srv.Port))
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

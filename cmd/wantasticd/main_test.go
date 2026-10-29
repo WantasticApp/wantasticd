@@ -159,3 +159,11 @@ func TestLoadOrCreateClaimKeyForceRotatesIdentity(t *testing.T) {
 		t.Fatal("--force did not rotate the manufacturer identity")
 	}
 }
+
+func TestSuggestCommand(t *testing.T) {
+	for in, want := range map[string]string{"cameback": "comeback", "jumpTo": "jumpto", "statsu": "status", "exitnode": "exit-node", "frobnicate": ""} {
+		if got := suggestCommand(in); got != want {
+			t.Errorf("suggestCommand(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -48,7 +48,12 @@ func ipcURL(path string) string {
 }
 
 func postIPC(path string) {
-	resp, err := trayClient.Post(ipcURL(path), "application/json", nil)
+	req, err := http.NewRequest(http.MethodPost, ipcURL(path), nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set(agent.ControlHeader, "1")
+	resp, err := trayClient.Do(req)
 	if err != nil {
 		log.Printf("tray: %s: %v", path, err)
 		return
@@ -103,7 +108,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			mToggleOnOff := systray.AddMenuItem("Disconnect", "Toggle VPN On/Off")
 
-			mToggleExit := systray.AddMenuItem("Enable Exit Node", "Allow others to route through this device")
+			exitMenu := newTrayExitMenu()
 
 			systray.AddSeparator()
 			mVersion := systray.AddMenuItem("Version "+version.Version, "Installed version")
@@ -120,11 +125,10 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				if err != nil {
 					mStatus.SetTitle("Status: Daemon not running")
 					mToggleOnOff.Disable()
-					mToggleExit.Disable()
+					exitMenu.apply(deriveExitMenu(nil))
 					return
 				}
 				mToggleOnOff.Enable()
-				mToggleExit.Enable()
 
 				statusText := "Offline"
 				if st.Running {
@@ -161,11 +165,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					mToggleOnOff.SetTitle("Connect")
 				}
 
-				if st.ExitNode {
-					mToggleExit.Check()
-				} else {
-					mToggleExit.Uncheck()
-				}
+				exitMenu.apply(deriveExitMenu(st))
 
 				// The daemon moved to a new build and our binary on disk was
 				// replaced: restart onto it so the menu matches the daemon.
@@ -174,6 +174,8 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					watch.restart()
 				}
 			}
+
+			exitMenu.onChange = func() { go refresh() }
 
 			// Handler loop for tray updates and interactions
 			go func() {
@@ -194,9 +196,6 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 					case <-mToggleOnOff.ClickedCh:
 						go func() { postIPC("/api/state/toggle"); refresh() }()
-
-					case <-mToggleExit.ClickedCh:
-						go func() { postIPC("/api/exitnode/toggle"); refresh() }()
 
 					case <-ticker.C:
 						refresh()

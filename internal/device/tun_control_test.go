@@ -2,7 +2,6 @@ package device
 
 import (
 	"bytes"
-	"net/netip"
 	"testing"
 )
 
@@ -48,43 +47,5 @@ func TestEncodeExitNodeSelectionTUNControlPeer(t *testing.T) {
 func TestEncodeExitNodeSelectionTUNControlInvalidPeer(t *testing.T) {
 	if _, err := EncodeExitNodeSelectionTUNControl("not-hex"); err == nil {
 		t.Fatal("expected invalid peer key error")
-	}
-}
-
-func TestEffectiveExitRoutesDefaultsByAddressFamily(t *testing.T) {
-	v4Routes, err := effectiveExitRoutes([]netip.Prefix{netip.MustParsePrefix("172.16.0.6/32")}, nil)
-	if err != nil {
-		t.Fatalf("effectiveExitRoutes(v4) returned error: %v", err)
-	}
-	if len(v4Routes) != 1 || v4Routes[0] != "0.0.0.0/0" {
-		t.Fatalf("unexpected v4-only routes: %v", v4Routes)
-	}
-
-	dualRoutes, err := effectiveExitRoutes([]netip.Prefix{
-		netip.MustParsePrefix("172.16.0.6/32"),
-		netip.MustParsePrefix("fd7a:115c:a1e0::901:5582/48"),
-	}, nil)
-	if err != nil {
-		t.Fatalf("effectiveExitRoutes(dual) returned error: %v", err)
-	}
-	if len(dualRoutes) != 2 || dualRoutes[0] != "0.0.0.0/0" || dualRoutes[1] != "::/0" {
-		t.Fatalf("unexpected dual-stack routes: %v", dualRoutes)
-	}
-}
-
-func TestCanonicalizeExitRoutesDeduplicatesAndMasks(t *testing.T) {
-	routes, err := canonicalizeExitRoutes([]string{
-		"10.0.0.1/24",
-		"10.0.0.0/24",
-		"  ::/0  ",
-	})
-	if err != nil {
-		t.Fatalf("canonicalizeExitRoutes returned error: %v", err)
-	}
-	if len(routes) != 2 {
-		t.Fatalf("unexpected canonical route count: %v", routes)
-	}
-	if routes[0] != "10.0.0.0/24" || routes[1] != "::/0" {
-		t.Fatalf("unexpected canonical routes: %v", routes)
 	}
 }

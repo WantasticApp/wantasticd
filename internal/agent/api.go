@@ -35,6 +35,10 @@ func NewAPIServer(a *Agent) *APIServer {
 
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
+	mux.HandleFunc("/api/exitnode", s.handleExitNodeStatus)
+	mux.HandleFunc("/api/exitnode/offer", s.handleExitNodeOffer)
+	mux.HandleFunc("/api/exitnode/jumpto", s.handleExitNodeJumpTo)
+	mux.HandleFunc("/api/exitnode/comeback", s.handleExitNodeComeback)
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
 	mux.HandleFunc("/api/ping", s.handlePing)
@@ -113,6 +117,9 @@ type StatusResponse struct {
 	RxBytes       uint64            `json:"rx_bytes"`
 	TxBytes       uint64            `json:"tx_bytes"`
 	Peers         []device.PeerInfo `json:"peers"`
+	// ExitNodeState details exit-node mode (both directions); ExitNode above
+	// stays the "this device offers itself as exit" flag.
+	ExitNodeState *device.ExitNodeStatus `json:"exit_node_state,omitempty"`
 
 	Version        string `json:"version,omitempty"`
 	Commit         string `json:"commit,omitempty"`
@@ -143,7 +150,6 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		TUNName:       s.agent.config.Interface.TUNName,
 		Running:       s.agent.IsRunning(),
 		DeviceRunning: s.agent.device.IsRunning(),
-		ExitNode:      s.agent.config.ExitNode.Enabled,
 		LocalAccess:   s.agent.config.AllowLocalAccess,
 		IPs:           ips,
 		PubKey:        s.agent.device.GetPublicKey(),
@@ -157,6 +163,9 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		UptimeSec:  int64(time.Since(processStart).Seconds()),
 		AutoUpdate: s.agent.config.AutoUpdate,
 	}
+	exitState := s.agent.device.ExitStatus()
+	status.ExitNode = exitState.Offering
+	status.ExitNodeState = &exitState
 	if srv := s.agent.config.Server; srv.Endpoint != "" {
 		status.ServerEndpoint = srv.Endpoint
 		if srv.Port > 0 {
@@ -188,41 +197,4 @@ func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "{\"status\":\"toggled\"}")
-}
-
-func (s *APIServer) handleToggleExitNode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	log.Println("[API] Exit Node offer toggle requested via IPC")
-
-	go func() {
-		if err := s.agent.ToggleOfferExitNode(); err != nil {
-			log.Printf("[API] Failed to toggle exit node offer: %v", err)
-		}
-	}()
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"pending\"}")
-}
-
-func (s *APIServer) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	peerPubKey := r.URL.Query().Get("peer")
-	log.Printf("[API] Exit Node set requested via IPC to peer: %s", peerPubKey)
-
-	go func() {
-		if err := s.agent.SetExitNode(peerPubKey); err != nil {
-			log.Printf("[API] Failed to set exit node routing: %v", err)
-		}
-	}()
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"pending\"}")
 }

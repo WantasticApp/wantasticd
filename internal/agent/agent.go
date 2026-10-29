@@ -337,39 +337,3 @@ func (a *Agent) IsRunning() bool {
 	defer a.mu.RUnlock()
 	return a.running
 }
-
-// SetExitNode instructs the server to route this device's traffic through the given peer exit node natively over WireGuard Noise.
-func (a *Agent) SetExitNode(peerPubKey string) error {
-	a.mu.RLock()
-	serverPubKey := a.config.Server.PublicKey
-	a.mu.RUnlock()
-
-	if serverPubKey == "" {
-		return fmt.Errorf("no server configured for exit node coordination")
-	}
-
-	data, err := device.EncodeExitNodeSelectionTUNControl(peerPubKey)
-	if err != nil {
-		return fmt.Errorf("invalid peer public key for routing: %w", err)
-	}
-
-	log.Printf("[Agent] Sending Exit Node Routing request to peer %s via Noise Protocol TUN control", peerPubKey)
-	return a.device.SendTUNControl(serverPubKey, data)
-}
-
-// ToggleOfferExitNode toggles whether this device offers itself as an exit node locally and informs the server natively over WireGuard Noise.
-func (a *Agent) ToggleOfferExitNode() error {
-	a.mu.Lock()
-	enabled := !a.config.ExitNode.Enabled
-	a.config.ExitNode.Enabled = enabled
-	serverPubKey := a.config.Server.PublicKey
-	a.mu.Unlock()
-
-	if serverPubKey != "" && a.device != nil {
-		data := device.EncodeExitNodeOfferTUNControl(enabled)
-		log.Printf("[Agent] Sending Exit Node offer status (%v) to server via Noise Protocol", enabled)
-		return a.device.SendTUNControl(serverPubKey, data)
-	}
-
-	return nil
-}

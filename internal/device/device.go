@@ -60,11 +60,11 @@ type Device struct {
 	systemRoutes        []string   // System routes added for TUN mode
 	tenantFirewallRules []netctl.TenantFirewallRule
 
-	// Exit node routes installed dynamically
-	exitNodeRoutes  []string
-	exitNodePeerKey [32]byte
-	exitNodeActive  bool
-	exitNodeShared  bool
+	// Exit-node mode (see exitnode.go): the engine owns routes/NAT, the guard
+	// filters forwarded internet traffic on the TUN write path.
+	exitMu    sync.Mutex
+	exit      *exitEngine
+	exitGuard *exitGuard
 
 	// Local-access subnet routing is independent from exit-node routing. The
 	// sharing side forwards overlay traffic to its private LAN; consuming peers
@@ -85,6 +85,7 @@ func New(cfg *config.Config) (*Device, error) {
 		config:             cfg,
 		stopCh:             make(chan struct{}),
 		peerHostnames:      make(map[string]string),
+		exitGuard:          newExitGuard(),
 		localAccessByOwner: make(map[[32]byte][]string),
 	}, nil
 }
@@ -212,6 +213,7 @@ func (d *Device) Start() error {
 		wd.StartP2P(serverKey)
 	}
 	d.startPortMapping(wd)
+	d.startExitEngine()
 	go allowInboundThroughAppFirewall()
 
 	// Diagnostic: dump device state after Up() to verify configuration
@@ -248,20 +250,19 @@ func (d *Device) Stop() error {
 	td := d.tunDev
 	routes := d.systemRoutes
 	tenantFirewallRules := d.tenantFirewallRules
-	exitRoutes := d.exitNodeRoutes
-	sharedExitNode := d.exitNodeShared
 	localAccessRoutes := d.localAccessRoutes
 	localAccessPublished := append([]string(nil), d.localAccessPublished...)
 	localAccessSources := append([]string(nil), d.localAccessSources...)
 	sharedLocalAccess := d.localAccessShared
 	d.systemRoutes = nil
 	d.tenantFirewallRules = nil
-	d.exitNodeRoutes = nil
 	d.localAccessRoutes = nil
 	d.localAccessByOwner = make(map[[32]byte][]string)
-	d.exitNodePeerKey = [32]byte{}
-	d.exitNodeActive = false
 	d.mu.Unlock()
+
+	// Exit-node routes and NAT go first: bypass routes via the physical
+	// gateway would outlive the tunnel, and NAT rules must not linger.
+	d.stopExitEngine()
 
 	if len(tenantFirewallRules) > 0 {
 		if err := ctl.TenantFirewallClear(tenantFirewallRules); err != nil {
@@ -271,7 +272,7 @@ func (d *Device) Stop() error {
 
 	// Remove all OS routes before closing the TUN interface so the
 	// kernel doesn't leave stale entries pointing at a dead utun index.
-	allRoutes := append(append([]string(nil), routes...), exitRoutes...)
+	allRoutes := append([]string(nil), routes...)
 	allRoutes = append(allRoutes, localAccessRoutes...)
 	for _, route := range allRoutes {
 		if err := d.removeRoute(route); err != nil {
@@ -279,11 +280,6 @@ func (d *Device) Stop() error {
 		}
 	}
 
-	if sharedExitNode {
-		if err := d.disableExitNodeSharing(); err != nil {
-			log.Printf("[TUN] Warning: failed to disable exit node sharing on stop: %v", err)
-		}
-	}
 	if sharedLocalAccess {
 		if err := disableLocalAccessSharingOS(d.tunName, localAccessPublished, localAccessSources); err != nil {
 			log.Printf("[TUN] Warning: failed to disable local-access sharing on stop: %v", err)
@@ -677,6 +673,7 @@ func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
 
 	d.nativeTun = nativeTun
 	actualName, _ := nativeTun.Name()
+	d.exitGuard.setTenant(d.config.Interface.Addresses, d.config.Server.AllowedIPs)
 	d.tunName = actualName
 	log.Printf("Created TUN interface: %s", actualName)
 
@@ -695,7 +692,7 @@ func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
 	}
 
 	log.Printf("TUN mode initialized successfully on %s", actualName)
-	return nativeTun, nil
+	return &exitGuardTUN{Device: nativeTun, guard: d.exitGuard}, nil
 }
 
 // cleanupTUNMode cleans up system routes and TUN interface

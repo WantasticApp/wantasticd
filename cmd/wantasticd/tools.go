@@ -211,7 +211,12 @@ func printStatus(w io.Writer, st agent.StatusResponse) {
 	if st.ServerEndpoint != "" {
 		row("Server", st.ServerEndpoint)
 	}
-	row("Exit node", fmt.Sprintf("%t", st.ExitNode))
+	if st.ExitNodeState != nil {
+		row("Offer exit node", exitOfferLine(st.ExitNodeState))
+		row("Using exit node", exitUseLine(st.ExitNodeState))
+	} else {
+		row("Exit node", fmt.Sprintf("%t", st.ExitNode))
+	}
 	row("Local access", fmt.Sprintf("%t", st.LocalAccess))
 	if st.Version != "" {
 		// Daemons that predate the version field do not report this either.
@@ -275,6 +280,9 @@ func runPeers(args []string, w io.Writer) int {
 		return exitOK
 	}
 	printPeers(w, st.Peers, latency, time.Now())
+	if es := st.ExitNodeState; es != nil && (es.Using != nil || es.Offering) {
+		fmt.Fprintf(w, "\nExit node: using %s; offering %s\n", exitUseLine(es), exitOfferLine(es))
+	}
 	return exitOK
 }
 

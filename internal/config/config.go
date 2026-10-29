@@ -593,3 +593,6 @@ func (c *Config) Save() error {
 	}
 	return os.Rename(tmp, c.filePath)
 }
+
+// FilePath is the path this config was loaded from ("" if none).
+func (c *Config) FilePath() string { return c.filePath }

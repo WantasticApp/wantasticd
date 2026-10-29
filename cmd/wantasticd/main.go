@@ -53,6 +53,8 @@ func main() {
 		handlePeers()
 	case "ping":
 		handlePing()
+	case "exit-node", "jumpto", "comeback":
+		os.Exit(runExitCommand(os.Args[1], os.Args[2:], os.Stdout))
 	case "tray":
 		handleTray()
 	case "update":
@@ -729,6 +731,9 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  status     Show tunnel state, addresses, traffic and peer counts (--json)")
 	fmt.Fprintln(os.Stderr, "  peers      List peers with path, endpoint, handshake and traffic (--ping, --json)")
 	fmt.Fprintln(os.Stderr, "  ping       Ping peers over the tunnel: ping [-c N] [-i 250ms] [-W 1s] [target...]")
+	fmt.Fprintln(os.Stderr, "  exit-node  Let peers use this device as their exit node: exit-node on|off|status")
+	fmt.Fprintln(os.Stderr, "  jumpto     Send all internet traffic through a peer: jumpto <peer-vpn-ip>")
+	fmt.Fprintln(os.Stderr, "  comeback   Stop using an exit node and restore normal routing")
 	fmt.Fprintln(os.Stderr, "  tray       Run the system tray client")
 	fmt.Fprintln(os.Stderr, "  update     Self-update to the latest version")
 	fmt.Fprintln(os.Stderr, "  version    Show version information")

@@ -700,7 +700,6 @@ func handleUpdate() {
 		return
 	}
 
-	fmt.Printf("Updating from %s to %s...\n", version.Version, latest)
 	execPath, err := os.Executable()
 	if err != nil {
 		log.Fatalf("Failed to determine executable path: %v", err)
@@ -709,6 +708,10 @@ func handleUpdate() {
 	if resolved, err := filepath.EvalSymlinks(execPath); err == nil {
 		execPath = resolved
 	}
+	if err := ensureUpdatePrivileges(execPath); err != nil {
+		log.Fatalf("Update failed: %v", err)
+	}
+	fmt.Printf("Updating from %s to %s...\n", version.Version, latest)
 	if err := mgr.RunUpdateScript(ctx, latest, execPath); err != nil {
 		log.Fatalf("Update failed: %v", err)
 	}

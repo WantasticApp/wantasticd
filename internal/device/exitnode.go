@@ -901,7 +901,7 @@ func (e *exitEngine) activateLocked(dp *wgdevice.DiscoveredPeer, peers map[strin
 	// The exit peer owns 0.0.0.0/0 before the split routes send anything in.
 	// Re-asserted every pass: a re-punch resets the peer's allowed IPs.
 	if !contains(peers[exitHex].allowedIPs, "0.0.0.0/0") {
-		if err := e.d.device.IpcSet(fmt.Sprintf("public_key=%s\nupdate_only=true\nreplace_allowed_ips=false\nallowed_ip=0.0.0.0/0\n", exitHex)); err != nil {
+		if err := e.d.device.IpcSet(addAllowedIPCmd(exitHex, "0.0.0.0/0")); err != nil {
 			return fmt.Errorf("route 0.0.0.0/0 to the exit peer: %v", err)
 		}
 		e.allowedSet = true
@@ -987,6 +987,12 @@ func (e *exitEngine) deleteRoutesLocked(match func(exitnode.Route) bool) {
 	e.st.Routes = kept
 }
 
+// addAllowedIPCmd adds one prefix to an existing peer. Appending is the UAPI
+// default: replace_allowed_ips accepts only "true", so it is left out.
+func addAllowedIPCmd(peerHex, prefix string) string {
+	return fmt.Sprintf("public_key=%s\nupdate_only=true\nallowed_ip=%s\n", peerHex, prefix)
+}
+
 // deactivateLocked restores normal routing; the exit choice is kept.
 func (e *exitEngine) deactivateLocked(reason string) {
 	if len(e.st.Routes) == 0 && e.st.ClientNAT == nil && !e.allowedSet {
@@ -1013,7 +1019,7 @@ func (e *exitEngine) deactivateLocked(reason string) {
 			}
 		}
 		if e.st.ServerHadV4Default && e.d.config.Server.PublicKey != "" {
-			_ = e.d.device.IpcSet(fmt.Sprintf("public_key=%s\nupdate_only=true\nallowed_ip=0.0.0.0/0\n", mustHex(e.d.config.Server.PublicKey)))
+			_ = e.d.device.IpcSet(addAllowedIPCmd(mustHex(e.d.config.Server.PublicKey), "0.0.0.0/0"))
 		}
 	}
 	e.allowedSet = false

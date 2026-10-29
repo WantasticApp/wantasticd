@@ -44,24 +44,8 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$null, [ref]$errors) | Out-Null
             if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }'
 
-  # macOS builds need cgo (Cocoa menu-bar app), so they build and are tested
-  # on macOS, isolated from the cross-compiled matrix.
-  quality-macos:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - name: Vet and test (tray build)
-        env:
-          CGO_ENABLED: 1
-        run: |
-          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
-          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
-
   create-release:
-    needs: [quality, quality-macos]
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -153,79 +137,64 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # macOS needs cgo (Cocoa menu-bar app), so it builds on a macOS runner: one
+  # job for both architectures, tested with the tray build. Apple-silicon
+  # runners are often short on capacity; if this job cannot run, the Intel
+  # fallback below builds the same archives from a separate runner pool.
   build-darwin:
     needs: create-release
-    # Apple silicon runner; the Intel build is cross-compiled with clang.
-    runs-on: macos-14
-    strategy:
-      fail-fast: false
-      matrix:
-        goarch: [arm64, amd64]
+    runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-
-      - name: Build (cgo, menu-bar app)
+      - name: Vet and test (tray build)
         env:
-          GOOS: darwin
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 1
-          # Go 1.25 supports macOS 12 and later.
-          MACOSX_DEPLOYMENT_TARGET: '12.0'
         run: |
-          CLANG_ARCH=arm64
-          [ "$GOARCH" = "amd64" ] && CLANG_ARCH=x86_64
-          export CC="clang -arch ${CLANG_ARCH}"
-          export CGO_CFLAGS="-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
-          export CGO_LDFLAGS="-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
-          SHA=$(git rev-parse --short HEAD)
-          LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+${SHA} -X wantastic-agent/pkg/version.Commit=${SHA} -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          go build -v -trimpath -ldflags="$LDFLAGS" -o wantasticd ./cmd/wantasticd
-
-      - name: Sign and verify
-        run: |
-          # Apple silicon refuses to run unsigned code; ad-hoc sign both builds.
-          codesign --force --sign - --identifier app.wantastic.wantasticd wantasticd
-          codesign --verify --verbose=2 wantasticd
-          WANT=arm64
-          [ "${{ matrix.goarch }}" = "amd64" ] && WANT=x86_64
-          ARCHS=$(lipo -archs wantasticd)
-          echo "archs: $ARCHS"
-          [ "$ARCHS" = "$WANT" ] || { echo "expected $WANT"; exit 1; }
-          # Only system libraries: a Homebrew dylib would not exist on users' Macs.
-          otool -L wantasticd
-          if otool -L wantasticd | tail -n +2 | grep -vE '^\s*(/usr/lib/|/System/Library/)'; then
-            echo "non-system library linked"; exit 1
-          fi
-          otool -l wantasticd | grep -A4 LC_BUILD_VERSION | grep minos
-
-      - name: Smoke test
-        run: |
-          if [ "${{ matrix.goarch }}" = "arm64" ]; then
-            ./wantasticd version | grep -F "${{ github.ref_name }}"
-          elif arch -x86_64 /usr/bin/true 2>/dev/null; then
-            arch -x86_64 ./wantasticd version | grep -F "${{ github.ref_name }}"
-          else
-            echo "Rosetta unavailable on this runner; skipping the Intel smoke test"
-          fi
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          tar -czvf "dist/wantasticd-darwin-${{ matrix.goarch }}.tar.gz" wantasticd README.md
-
+          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+      - name: Build, sign and verify
+        run: sh scripts/build-darwin.sh "${{ github.ref_name }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-darwin-${{ matrix.goarch }}
+          name: dist-darwin
+          path: dist/
+          if-no-files-found: error
+
+  build-darwin-intel:
+    needs: [create-release, build-darwin]
+    if: always() && needs.create-release.result == 'success' && needs.build-darwin.result != 'success'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Vet and test (tray build)
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+      - name: Build, sign and verify
+        run: sh scripts/build-darwin.sh "${{ github.ref_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin
           path: dist/
           if-no-files-found: error
 
   # Publish only after every platform built, so the "latest" marker never
   # points agents at a release whose archive for their platform is missing.
   publish:
-    needs: [build, build-darwin]
+    needs: [build, build-darwin, build-darwin-intel]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      (needs.build-darwin.result == 'success' || needs.build-darwin-intel.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

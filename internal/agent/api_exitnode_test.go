@@ -8,7 +8,7 @@ import (
 
 func TestExitNodeEndpointsRequireControlHeader(t *testing.T) {
 	s := &APIServer{}
-	for _, h := range []func(http.ResponseWriter, *http.Request){s.handleExitNodeOffer, s.handleExitNodeJumpTo, s.handleExitNodeComeback, s.handleToggleExitNode, s.handleSetExitNode} {
+	for _, h := range []func(http.ResponseWriter, *http.Request){s.handleExitNodeOffer, s.handleExitNodeJumpTo, s.handleExitNodeComeback, s.handleToggleExitNode, s.handleSetExitNode, s.handleToggleState, s.handleConnect, s.handleDisconnect} {
 		for _, req := range []*http.Request{
 			httptest.NewRequest(http.MethodPost, "/x?enabled=on", nil),              // no header (CSRF)
 			withHeader(httptest.NewRequest(http.MethodGet, "/x?enabled=on", nil)),   // GET

@@ -6,18 +6,328 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"wantastic-agent/internal/agent"
-	"wantastic-agent/internal/device"
 	"wantastic-agent/pkg/version"
 
 	"github.com/getlantern/systray"
 )
+
+// trayRefresh is how often the menu re-reads the daemon: often enough that
+// speeds and peer paths look live while the menu is open.
+const trayRefresh = 2 * time.Second
+
+// noticeTTL is how long an action's result stays in the menu.
+const noticeTTL = 20 * time.Second
+
+// trayClient talks to the daemon's local IPC API. Every call is bounded so a
+// wedged daemon can never freeze the menu; actions that wait on the network
+// (connect, exit node, ping) get their own longer client.
+var (
+	trayClient   = &http.Client{Timeout: 3 * time.Second}
+	actionClient = &http.Client{Timeout: 45 * time.Second}
+)
+
+func ipcURL(path string) string {
+	return "http://127.0.0.1:" + agent.GetIPCPort() + path
+}
+
+// postControl runs a state-changing daemon action and returns the daemon's
+// notice, or its error. Every control endpoint answers {ok, error, notice}.
+func postControl(path string) (string, error) {
+	req, err := http.NewRequest(http.MethodPost, ipcURL(path), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set(agent.ControlHeader, "1")
+	resp, err := actionClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("daemon not reachable")
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("the running daemon is older than this tray; restart the service")
+	}
+	var r struct {
+		OK     bool   `json:"ok"`
+		Error  string `json:"error"`
+		Notice string `json:"notice"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", fmt.Errorf("daemon: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if !r.OK {
+		return "", fmt.Errorf("%s", firstNonEmpty(r.Error, fmt.Sprintf("HTTP %d", resp.StatusCode)))
+	}
+	return r.Notice, nil
+}
+
+func fetchJSON(client *http.Client, path string, v any) error {
+	resp, err := client.Get(ipcURL(path))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+func fetchStatus() (*agent.StatusResponse, error) {
+	var st agent.StatusResponse
+	if err := fetchJSON(trayClient, "/api/status", &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// trayNotice is the one-line result of the last action ("✓ Connected",
+// "⚠ …"), hidden again after noticeTTL.
+type trayNotice struct {
+	item *systray.MenuItem
+	mu   sync.Mutex
+	at   time.Time
+}
+
+func (n *trayNotice) set(text string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.at = time.Now()
+	n.item.SetTitle(text)
+	n.item.SetTooltip(text)
+	n.item.Show()
+}
+
+func (n *trayNotice) expire() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !n.at.IsZero() && time.Since(n.at) > noticeTTL {
+		n.at = time.Time{}
+		n.item.Hide()
+	}
+}
+
+func (n *trayNotice) report(okText string, notice string, err error) {
+	switch {
+	case err != nil:
+		n.set("⚠ " + err.Error())
+	case notice != "":
+		n.set("ℹ " + notice)
+	default:
+		n.set("✓ " + okText)
+	}
+}
+
+func setTrayIcon(s trayState) {
+	if runtime.GOOS == "windows" {
+		systray.SetIcon(pngToICO(trayIconPNG(s, 32), 32))
+		return
+	}
+	systray.SetIcon(trayIconPNG(s, 44))
+}
+
+// RunSystray starts the system tray GUI and handles user interactions via IPC.
+// It blocks until the systray is quit.
+func RunSystray(ctx context.Context, cancel context.CancelFunc) {
+	watch := newBinaryWatch()
+	systray.Run(
+		func() { // onReady
+			setTrayIcon(trayDaemonDown)
+			systray.SetTooltip("Wantastic")
+
+			mHeader := systray.AddMenuItem("○ Connecting…", "Connection state")
+			mHeader.Disable()
+			mAddress := systray.AddMenuItem("IP: —", "Click to copy this device's VPN IP")
+			mTraffic := systray.AddMenuItem("Traffic: —", "Total since the daemon started")
+			mTraffic.Disable()
+			mRate := systray.AddMenuItem("Speed: —", "Current throughput")
+			mRate.Disable()
+			mDetails := systray.AddMenuItem("", "")
+			mDetails.Disable()
+
+			systray.AddSeparator()
+			mToggle := systray.AddMenuItem("Disconnect", "Connect or disconnect the tunnel; the service keeps running")
+
+			mPeers := systray.AddMenuItem("Peers: —", "Devices in this network; click one to copy its IP")
+			peerMenu := newPeerMenuGroup(mPeers, "No peers")
+			mPing := systray.AddMenuItem("Ping all peers", "Measure latency to every peer over the tunnel")
+			mPingResult := systray.AddMenuItem("", "")
+			mPingResult.Disable()
+			mPingResult.Hide()
+
+			exitMenu := newTrayExitMenu()
+
+			mNotice := systray.AddMenuItem("", "")
+			mNotice.Disable()
+			mNotice.Hide()
+			notice := &trayNotice{item: mNotice}
+			exitMenu.report = notice.report
+
+			systray.AddSeparator()
+			mVersion := systray.AddMenuItem("Version "+version.Version, "Installed version")
+			mVersion.Disable()
+			mQuit := systray.AddMenuItem("Quit tray", "Close this menu; the VPN service keeps running")
+
+			var (
+				refreshMu sync.Mutex
+				prev      trafficSample
+				lastState = trayState(-1)
+				latency   map[string]agent.PingResult
+				address   string
+			)
+			// Clicks refresh from their own goroutines; menu updates are
+			// serialised here.
+			refresh := func() {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				st, err := fetchStatus()
+				if err != nil {
+					st = nil
+				}
+				now := time.Now()
+				var cur trafficSample
+				if st != nil {
+					cur = trafficSample{rx: st.RxBytes, tx: st.TxBytes, at: now}
+				}
+				v := deriveTrayView(st, prev, cur)
+				prev = cur
+
+				if v.State != lastState {
+					setTrayIcon(v.State)
+					lastState = v.State
+				}
+				systray.SetTooltip(v.Tooltip)
+				mHeader.SetTitle(v.Header)
+				mAddress.SetTitle(v.Address)
+				address = strings.TrimPrefix(v.Address, "IP: ")
+				mTraffic.SetTitle(v.Traffic)
+				mRate.SetTitle(v.Rate)
+				mDetails.SetTitle(v.Details)
+				mToggle.SetTitle(v.ToggleTitle)
+				setEnabled(mToggle, v.ToggleEnabled)
+				mPeers.SetTitle(v.PeersTitle)
+				setEnabled(mPing, v.State == trayConnected || v.State == trayExitActive)
+
+				if st != nil {
+					syncPeerMenuGroup(peerMenu, buildPeerMenuEntries(st.Peers, latency, now))
+				} else {
+					syncPeerMenuGroup(peerMenu, nil)
+				}
+				exitMenu.apply(deriveExitMenu(st))
+				notice.expire()
+
+				ver := "Version " + version.Version
+				if st != nil && st.Version != "" && st.Version != version.Version {
+					ver += " (service " + st.Version + ")"
+				}
+				mVersion.SetTitle(ver)
+
+				// The daemon moved to a new build and our binary on disk was
+				// replaced: restart onto it so the menu matches the daemon.
+				if st != nil && st.Version != "" && st.Version != version.Version && watch.replaced() {
+					log.Printf("tray: daemon runs %s, tray %s; restarting on the updated binary", st.Version, version.Version)
+					watch.restart()
+				}
+			}
+
+			exitMenu.onChange = func() { go refresh() }
+
+			var pinging sync.Mutex
+			pingAll := func() {
+				if !pinging.TryLock() {
+					return
+				}
+				defer pinging.Unlock()
+				mPing.SetTitle("Pinging all peers…")
+				mPing.Disable()
+				var pr agent.PingResponse
+				err := fetchJSON(actionClient, "/api/ping?count=3&interval=200&timeout=1000", &pr)
+				if err == nil && pr.Error == "" {
+					m := make(map[string]agent.PingResult, len(pr.Results))
+					for _, r := range pr.Results {
+						m[r.IP] = r
+					}
+					refreshMu.Lock()
+					latency = m
+					refreshMu.Unlock()
+				}
+				mPing.SetTitle("Ping all peers")
+				mPingResult.SetTitle(pingSummary(&pr, err) + " · " + time.Now().Format("15:04:05"))
+				mPingResult.Show()
+				refresh()
+			}
+
+			toggle := func() {
+				refreshMu.Lock()
+				disconnect := lastState == trayConnected || lastState == trayExitActive
+				refreshMu.Unlock()
+				mToggle.Disable()
+				if disconnect {
+					mToggle.SetTitle("Disconnecting…")
+					n, err := postControl("/api/disconnect")
+					notice.report("Disconnected; the service keeps running", n, err)
+				} else {
+					mToggle.SetTitle("Connecting…")
+					n, err := postControl("/api/connect")
+					notice.report("Connected", n, err)
+				}
+				refresh()
+			}
+
+			go func() {
+				ticker := time.NewTicker(trayRefresh)
+				defer ticker.Stop()
+				refresh()
+
+				for {
+					select {
+					case <-ctx.Done():
+						systray.Quit()
+						return
+
+					case <-mQuit.ClickedCh:
+						cancel()
+						systray.Quit()
+						return
+
+					case <-mToggle.ClickedCh:
+						go toggle()
+
+					case <-mPing.ClickedCh:
+						go pingAll()
+
+					case <-mAddress.ClickedCh:
+						refreshMu.Lock()
+						ip := address
+						refreshMu.Unlock()
+						if ip != "" && ip != "—" {
+							if err := copyToClipboard(ip); err != nil {
+								notice.set("⚠ Copy failed: " + err.Error())
+							} else {
+								notice.set("✓ Copied " + ip)
+							}
+						}
+
+					case <-ticker.C:
+						refresh()
+					}
+				}
+			}()
+		},
+		func() { // onExit
+			log.Println("Systray finished")
+		},
+	)
+}
 
 type peerMenuGroup struct {
 	parent     *systray.MenuItem
@@ -33,195 +343,6 @@ type peerMenuItemState struct {
 	copyText string
 }
 
-type peerMenuEntry struct {
-	Title    string
-	Tooltip  string
-	CopyText string
-}
-
-// trayClient talks to the daemon's local IPC API. Every call is bounded so a
-// wedged daemon can never freeze the menu.
-var trayClient = &http.Client{Timeout: 3 * time.Second}
-
-func ipcURL(path string) string {
-	return "http://127.0.0.1:" + agent.GetIPCPort() + path
-}
-
-func postIPC(path string) {
-	req, err := http.NewRequest(http.MethodPost, ipcURL(path), nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set(agent.ControlHeader, "1")
-	resp, err := trayClient.Do(req)
-	if err != nil {
-		log.Printf("tray: %s: %v", path, err)
-		return
-	}
-	resp.Body.Close()
-}
-
-func fetchStatus() (*agent.StatusResponse, error) {
-	resp, err := trayClient.Get(ipcURL("/api/status"))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %s", resp.Status)
-	}
-	var st agent.StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
-		return nil, err
-	}
-	return &st, nil
-}
-
-// RunSystray starts the system tray GUI and handles user interactions via IPC.
-// It blocks until the systray is quit.
-func RunSystray(ctx context.Context, cancel context.CancelFunc) {
-	watch := newBinaryWatch()
-	systray.Run(
-		func() { // onReady
-			systray.SetTitle("W")
-			systray.SetTooltip("Wantastic VPN Agent")
-
-			mStatus := systray.AddMenuItem("Status: Connecting...", "Current Mode")
-			mStatus.Disable()
-
-			mIP := systray.AddMenuItem("IP: N/A", "Assigned IP Address")
-			mIP.Disable()
-
-			mPubKey := systray.AddMenuItem("PubKey: N/A", "Device Public Key")
-			mPubKey.Disable()
-
-			mStats := systray.AddMenuItem("Traffic: 0 B / 0 B", "Rx / Tx Bytes")
-			mStats.Disable()
-
-			mPeers := systray.AddMenuItem("Peers: 0 (P2P: 0, Relay: 0)", "Peer overview")
-			mP2PPeers := mPeers.AddSubMenuItem("P2P Peers: 0", "Direct peer connections")
-			mRelayPeers := mPeers.AddSubMenuItem("Relay Peers: 0", "Relayed peer connections")
-			p2pMenu := newPeerMenuGroup(mP2PPeers, "No direct peers")
-			relayMenu := newPeerMenuGroup(mRelayPeers, "No relay peers")
-
-			systray.AddSeparator()
-
-			mToggleOnOff := systray.AddMenuItem("Disconnect", "Toggle VPN On/Off")
-
-			exitMenu := newTrayExitMenu()
-
-			systray.AddSeparator()
-			mVersion := systray.AddMenuItem("Version "+version.Version, "Installed version")
-			mVersion.Disable()
-			mQuit := systray.AddMenuItem("Quit", "Exit Tray")
-
-			// Toggle clicks refresh from their own goroutines; the peer menu
-			// groups are not safe for concurrent updates.
-			var refreshMu sync.Mutex
-			refresh := func() {
-				refreshMu.Lock()
-				defer refreshMu.Unlock()
-				st, err := fetchStatus()
-				if err != nil {
-					mStatus.SetTitle("Status: Daemon not running")
-					mToggleOnOff.Disable()
-					exitMenu.apply(deriveExitMenu(nil))
-					return
-				}
-				mToggleOnOff.Enable()
-
-				statusText := "Offline"
-				if st.Running {
-					statusText = "Online"
-				}
-				mStatus.SetTitle(fmt.Sprintf("Status: %s", statusText))
-
-				ipText := "N/A"
-				if len(st.IPs) > 0 {
-					ipText = st.IPs[0]
-				}
-				mIP.SetTitle(fmt.Sprintf("IP: %s", ipText))
-
-				pubKeyText := "N/A"
-				if len(st.PubKey) > 8 {
-					pubKeyText = st.PubKey[:8]
-				}
-				mPubKey.SetTitle(fmt.Sprintf("PubKey: %s...", pubKeyText))
-
-				mStats.SetTitle(fmt.Sprintf("Traffic: ↓ %s / ↑ %s", trayBytes(st.RxBytes), trayBytes(st.TxBytes)))
-
-				p2pEntries, relayEntries := buildPeerMenuEntries(st.Peers)
-				p2pCount := len(p2pEntries)
-				relayCount := len(relayEntries)
-				mPeers.SetTitle(fmt.Sprintf("Peers: %d (P2P: %d, Relay: %d)", len(st.Peers), p2pCount, relayCount))
-				mP2PPeers.SetTitle(fmt.Sprintf("P2P Peers: %d", p2pCount))
-				mRelayPeers.SetTitle(fmt.Sprintf("Relay Peers: %d", relayCount))
-				syncPeerMenuGroup(p2pMenu, p2pEntries)
-				syncPeerMenuGroup(relayMenu, relayEntries)
-
-				if st.Running {
-					mToggleOnOff.SetTitle("Disconnect")
-				} else {
-					mToggleOnOff.SetTitle("Connect")
-				}
-
-				exitMenu.apply(deriveExitMenu(st))
-
-				// The daemon moved to a new build and our binary on disk was
-				// replaced: restart onto it so the menu matches the daemon.
-				if st.Version != "" && st.Version != version.Version && watch.replaced() {
-					log.Printf("tray: daemon runs %s, tray %s; restarting on the updated binary", st.Version, version.Version)
-					watch.restart()
-				}
-			}
-
-			exitMenu.onChange = func() { go refresh() }
-
-			// Handler loop for tray updates and interactions
-			go func() {
-				ticker := time.NewTicker(5 * time.Second)
-				defer ticker.Stop()
-				refresh()
-
-				for {
-					select {
-					case <-ctx.Done():
-						systray.Quit()
-						return
-
-					case <-mQuit.ClickedCh:
-						cancel()
-						systray.Quit()
-						return
-
-					case <-mToggleOnOff.ClickedCh:
-						go func() { postIPC("/api/state/toggle"); refresh() }()
-
-					case <-ticker.C:
-						refresh()
-					}
-				}
-			}()
-		},
-		func() { // onExit
-			log.Println("Systray finished")
-		},
-	)
-}
-
-func trayBytes(n uint64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := uint64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
 func newPeerMenuGroup(parent *systray.MenuItem, emptyTitle string) *peerMenuGroup {
 	emptyItem := parent.AddSubMenuItem(emptyTitle, emptyTitle)
 	emptyItem.Disable()
@@ -234,8 +355,6 @@ func newPeerMenuGroup(parent *systray.MenuItem, emptyTitle string) *peerMenuGrou
 
 func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 	if len(entries) == 0 {
-		group.emptyItem.SetTitle(group.emptyTitle)
-		group.emptyItem.SetTooltip(group.emptyTitle)
 		group.emptyItem.Show()
 		for _, item := range group.peerItems {
 			item.setCopyText("")
@@ -285,99 +404,4 @@ func (item *peerMenuItemState) handleClicks() {
 			log.Printf("[Tray] Failed to copy peer value to clipboard: %v", err)
 		}
 	}
-}
-
-func buildPeerMenuEntries(peers []device.PeerInfo) ([]peerMenuEntry, []peerMenuEntry) {
-	var p2pEntries []peerMenuEntry
-	var relayEntries []peerMenuEntry
-
-	for _, peer := range peers {
-		entry := peerMenuEntry{
-			Title:    formatPeerMenuTitle(peer),
-			Tooltip:  formatPeerMenuTooltip(peer),
-			CopyText: formatPeerCopyText(peer),
-		}
-		if isDirectPeer(peer) {
-			p2pEntries = append(p2pEntries, entry)
-		} else {
-			relayEntries = append(relayEntries, entry)
-		}
-	}
-
-	return p2pEntries, relayEntries
-}
-
-func isDirectPeer(peer device.PeerInfo) bool {
-	return peer.IsP2P && peer.P2PState == "established"
-}
-
-func formatPeerMenuTitle(peer device.PeerInfo) string {
-	hostname := strings.TrimSpace(peer.Hostname)
-	ip := strings.TrimSpace(peer.AssignedIP)
-	var base string
-
-	switch {
-	case hostname != "" && ip != "":
-		base = fmt.Sprintf("%s (%s)", hostname, ip)
-	case ip != "":
-		base = ip
-	case hostname != "":
-		base = hostname
-	case !peer.IsP2P && peer.Endpoint != "":
-		base = fmt.Sprintf("Server (%s)", peer.Endpoint)
-	case peer.Endpoint != "":
-		base = fmt.Sprintf("Relay (%s)", peer.Endpoint)
-	default:
-		base = abbreviatePeerKey(peer.PublicKey)
-	}
-
-	if peer.IsP2P && peer.P2PState != "" && peer.P2PState != "established" {
-		return fmt.Sprintf("%s [%s]", base, peer.P2PState)
-	}
-	return base
-}
-
-func formatPeerMenuTooltip(peer device.PeerInfo) string {
-	var parts []string
-	if peer.Hostname != "" {
-		parts = append(parts, "Host: "+peer.Hostname)
-	}
-	if peer.AssignedIP != "" {
-		parts = append(parts, "IP: "+peer.AssignedIP)
-	}
-	if peer.Endpoint != "" {
-		parts = append(parts, "Endpoint: "+peer.Endpoint)
-	}
-	if peer.P2PState != "" {
-		parts = append(parts, "State: "+peer.P2PState)
-	} else if peer.IsP2P {
-		parts = append(parts, "State: direct")
-	} else {
-		parts = append(parts, "State: relay")
-	}
-	if copyText := formatPeerCopyText(peer); copyText != "" {
-		parts = append(parts, "Click copies: "+copyText)
-	}
-	parts = append(parts, "PubKey: "+abbreviatePeerKey(peer.PublicKey))
-	return strings.Join(parts, " | ")
-}
-
-func formatPeerCopyText(peer device.PeerInfo) string {
-	switch {
-	case strings.TrimSpace(peer.AssignedIP) != "":
-		return strings.TrimSpace(peer.AssignedIP)
-	case strings.TrimSpace(peer.Endpoint) != "":
-		return strings.TrimSpace(peer.Endpoint)
-	case strings.TrimSpace(peer.Hostname) != "":
-		return strings.TrimSpace(peer.Hostname)
-	default:
-		return strings.TrimSpace(peer.PublicKey)
-	}
-}
-
-func abbreviatePeerKey(key string) string {
-	if len(key) <= 12 {
-		return key
-	}
-	return key[:8] + "..." + key[len(key)-4:]
 }

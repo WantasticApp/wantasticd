@@ -35,6 +35,8 @@ func NewAPIServer(a *Agent) *APIServer {
 
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/state/toggle", s.handleToggleState)
+	mux.HandleFunc("/api/connect", s.handleConnect)
+	mux.HandleFunc("/api/disconnect", s.handleDisconnect)
 	mux.HandleFunc("/api/exitnode", s.handleExitNodeStatus)
 	mux.HandleFunc("/api/exitnode/offer", s.handleExitNodeOffer)
 	mux.HandleFunc("/api/exitnode/jumpto", s.handleExitNodeJumpTo)
@@ -177,24 +179,50 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(status)
 }
 
-func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+// ConnectionResponse is returned by /api/connect, /api/disconnect and
+// /api/state/toggle.
+type ConnectionResponse struct {
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
+	Connected bool   `json:"connected"`
+}
+
+func (s *APIServer) connectionReply(w http.ResponseWriter, err error) {
+	resp := ConnectionResponse{OK: err == nil, Connected: s.agent.device.IsRunning()}
+	code := http.StatusOK
+	if err != nil {
+		resp.Error = err.Error()
+		code = http.StatusConflict
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *APIServer) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if !s.guard(w, r) {
 		return
 	}
+	s.connectionReply(w, s.agent.Connect())
+}
 
-	log.Println("[API] VPN State toggle requested via IPC")
+func (s *APIServer) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	if !s.guard(w, r) {
+		return
+	}
+	s.connectionReply(w, s.agent.Disconnect())
+}
 
-	go func() {
-		if s.agent.device.IsRunning() {
-			s.agent.device.Stop()
-			log.Println("[API] Stopped VPN Device via API")
-		} else {
-			s.agent.device.Start()
-			log.Println("[API] Started VPN Device via API")
-		}
-	}()
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\":\"toggled\"}")
+// handleToggleState is the older tray's single button. It now requires the
+// control header like every other state change, so a web page cannot drop
+// the tunnel with a plain cross-site POST.
+func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {
+	if !s.guard(w, r) {
+		return
+	}
+	if s.agent.device.IsRunning() {
+		s.connectionReply(w, s.agent.Disconnect())
+		return
+	}
+	s.connectionReply(w, s.agent.Connect())
 }

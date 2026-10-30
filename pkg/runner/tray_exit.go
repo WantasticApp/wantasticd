@@ -22,6 +22,8 @@ type trayExitMenu struct {
 	itemIPs  []string
 	offering bool
 	onChange func()
+	// report shows an action's outcome in the menu.
+	report func(okText, notice string, err error)
 }
 
 func newTrayExitMenu() *trayExitMenu {
@@ -30,24 +32,31 @@ func newTrayExitMenu() *trayExitMenu {
 	m.offer = m.root.AddSubMenuItemCheckbox("Allow this device as exit node", "", false)
 	m.use = m.root.AddSubMenuItem("Use exit node", "Send all internet traffic through a peer")
 	m.none = m.use.AddSubMenuItemCheckbox("Don't use an exit node", "Normal routing", true)
-	go m.watch(m.offer, func() {
+	go m.watch(m.offer, func() (string, string, error) {
 		m.mu.Lock()
 		on := !m.offering
 		m.mu.Unlock()
-		v := "off"
 		if on {
-			v = "on"
+			n, err := postControl("/api/exitnode/offer?enabled=on")
+			return "This device is now an exit node", n, err
 		}
-		postIPC("/api/exitnode/offer?enabled=" + v)
+		n, err := postControl("/api/exitnode/offer?enabled=off")
+		return "Exit-node sharing off", n, err
 	})
-	go m.watch(m.none, func() { postIPC("/api/exitnode/comeback") })
+	go m.watch(m.none, func() (string, string, error) {
+		n, err := postControl("/api/exitnode/comeback")
+		return "Normal routing restored", n, err
+	})
 	return m
 }
 
-func (m *trayExitMenu) watch(item *systray.MenuItem, action func()) {
+func (m *trayExitMenu) watch(item *systray.MenuItem, action func() (okText, notice string, err error)) {
 	for range item.ClickedCh {
 		go func() {
-			action()
+			okText, notice, err := action()
+			if m.report != nil && okText != "" {
+				m.report(okText, notice, err)
+			}
 			if m.onChange != nil {
 				m.onChange()
 			}
@@ -74,13 +83,17 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 		it := m.use.AddSubMenuItemCheckbox("", "", false)
 		m.items = append(m.items, it)
 		m.itemIPs = append(m.itemIPs, "")
-		go m.watch(it, func() {
+		go m.watch(it, func() (string, string, error) {
 			m.mu.Lock()
 			ip := m.itemIPs[idx]
 			m.mu.Unlock()
-			if ip != "" {
-				postIPC("/api/exitnode/jumpto?" + url.Values{"ip": {ip}, "wait": {"0"}}.Encode())
+			if ip == "" {
+				return "", "", nil
 			}
+			// A few seconds' wait lets the menu report "active" instead of
+			// "pending" when a direct path is already up.
+			n, err := postControl("/api/exitnode/jumpto?" + url.Values{"ip": {ip}, "wait": {"5000"}}.Encode())
+			return "Internet now goes through " + ip, n, err
 		})
 	}
 	for i, it := range m.items {

@@ -183,7 +183,7 @@ func printStatus(w io.Writer, st agent.StatusResponse) {
 	case st.Running && st.DeviceRunning:
 		state = "Connected"
 	case st.Running:
-		state = "Running (tunnel down)"
+		state = "Disconnected (reconnect: wantasticd up)"
 	}
 	mode := "Userspace"
 	if st.TUNMode {

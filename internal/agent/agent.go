@@ -270,7 +270,10 @@ func (a *Agent) runDNSCheck(ctx context.Context) {
 		case <-a.stopCh:
 			return
 		case <-ticker.C:
-			platformdns.ApplyTunnel(ctx, a.config.Interface.DNS)
+			// Disconnected from the tray: the tunnel resolvers are unreachable.
+			if a.device.IsRunning() {
+				platformdns.ApplyTunnel(ctx, a.config.Interface.DNS)
+			}
 		}
 	}
 }

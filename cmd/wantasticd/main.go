@@ -53,6 +53,8 @@ func main() {
 		handlePeers()
 	case "ping":
 		handlePing()
+	case "up", "down":
+		os.Exit(runUpDown(os.Args[1], os.Stdout))
 	case "exit-node", "jumpto", "comeback":
 		os.Exit(runExitCommand(os.Args[1], os.Args[2:], os.Stdout))
 	case "tray":
@@ -75,7 +77,7 @@ func main() {
 	}
 }
 
-var userCommands = []string{"genkey", "login", "connect", "status", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "update", "version"}
+var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "update", "version"}
 
 // suggestCommand returns the command within two typos of name, if any.
 func suggestCommand(name string) string {
@@ -770,6 +772,8 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  login      Authenticate and configure client")
 	fmt.Fprintln(os.Stderr, "  connect    Connect using a configuration file")
 	fmt.Fprintln(os.Stderr, "  status     Show tunnel state, addresses, traffic and peer counts (--json)")
+	fmt.Fprintln(os.Stderr, "  up         Reconnect the tunnel after down")
+	fmt.Fprintln(os.Stderr, "  down       Disconnect the tunnel; the daemon keeps running")
 	fmt.Fprintln(os.Stderr, "  peers      List peers with path, endpoint, handshake and traffic (--ping, --json)")
 	fmt.Fprintln(os.Stderr, "  ping       Ping peers over the tunnel: ping [-c N] [-i 250ms] [-W 1s] [target...]")
 	fmt.Fprintln(os.Stderr, "  exit-node  Let peers use this device as their exit node: exit-node on|off|status")

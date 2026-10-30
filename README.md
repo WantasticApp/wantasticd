@@ -87,6 +87,37 @@ Open PowerShell as Administrator:
 irm https://get.wantastic.app/install.ps1 | iex
 ```
 
+The installer does not elevate itself; from a normal prompt it stops and asks
+you to re-run it as Administrator. It checks `wantasticd.exe`'s signature
+before installing: a release signed by anyone other than Wantastic LLC, or
+with a broken signature, is refused.
+
+#### Windows code signing (maintainers)
+
+Release builds of `wantasticd.exe` and `install.ps1` are Authenticode-signed
+as **Wantastic LLC** through [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/)
+once it is enabled. Until then, Windows builds ship unsigned. They are no
+longer UPX-packed, a common cause of antivirus false positives, and they carry
+Wantastic LLC version information.
+
+1. Create an Artifact Signing account and complete **Public Trust** identity
+   validation for the organization *Wantastic LLC*. Then create a **Public
+   Trust** certificate profile.
+2. Register an app in Microsoft Entra ID, add a client secret, and on the
+   signing account grant it the **Artifact Signing Certificate Profile Signer**
+   role.
+3. In the GitHub repository settings, add these:
+   - Secrets: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`
+   - Variables: `AZURE_SIGNING_ENDPOINT` (e.g. `https://eus.codesigning.azure.net/`),
+     `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`, and `WINDOWS_SIGNING=azure`
+     to turn signing on.
+
+With signing on, the `sign-windows` release job signs and verifies every Windows
+executable and `install.ps1`. If signing fails, nothing is published.
+
+If a build has already been flagged, submit it as a false positive at
+<https://www.microsoft.com/wdsi/filesubmission>.
+
 ---
 
 ## Authentication
@@ -213,12 +244,31 @@ wantasticd peers [--ping] [--json]
 # Ping peers over the tunnel (all peers when no target is given)
 wantasticd ping [-c 4] [-i 250ms] [-W 1s] [hostname|vpn-ip|pubkey-prefix ...]
 
+# Disconnect / reconnect the tunnel; the service keeps running
+wantasticd down
+wantasticd up
+
 # Login interactively
 wantasticd login
 
 # Login with token
 wantasticd login --token <TOKEN>
 ```
+
+### Tray menu
+
+The tray (menu bar on macOS, notification area on Windows) shows a coloured
+icon: green when connected, blue when using an exit node, grey when
+disconnected, red when the service is not running. From the menu you can:
+
+- see the VPN IP (click to copy), total traffic, live speed, uptime and server;
+- disconnect and reconnect, while the service keeps running;
+- list peers with their path (direct/relay), and click one to copy its IP;
+- **Ping all peers**: latency for every peer, shown next to each one;
+- under **Exit node**, allow this device as an exit node, pick a peer to send
+  all internet traffic through, or return to normal routing.
+
+Each action's result or error is shown in the menu for 20 seconds.
 
 ### Allow tenant access to this device's local LAN
 

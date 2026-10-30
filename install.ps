@@ -42,13 +42,15 @@ Write-Host "====================================`n"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# No self-elevation: relaunching PowerShell elevated is a pattern antivirus
+# flags, and under `irm | iex` there is no script file to relaunch anyway.
 if (-not $isAdmin) {
-    Write-Warning "Administrator privileges required. Re-launching elevated…"
-    $args = if ($Token) { "-Token `"$Token`"" } else { "" }
-    if ($NoTray) { $args += " -NoTray" }
-    Start-Process powershell -Verb RunAs `
-        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $args"
-    exit 0
+    Write-Host "Administrator privileges are required." -ForegroundColor Yellow
+    Write-Host "Right-click PowerShell, choose 'Run as administrator', and run again:"
+    Write-Host "  irm $BaseUrl/install.ps1 | iex"
+    # return, not exit: under `irm | iex` exit would close the window
+    # before the message can be read.
+    return
 }
 
 # ── architecture ──────────────────────────────────────────────────────────────
@@ -88,6 +90,28 @@ if (-not $ExtractedBin) {
     exit 1
 }
 
+# ── verify publisher ──────────────────────────────────────────────────────────
+# Signed releases must be signed by Wantastic LLC; a broken or foreign
+# signature means the download was tampered with. Unsigned builds predate
+# release signing and are still accepted.
+$Signature = Get-AuthenticodeSignature -FilePath $ExtractedBin.FullName
+switch ($Signature.Status) {
+    "Valid" {
+        if ($Signature.SignerCertificate.Subject -notmatch "Wantastic LLC") {
+            Remove-Item -Recurse -Force $TempDir
+            throw "wantasticd.exe is signed by an unexpected publisher: $($Signature.SignerCertificate.Subject)"
+        }
+        Write-Host "Signature: valid (Wantastic LLC)"
+    }
+    "NotSigned" {
+        Write-Warning "wantasticd.exe is not code-signed (release predates signing)."
+    }
+    default {
+        Remove-Item -Recurse -Force $TempDir
+        throw "wantasticd.exe signature check failed: $($Signature.Status) $($Signature.StatusMessage)"
+    }
+}
+
 # ── install binary ────────────────────────────────────────────────────────────
 # Stop existing service/process before replacing the binary
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -108,6 +132,8 @@ if (Test-Path $InstallPath) {
 }
 Remove-Item -Force -ErrorAction SilentlyContinue "$InstallPath.new", "$InstallPath.failed"
 Copy-Item -Path $ExtractedBin.FullName -Destination $InstallPath -Force
+# Downloaded files carry a "from the internet" mark; this copy was verified.
+Unblock-File -Path $InstallPath
 Remove-Item -Recurse -Force $TempDir
 Write-Host "Installed to $InstallPath"
 

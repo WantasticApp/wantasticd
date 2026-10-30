@@ -261,7 +261,10 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 
 	backend := platforms.NewBackend(platforms.Options{})
 	networkSpeed := newNetworkSpeedManager(auth.PersistentFilePath("network-speed.json"))
-	telemetryBackend := &networkTelemetryBackend{backend: backend, speed: networkSpeed}
+	var telemetryBackend wusp.DataBackend = &networkTelemetryBackend{backend: backend, speed: networkSpeed}
+	if exit, ok := transport.(exitNodeController); ok {
+		telemetryBackend = &exitNodeBackend{backend: telemetryBackend, exit: exit}
+	}
 	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	runtime := &uspRuntime{

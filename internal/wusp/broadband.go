@@ -95,6 +95,7 @@ var AllDeviceObjects = concatObjects(
 	WUSPWiFiTelemetryObjects,
 	WUSPTrafficTelemetryObjects,
 	WUSPDNSObjects,
+	WUSPExitNodeObjects,
 )
 
 // AllDeviceParams is the full WUSP schema registry consumed by the encoder and
@@ -113,6 +114,7 @@ var AllDeviceParams = concat(
 	AllWUSPWiFiTelemetryParams,
 	AllWUSPTrafficTelemetryParams,
 	AllWUSPDNSParams,
+	AllWUSPExitNodeParams,
 )
 
 // BroadbandDataModels collects the runtime model slices bundled into WUSP.
@@ -224,6 +226,15 @@ var BroadbandDataModels = []BroadbandDataModel{
 		WUSPSourceURL,
 		WUSPDNSObjects,
 		AllWUSPDNSParams,
+	),
+	newBroadbandDataModel(
+		"wusp-exit-node",
+		"Wantastic WUSP Exit Node",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPExitNodeObjects,
+		AllWUSPExitNodeParams,
 	),
 }
 

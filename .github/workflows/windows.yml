@@ -60,6 +60,8 @@ jobs:
           CGO_ENABLED: 0
         # Failures are repeated as annotations so they show on the run page.
         run: |
+          # go writes progress to stderr; with 2>&1 that must not be fatal.
+          $ErrorActionPreference = "Continue"
           $pkgs = "./cmd/...", "./pkg/...", "./internal/update/...", "./internal/agent/...", "./internal/auth/...", "./internal/platform/firewall/..."
           go vet @pkgs 2>&1 | Tee-Object -FilePath vet.log
           $vet = $LASTEXITCODE

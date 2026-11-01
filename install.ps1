@@ -208,8 +208,8 @@ function Install-Wantasticd {
         # --no-connect: save the configuration and exit; the service connects.
         $loginArgs = @("login", "--no-connect")
         if ($Token) { $loginArgs += @("--token", $Token) }
-        # Start-Process -Wait: release builds are GUI-subsystem executables,
-        # which `&` would not wait for.
+        # Start-Process -Wait shares this console and waits, also for older
+        # GUI-subsystem builds that `&` would not wait for.
         $login = Start-Process -FilePath $InstallPath -ArgumentList $loginArgs -NoNewWindow -Wait -PassThru
         if ($login.ExitCode -eq 0) {
             $loggedIn = $true

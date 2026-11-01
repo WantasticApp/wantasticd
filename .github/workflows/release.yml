@@ -119,7 +119,8 @@ jobs:
           EXT=""
           if [ "$GOOS" = "windows" ]; then
             # The Windows tray is pure Go (no cgo), so Windows keeps it.
-            LDFLAGS="$LDFLAGS -H=windowsgui"
+            # Console subsystem: commands must print in PowerShell/cmd and
+            # be waited for; the tray hides the console it gets at logon.
             EXT=".exe"
           else
             # Linux targets are headless routers/servers.

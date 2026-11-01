@@ -58,6 +58,7 @@ func main() {
 	case "exit-node", "jumpto", "comeback":
 		os.Exit(runExitCommand(os.Args[1], os.Args[2:], os.Stdout))
 	case "tray":
+		releaseOwnConsole()
 		handleTray()
 	case "update":
 		handleUpdate()

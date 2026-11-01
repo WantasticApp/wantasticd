@@ -306,3 +306,72 @@ func TestPreserveLastSMSInboxSnapshot(t *testing.T) {
 		t.Fatalf("LastCommandStatus=%q want current status", wusp.ValueToString(status))
 	}
 }
+
+type countingCacheBackend struct {
+	mu    sync.Mutex
+	calls int
+	gate  chan struct{} // when set, the first Collect waits on it
+}
+
+func (b *countingCacheBackend) Collect(ctx context.Context, _ ...string) (*wusp.Message, error) {
+	b.mu.Lock()
+	b.calls++
+	first := b.calls == 1
+	b.mu.Unlock()
+	if first && b.gate != nil {
+		<-b.gate
+	}
+	msg := wusp.NewMessage()
+	msg.Set("Device.DeviceInfo.Manufacturer", wusp.String("Wantastic"))
+	return msg, nil
+}
+
+func (b *countingCacheBackend) Set(context.Context, string, wusp.Value) error { return nil }
+
+func (b *countingCacheBackend) Delete(context.Context, ...string) error { return nil }
+
+func (b *countingCacheBackend) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// A write that lands while a sweep is running gets its own sweep afterwards
+// instead of waiting for the next periodic refresh.
+func TestPersistentDataModelCacheMutationDuringRefreshReruns(t *testing.T) {
+	backend := &countingCacheBackend{gate: make(chan struct{})}
+	cache := newPersistentDataModelCache(backend, t.TempDir()+"/model.cache", time.Hour)
+	cache.refreshAsync()
+	deadline := time.Now().Add(time.Second)
+	for backend.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := cache.Set(context.Background(), "Device.WiFi.Radio.1.Channel", wusp.Uint(44)); err != nil {
+		t.Fatal(err)
+	}
+	close(backend.gate)
+	deadline = time.Now().Add(2 * time.Second)
+	for backend.count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := backend.count(); got < 2 {
+		t.Fatalf("collections = %d, want a second sweep after the mid-sweep write", got)
+	}
+}
+
+func TestPersistentDataModelCacheRefreshDueWhileWatched(t *testing.T) {
+	cache := newPersistentDataModelCache(staticCacheBackend{msg: wusp.NewMessage()}, t.TempDir()+"/model.cache", time.Minute)
+	now := time.Now()
+	cache.lastRefresh = now.Add(-20 * time.Second)
+	if cache.refreshDue(now) {
+		t.Fatal("unwatched cache refreshed before its 60s interval")
+	}
+	cache.MarkWatched()
+	if !cache.refreshDue(now) {
+		t.Fatal("watched cache did not refresh after 20s")
+	}
+	cache.lastRefresh = now.Add(-2 * time.Second)
+	if cache.refreshDue(now) {
+		t.Fatal("watched cache refreshed again after 2s")
+	}
+}

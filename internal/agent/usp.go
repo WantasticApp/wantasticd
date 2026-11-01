@@ -619,6 +619,10 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		}
 	}()
 
+	if req.Method == wusp.USPAgentMethodGet && r.dataModelCache != nil {
+		// Someone is looking at this device: keep its values fresh.
+		r.dataModelCache.MarkWatched()
+	}
 	diaglog.Printf("[USP] Calling agent.HandleRequest method=%d id=%d", req.Method, req.ID)
 	type requestResult struct {
 		resp wusp.USPAgentResponse

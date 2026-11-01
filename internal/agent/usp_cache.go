@@ -20,10 +20,15 @@ type persistentDataModelCache struct {
 	path     string
 	interval time.Duration
 
-	mu             sync.RWMutex
-	msg            *wusp.Message
-	refreshing     bool
-	refreshDone    chan struct{}
+	mu          sync.RWMutex
+	msg         *wusp.Message
+	refreshing  bool
+	refreshDone chan struct{}
+	// rerun asks for one more refresh once the running one ends: a write
+	// that landed mid-sweep must not wait for the next periodic refresh.
+	rerun          bool
+	lastRefresh    time.Time
+	watchedUntil   time.Time
 	lastRefreshErr error
 	changeObserver func(previous, current *wusp.Message)
 	startOnce      sync.Once
@@ -153,21 +158,54 @@ func (c *persistentDataModelCache) Patch(msg *wusp.Message) error {
 	return nil
 }
 
+// dataModelCacheWatchedRefresh is the refresh period while the controller is
+// reading this device (someone has it open in the console), and
+// dataModelCacheWatchWindow how long one read keeps that pace.
+const (
+	dataModelCacheWatchedRefresh = 15 * time.Second
+	dataModelCacheWatchWindow    = 2 * time.Minute
+	dataModelCacheSettleDelay    = 4 * time.Second
+)
+
+// MarkWatched records a controller read: the cache refreshes on the faster
+// watched period for the next dataModelCacheWatchWindow.
+func (c *persistentDataModelCache) MarkWatched() {
+	c.mu.Lock()
+	c.watchedUntil = time.Now().Add(dataModelCacheWatchWindow)
+	c.mu.Unlock()
+}
+
 func (c *persistentDataModelCache) Start(ctx context.Context) {
 	c.startOnce.Do(func() {
 		go func() {
-			ticker := time.NewTicker(c.interval)
+			tick := min(c.interval, dataModelCacheWatchedRefresh)
+			ticker := time.NewTicker(tick)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
-					c.refreshAsync()
+				case now := <-ticker.C:
+					if c.refreshDue(now) {
+						c.refreshAsync()
+					}
 				}
 			}
 		}()
 	})
+}
+
+// refreshDue reports whether a periodic refresh should start: every interval,
+// or every dataModelCacheWatchedRefresh while the device is being watched.
+func (c *persistentDataModelCache) refreshDue(now time.Time) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	period := c.interval
+	if now.Before(c.watchedUntil) && dataModelCacheWatchedRefresh < period {
+		period = dataModelCacheWatchedRefresh
+	}
+	// Half a tick of slack so ticker jitter does not skip a whole period.
+	return now.Sub(c.lastRefresh) >= period-dataModelCacheWatchedRefresh/2
 }
 
 func (c *persistentDataModelCache) Refresh(ctx context.Context) error {
@@ -230,8 +268,14 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 		c.mu.Lock()
 		c.refreshing = false
 		c.lastRefreshErr = err
+		c.lastRefresh = time.Now()
+		rerun := c.rerun
+		c.rerun = false
 		close(done)
 		c.mu.Unlock()
+		if rerun {
+			c.refreshAsync()
+		}
 	}()
 
 	msg, err := c.backend.Collect(ctx)
@@ -447,10 +491,25 @@ func (c *persistentDataModelCache) refreshAsync() {
 }
 
 // refreshAfterMutation reconciles the optimistic cache patch without delaying
-// the Set/Add/Delete response. Refresh is single-flight, so a burst of related
-// writes still causes at most one platform collection.
+// the Set/Add/Delete response: now, and once more after the platform has
+// settled (radios and interfaces apply a change over a few seconds). Refresh
+// is single-flight; a sweep already running is followed by one more, so a
+// burst of related writes still causes at most two platform collections.
 func (c *persistentDataModelCache) refreshAfterMutation() {
+	c.mu.Lock()
+	if c.refreshing {
+		c.rerun = true
+	}
+	c.mu.Unlock()
 	c.refreshAsync()
+	time.AfterFunc(dataModelCacheSettleDelay, func() {
+		c.mu.Lock()
+		if c.refreshing {
+			c.rerun = true
+		}
+		c.mu.Unlock()
+		c.refreshAsync()
+	})
 }
 
 func (c *persistentDataModelCache) load() {

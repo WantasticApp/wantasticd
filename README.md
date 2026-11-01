@@ -87,6 +87,17 @@ Open PowerShell as Administrator:
 irm https://get.wantastic.app/install.ps1 | iex
 ```
 
+Works from any folder (nothing is saved next to you; `C:\Windows\System32`
+is read-only even for Administrators). With a login token:
+
+```powershell
+& ([scriptblock]::Create((irm https://get.wantastic.app/install.ps1))) -Token <TOKEN>
+```
+
+Requires Windows 10, Windows 11 or Windows Server 2016+ (x64, ARM64 or x86).
+Windows 7, 8 and 8.1 are not supported: the Go runtime does not run there.
+Re-running the installer upgrades in place and keeps the existing login.
+
 The installer does not elevate itself; from a normal prompt it stops and asks
 you to re-run it as Administrator. It checks `wantasticd.exe`'s signature
 before installing: a release signed by anyone other than Wantastic LLC, or

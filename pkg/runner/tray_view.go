@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"image/png"
 	"math"
+	"net/netip"
 	"runtime"
 	"sort"
 	"strings"
@@ -200,11 +201,12 @@ func pingSummary(pr *agent.PingResponse, err error) string {
 	return fmt.Sprintf("Ping: %d/%d peers answered · avg %.0f ms", up, len(pr.Results), sum/float64(up))
 }
 
-// peerMenuEntry is one row under Peers; clicking it copies CopyText.
+// peerMenuEntry is one row under Peers; its submenu copies VPNIP or PublicIP.
 type peerMenuEntry struct {
 	Title    string
 	Tooltip  string
-	CopyText string
+	VPNIP    string
+	PublicIP string
 }
 
 // buildPeerMenuEntries lists every peer except the server, direct ones first,
@@ -234,35 +236,35 @@ func buildPeerMenuEntries(peers []device.PeerInfo, latency map[string]agent.Ping
 				title += " · no reply"
 			}
 		}
-		tip := []string{"VPN IP: " + firstNonEmpty(p.AssignedIP, "—")}
-		if p.Endpoint != "" {
-			tip = append(tip, "Endpoint: "+p.Endpoint)
-		}
+		var tip []string
 		if p.LastHandshake > 0 {
 			tip = append(tip, "Handshake: "+trayDuration(now.Sub(time.Unix(p.LastHandshake, 0)))+" ago")
 		} else {
 			tip = append(tip, "Handshake: never")
 		}
 		tip = append(tip, fmt.Sprintf("Traffic: ↓ %s ↑ %s", trayBytes(p.RxBytes), trayBytes(p.TxBytes)))
-		copyText := firstNonEmpty(p.AssignedIP, p.Endpoint, p.PublicKey)
-		tip = append(tip, "Click to copy "+copyText)
-		out = append(out, peerMenuEntry{Title: title, Tooltip: strings.Join(tip, "\n"), CopyText: copyText})
+		out = append(out, peerMenuEntry{
+			Title:    "( " + title + " )",
+			Tooltip:  strings.Join(tip, "\n"),
+			VPNIP:    strings.TrimSpace(p.AssignedIP),
+			PublicIP: endpointHost(p.Endpoint),
+		})
 	}
 	return out
 }
 
+// peerLabel names a peer row: its hostname, else its VPN IP, else its key.
 func peerLabel(p device.PeerInfo) string {
-	host, ip := strings.TrimSpace(p.Hostname), strings.TrimSpace(p.AssignedIP)
-	switch {
-	case host != "" && ip != "":
-		return fmt.Sprintf("%s (%s)", host, ip)
-	case ip != "":
-		return ip
-	case host != "":
-		return host
-	default:
-		return abbreviatePeerKey(p.PublicKey)
+	return firstNonEmpty(p.Hostname, p.AssignedIP, abbreviatePeerKey(p.PublicKey))
+}
+
+// endpointHost is the IP of a WireGuard "ip:port" endpoint.
+func endpointHost(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if ap, err := netip.ParseAddrPort(endpoint); err == nil {
+		return ap.Addr().Unmap().String()
 	}
+	return endpoint
 }
 
 func abbreviatePeerKey(key string) string {

@@ -336,7 +336,15 @@ type peerMenuGroup struct {
 	peerItems  []*peerMenuItemState
 }
 
+// peerMenuItemState is one peer row: its title opens a submenu with the
+// peer's VPN IP and public IP, each copied on click.
 type peerMenuItemState struct {
+	item     *systray.MenuItem
+	vpnIP    *copyMenuItem
+	publicIP *copyMenuItem
+}
+
+type copyMenuItem struct {
 	item *systray.MenuItem
 
 	mu       sync.RWMutex
@@ -357,7 +365,8 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 	if len(entries) == 0 {
 		group.emptyItem.Show()
 		for _, item := range group.peerItems {
-			item.setCopyText("")
+			item.vpnIP.set("VPN IP", "")
+			item.publicIP.set("Public IP", "")
 			item.item.Hide()
 		}
 		return
@@ -366,37 +375,60 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 	group.emptyItem.Hide()
 	for len(group.peerItems) < len(entries) {
 		item := group.parent.AddSubMenuItem("", "")
-		state := &peerMenuItemState{item: item}
-		go state.handleClicks()
+		state := &peerMenuItemState{
+			item:     item,
+			vpnIP:    newCopyMenuItem(item),
+			publicIP: newCopyMenuItem(item),
+		}
 		group.peerItems = append(group.peerItems, state)
 	}
 	for i, entry := range entries {
-		group.peerItems[i].setCopyText(entry.CopyText)
-		group.peerItems[i].item.SetTitle(entry.Title)
-		group.peerItems[i].item.SetTooltip(entry.Tooltip)
-		group.peerItems[i].item.Show()
+		row := group.peerItems[i]
+		row.item.SetTitle(entry.Title)
+		row.item.SetTooltip(entry.Tooltip)
+		row.vpnIP.set("VPN IP", entry.VPNIP)
+		row.publicIP.set("Public IP", entry.PublicIP)
+		row.item.Show()
 	}
 	for i := len(entries); i < len(group.peerItems); i++ {
-		group.peerItems[i].setCopyText("")
+		group.peerItems[i].vpnIP.set("VPN IP", "")
+		group.peerItems[i].publicIP.set("Public IP", "")
 		group.peerItems[i].item.Hide()
 	}
 }
 
-func (item *peerMenuItemState) setCopyText(copyText string) {
-	item.mu.Lock()
-	item.copyText = copyText
-	item.mu.Unlock()
+func newCopyMenuItem(parent *systray.MenuItem) *copyMenuItem {
+	c := &copyMenuItem{item: parent.AddSubMenuItem("", "")}
+	go c.handleClicks()
+	return c
 }
 
-func (item *peerMenuItemState) getCopyText() string {
-	item.mu.RLock()
-	defer item.mu.RUnlock()
-	return item.copyText
+// set shows "<label>  <value>" and copies value on click; with no value the
+// line reads "<label>  —" and is disabled.
+func (c *copyMenuItem) set(label, value string) {
+	c.mu.Lock()
+	c.copyText = value
+	c.mu.Unlock()
+	if value == "" {
+		c.item.SetTitle(label + "  —")
+		c.item.SetTooltip("")
+		c.item.Disable()
+		return
+	}
+	c.item.SetTitle(label + "  " + value)
+	c.item.SetTooltip("Click to copy " + value)
+	c.item.Enable()
 }
 
-func (item *peerMenuItemState) handleClicks() {
-	for range item.item.ClickedCh {
-		copyText := item.getCopyText()
+func (c *copyMenuItem) getCopyText() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.copyText
+}
+
+func (c *copyMenuItem) handleClicks() {
+	for range c.item.ClickedCh {
+		copyText := c.getCopyText()
 		if copyText == "" {
 			continue
 		}

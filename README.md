@@ -94,9 +94,21 @@ is read-only even for Administrators). With a login token:
 & ([scriptblock]::Create((irm https://get.wantastic.app/install.ps1))) -Token <TOKEN>
 ```
 
+Options go after the scriptblock, as with `-Token` above:
+
+| Option | Effect |
+| --- | --- |
+| `-Token <TOKEN>` | log in with a token instead of the browser step |
+| `-NoLogin` | install now, log in later (`wantasticd login --no-connect`, then `Start-Service wantasticd`) |
+| `-NoTray` | do not start the tray app at logon |
+| `-Version v1.0.58` | install that release instead of the latest |
+| `-ZipPath <file>` | install from a downloaded `wantasticd-windows-*.zip` (offline) |
+| `-Uninstall` | remove the service, tray, firewall rule, PATH entry and program files; add `-Purge` to also remove the login |
+
 Requires Windows 10, Windows 11 or Windows Server 2016+ (x64, ARM64 or x86).
 Windows 7, 8 and 8.1 are not supported: the Go runtime does not run there.
-Re-running the installer upgrades in place and keeps the existing login.
+Works in Windows PowerShell 5.1 and PowerShell 7. Re-running the installer
+upgrades in place and keeps the existing login.
 
 The installer does not elevate itself; from a normal prompt it stops and asks
 you to re-run it as Administrator. It checks `wantasticd.exe`'s signature
@@ -123,8 +135,13 @@ Wantastic LLC version information.
      `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`, and `WINDOWS_SIGNING=azure`
      to turn signing on.
 
-With signing on, the `sign-windows` release job signs and verifies every Windows
-executable and `install.ps1`. If signing fails, nothing is published.
+Windows has its own workflow (`.github/workflows/windows.yml`). It runs the Go
+tests on Windows, builds amd64/arm64/x86, signs them, and then runs
+`install.ps1` for real (fresh install, upgrade, uninstall) in both Windows
+PowerShell 5.1 and PowerShell 7. It runs on every push or pull request that
+touches Windows code, and the release calls it for each tag. With signing on,
+it signs and verifies every Windows executable and `install.ps1`. If signing
+or the installer test fails, nothing is published.
 
 If a build has already been flagged, submit it as a false positive at
 <https://www.microsoft.com/wdsi/filesubmission>.

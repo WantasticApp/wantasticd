@@ -163,8 +163,11 @@ func printDeviceAuthUI(verifyURL, userCode string) {
 		borderWidth = 54 // display columns inside the box
 	)
 	border := strings.Repeat(string(borderRune), borderWidth)
+	// Long lines (the verification URL) wrap rather than being cut off.
 	row := func(content string) {
-		fmt.Fprintf(os.Stderr, "  ┃%s┃\n", centerPad(content, borderWidth))
+		for _, line := range wrapRunes(content, borderWidth-2) {
+			fmt.Fprintf(os.Stderr, "  ┃%s┃\n", centerPad(line, borderWidth))
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "")
@@ -212,6 +215,20 @@ func centerPad(s string, width int) string {
 	left := total / 2
 	right := total - left
 	return strings.Repeat(" ", left) + s + strings.Repeat(" ", right)
+}
+
+// wrapRunes splits s into lines of at most width runes; "" stays one empty line.
+func wrapRunes(s string, width int) []string {
+	runes := []rune(s)
+	if len(runes) <= width {
+		return []string{s}
+	}
+	var lines []string
+	for len(runes) > width {
+		lines = append(lines, string(runes[:width]))
+		runes = runes[width:]
+	}
+	return append(lines, string(runes))
 }
 
 // testPollInterval overrides the per-poll sleep in RunDeviceFlow when non-zero.

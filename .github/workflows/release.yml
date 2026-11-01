@@ -31,18 +31,8 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go vet -tags nosystray ./...
-      - name: Vet Windows (tray build)
-        env:
-          CGO_ENABLED: 0
-          GOOS: windows
-        run: go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
       - name: Validate installers
-        run: |
-          sh -n install.sh scripts/install.sh internal/update/self-update.sh
-          pwsh -NoProfile -Command '
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$null, [ref]$errors) | Out-Null
-            if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }'
+        run: sh -n install.sh scripts/install.sh internal/update/self-update.sh
 
   create-release:
     needs: quality
@@ -55,21 +45,20 @@ jobs:
         run: |
           gh release view ${{ github.ref_name }} || gh release create ${{ github.ref_name }} --title "${{ github.ref_name }}" --generate-notes --verify-tag
 
+  # Linux targets are headless routers/servers.
   build:
     needs: create-release
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, windows]
+        goos: [linux]
         goarch: [amd64, arm64]
         include:
           - goos: linux
             goarch: 386
           - goos: linux
             goarch: arm
-          - goos: windows
-            goarch: 386
           - goos: linux
             goarch: loong64
           - goos: linux
@@ -94,19 +83,6 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Version info (Wantastic LLC) and a manifest: unlabelled executables
-      # score worse with antivirus heuristics and SmartScreen.
-      - name: Windows resources
-        if: matrix.goos == 'windows'
-        run: |
-          FILEVER=$(echo "${{ github.ref_name }}" | sed -E 's/^v//; s/[^0-9.].*$//')
-          case "$FILEVER" in *.*.*) ;; *) FILEVER="0.0.0" ;; esac
-          FILEVER="${FILEVER}.0"
-          go run github.com/tc-hib/go-winres@v0.3.3 make --in winres/winres.json \
-            --out cmd/wantasticd/rsrc --arch ${{ matrix.goarch }} \
-            --file-version "$FILEVER" --product-version "$FILEVER"
-          ls -l cmd/wantasticd/rsrc_windows_${{ matrix.goarch }}.syso
-
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -115,23 +91,9 @@ jobs:
         run: |
           SHA=$(git rev-parse --short HEAD)
           LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${{ github.ref_name }}+${SHA} -X wantastic-agent/pkg/version.Commit=${SHA} -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          TAGS=""
-          EXT=""
-          if [ "$GOOS" = "windows" ]; then
-            # The Windows tray is pure Go (no cgo), so Windows keeps it.
-            # Console subsystem: commands must print in PowerShell/cmd and
-            # be waited for; the tray hides the console it gets at logon.
-            EXT=".exe"
-          else
-            # Linux targets are headless routers/servers.
-            TAGS="nosystray"
-          fi
-          go build -v -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o "wantasticd${EXT}" ./cmd/wantasticd
+          go build -v -trimpath -tags nosystray -ldflags="$LDFLAGS" -o wantasticd ./cmd/wantasticd
 
-      # Linux only: UPX-packed Windows executables are a common antivirus
-      # false positive.
       - name: Compress binary
-        if: matrix.goos != 'windows'
         run: |
           sudo apt-get update && sudo apt-get install -y upx-ucl
           BIN=wantasticd
@@ -140,12 +102,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          NAME="wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip "dist/${NAME}.zip" wantasticd.exe README.md
-          else
-            tar -czvf "dist/${NAME}.tar.gz" wantasticd README.md
-          fi
+          tar -czvf "dist/wantasticd-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" wantasticd README.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -204,81 +161,23 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # Authenticode-signs the Windows executables and install.ps1 as Wantastic
-  # LLC (Azure Artifact Signing). Enabled by the repository variable
-  # WINDOWS_SIGNING=azure; see README "Windows code signing".
-  sign-windows:
-    needs: build
-    if: vars.WINDOWS_SIGNING == 'azure'
-    runs-on: windows-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        goarch: [amd64, arm64, 386]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist-windows-${{ matrix.goarch }}
-          path: dist
-      - name: Unpack
-        shell: pwsh
-        run: |
-          Expand-Archive -Path "dist/wantasticd-windows-${{ matrix.goarch }}.zip" -DestinationPath sign -Force
-          New-Item -ItemType Directory -Force -Path sign-installer | Out-Null
-          Copy-Item install.ps1 sign-installer/install.ps1
-      - name: Sign
-        uses: azure/artifact-signing-action@v2.0.0
-        with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
-          files: |
-            ${{ github.workspace }}\sign\wantasticd.exe
-            ${{ github.workspace }}\sign-installer\install.ps1
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          description: Wantastic
-          description-url: https://wantastic.app
-      - name: Verify and repack
-        shell: pwsh
-        run: |
-          foreach ($f in "sign/wantasticd.exe", "sign-installer/install.ps1") {
-            $sig = Get-AuthenticodeSignature $f
-            Write-Host "$f : $($sig.Status) $($sig.SignerCertificate.Subject)"
-            if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "Wantastic LLC") {
-              throw "$f is not validly signed by Wantastic LLC"
-            }
-          }
-          Remove-Item dist/*.zip
-          Compress-Archive -Path sign/wantasticd.exe, sign/README.md -DestinationPath "dist/wantasticd-windows-${{ matrix.goarch }}.zip"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-windows-${{ matrix.goarch }}
-          path: dist/
-          if-no-files-found: error
-          overwrite: true
-      # Identical across the matrix; one copy is enough.
-      - uses: actions/upload-artifact@v4
-        if: matrix.goarch == 'amd64'
-        with:
-          name: signed-installer
-          path: sign-installer/install.ps1
-          if-no-files-found: error
+  # Windows lives in its own workflow: native tests, build, signing and a
+  # real install/upgrade/uninstall of install.ps1.
+  windows:
+    needs: create-release
+    uses: ./.github/workflows/windows.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
 
   # Publish only after every platform built, so the "latest" marker never
   # points agents at a release whose archive for their platform is missing.
   publish:
-    needs: [build, build-darwin, build-darwin-intel, sign-windows]
-    # Signing skipped (not enabled) is fine; signing failed is not: unsigned
-    # Windows builds must not ship once signing is on.
+    needs: [build, build-darwin, build-darwin-intel, windows]
+    # The Windows workflow fails when signing is on but did not succeed, so
+    # unsigned Windows builds never ship once signing is enabled.
     if: >-
-      always() && needs.build.result == 'success' &&
-      (needs.sign-windows.result == 'success' || needs.sign-windows.result == 'skipped') &&
+      always() && needs.build.result == 'success' && needs.windows.result == 'success' &&
       (needs.build-darwin.result == 'success' || needs.build-darwin-intel.result == 'success')
     runs-on: ubuntu-latest
     steps:
@@ -336,7 +235,7 @@ jobs:
           destination-dir: latest
 
       - name: Signed installer
-        if: needs.sign-windows.result == 'success'
+        if: needs.windows.outputs.signed == 'true'
         uses: actions/download-artifact@v4
         with:
           name: signed-installer

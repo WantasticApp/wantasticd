@@ -1,0 +1,280 @@
+name: Windows
+
+# Everything Windows: native tests, builds, Authenticode signing and a real
+# install/upgrade/uninstall of install.ps1 under Windows PowerShell 5.1 and
+# PowerShell 7. Release calls it with the tag; pushes and pull requests that
+# touch Windows code run it on their own (nothing is published then).
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (empty for a test build)
+        type: string
+        default: ''
+    outputs:
+      signed:
+        description: '"true" when the executables and install.ps1 were signed'
+        value: ${{ jobs.sign.outputs.signed }}
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - install.ps1
+      - install.ps
+      - winres/**
+      - cmd/**
+      - pkg/**
+      - internal/**
+      - go.mod
+      - go.sum
+      - .github/workflows/windows.yml
+  push:
+    branches: [main]
+    paths:
+      - install.ps1
+      - install.ps
+      - winres/**
+      - cmd/**
+      - pkg/**
+      - internal/**
+      - go.mod
+      - go.sum
+      - .github/workflows/windows.yml
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25.12'
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Vet and test (tray build)
+        env:
+          CGO_ENABLED: 0
+        run: |
+          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... ./internal/auth/...
+          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... ./internal/auth/...
+      - name: Parse install.ps1 (PowerShell 5.1 and 7)
+        run: |
+          if ((Get-FileHash install.ps1).Hash -ne (Get-FileHash install.ps).Hash) { throw "install.ps must be a copy of install.ps1" }
+          if ([IO.File]::ReadAllBytes("install.ps1") | Where-Object { $_ -gt 127 }) { throw "install.ps1 must be ASCII-only" }
+          $check = '$e = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$e) | Out-Null; if ($e) { $e | ForEach-Object { Write-Error $_.ToString() }; exit 1 }'
+          powershell -NoProfile -Command $check; if ($LASTEXITCODE) { exit 1 }
+          pwsh -NoProfile -Command $check; if ($LASTEXITCODE) { exit 1 }
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64, 386]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Version info (Wantastic LLC) and a manifest: unlabelled executables
+      # score worse with antivirus heuristics and SmartScreen.
+      - name: Windows resources
+        run: |
+          FILEVER=$(echo "${{ inputs.tag }}" | sed -E 's/^v//; s/[^0-9.].*$//')
+          case "$FILEVER" in *.*.*) ;; *) FILEVER="0.0.0" ;; esac
+          FILEVER="${FILEVER}.0"
+          go run github.com/tc-hib/go-winres@v0.3.3 make --in winres/winres.json \
+            --out cmd/wantasticd/rsrc --arch ${{ matrix.goarch }} \
+            --file-version "$FILEVER" --product-version "$FILEVER"
+          ls -l cmd/wantasticd/rsrc_windows_${{ matrix.goarch }}.syso
+
+      # Console subsystem: commands must print in PowerShell/cmd and be
+      # waited for; the tray hides the console it gets at logon. The Windows
+      # tray is pure Go, so no cgo. No UPX: packed executables are a common
+      # antivirus false positive.
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          TAG="${{ inputs.tag }}"
+          TAG="${TAG:-v0.0.0-dev}"
+          LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${TAG}+${SHA} -X wantastic-agent/pkg/version.Commit=${SHA} -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          go build -v -trimpath -ldflags="$LDFLAGS" -o wantasticd.exe ./cmd/wantasticd
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          zip "dist/wantasticd-windows-${{ matrix.goarch }}.zip" wantasticd.exe README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+
+  # Authenticode-signs the executables and install.ps1 as Wantastic LLC
+  # (Azure Artifact Signing), for releases only. Enabled by the repository
+  # variable WINDOWS_SIGNING=azure; see README "Windows code signing".
+  sign:
+    needs: build
+    if: inputs.tag != '' && vars.WINDOWS_SIGNING == 'azure'
+    runs-on: windows-latest
+    outputs:
+      signed: ${{ steps.done.outputs.signed }}
+    strategy:
+      fail-fast: true
+      matrix:
+        goarch: [amd64, arm64, 386]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.goarch }}
+          path: dist
+      - name: Unpack
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "dist/wantasticd-windows-${{ matrix.goarch }}.zip" -DestinationPath sign -Force
+          New-Item -ItemType Directory -Force -Path sign-installer | Out-Null
+          Copy-Item install.ps1 sign-installer/install.ps1
+      - name: Sign
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\sign\wantasticd.exe
+            ${{ github.workspace }}\sign-installer\install.ps1
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Wantastic
+          description-url: https://wantastic.app
+      - name: Verify and repack
+        shell: pwsh
+        run: |
+          foreach ($f in "sign/wantasticd.exe", "sign-installer/install.ps1") {
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host "$f : $($sig.Status) $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "Wantastic LLC") {
+              throw "$f is not validly signed by Wantastic LLC"
+            }
+          }
+          Remove-Item dist/*.zip
+          Compress-Archive -Path sign/wantasticd.exe, sign/README.md -DestinationPath "dist/wantasticd-windows-${{ matrix.goarch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+      # Identical across the matrix; one copy is enough.
+      - uses: actions/upload-artifact@v4
+        if: matrix.goarch == 'amd64'
+        with:
+          name: signed-installer
+          path: sign-installer/install.ps1
+          if-no-files-found: error
+      - id: done
+        shell: bash
+        run: echo "signed=true" >> "$GITHUB_OUTPUT"
+
+  # Runs install.ps1 for real against the archive just built (signed when
+  # signing is on): fresh install, upgrade in place, uninstall, in both
+  # Windows PowerShell 5.1 (what most users have) and PowerShell 7.
+  installer:
+    needs: [build, sign]
+    if: always() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    env:
+      WANTASTIC_INSTALL_STRICT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows-amd64
+          path: dist
+      - name: Signed installer
+        if: needs.sign.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-installer
+          path: signed-installer
+      - name: Pick installer
+        shell: pwsh
+        run: |
+          $src = if (Test-Path signed-installer/install.ps1) { "signed-installer/install.ps1" } else { "install.ps1" }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\wi" | Out-Null
+          Copy-Item $src "$env:RUNNER_TEMP\wi\install.ps1"
+          Copy-Item "dist/wantasticd-windows-amd64.zip" "$env:RUNNER_TEMP\wi\wantasticd.zip"
+
+      - name: Fresh install
+        shell: ${{ matrix.shell }}
+        run: |
+          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
+          if ($LASTEXITCODE) { exit 1 }
+
+      - name: Check install
+        shell: ${{ matrix.shell }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
+          $want = "`"$exe`" connect --config `"$env:ProgramData\Wantastic\config.conf`" --tray=false"
+          $svc = Get-CimInstance Win32_Service -Filter "Name='wantasticd'"
+          if (-not $svc) { throw "service missing" }
+          Write-Host "PathName: $($svc.PathName)  StartMode: $($svc.StartMode)"
+          if ($svc.PathName -ne $want) { throw "service path is wrong" }
+          if ($svc.StartMode -ne "Auto") { throw "service is not automatic" }
+          if ((& sc.exe qfailure wantasticd | Out-String) -notmatch "RESTART") { throw "no recovery actions" }
+          if (-not (Get-NetFirewallRule -Name Wantastic-wantasticd -ErrorAction SilentlyContinue)) { throw "firewall rule missing" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if (($path -split ';') -notcontains "$env:ProgramFiles\Wantastic") { throw "not on PATH" }
+          $v = & $exe version | Out-String
+          Write-Host $v
+          if ($v -notmatch "wantasticd version") { throw "version printed nothing" }
+
+      - name: Upgrade in place
+        shell: ${{ matrix.shell }}
+        run: |
+          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin
+          if ($LASTEXITCODE) { exit 1 }
+          if (-not (Test-Path "$env:ProgramFiles\Wantastic\wantasticd.exe.previous")) { throw "no rollback copy" }
+          if (-not (Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run).Wantastic) { throw "tray not registered" }
+          if ((Get-CimInstance Win32_Service -Filter "Name='wantasticd'").StartMode -ne "Auto") { throw "service changed" }
+
+      - name: Uninstall
+        shell: ${{ matrix.shell }}
+        run: |
+          & "$env:RUNNER_TEMP\wi\install.ps1" -Uninstall -Purge
+          if ($LASTEXITCODE) { exit 1 }
+          Start-Sleep -Seconds 2
+          if (Get-Service wantasticd -ErrorAction SilentlyContinue) { throw "service still there" }
+          if (Test-Path "$env:ProgramFiles\Wantastic") { throw "install dir still there" }
+          if (Get-NetFirewallRule -Name Wantastic-wantasticd -ErrorAction SilentlyContinue) { throw "firewall rule still there" }
+          if ((Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run).Wantastic) { throw "tray still registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if (($path -split ';') -contains "$env:ProgramFiles\Wantastic") { throw "still on PATH" }
+
+      - name: Reinstall after uninstall
+        shell: ${{ matrix.shell }}
+        run: |
+          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
+          if ($LASTEXITCODE) { exit 1 }
+          & "$env:RUNNER_TEMP\wi\install.ps1" -Uninstall -Purge
+          if ($LASTEXITCODE) { exit 1 }

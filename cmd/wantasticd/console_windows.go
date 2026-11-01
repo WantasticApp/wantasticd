@@ -33,3 +33,15 @@ func releaseOwnConsole() {
 	}
 	procFreeConsole.Call()
 }
+
+// enableVirtualTerminal turns on ANSI escape handling in the console so
+// colours and the login QR code render in the classic console host too
+// (Windows Terminal already has it on).
+func enableVirtualTerminal() {
+	for _, h := range []windows.Handle{windows.Stdout, windows.Stderr} {
+		var mode uint32
+		if windows.GetConsoleMode(h, &mode) == nil {
+			windows.SetConsoleMode(h, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+		}
+	}
+}

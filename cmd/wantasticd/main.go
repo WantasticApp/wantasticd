@@ -32,6 +32,7 @@ import (
 )
 
 func main() {
+	enableVirtualTerminal()
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)

@@ -7,7 +7,7 @@ import (
 
 func TestBuildUpdateURLUsesImmutableReleaseTag(t *testing.T) {
 	got := BuildUpdateURL("v1.0.5+a065504", "linux-arm64")
-	want := "https://get.wantastic.app/v1.0.5/wantasticd-linux-arm64.tar.gz"
+	want := "https://get.wantastic.app/v1.0.5/wantasticd-linux-arm64.tar.gz?v=v1.0.5%2Ba065504"
 	if got != want {
 		t.Fatalf("BuildUpdateURL() = %q, want %q", got, want)
 	}
@@ -69,10 +69,10 @@ func TestSelfUpdateVerifiesAndRollsBackFailedService(t *testing.T) {
 }
 
 func TestReleaseURLUsesZipOnWindows(t *testing.T) {
-	if got, want := BuildUpdateURL("v1.2.3+abc", "windows-amd64"), "https://get.wantastic.app/v1.2.3/wantasticd-windows-amd64.zip"; got != want {
+	if got, want := BuildUpdateURL("v1.2.3+abc", "windows-amd64"), "https://get.wantastic.app/v1.2.3/wantasticd-windows-amd64.zip?v=v1.2.3%2Babc"; got != want {
 		t.Fatalf("BuildUpdateURL() = %q, want %q", got, want)
 	}
-	if got, want := BuildUpdateURL("v1.2.3", "darwin-arm64"), "https://get.wantastic.app/v1.2.3/wantasticd-darwin-arm64.tar.gz"; got != want {
+	if got, want := BuildUpdateURL("v1.2.3", "darwin-arm64"), "https://get.wantastic.app/v1.2.3/wantasticd-darwin-arm64.tar.gz?v=v1.2.3"; got != want {
 		t.Fatalf("BuildUpdateURL() = %q, want %q", got, want)
 	}
 }

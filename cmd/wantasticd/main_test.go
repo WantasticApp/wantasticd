@@ -168,3 +168,28 @@ func TestSuggestCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestClaimHostname(t *testing.T) {
+	for in, want := range map[string]string{
+		"Karims-Mac-mini.local": "Karims-Mac-mini",
+		"office-gw.lan":         "office-gw",
+		"DESKTOP-7Q2":           "DESKTOP-7Q2",
+		"OpenWrt":               "",
+		"localhost":             "",
+		"  ":                    "",
+	} {
+		if got := claimHostname(func() (string, error) { return in, nil }); got != want {
+			t.Errorf("claimHostname(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestBuildClaimURLCarriesHostname(t *testing.T) {
+	prev := osHostname
+	osHostname = func() (string, error) { return "office gw.local", nil }
+	defer func() { osHostname = prev }()
+	got := buildClaimURL("https://console.wantastic.app", "key=")
+	if !strings.HasSuffix(got, "&hostname=office+gw") {
+		t.Fatalf("claim URL = %q, want a hostname parameter", got)
+	}
+}

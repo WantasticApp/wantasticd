@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,9 +154,12 @@ func (m *Manager) downloadOnce(ctx context.Context, url, dest string) error {
 	return nil
 }
 
+// releaseURL is the tag's archive. The ?v= query carries the full version
+// (with commit) so a CDN copy cached before a tag was rebuilt is never used.
 func (m *Manager) releaseURL(version, platform string) string {
-	releaseTag, _, _ := strings.Cut(strings.TrimSpace(version), "+")
-	return fmt.Sprintf("%s/%s/wantasticd-%s%s", m.baseURL, releaseTag, platform, archiveExt(platform))
+	version = strings.TrimSpace(version)
+	releaseTag, _, _ := strings.Cut(version, "+")
+	return fmt.Sprintf("%s/%s/wantasticd-%s%s?v=%s", m.baseURL, releaseTag, platform, archiveExt(platform), url.QueryEscape(version))
 }
 
 // archiveExt is the release archive type: Windows ships .zip, the rest .tar.gz.

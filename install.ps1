@@ -227,9 +227,11 @@ function Install-Tray([bool]$Skip) {
     }
 }
 
+# The config is JSON ("private_key"); older releases wrote "PrivateKey = ...".
 function Test-LoggedIn {
     (Test-Path $Wantastic.ConfigFile) -and
-        (Select-String -Path $Wantastic.ConfigFile -Pattern '^\s*PrivateKey\s*=\s*[A-Za-z0-9+/]{43}=' -Quiet)
+        (Select-String -Path $Wantastic.ConfigFile -Quiet `
+            -Pattern '"private_key"\s*:\s*"[A-Za-z0-9+/]{43}="', '^\s*PrivateKey\s*=\s*[A-Za-z0-9+/]{43}=')
 }
 
 function Install-Wantasticd {
@@ -244,6 +246,7 @@ function Install-Wantasticd {
 
     $TempDir = Join-Path ([IO.Path]::GetTempPath()) "wantasticd_install_$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+    $expected = $null
     try {
         # -- download ----------------------------------------------------------
         if ($ZipPath) {
@@ -257,7 +260,10 @@ function Install-Wantasticd {
             $tag = ($Version -split '\+')[0]
             if ($tag -notmatch '^v?[0-9][A-Za-z0-9._-]*$') { throw "Invalid release version: $Version" }
             if ($tag -notmatch '^v') { $tag = "v$tag" }
-            $url = "$($Wantastic.BaseUrl)/$tag/wantasticd-windows-$arch.zip"
+            # ?v= carries the full version (with commit) so a CDN copy cached
+            # before a tag was rebuilt is never used.
+            $url = "$($Wantastic.BaseUrl)/$tag/wantasticd-windows-$arch.zip?v=$([uri]::EscapeDataString($Version))"
+            $expected = $Version
             Write-Info "Version $Version"
             Write-Info $url
             $ZipPath = Join-Path $TempDir "wantasticd.zip"
@@ -278,6 +284,9 @@ function Install-Wantasticd {
             throw "The downloaded wantasticd.exe does not run on this computer (windows/$arch): $reported"
         }
         $Version = $Matches[1]
+        if ($expected -and $expected.Contains("+") -and $Version -ne $expected) {
+            throw "The download server returned wantasticd $Version instead of $expected (an outdated cached copy). Wait a few minutes and run the installer again."
+        }
 
         # -- install binary ----------------------------------------------------
         Write-Step "Installing wantasticd $Version"

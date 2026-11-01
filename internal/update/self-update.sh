@@ -271,7 +271,8 @@ main() {
       exit 1
       ;;
   esac
-  DOWNLOAD_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz"
+  # ?v= (full version, + escaped) skips CDN copies cached before a rebuild.
+  DOWNLOAD_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz?v=$(printf '%s' "$VERSION" | sed 's/+/%2B/g')"
 
   TMP_DIR=$(mktemp -d)
   # WANTASTIC_UPDATE_WORKDIR is the agent's download directory (holding this

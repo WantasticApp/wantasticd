@@ -287,7 +287,8 @@ case "$RELEASE_TAG" in
     exit 1
     ;;
 esac
-ARCHIVE_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz"
+# ?v= (full version, + escaped) skips CDN copies cached before a rebuild.
+ARCHIVE_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz?v=$(printf '%s' "$VERSION" | sed 's/+/%2B/g')"
 echo "Downloading $ARCHIVE_URL…"
 http_get "$ARCHIVE_URL" "$TMP_DIR/pkg.tar.gz"
 tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"

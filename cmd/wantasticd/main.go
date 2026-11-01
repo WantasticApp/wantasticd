@@ -305,7 +305,40 @@ func generateWireGuardKeyPair() (string, string, error) {
 
 func buildClaimURL(portalBaseURL, publicKey string) string {
 	base := normalizeClaimServerURL(portalBaseURL)
-	return base + "/#desktop?claim_public_key=" + url.QueryEscape(strings.TrimSpace(publicKey)) + "&wantastic_server=" + url.QueryEscape(base)
+	claimURL := base + "/#desktop?claim_public_key=" + url.QueryEscape(strings.TrimSpace(publicKey)) + "&wantastic_server=" + url.QueryEscape(base)
+	if host := claimHostname(osHostname); host != "" {
+		claimURL += "&hostname=" + url.QueryEscape(host)
+	}
+	return claimURL
+}
+
+// osHostname is os.Hostname, replaceable in tests.
+var osHostname = os.Hostname
+
+// claimHostname is the device hostname for the claim link, where it only
+// pre-fills the device name in the console's claim form. Network suffixes
+// and stock defaults that say nothing about the device are dropped.
+func claimHostname(hostname func() (string, error)) string {
+	host, err := hostname()
+	if err != nil {
+		return ""
+	}
+	host = strings.TrimSpace(host)
+	lower := strings.ToLower(host)
+	for _, suffix := range []string{".local", ".lan", ".home", ".localdomain"} {
+		if strings.HasSuffix(lower, suffix) {
+			host = host[:len(host)-len(suffix)]
+			break
+		}
+	}
+	switch strings.ToLower(host) {
+	case "", "localhost", "openwrt":
+		return ""
+	}
+	if len(host) > 64 {
+		host = strings.ToValidUTF8(host[:64], "")
+	}
+	return host
 }
 
 func resolveClaimServerURL(serverURL, server, portalURL string) string {

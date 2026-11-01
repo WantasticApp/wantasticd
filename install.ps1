@@ -1,6 +1,6 @@
 # Wantastic Agent - Windows Install Script
-# Installs wantasticd as a Windows Service. The notification-area (tray) app
-# starts for every user at logon; pass -NoTray to skip it.
+# Installs wantasticd as a Windows Service, opens Windows Firewall for it, and
+# starts the notification-area (tray) app for every user at logon.
 #
 # Run in PowerShell opened with "Run as administrator", from any folder:
 #   irm https://get.wantastic.app/install.ps1 | iex
@@ -8,9 +8,12 @@
 #   & ([scriptblock]::Create((irm https://get.wantastic.app/install.ps1))) -Token <TOKEN>
 #
 # Options:
-#   -Token <TOKEN>     log in with a token instead of the browser step
+#   (default)          claim: shows a QR code; the device connects once you
+#                      approve it in the console. Nothing waits here.
+#   -Token <TOKEN>     log in with a token instead
+#   -Login             sign in through the browser (device code) instead
+#   -NoLogin           install only; add the device later
 #   -NoTray            do not start the tray app at logon
-#   -NoLogin           install without logging in (log in later)
 #   -Version <vX.Y.Z>  install that release instead of the latest
 #   -ZipPath <file>    install from a downloaded wantasticd-windows-*.zip
 #   -Uninstall         remove wantasticd (keeps the login; add -Purge to drop it)
@@ -26,6 +29,7 @@ param(
     [string]$Token = $env:WANTASTIC_TOKEN,
     [switch]$NoTray,
     [switch]$NoLogin,
+    [switch]$Login,
     [string]$Version,
     [string]$ZipPath,
     [switch]$Uninstall,
@@ -179,6 +183,22 @@ function Set-MachinePath([switch]$Remove) {
     if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
 }
 
+# Runs a native program and returns its exit code and combined output.
+# Windows PowerShell 5.1 turns redirected stderr into errors, which
+# $ErrorActionPreference = "Stop" would make fatal.
+function Invoke-Exe([string]$Exe, [string[]]$Arguments) {
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $old
+    }
+    return [pscustomobject]@{ Code = $code; Output = (@($out) -join "`n") }
+}
+
+# Fallback for releases before 1.0.59; newer ones add their own rules.
 function Set-FirewallRule {
     # Direct peer-to-peer paths need inbound UDP to the service; without a rule
     # Windows Firewall drops it silently and every peer stays on relay.
@@ -213,7 +233,7 @@ function Test-LoggedIn {
 }
 
 function Install-Wantasticd {
-    param([string]$Token, [bool]$NoTray, [bool]$NoLogin, [string]$Version, [string]$ZipPath)
+    param([string]$Token, [bool]$NoTray, [bool]$NoLogin, [bool]$Login, [string]$Version, [string]$ZipPath)
 
     $os = [Environment]::OSVersion.Version
     if ($os.Major -lt 10) {
@@ -286,78 +306,116 @@ function Install-Wantasticd {
     }
 
     Set-MachinePath
-    Set-FirewallRule
+    $exe = $Wantastic.InstallPath
+    # Releases from 1.0.59 register the service and firewall rules themselves
+    # through the Service Control Manager API; older ones (-Version) cannot.
+    $native = (Invoke-Exe $exe @("service")).Output -notmatch 'Unknown command'
 
-    # -- login -----------------------------------------------------------------
-    $loggedIn = $false
+    # -- sign-in ---------------------------------------------------------------
+    # Default: claim. The service waits for this device's claim key to be
+    # claimed in the console and connects on its own, so nothing here blocks.
+    Write-Step "Sign-in"
+    $mode = "none"
+    $claimUrl = $null
     if (-not $Token -and (Test-LoggedIn)) {
-        Write-Step "Login"
         Write-Ok "Keeping the existing login (run 'wantasticd login' to switch accounts)."
-        $loggedIn = $true
-    } elseif ($NoLogin -and -not $Token) {
-        Write-Step "Login"
-        Write-Info "Skipped (-NoLogin)."
-    } else {
-        Write-Step "Login"
+        $mode = "loggedin"
+    } elseif ($Token -or $Login) {
         # --no-connect: save the configuration and exit; the service connects.
         $loginArgs = @("login", "--no-connect")
         if ($Token) { $loginArgs += @("--token", $Token) }
         # Start-Process -Wait shares this console and waits, also for older
         # GUI-subsystem builds that `&` would not wait for.
-        $login = Start-Process -FilePath $Wantastic.InstallPath -ArgumentList $loginArgs -NoNewWindow -Wait -PassThru
+        $login = Start-Process -FilePath $exe -ArgumentList $loginArgs -NoNewWindow -Wait -PassThru
         if ($login.ExitCode -eq 0 -and (Test-LoggedIn)) {
-            $loggedIn = $true
+            $mode = "loggedin"
         } else {
             Write-Warning "Login did not complete (exit $($login.ExitCode))."
         }
+    } elseif ($NoLogin) {
+        Write-Info "Skipped (-NoLogin)."
+    } else {
+        $gen = Invoke-Exe $exe @("genkey", "--no-wait")
+        Write-Host $gen.Output
+        if ($gen.Code -ne 0) { throw "Could not create the device claim key (exit $($gen.Code))." }
+        if ($gen.Output -match '(?m)^Claim URL: (\S+)') { $claimUrl = $Matches[1] }
+        $mode = "claim"
     }
+    $start = $mode -ne "none"
 
     # -- service ---------------------------------------------------------------
     Write-Step "Windows Service"
-    # The service runs in session 0 with no desktop; the tray is a per-user app.
-    $binPath = "`"$($Wantastic.InstallPath)`" connect --config `"$($Wantastic.ConfigFile)`" --tray=false"
-    Register-WantasticService $binPath
-
-    if ($loggedIn) {
-        Write-Info "Starting..."
-        Start-Service -Name $Wantastic.ServiceName
-        $svc = Get-Service -Name $Wantastic.ServiceName
-        try {
-            $svc.WaitForStatus("Running", [TimeSpan]::FromSeconds(20))
-        } catch {
-            throw "The service did not reach the Running state within 20 seconds. Check Event Viewer > Windows Logs > Application."
+    if ($native) {
+        $svcArgs = @("service", "install", "--config", $Wantastic.ConfigFile)
+        if (-not $start) { $svcArgs += "--no-start" }
+        $r = Invoke-Exe $exe $svcArgs
+        $r.Output -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Info $_ }
+        if ($r.Code -ne 0) { throw "Service setup failed (exit $($r.Code)). Check Event Viewer > Windows Logs > Application." }
+    } else {
+        # The service runs in session 0 with no desktop; the tray is a per-user app.
+        $binPath = "`"$exe`" connect --config `"$($Wantastic.ConfigFile)`" --tray=false"
+        Register-WantasticService $binPath
+        Set-FirewallRule
+        if ($start) {
+            Start-Service -Name $Wantastic.ServiceName
+            try {
+                (Get-Service -Name $Wantastic.ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+            } catch {
+                throw "The service did not reach the Running state within 30 seconds. Check Event Viewer > Windows Logs > Application."
+            }
+            Write-Ok "Service running."
         }
-        Write-Ok "Service running; it starts automatically with Windows."
     }
 
     Write-Step "Tray"
     Install-Tray $NoTray
 
-    if ($loggedIn) {
-        Write-Host "`nwantasticd $Version is installed and running." -ForegroundColor Green
-    } else {
-        Write-Host "`nwantasticd $Version is installed but not connected: this device is not logged in yet." -ForegroundColor Yellow
-        Write-Host "Log in and start it (PowerShell as administrator):"
-        Write-Host "  wantasticd login --no-connect"
-        Write-Host "  Start-Service $($Wantastic.ServiceName)"
+    switch ($mode) {
+        "loggedin" {
+            Write-Host "`nwantasticd $Version is installed and connecting; it starts with Windows." -ForegroundColor Green
+        }
+        "claim" {
+            Write-Host "`nwantasticd $Version is installed and waiting to be added to your account." -ForegroundColor Green
+            Write-Host "Scan the QR code above, or open this link, and approve the device:"
+            if ($claimUrl) { Write-Host "  $claimUrl" -ForegroundColor Cyan }
+            Write-Host "It connects by itself as soon as it is claimed (the tray icon turns green)."
+            Write-Host "Prefer signing in here instead? Run: wantasticd login --no-connect; wantasticd service restart"
+        }
+        default {
+            Write-Host "`nwantasticd $Version is installed but not connected yet." -ForegroundColor Yellow
+            Write-Host "Add this device, then start the service (PowerShell as administrator):"
+            Write-Host "  wantasticd genkey --no-wait     (claim with the QR code)   or   wantasticd login --no-connect"
+            Write-Host "  wantasticd service start"
+        }
     }
     Write-Host "`nUseful commands:"
-    Write-Host "  wantasticd status        connection and peers"
-    Write-Host "  wantasticd down / up     disconnect / reconnect"
-    Write-Host "  wantasticd update        install the newest release"
-    Write-Host "  Restart-Service $($Wantastic.ServiceName)"
+    Write-Host "  wantasticd status            connection and peers"
+    Write-Host "  wantasticd down / up         disconnect / reconnect"
+    Write-Host "  wantasticd service status    Windows service state"
+    Write-Host "  wantasticd update            install the newest release"
 }
 
 function Uninstall-Wantasticd([bool]$Purge) {
     Write-Step "Removing wantasticd"
+    $exe = $Wantastic.InstallPath
+    $removed = $false
+    if (Test-Path $exe) {
+        $r = Invoke-Exe $exe @("service", "uninstall")
+        if ($r.Code -eq 0) {
+            $r.Output -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Info $_ }
+            $removed = $true
+        }
+    }
     Stop-Wantasticd
-    if (Get-Service -Name $Wantastic.ServiceName -ErrorAction SilentlyContinue) {
+    if (-not $removed -and (Get-Service -Name $Wantastic.ServiceName -ErrorAction SilentlyContinue)) {
         $out = & sc.exe delete $Wantastic.ServiceName | Out-String
         if ($LASTEXITCODE -ne 0) { throw "Could not remove the Windows service: $($out.Trim())" }
         Write-Ok "Service removed."
     }
-    Remove-ItemProperty -Path $Wantastic.RunKey -Name $Wantastic.TrayValue -ErrorAction SilentlyContinue
+    # Rules from any installer version: netsh ones carry only a display name.
     Get-NetFirewallRule -Name $Wantastic.FirewallRule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    Get-NetFirewallRule -DisplayName "Wantastic*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    Remove-ItemProperty -Path $Wantastic.RunKey -Name $Wantastic.TrayValue -ErrorAction SilentlyContinue
     Set-MachinePath -Remove
     for ($attempt = 1; Test-Path $Wantastic.InstallDir; $attempt++) {
         try {
@@ -371,7 +429,7 @@ function Uninstall-Wantasticd([bool]$Purge) {
     }
     if ($Purge) {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Wantastic.ConfigDir
-        Write-Ok "Removed the login and settings ($($Wantastic.ConfigDir))."
+        Write-Ok "Removed the login, claim key and settings ($($Wantastic.ConfigDir))."
     } elseif (Test-Path $Wantastic.ConfigDir) {
         Write-Info "Kept the login in $($Wantastic.ConfigDir) (add -Purge to remove it)."
     }
@@ -402,7 +460,7 @@ function Invoke-WantasticInstaller {
     if ($Uninstall) {
         Uninstall-Wantasticd $Purge
     } else {
-        Install-Wantasticd -Token $Token -NoTray $NoTray -NoLogin $NoLogin -Version $Version -ZipPath $ZipPath
+        Install-Wantasticd -Token $Token -NoTray $NoTray -NoLogin $NoLogin -Login $Login -Version $Version -ZipPath $ZipPath
     }
     return $true
 }

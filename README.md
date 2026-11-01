@@ -94,16 +94,34 @@ is read-only even for Administrators). With a login token:
 & ([scriptblock]::Create((irm https://get.wantastic.app/install.ps1))) -Token <TOKEN>
 ```
 
+By default the installer shows a **claim QR code** and link. Approve the device
+in the console and it connects by itself; the service is already running and
+waiting, so the installer never blocks on sign-in. It also opens Windows
+Firewall: inbound UDP for direct peer connections, plus traffic from peers over
+the tunnel, so they can ping and reach this PC. The agent re-applies both
+firewall rules whenever it connects.
+
 Options go after the scriptblock, as with `-Token` above:
 
 | Option | Effect |
 | --- | --- |
-| `-Token <TOKEN>` | log in with a token instead of the browser step |
-| `-NoLogin` | install now, log in later (`wantasticd login --no-connect`, then `Start-Service wantasticd`) |
+| *(none)* | claim with the QR code; connects once approved |
+| `-Token <TOKEN>` | log in with a token instead |
+| `-Login` | sign in through the browser (device code) instead |
+| `-NoLogin` | install only; add the device later (`wantasticd genkey --no-wait`, then `wantasticd service start`) |
 | `-NoTray` | do not start the tray app at logon |
-| `-Version v1.0.58` | install that release instead of the latest |
+| `-Version v1.0.59` | install that release instead of the latest |
 | `-ZipPath <file>` | install from a downloaded `wantasticd-windows-*.zip` (offline) |
-| `-Uninstall` | remove the service, tray, firewall rule, PATH entry and program files; add `-Purge` to also remove the login |
+| `-Uninstall` | remove the service, tray, firewall rules, PATH entry and program files; add `-Purge` to also remove the login and claim key |
+
+The service is managed by `wantasticd` itself (Administrator):
+
+```powershell
+wantasticd service install     # register or repair: automatic start, restart on failure, firewall
+wantasticd service status      # state, startup type, command line
+wantasticd service start | stop | restart
+wantasticd service uninstall   # remove the service and its firewall rules
+```
 
 Requires Windows 10, Windows 11 or Windows Server 2016+ (x64, ARM64 or x86).
 Windows 7, 8 and 8.1 are not supported: the Go runtime does not run there.

@@ -60,7 +60,7 @@ jobs:
           CGO_ENABLED: 0
         # Failures are repeated as annotations so they show on the run page.
         run: |
-          $pkgs = "./cmd/...", "./pkg/...", "./internal/update/...", "./internal/agent/...", "./internal/auth/..."
+          $pkgs = "./cmd/...", "./pkg/...", "./internal/update/...", "./internal/agent/...", "./internal/auth/...", "./internal/platform/firewall/..."
           go vet @pkgs 2>&1 | Tee-Object -FilePath vet.log
           $vet = $LASTEXITCODE
           # TODO: the USP/WUSP runtime tests time out on Windows runners (data
@@ -236,54 +236,58 @@ jobs:
           Copy-Item $src "$env:RUNNER_TEMP\wi\install.ps1"
           Copy-Item "dist/wantasticd-windows-amd64.zip" "$env:RUNNER_TEMP\wi\wantasticd.zip"
 
-      - name: Fresh install
+      # Default install: claim mode. With no login the service waits for the
+      # device's claim, so it must start for real and stay Running.
+      - name: Fresh install (claim)
         run: |
-          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
+          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoTray
           if ($LASTEXITCODE) { exit 1 }
 
       - name: Check install
         run: |
           $ErrorActionPreference = "Stop"
           $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
-          $want = "`"$exe`" connect --config `"$env:ProgramData\Wantastic\config.conf`" --tray=false"
           $svc = Get-CimInstance Win32_Service -Filter "Name='wantasticd'"
           if (-not $svc) { throw "service missing" }
-          Write-Host "PathName: $($svc.PathName)  StartMode: $($svc.StartMode)"
-          if ($svc.PathName -ne $want) { throw "service path is wrong" }
+          Write-Host "PathName: $($svc.PathName)  StartMode: $($svc.StartMode)  State: $($svc.State)"
+          if (-not $svc.PathName.StartsWith("`"$exe`" connect --config ")) { throw "service path is wrong" }
+          if ($svc.PathName -notmatch 'config\.conf"? --tray=false$') { throw "service arguments are wrong" }
           if ($svc.StartMode -ne "Auto") { throw "service is not automatic" }
           if ((& sc.exe qfailure wantasticd | Out-String) -notmatch "RESTART") { throw "no recovery actions" }
-          if (-not (Get-NetFirewallRule -Name Wantastic-wantasticd -ErrorAction SilentlyContinue)) { throw "firewall rule missing" }
+          if (-not (Test-Path "$env:ProgramData\Wantastic\device-claim-key.json")) { throw "no claim key" }
+          $rule = Get-NetFirewallRule -DisplayName "Wantastic (wantasticd)" -ErrorAction SilentlyContinue
+          if (-not $rule) { throw "firewall rule missing" }
+          if (($rule | Get-NetFirewallApplicationFilter).Program -ne $exe) { throw "firewall rule has the wrong program" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if (($path -split ';') -notcontains "$env:ProgramFiles\Wantastic") { throw "not on PATH" }
           $v = & $exe version | Out-String
           Write-Host $v
           if ($v -notmatch "wantasticd version") { throw "version printed nothing" }
 
-      # A claim key without a login makes the service wait for its claim, so
-      # it starts for real: the Service Control Manager must see it Running
-      # and be able to stop it.
-      - name: Service starts and stops
+      - name: Service stays up and is controllable
         run: |
           $ErrorActionPreference = "Stop"
           $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
-          & $exe genkey --no-wait | Out-Host
-          if ($LASTEXITCODE) { throw "genkey failed" }
-          Start-Service wantasticd
-          $svc = Get-Service wantasticd
-          $svc.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
           Start-Sleep -Seconds 10
-          $svc.Refresh()
-          if ($svc.Status -ne "Running") { throw "service stopped on its own: $($svc.Status)" }
-          Stop-Service wantasticd
-          $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+          if ((Get-Service wantasticd).Status -ne "Running") { throw "service stopped on its own" }
+          $st = & $exe service status | Out-String
+          Write-Host $st
+          if ($st -notmatch "State:\s+running") { throw "service status wrong" }
+          & $exe service stop;    if ($LASTEXITCODE) { throw "service stop failed" }
+          if ((Get-Service wantasticd).Status -ne "Stopped") { throw "not stopped" }
+          & $exe service start;   if ($LASTEXITCODE) { throw "service start failed" }
+          & $exe service restart; if ($LASTEXITCODE) { throw "service restart failed" }
+          if ((Get-Service wantasticd).Status -ne "Running") { throw "not running after restart" }
 
       - name: Upgrade in place
         run: |
-          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin
+          & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip"
           if ($LASTEXITCODE) { exit 1 }
           if (-not (Test-Path "$env:ProgramFiles\Wantastic\wantasticd.exe.previous")) { throw "no rollback copy" }
           if (-not (Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run).Wantastic) { throw "tray not registered" }
-          if ((Get-CimInstance Win32_Service -Filter "Name='wantasticd'").StartMode -ne "Auto") { throw "service changed" }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='wantasticd'"
+          if ($svc.StartMode -ne "Auto" -or $svc.State -ne "Running") { throw "service not automatic and running after upgrade" }
+          if (@(Get-NetFirewallRule -DisplayName "Wantastic (wantasticd)").Count -ne 1) { throw "duplicate firewall rules" }
 
       - name: Uninstall
         run: |
@@ -292,14 +296,17 @@ jobs:
           Start-Sleep -Seconds 2
           if (Get-Service wantasticd -ErrorAction SilentlyContinue) { throw "service still there" }
           if (Test-Path "$env:ProgramFiles\Wantastic") { throw "install dir still there" }
-          if (Get-NetFirewallRule -Name Wantastic-wantasticd -ErrorAction SilentlyContinue) { throw "firewall rule still there" }
+          if (Test-Path "$env:ProgramData\Wantastic") { throw "data dir still there after -Purge" }
+          if (Get-NetFirewallRule -DisplayName "Wantastic*" -ErrorAction SilentlyContinue) { throw "firewall rule still there" }
           if ((Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run).Wantastic) { throw "tray still registered" }
+          if (Get-Process wantasticd -ErrorAction SilentlyContinue) { throw "wantasticd still running" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if (($path -split ';') -contains "$env:ProgramFiles\Wantastic") { throw "still on PATH" }
 
-      - name: Reinstall after uninstall
+      - name: Install without sign-in, then uninstall
         run: |
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
           if ($LASTEXITCODE) { exit 1 }
+          if ((Get-Service wantasticd).Status -ne "Stopped") { throw "service should not start without sign-in" }
           & "$env:RUNNER_TEMP\wi\install.ps1" -Uninstall -Purge
           if ($LASTEXITCODE) { exit 1 }

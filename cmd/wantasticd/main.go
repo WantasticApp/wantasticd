@@ -21,6 +21,7 @@ import (
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 	platformdns "wantastic-agent/internal/platform/dns"
+	"wantastic-agent/internal/platform/firewall"
 	"wantastic-agent/internal/update"
 
 	"wantastic-agent/internal/agent"
@@ -61,6 +62,8 @@ func main() {
 	case "tray":
 		releaseOwnConsole()
 		handleTray()
+	case "service":
+		os.Exit(runServiceCommand(os.Args[2:]))
 	case "update":
 		handleUpdate()
 	case "update-finish":
@@ -79,7 +82,7 @@ func main() {
 	}
 }
 
-var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "update", "version"}
+var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "service", "update", "version"}
 
 // suggestCommand returns the command within two typos of name, if any.
 func suggestCommand(name string) string {
@@ -782,6 +785,9 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  jumpto     Send all internet traffic through a peer: jumpto <peer-vpn-ip>")
 	fmt.Fprintln(os.Stderr, "  comeback   Stop using an exit node and restore normal routing")
 	fmt.Fprintln(os.Stderr, "  tray       Run the system tray client")
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "  service    Windows service: install | uninstall | start | stop | restart | status")
+	}
 	fmt.Fprintln(os.Stderr, "  update     Self-update to the latest version")
 	fmt.Fprintln(os.Stderr, "  version    Show version information")
 	fmt.Fprintln(os.Stderr, "\nEnvironment Variables:")
@@ -834,6 +840,19 @@ func interfaceExists(name string) bool {
 	return false
 }
 
+// openFirewall (re)applies the Windows Firewall rules on every start, so they
+// follow a changed overlay address and come back if someone removes them.
+func openFirewall(cfg *config.Config) {
+	if exe, err := os.Executable(); err == nil {
+		if err := firewall.AllowApp(exe); err != nil {
+			log.Printf("Warning: firewall rule for direct peer connections: %v", err)
+		}
+	}
+	if err := firewall.AllowOverlay(cfg.Interface.Addresses); err != nil {
+		log.Printf("Warning: firewall rule for traffic from peers: %v", err)
+	}
+}
+
 func startAgentWithRetry(ctx context.Context, cfg *config.Config) (*agent.Agent, error) {
 	maxRetries := 10
 	var lastErr error
@@ -859,6 +878,7 @@ func startAgentWithRetry(ctx context.Context, cfg *config.Config) (*agent.Agent,
 			return nil, err
 		}
 
+		go openFirewall(cfg)
 		return agt, nil
 	}
 

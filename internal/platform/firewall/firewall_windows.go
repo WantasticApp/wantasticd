@@ -12,11 +12,17 @@ import (
 	"strings"
 	"syscall"
 	"unicode/utf16"
+
+	"golang.org/x/sys/windows"
 )
 
 // AllowApp lets inbound UDP reach exePath on every network profile, so
 // peers can reach this device directly instead of through the relay.
 func AllowApp(exePath string) error {
+	// Firewall program filters reject 8.3 short paths (C:\PROGRA~1\...).
+	if long, err := longPath(exePath); err == nil {
+		exePath = long
+	}
 	return replaceRule(AppRuleID, AppRuleName, "Direct peer-to-peer connections for Wantastic",
 		"-Protocol UDP -Program "+psQuote(exePath))
 }
@@ -59,6 +65,19 @@ func removeScript(id, name string) string {
 
 func exists(id string) bool {
 	return powershell(fmt.Sprintf("if (-not (Get-NetFirewallRule -Name %s -ErrorAction SilentlyContinue)) { exit 3 }\n", psQuote(id))) == nil
+}
+
+func longPath(p string) (string, error) {
+	in, err := windows.UTF16PtrFromString(p)
+	if err != nil {
+		return "", err
+	}
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n, err := windows.GetLongPathName(in, &buf[0], uint32(len(buf)))
+	if err != nil || n == 0 || int(n) > len(buf) {
+		return "", fmt.Errorf("long path of %s: %v", p, err)
+	}
+	return windows.UTF16ToString(buf[:n]), nil
 }
 
 func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

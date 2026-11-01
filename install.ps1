@@ -401,10 +401,8 @@ function Uninstall-Wantasticd([bool]$Purge) {
     $removed = $false
     if (Test-Path $exe) {
         $r = Invoke-Exe $exe @("service", "uninstall")
-        if ($r.Code -eq 0) {
-            $r.Output -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Info $_ }
-            $removed = $true
-        }
+        $r.Output -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Info $_ }
+        $removed = $r.Code -eq 0
     }
     Stop-Wantasticd
     if (-not $removed -and (Get-Service -Name $Wantastic.ServiceName -ErrorAction SilentlyContinue)) {
@@ -428,7 +426,14 @@ function Uninstall-Wantasticd([bool]$Purge) {
         }
     }
     if ($Purge) {
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Wantastic.ConfigDir
+        for ($attempt = 1; Test-Path $Wantastic.ConfigDir; $attempt++) {
+            try {
+                Remove-Item -Recurse -Force $Wantastic.ConfigDir
+            } catch {
+                if ($attempt -ge 10) { throw "Could not remove $($Wantastic.ConfigDir): $($_.Exception.Message)" }
+                Start-Sleep -Seconds 1
+            }
+        }
         Write-Ok "Removed the login, claim key and settings ($($Wantastic.ConfigDir))."
     } elseif (Test-Path $Wantastic.ConfigDir) {
         Write-Info "Kept the login in $($Wantastic.ConfigDir) (add -Purge to remove it)."

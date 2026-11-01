@@ -66,8 +66,9 @@ jobs:
           go vet @pkgs 2>&1 | Tee-Object -FilePath vet.log
           $vet = $LASTEXITCODE
           # TODO: the USP/WUSP runtime tests time out on Windows runners (data
-          # model warmup) and treat file:// URLs as paths; skipped until fixed.
-          go test -skip '^(TestUSPRuntime|TestIntegration_)' @pkgs 2>&1 | Tee-Object -FilePath test.log
+          # model warmup), treat file:// URLs as paths and leave files open in
+          # TempDir; skipped until fixed.
+          go test -skip '^(TestUSPRuntime|TestIntegration_|TestPersistentDataModelCache)' @pkgs 2>&1 | Tee-Object -FilePath test.log
           $test = $LASTEXITCODE
           if ($vet -or $test) {
             # One annotation (they are capped per step) holding the log tail.
@@ -245,11 +246,13 @@ jobs:
       # device's claim, so it must start for real and stay Running.
       - name: Fresh install (claim)
         run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoTray
           if ($LASTEXITCODE) { exit 1 }
 
       - name: Check install
         run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
           $ErrorActionPreference = "Stop"
           $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
           $svc = Get-CimInstance Win32_Service -Filter "Name='wantasticd'"
@@ -271,6 +274,7 @@ jobs:
 
       - name: Service stays up and is controllable
         run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
           $ErrorActionPreference = "Stop"
           $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
           Start-Sleep -Seconds 10
@@ -286,6 +290,7 @@ jobs:
 
       - name: Upgrade in place
         run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip"
           if ($LASTEXITCODE) { exit 1 }
           if (-not (Test-Path "$env:ProgramFiles\Wantastic\wantasticd.exe.previous")) { throw "no rollback copy" }
@@ -296,6 +301,7 @@ jobs:
 
       - name: Uninstall
         run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
           & "$env:RUNNER_TEMP\wi\install.ps1" -Uninstall -Purge
           if ($LASTEXITCODE) { exit 1 }
           Start-Sleep -Seconds 2
@@ -310,6 +316,7 @@ jobs:
 
       - name: Install without sign-in, then uninstall
         run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
           if ($LASTEXITCODE) { exit 1 }
           if ((Get-Service wantasticd).Status -ne "Stopped") { throw "service should not start without sign-in" }

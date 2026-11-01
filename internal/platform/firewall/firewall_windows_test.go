@@ -5,6 +5,7 @@ package firewall
 import (
 	"net/netip"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -15,10 +16,9 @@ func TestRulesRoundTrip(t *testing.T) {
 	if !windows.GetCurrentProcessToken().IsElevated() {
 		t.Skip("needs Administrator")
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The program need not exist; a fixed path keeps the test independent
+	// of where go test builds its binary.
+	exe := filepath.Join(os.Getenv("ProgramFiles"), "WantasticTest", "wantasticd.exe")
 	t.Cleanup(func() { Remove() })
 	for i := 0; i < 2; i++ { // the second pass replaces, never duplicates
 		if err := AllowApp(exe); err != nil {

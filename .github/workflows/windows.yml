@@ -257,6 +257,24 @@ jobs:
           Write-Host $v
           if ($v -notmatch "wantasticd version") { throw "version printed nothing" }
 
+      # A claim key without a login makes the service wait for its claim, so
+      # it starts for real: the Service Control Manager must see it Running
+      # and be able to stop it.
+      - name: Service starts and stops
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
+          & $exe genkey --no-wait | Out-Host
+          if ($LASTEXITCODE) { throw "genkey failed" }
+          Start-Service wantasticd
+          $svc = Get-Service wantasticd
+          $svc.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+          Start-Sleep -Seconds 10
+          $svc.Refresh()
+          if ($svc.Status -ne "Running") { throw "service stopped on its own: $($svc.Status)" }
+          Stop-Service wantasticd
+          $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+
       - name: Upgrade in place
         run: |
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin

@@ -13,12 +13,14 @@ import (
 )
 
 func RunServiceHook(runFunc func(context.Context)) {
-	isInteractive, err := svc.IsWindowsService()
+	// IsWindowsService is true only when the Service Control Manager started
+	// this process; commands typed in a console run in the foreground.
+	isService, err := svc.IsWindowsService()
 	if err != nil {
-		log.Fatalf("failed to determine if interactive session: %v", err)
+		log.Fatalf("failed to determine whether running as a Windows service: %v", err)
 	}
 
-	if isInteractive {
+	if !isService {
 		runFunc(context.Background())
 		return
 	}

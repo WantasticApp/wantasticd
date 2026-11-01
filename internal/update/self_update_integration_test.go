@@ -1,3 +1,7 @@
+//go:build !windows
+
+// self-update.sh is the Unix updater; Windows updates in Go (install_windows.go).
+
 package update
 
 import (

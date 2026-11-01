@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestDownloadReleaseUsesImmutableTagPath(t *testing.T) {
 	if err := m.downloadRelease(context.Background(), "v1.2.3+abc", dest); err != nil {
 		t.Fatal(err)
 	}
-	if want := "/v1.2.3/wantasticd-" + GetPlatform() + ".tar.gz"; gotPath != want {
+	if want := "/v1.2.3/wantasticd-" + GetPlatform() + archiveExt(GetPlatform()); gotPath != want {
 		t.Fatalf("downloaded %q, want %q", gotPath, want)
 	}
 	if data, _ := os.ReadFile(dest); string(data) != "archive-bytes" {
@@ -36,6 +37,9 @@ func TestDownloadReleaseUsesImmutableTagPath(t *testing.T) {
 // Stock OpenWrt has no curl: the agent passes its own download to the script,
 // which must install it without calling any downloader.
 func TestSelfUpdateInstallsPassedArchiveWithoutCurl(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("self-update.sh is the Unix updater")
+	}
 	root := t.TempDir()
 	binDir := filepath.Join(root, "bin")
 	packageDir := filepath.Join(root, "package")

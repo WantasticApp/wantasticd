@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"wantastic-agent/internal/config"
@@ -136,7 +137,7 @@ func TestLoadOrCreateClaimKeyReusesIdentityAndPersistsServerChange(t *testing.T)
 	}
 	if info, err := os.Stat(path); err != nil {
 		t.Fatalf("stat claim key: %v", err)
-	} else if info.Mode().Perm() != 0o600 {
+	} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 { // Windows has ACLs, not mode bits
 		t.Fatalf("claim key permissions = %o, want 600", info.Mode().Perm())
 	}
 }

@@ -202,6 +202,9 @@ jobs:
       fail-fast: false
       matrix:
         shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     env:
       WANTASTIC_INSTALL_STRICT: '1'
     steps:
@@ -225,13 +228,11 @@ jobs:
           Copy-Item "dist/wantasticd-windows-amd64.zip" "$env:RUNNER_TEMP\wi\wantasticd.zip"
 
       - name: Fresh install
-        shell: ${{ matrix.shell }}
         run: |
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
           if ($LASTEXITCODE) { exit 1 }
 
       - name: Check install
-        shell: ${{ matrix.shell }}
         run: |
           $ErrorActionPreference = "Stop"
           $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
@@ -250,7 +251,6 @@ jobs:
           if ($v -notmatch "wantasticd version") { throw "version printed nothing" }
 
       - name: Upgrade in place
-        shell: ${{ matrix.shell }}
         run: |
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin
           if ($LASTEXITCODE) { exit 1 }
@@ -259,7 +259,6 @@ jobs:
           if ((Get-CimInstance Win32_Service -Filter "Name='wantasticd'").StartMode -ne "Auto") { throw "service changed" }
 
       - name: Uninstall
-        shell: ${{ matrix.shell }}
         run: |
           & "$env:RUNNER_TEMP\wi\install.ps1" -Uninstall -Purge
           if ($LASTEXITCODE) { exit 1 }
@@ -272,7 +271,6 @@ jobs:
           if (($path -split ';') -contains "$env:ProgramFiles\Wantastic") { throw "still on PATH" }
 
       - name: Reinstall after uninstall
-        shell: ${{ matrix.shell }}
         run: |
           & "$env:RUNNER_TEMP\wi\install.ps1" -ZipPath "$env:RUNNER_TEMP\wi\wantasticd.zip" -NoLogin -NoTray
           if ($LASTEXITCODE) { exit 1 }

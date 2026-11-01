@@ -28,7 +28,7 @@ func TestRulesRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{AppRuleName, OverlayRuleName} {
+	for _, name := range []string{AppRuleID, OverlayRuleID} {
 		if !exists(name) {
 			t.Fatalf("rule %q missing", name)
 		}
@@ -36,7 +36,7 @@ func TestRulesRoundTrip(t *testing.T) {
 	if err := Remove(); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{AppRuleName, OverlayRuleName} {
+	for _, name := range []string{AppRuleID, OverlayRuleID} {
 		if exists(name) {
 			t.Fatalf("rule %q still present", name)
 		}

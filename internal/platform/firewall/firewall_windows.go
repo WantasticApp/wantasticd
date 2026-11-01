@@ -3,6 +3,7 @@
 package firewall
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/netip"
 	"os"
@@ -10,12 +11,14 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf16"
 )
 
 // AllowApp lets inbound UDP reach exePath on every network profile, so
 // peers can reach this device directly instead of through the relay.
 func AllowApp(exePath string) error {
-	return replaceRule(AppRuleName, fmt.Sprintf(`dir=in action=allow enable=yes profile=any protocol=UDP program="%s" description="Direct peer-to-peer connections for Wantastic"`, exePath))
+	return replaceRule(AppRuleID, AppRuleName, "Direct peer-to-peer connections for Wantastic",
+		"-Protocol UDP -Program "+psQuote(exePath))
 }
 
 // AllowOverlay lets any inbound traffic addressed to this device's overlay
@@ -25,56 +28,56 @@ func AllowOverlay(addrs []netip.Prefix) error {
 	var ips []string
 	for _, p := range addrs {
 		if p.IsValid() {
-			ips = append(ips, p.Addr().String())
+			ips = append(ips, psQuote(p.Addr().String()))
 		}
 	}
 	if len(ips) == 0 {
 		return nil
 	}
-	return replaceRule(OverlayRuleName, fmt.Sprintf(`dir=in action=allow enable=yes profile=any protocol=any localip=%s description="Traffic from Wantastic peers over the tunnel"`, strings.Join(ips, ",")))
+	return replaceRule(OverlayRuleID, OverlayRuleName, "Traffic from Wantastic peers over the tunnel",
+		"-Protocol Any -LocalAddress @("+strings.Join(ips, ",")+")")
 }
 
 // Remove deletes the rules AllowApp and AllowOverlay create.
 func Remove() error {
-	var firstErr error
-	for _, name := range []string{AppRuleName, OverlayRuleName} {
-		if exists(name) {
-			if err := netsh(fmt.Sprintf(`delete rule name="%s"`, name)); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return powershell(removeScript(AppRuleID, AppRuleName) + removeScript(OverlayRuleID, OverlayRuleName))
 }
 
-// replaceRule deletes every rule with this name (including ones an older
-// installer made) and adds one with the given settings.
-func replaceRule(name, settings string) error {
-	if exists(name) {
-		if err := netsh(fmt.Sprintf(`delete rule name="%s"`, name)); err != nil {
-			return err
-		}
-	}
-	return netsh(fmt.Sprintf(`add rule name="%s" %s`, name, settings))
+func replaceRule(id, name, description, match string) error {
+	return powershell(removeScript(id, name) + fmt.Sprintf(
+		"New-NetFirewallRule -Name %s -DisplayName %s -Description %s -Direction Inbound -Action Allow -Profile Any -Enabled True %s | Out-Null\n",
+		psQuote(id), psQuote(name), psQuote(description), match))
 }
 
-func exists(name string) bool {
-	return netsh(fmt.Sprintf(`show rule name="%s"`, name)) == nil
+// removeScript drops rules by ID and by display name (older netsh-made rules
+// have only the latter).
+func removeScript(id, name string) string {
+	return fmt.Sprintf("Get-NetFirewallRule -Name %s -ErrorAction SilentlyContinue | Remove-NetFirewallRule\n"+
+		"Get-NetFirewallRule -DisplayName %s -ErrorAction SilentlyContinue | Remove-NetFirewallRule\n",
+		psQuote(id), psQuote(name))
 }
 
-// netsh runs "netsh advfirewall firewall <args>". The command line is passed
-// verbatim: netsh parses key="value with spaces" itself, which Go's argument
-// quoting would break.
-func netsh(args string) error {
-	exe := filepath.Join(os.Getenv("SystemRoot"), "System32", "netsh.exe")
-	cmd := exec.Command(exe)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CmdLine:    `"` + exe + `" advfirewall firewall ` + args,
-		HideWindow: true,
+func exists(id string) bool {
+	return powershell(fmt.Sprintf("if (-not (Get-NetFirewallRule -Name %s -ErrorAction SilentlyContinue)) { exit 3 }\n", psQuote(id))) == nil
+}
+
+func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+// powershell runs script with -EncodedCommand (UTF-16LE base64), so no
+// value in it goes through command-line quoting.
+func powershell(script string) error {
+	script = "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n" + script
+	u := utf16.Encode([]rune(script))
+	b := make([]byte, len(u)*2)
+	for i, c := range u {
+		b[2*i], b[2*i+1] = byte(c), byte(c>>8)
 	}
+	exe := filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+	cmd := exec.Command(exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(b))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("netsh advfirewall firewall %s: %v: %s", strings.SplitN(args, " ", 2)[0], err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("windows firewall: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

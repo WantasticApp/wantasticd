@@ -85,7 +85,9 @@ func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + 
 // powershell runs script with -EncodedCommand (UTF-16LE base64), so no
 // value in it goes through command-line quoting.
 func powershell(script string) error {
-	script = "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n" + script
+	// The explicit exit 0: otherwise a silenced "no such rule" lookup as the
+	// last command makes powershell.exe exit 1.
+	script = "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n" + script + "exit 0\n"
 	u := utf16.Encode([]rune(script))
 	b := make([]byte, len(u)*2)
 	for i, c := range u {

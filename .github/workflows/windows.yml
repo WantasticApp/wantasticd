@@ -67,9 +67,12 @@ jobs:
           # model warmup) and treat file:// URLs as paths; skipped until fixed.
           go test -skip '^(TestUSPRuntime|TestIntegration_)' @pkgs 2>&1 | Tee-Object -FilePath test.log
           $test = $LASTEXITCODE
-          Select-String -Path vet.log, test.log -Pattern '--- FAIL|^FAIL|panic:|\.go:\d+' |
-            Select-Object -First 40 | ForEach-Object { Write-Host "::error::$($_.Line.Trim())" }
-          if ($vet -or $test) { exit 1 }
+          if ($vet -or $test) {
+            # One annotation (they are capped per step) holding the log tail.
+            $tail = Get-Content vet.log, test.log | Where-Object { $_ -notmatch '^(ok|\?)\s' } | Select-Object -Last 80
+            Write-Host "::error title=go vet/test failed (vet $vet, test $test)::$(($tail -join '%0A') -replace '\r', '')"
+            exit 1
+          }
       - name: Parse install.ps1 (PowerShell 5.1 and 7)
         run: |
           if ((Get-FileHash install.ps1).Hash -ne (Get-FileHash install.ps).Hash) { throw "install.ps must be a copy of install.ps1" }

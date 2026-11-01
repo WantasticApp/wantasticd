@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wantastic-agent/internal/config"
@@ -33,6 +34,9 @@ import (
 type Device struct {
 	config *config.Config
 	device *wgdevice.Device
+	// wg is device for readers that must not take mu (peer name lookups
+	// run under callers that may hold it).
+	wg atomic.Pointer[wgdevice.Device]
 	tunDev tun.Device
 
 	mu      sync.RWMutex
@@ -138,6 +142,7 @@ func (d *Device) Start() error {
 	wd.SetTUNControlHandler(d.handleTUNControl)
 	wd.SetAddPeerRouteHandler(d.addPeerRoute)
 	d.device = wd
+	d.wg.Store(wd)
 
 	if err := d.applyConfig(); err != nil {
 		d.mu.Lock()
@@ -881,13 +886,30 @@ func p2pObservedEndpoint(dp *wgdevice.DiscoveredPeer) string {
 	return addr.String()
 }
 
+// getPeerHostname names a peer by its hex public key: a locally learned
+// hostname first, else the device name the coordinator sent with the peer list.
 func (d *Device) getPeerHostname(publicKey string) string {
 	if publicKey == "" {
 		return ""
 	}
 	d.peerHostnamesMu.RLock()
-	defer d.peerHostnamesMu.RUnlock()
-	return d.peerHostnames[publicKey]
+	name := d.peerHostnames[publicKey]
+	d.peerHostnamesMu.RUnlock()
+	if name != "" {
+		return name
+	}
+	wd := d.wg.Load()
+	if wd == nil {
+		return ""
+	}
+	client := wd.GetP2PClient()
+	raw, err := hex.DecodeString(publicKey)
+	if client == nil || err != nil || len(raw) != wgdevice.NoisePublicKeySize {
+		return ""
+	}
+	var key wgdevice.NoisePublicKey
+	copy(key[:], raw)
+	return client.PeerName(key)
 }
 
 func (d *Device) setPeerHostname(publicKey, hostname string) {

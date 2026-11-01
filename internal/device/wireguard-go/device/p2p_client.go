@@ -21,8 +21,8 @@ import (
 const (
 	p2pPunchTimeout        = 18 * time.Second
 	p2pStalledAttemptTTL   = 30 * time.Second
-	p2pRetryBaseDelay      = 15 * time.Second
-	p2pRetryMaxDelay       = 2 * time.Minute
+	p2pRetryBaseDelay      = 5 * time.Second
+	p2pRetryMaxDelay       = time.Minute
 	p2pMaxPredictedTargets = 16
 	p2pMaxPeerListEntries  = 4096
 	p2pControlQueueSize    = 256
@@ -78,6 +78,7 @@ type P2PClient struct {
 	sessions map[uint32]*P2PSession
 
 	peerKeyIndex   map[NoisePublicKey]uint32
+	peerNames      map[NoisePublicKey]string
 	attemptGates   map[uint32]*atomic.Int64
 	sessionByNonce map[[8]byte]*P2PSession
 	destinations   atomic.Pointer[p2pDestinationIndex]
@@ -566,8 +567,55 @@ func (c *P2PClient) HandleMessage(msg *P2PMessage) {
 		c.handlePeerList(msg)
 	case P2PSubtypePunchRelay:
 		c.handlePunchRelay(msg)
+	case P2PSubtypePeerNames:
+		c.handlePeerNames(msg)
 	case P2PSubtypeHeartbeat:
 	}
+}
+
+// handlePeerNames merges the coordinator's device names:
+// [count:2] then per peer [pubkey:32][len:1][name:len].
+func (c *P2PClient) handlePeerNames(msg *P2PMessage) {
+	payload := msg.Payload
+	if len(payload) < 2 {
+		return
+	}
+	count := int(binary.BigEndian.Uint16(payload[0:2]))
+	offset := 2
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.peerNames == nil {
+		c.peerNames = make(map[NoisePublicKey]string)
+	}
+	for i := 0; i < count && len(c.peerNames) <= p2pMaxPeerListEntries; i++ {
+		if offset+33 > len(payload) {
+			return
+		}
+		var key NoisePublicKey
+		copy(key[:], payload[offset:offset+32])
+		n := int(payload[offset+32])
+		offset += 33
+		if offset+n > len(payload) {
+			return
+		}
+		name := strings.TrimSpace(strings.ToValidUTF8(string(payload[offset:offset+n]), ""))
+		offset += n
+		if key.IsZero() {
+			continue
+		}
+		if name == "" {
+			delete(c.peerNames, key)
+			continue
+		}
+		c.peerNames[key] = name
+	}
+}
+
+// PeerName is the coordinator's name for the device with key, or "".
+func (c *P2PClient) PeerName(key NoisePublicKey) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.peerNames[key]
 }
 
 func (c *P2PClient) handleRegisterAck(msg *P2PMessage) {
@@ -612,6 +660,7 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		c.attemptGates = make(map[uint32]*atomic.Int64)
 	}
 	renumbered := false
+	var retry []uint32
 	offset := 4
 	for i := uint32(0); i < count; i++ {
 		peerID := binary.BigEndian.Uint32(msg.Payload[offset:])
@@ -647,6 +696,17 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 			}
 			c.peers[peerID] = peer
 		}
+		// A failed peer that reconnected (the coordinator sees it at a new
+		// public address) gets a fresh attempt instead of waiting out the
+		// backoff earned while it was unreachable.
+		if ok && peer.State == P2PStateFailed && udpAddrMoved(peer.ObservedAddr, observedAddr) {
+			peer.State = P2PStateDiscovered
+			peer.PunchAttempts = 0
+			if gate := c.attemptGates[peerID]; gate != nil {
+				gate.Store(0)
+			}
+			retry = append(retry, peerID)
+		}
 
 		peer.PublicKey = publicKey
 		peer.LocalAddr = localAddr
@@ -672,7 +732,19 @@ func (c *P2PClient) handlePeerList(msg *P2PMessage) {
 		// our candidates as well.
 		c.reregister.Store(true)
 	}
+	for _, peerID := range retry {
+		c.queueP2PAttempt(peerID)
+	}
 	c.device.log.Verbosef("[P2P] Discovered %d peers", count)
+}
+
+// udpAddrMoved reports whether a known address changed; learning an address
+// for the first time is not a move.
+func udpAddrMoved(prev, next net.UDPAddr) bool {
+	if prev.IP == nil || prev.IP.IsUnspecified() || prev.Port == 0 {
+		return false
+	}
+	return !prev.IP.Equal(next.IP) || prev.Port != next.Port
 }
 
 // renumberPeerLocked moves the entry known for publicKey to newID when the

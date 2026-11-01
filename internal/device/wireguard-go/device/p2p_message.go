@@ -19,6 +19,7 @@ const (
 	P2PSubtypePunchRelay   = 5 // Server -> Both: Relay punch intent + endpoints
 	P2PSubtypePunchPacket  = 6 // Client <-> Client: Direct punch packets (encrypted)
 	P2PSubtypeHeartbeat    = 7 // Client <-> Client: Keepalive for P2P session
+	P2PSubtypePeerNames    = 8 // Server -> Client: Device names for listed peers
 )
 
 // MessageP2PType is the wire type for P2P coordination messages.

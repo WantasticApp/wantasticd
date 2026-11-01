@@ -2,6 +2,7 @@ package device
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"net"
 	"net/netip"
@@ -613,5 +614,70 @@ func TestPunchRelayForEstablishedPeerReturnsToRelay(t *testing.T) {
 	}
 	if got := pair[0].dev.allowedips.Lookup(destination); got != relayPeer {
 		t.Fatalf("relay route was not restored")
+	}
+}
+
+func TestHandlePeerListRetriesFailedPeerThatReconnected(t *testing.T) {
+	client := &P2PClient{
+		device:       &Device{log: NewLogger(LogLevelSilent, "")},
+		peers:        make(map[uint32]*DiscoveredPeer),
+		sessions:     make(map[uint32]*P2PSession),
+		attemptGates: make(map[uint32]*atomic.Int64),
+		ctx:          context.Background(),
+		attemptQueue: make(chan uint32, 1),
+	}
+	peerID := uint32(42)
+	gate := new(atomic.Int64)
+	gate.Store(time.Now().Add(time.Minute).UnixNano())
+	client.attemptGates[peerID] = gate
+	client.peers[peerID] = &DiscoveredPeer{
+		ID:            peerID,
+		State:         P2PStateFailed,
+		LastUsed:      time.Now(),
+		PunchAttempts: 3,
+		ObservedAddr:  net.UDPAddr{IP: net.ParseIP("203.0.113.1").To4(), Port: 1},
+	}
+
+	client.handlePeerList(&P2PMessage{Payload: testPeerListPayload(peerID)})
+
+	got := client.peers[peerID]
+	if got.State != P2PStateDiscovered || got.PunchAttempts != 0 || gate.Load() != 0 {
+		t.Fatalf("state=%v attempts=%d gate=%d, want a fresh peer", got.State, got.PunchAttempts, gate.Load())
+	}
+	select {
+	case id := <-client.attemptQueue:
+		if id != peerID {
+			t.Fatalf("queued %d, want %d", id, peerID)
+		}
+	default:
+		t.Fatal("reconnected peer was not queued for a new attempt")
+	}
+}
+
+func TestHandlePeerNamesStoresCoordinatorNames(t *testing.T) {
+	client := &P2PClient{device: &Device{log: NewLogger(LogLevelSilent, "")}}
+	var a, b NoisePublicKey
+	a[0], b[0] = 1, 2
+	payload := []byte{0, 3}
+	for _, e := range []struct {
+		key  NoisePublicKey
+		name string
+	}{{a, "mac-mini"}, {b, "  "}, {NoisePublicKey{}, "zero"}} {
+		payload = append(payload, e.key[:]...)
+		payload = append(payload, byte(len(e.name)))
+		payload = append(payload, e.name...)
+	}
+	client.HandleMessage(&P2PMessage{Subtype: P2PSubtypePeerNames, Payload: payload})
+	if got := client.PeerName(a); got != "mac-mini" {
+		t.Fatalf("PeerName(a) = %q, want mac-mini", got)
+	}
+	if got := client.PeerName(b); got != "" {
+		t.Fatalf("blank name stored: %q", got)
+	}
+
+	// A truncated payload must not panic or store a partial entry.
+	client.HandleMessage(&P2PMessage{Subtype: P2PSubtypePeerNames, Payload: append([]byte{0, 1}, b[:20]...)})
+	if got := client.PeerName(b); got != "" {
+		t.Fatalf("truncated payload stored %q", got)
 	}
 }

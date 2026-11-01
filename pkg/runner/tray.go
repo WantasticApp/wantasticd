@@ -22,7 +22,7 @@ import (
 
 // trayRefresh is how often the menu re-reads the daemon: often enough that
 // speeds and peer paths look live while the menu is open.
-const trayRefresh = 2 * time.Second
+const trayRefresh = time.Second
 
 // noticeTTL is how long an action's result stays in the menu.
 const noticeTTL = 20 * time.Second
@@ -127,6 +127,36 @@ func (n *trayNotice) report(okText string, notice string, err error) {
 	}
 }
 
+// menuText remembers what each item shows so a refresh touches only the lines
+// that changed: rewriting every line each second makes some menus flicker
+// and drops hover state.
+var menuText sync.Map // menuTextKey -> string
+
+type menuTextKey struct {
+	item    *systray.MenuItem
+	tooltip bool
+}
+
+func setMenuText(key menuTextKey, text string, apply func(string)) {
+	if prev, ok := menuText.Load(key); ok && prev.(string) == text {
+		return
+	}
+	menuText.Store(key, text)
+	apply(text)
+}
+
+func setTitle(item *systray.MenuItem, text string) {
+	setMenuText(menuTextKey{item: item}, text, item.SetTitle)
+}
+
+func setTooltip(item *systray.MenuItem, text string) {
+	setMenuText(menuTextKey{item: item, tooltip: true}, text, item.SetTooltip)
+}
+
+func setTrayTooltip(text string) {
+	setMenuText(menuTextKey{tooltip: true}, text, systray.SetTooltip)
+}
+
 func setTrayIcon(s trayState) {
 	if runtime.GOOS == "windows" {
 		systray.SetIcon(pngToICO(trayIconPNG(s, 32), 32))
@@ -142,7 +172,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 	systray.Run(
 		func() { // onReady
 			setTrayIcon(trayDaemonDown)
-			systray.SetTooltip("Wantastic")
+			setTrayTooltip("Wantastic")
 
 			mHeader := systray.AddMenuItem("○ Connecting…", "Connection state")
 			mHeader.Disable()
@@ -205,16 +235,16 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					setTrayIcon(v.State)
 					lastState = v.State
 				}
-				systray.SetTooltip(v.Tooltip)
-				mHeader.SetTitle(v.Header)
-				mAddress.SetTitle(v.Address)
+				setTrayTooltip(v.Tooltip)
+				setTitle(mHeader, v.Header)
+				setTitle(mAddress, v.Address)
 				address = strings.TrimPrefix(v.Address, "IP: ")
-				mTraffic.SetTitle(v.Traffic)
-				mRate.SetTitle(v.Rate)
-				mDetails.SetTitle(v.Details)
-				mToggle.SetTitle(v.ToggleTitle)
+				setTitle(mTraffic, v.Traffic)
+				setTitle(mRate, v.Rate)
+				setTitle(mDetails, v.Details)
+				setTitle(mToggle, v.ToggleTitle)
 				setEnabled(mToggle, v.ToggleEnabled)
-				mPeers.SetTitle(v.PeersTitle)
+				setTitle(mPeers, v.PeersTitle)
 				setEnabled(mPing, v.State == trayConnected || v.State == trayExitActive)
 
 				if st != nil {
@@ -229,7 +259,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				if st != nil && st.Version != "" && st.Version != version.Version {
 					ver += " (service " + st.Version + ")"
 				}
-				mVersion.SetTitle(ver)
+				setTitle(mVersion, ver)
 
 				// The daemon moved to a new build and our binary on disk was
 				// replaced: restart onto it so the menu matches the daemon.
@@ -272,11 +302,11 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				refreshMu.Unlock()
 				mToggle.Disable()
 				if disconnect {
-					mToggle.SetTitle("Disconnecting…")
+					setTitle(mToggle, "Disconnecting…")
 					n, err := postControl("/api/disconnect")
 					notice.report("Disconnected; the service keeps running", n, err)
 				} else {
-					mToggle.SetTitle("Connecting…")
+					setTitle(mToggle, "Connecting…")
 					n, err := postControl("/api/connect")
 					notice.report("Connected", n, err)
 				}
@@ -384,8 +414,8 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 	}
 	for i, entry := range entries {
 		row := group.peerItems[i]
-		row.item.SetTitle(entry.Title)
-		row.item.SetTooltip(entry.Tooltip)
+		setTitle(row.item, entry.Title)
+		setTooltip(row.item, entry.Tooltip)
 		row.vpnIP.set("VPN IP", entry.VPNIP)
 		row.publicIP.set("Public IP", entry.PublicIP)
 		row.item.Show()
@@ -410,13 +440,13 @@ func (c *copyMenuItem) set(label, value string) {
 	c.copyText = value
 	c.mu.Unlock()
 	if value == "" {
-		c.item.SetTitle(label + "  —")
-		c.item.SetTooltip("")
+		setTitle(c.item, label+"  —")
+		setTooltip(c.item, "")
 		c.item.Disable()
 		return
 	}
-	c.item.SetTitle(label + "  " + value)
-	c.item.SetTooltip("Click to copy " + value)
+	setTitle(c.item, label+"  "+value)
+	setTooltip(c.item, "Click to copy "+value)
 	c.item.Enable()
 }
 

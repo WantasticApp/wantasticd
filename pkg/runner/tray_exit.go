@@ -68,12 +68,12 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.offering = s.OfferChecked
-	m.root.SetTitle(s.Header)
-	m.offer.SetTitle(s.OfferTitle)
-	m.offer.SetTooltip(s.OfferTooltip)
+	setTitle(m.root, s.Header)
+	setTitle(m.offer, s.OfferTitle)
+	setTooltip(m.offer, s.OfferTooltip)
 	setChecked(m.offer, s.OfferChecked)
 	setEnabled(m.offer, s.OfferEnabled)
-	m.use.SetTooltip(s.UseTooltip)
+	setTooltip(m.use, s.UseTooltip)
 	setEnabled(m.use, s.UseEnabled)
 	setChecked(m.none, s.NoneChecked)
 	setEnabled(m.none, s.NoneEnabled)
@@ -104,8 +104,8 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 		}
 		e := s.Items[i]
 		m.itemIPs[i] = e.IP
-		it.SetTitle(e.Title)
-		it.SetTooltip(e.Tooltip)
+		setTitle(it, e.Title)
+		setTooltip(it, e.Tooltip)
 		setChecked(it, e.Checked)
 		setEnabled(it, e.Enabled)
 		it.Show()

@@ -85,6 +85,11 @@ func TestExitNodeBackendReportsStatus(t *testing.T) {
 	}
 
 	exit.status.Using = nil
+	// Change notifications are schema-validated; an empty enum would drop them.
+	full, _ := b.Collect(context.Background())
+	if err := wusp.ValidateMessageFast(full); err != nil {
+		t.Fatalf("idle exit-node fields fail validation: %v", err)
+	}
 	msg, _ = b.Collect(context.Background(), p+"UseState")
 	if got := exitValue(msg, p+"UseState"); got != "off" {
 		t.Errorf("UseState with no exit node = %q, want off", got)

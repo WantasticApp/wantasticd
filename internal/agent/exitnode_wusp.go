@@ -89,7 +89,8 @@ func appendExitNodeFields(msg *wusp.Message, st device.ExitNodeStatus) {
 
 	use := st.Using
 	if use == nil {
-		use = &device.ExitUse{State: "off"}
+		// UsePath is an enum; "offline" stands for "no exit node".
+		use = &device.ExitUse{State: "off", Path: "offline"}
 	}
 	msg.Set(p+"Use", wusp.String(use.IP))
 	msg.Set(p+"UseState", wusp.String(use.State))

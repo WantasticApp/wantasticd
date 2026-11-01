@@ -58,9 +58,16 @@ jobs:
       - name: Vet and test (tray build)
         env:
           CGO_ENABLED: 0
+        # Failures are repeated as annotations so they show on the run page.
         run: |
-          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... ./internal/auth/...
-          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... ./internal/auth/...
+          $pkgs = "./cmd/...", "./pkg/...", "./internal/update/...", "./internal/agent/...", "./internal/auth/..."
+          go vet @pkgs 2>&1 | Tee-Object -FilePath vet.log
+          $vet = $LASTEXITCODE
+          go test @pkgs 2>&1 | Tee-Object -FilePath test.log
+          $test = $LASTEXITCODE
+          Select-String -Path vet.log, test.log -Pattern '--- FAIL|^FAIL|panic:|\.go:\d+' |
+            Select-Object -First 40 | ForEach-Object { Write-Host "::error::$($_.Line.Trim())" }
+          if ($vet -or $test) { exit 1 }
       - name: Parse install.ps1 (PowerShell 5.1 and 7)
         run: |
           if ((Get-FileHash install.ps1).Hash -ne (Get-FileHash install.ps).Hash) { throw "install.ps must be a copy of install.ps1" }

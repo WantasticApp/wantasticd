@@ -88,8 +88,9 @@ class ConsoleWebHolder(context: Context, private val home: String) {
 
 /**
  * The console as its own full-screen app over Wantastic, in the mini-program
- * style: the page fills the screen, a capsule top right carries the menu and
- * close, Back walks the console's history and then closes it.
+ * style: the page fills the screen with no header, a floating capsule top
+ * right carries the menu and close, Back walks the console's history and
+ * then closes it.
  */
 @Composable
 fun ConsoleMiniApp(holder: ConsoleWebHolder, onClose: () -> Unit) {
@@ -107,61 +108,61 @@ fun ConsoleMiniApp(holder: ConsoleWebHolder, onClose: () -> Unit) {
     BackHandler {
         if (holder.web.canGoBack()) holder.web.goBack() else onClose()
     }
-    Column(Modifier.fillMaxSize().background(Color(0xFFF4F7FB)).imePadding()) {
-        Box(
-            Modifier.fillMaxWidth().background(Color.White).statusBarsPadding().height(48.dp).padding(horizontal = 12.dp),
-        ) {
-            Text(
-                holder.title, color = Color(0xFF0B1226), fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
-                maxLines = 1, modifier = Modifier.align(Alignment.Center).padding(horizontal = 110.dp),
+    // The console takes the whole screen; only the capsule floats over it.
+    Box(Modifier.fillMaxSize().background(Color(0xFFF4F7FB)).imePadding()) {
+        AndroidView(
+            factory = { holder.web.also { (it.parent as? android.view.ViewGroup)?.removeView(it) } },
+            modifier = Modifier.fillMaxSize().statusBarsPadding(),
+        )
+        if (holder.progress in 1..99) {
+            LinearProgressIndicator(
+                progress = { holder.progress / 100f },
+                modifier = Modifier.fillMaxWidth().statusBarsPadding().height(2.dp),
+                color = Glass.Blue,
             )
-            // The capsule: menu · close.
-            Row(
-                Modifier.align(Alignment.CenterEnd)
-                    .clip(RoundedCornerShape(50))
-                    .background(Color(0x0F0B1226))
-                    .border(0.5.dp, Color(0x260B1226), RoundedCornerShape(50))
-                    .height(32.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        }
+        // The capsule: menu · close.
+        Row(
+            Modifier.align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(top = 8.dp, end = 12.dp)
+                .clip(RoundedCornerShape(50))
+                .background(Color(0xE6FFFFFF))
+                .border(0.5.dp, Color(0x260B1226), RoundedCornerShape(50))
+                .height(32.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.width(44.dp).height(32.dp).clickable { menu = true }.semantics { contentDescription = "More" },
+                contentAlignment = Alignment.Center,
             ) {
-                Box(
-                    Modifier.width(44.dp).height(32.dp).clickable { menu = true }.semantics { contentDescription = "More" },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Canvas(Modifier.size(width = 20.dp, height = 6.dp)) {
-                        val r = 2.4.dp.toPx()
-                        for (i in 0..2) drawCircle(Color(0xFF0B1226), r, Offset(r + i * (size.width - 2 * r) / 2, size.height / 2))
-                    }
-                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Reload") }, onClick = { menu = false; holder.web.reload() })
-                        DropdownMenuItem(text = { Text("Open in browser") }, onClick = {
-                            menu = false
-                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(holder.url)))
-                        })
-                        DropdownMenuItem(text = { Text("Copy link") }, onClick = {
-                            menu = false
-                            (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
-                                .setPrimaryClip(ClipData.newPlainText("Wantastic console", holder.url))
-                        })
-                    }
+                Canvas(Modifier.size(width = 20.dp, height = 6.dp)) {
+                    val r = 2.4.dp.toPx()
+                    for (k in 0..2) drawCircle(Color(0xFF0B1226), r, Offset(r + k * (size.width - 2 * r) / 2, size.height / 2))
                 }
-                Box(Modifier.width(0.5.dp).height(18.dp).background(Color(0x330B1226)))
-                Box(
-                    Modifier.width(44.dp).height(32.dp).clickable(onClick = onClose).semantics { contentDescription = "Close console" },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Canvas(Modifier.size(18.dp)) {
-                        drawCircle(Color(0xFF0B1226), size.minDimension / 2 - 1.dp.toPx(), style = Stroke(1.8.dp.toPx()))
-                        drawCircle(Color(0xFF0B1226), 3.dp.toPx())
-                    }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text("Reload") }, onClick = { menu = false; holder.web.reload() })
+                    DropdownMenuItem(text = { Text("Open in browser") }, onClick = {
+                        menu = false
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(holder.url)))
+                    })
+                    DropdownMenuItem(text = { Text("Copy link") }, onClick = {
+                        menu = false
+                        (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                            .setPrimaryClip(ClipData.newPlainText("Wantastic console", holder.url))
+                    })
+                }
+            }
+            Box(Modifier.width(0.5.dp).height(18.dp).background(Color(0x330B1226)))
+            Box(
+                Modifier.width(44.dp).height(32.dp).clickable(onClick = onClose).semantics { contentDescription = "Close console" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Canvas(Modifier.size(18.dp)) {
+                    drawCircle(Color(0xFF0B1226), size.minDimension / 2 - 1.dp.toPx(), style = Stroke(1.8.dp.toPx()))
+                    drawCircle(Color(0xFF0B1226), 3.dp.toPx())
                 }
             }
         }
-        if (holder.progress in 1..99) {
-            LinearProgressIndicator(progress = { holder.progress / 100f }, modifier = Modifier.fillMaxWidth().height(2.dp), color = Glass.Blue)
-        } else {
-            Spacer(Modifier.height(2.dp))
-        }
-        AndroidView(factory = { holder.web.also { (it.parent as? android.view.ViewGroup)?.removeView(it) } }, modifier = Modifier.fillMaxSize())
     }
 }

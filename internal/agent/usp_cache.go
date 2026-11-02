@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -532,10 +533,15 @@ func writeCacheAtomically(path string, data []byte) error {
 	return nil
 }
 
+// replaceFileMu serializes saves: Windows refuses two renames onto the same
+// file at once ("Access is denied").
+var replaceFileMu sync.Mutex
+
 // replaceFile atomically replaces path with data (mode 0600). Each write uses
 // its own temporary file: with one fixed name, two saves running at once
 // (a periodic refresh and a post-change refresh) renamed each other's file
-// away and one failed.
+// away and one failed. The rename is retried briefly: on Windows it fails
+// while another process (the tray, an antivirus scan) has the file open.
 func replaceFile(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -547,7 +553,16 @@ func replaceFile(path string, data []byte) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = os.Rename(name, path)
+		replaceFileMu.Lock()
+		// Another process (a second agent, an antivirus scan) can still hold
+		// the destination briefly on Windows; retry a few times.
+		for attempt := 0; attempt < 5; attempt++ {
+			if err = os.Rename(name, path); err == nil || runtime.GOOS != "windows" {
+				break
+			}
+			time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+		}
+		replaceFileMu.Unlock()
 	}
 	if err != nil {
 		os.Remove(name)

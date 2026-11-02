@@ -19,12 +19,12 @@ val signingProps = Properties().apply {
 
 android {
     namespace = "app.wantastic.android"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "app.wantastic.android"
         minSdk = 24
-        targetSdk = 35
+        targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
     }

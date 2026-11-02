@@ -47,7 +47,8 @@ jobs:
           go-version-file: mobile/go.mod
           cache-dependency-path: mobile/go.sum
 
-      # The Go engine (../mobile, the agent's own code) as an Android library.
+      # The Go engine (../mobile, the agent's own code) as an Android library,
+      # 16 KB page aligned as Google Play requires for native code.
       - name: Engine (gomobile)
         working-directory: mobile
         run: |
@@ -57,7 +58,7 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           mkdir -p ../android/app/libs
           gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 24 \
-            -javapkg app.wantastic -trimpath -ldflags="-s -w" -o ../android/app/libs/wantastic-engine.aar .
+            -javapkg app.wantastic -trimpath -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" -o ../android/app/libs/wantastic-engine.aar .
 
       - name: Version
         id: version

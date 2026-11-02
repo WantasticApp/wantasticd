@@ -33,7 +33,6 @@ import app.wantastic.android.ui.rememberBackdrop
 import app.wantastic.android.ui.GlassPillNav
 import app.wantastic.android.ui.PillItem
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AccountBox
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
@@ -76,7 +75,6 @@ import app.wantastic.android.vpn.WantasticVpnService
 private enum class Tab(val label: String, val icon: ImageVector) {
     Network("Network", Icons.Filled.Home),
     Peers("Peers", Icons.Filled.Person),
-    Console("Console", Icons.Filled.AccountBox),
     Settings("Settings", Icons.Filled.Settings),
 }
 
@@ -161,7 +159,7 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
             // Approving happens in the console mini app: no outside browser.
             SignInScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onContinue = { browsing = true })
         } else {
-            Tabs(status, deviceName, onConnect, onLogIn = { openConsole(claimUrl) }, onConsole = { openConsole() })
+            Tabs(status, deviceName, onConnect, onLogIn = { openConsole(claimUrl) }, onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) })
         }
         AnimatedVisibility(
             visible = consoleOpen && console != null,
@@ -174,7 +172,7 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
 }
 
 @Composable
-private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: () -> Unit, onLogIn: () -> Unit, onConsole: () -> Unit) {
+private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: () -> Unit, onLogIn: () -> Unit, onConsole: (String) -> Unit) {
     val engine = Engines.current
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
     var exitOpen by rememberSaveable { mutableStateOf(false) }
@@ -197,7 +195,7 @@ private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: (
                     onExitNode = { exitOpen = true },
                 )
                 Tab.Peers -> PeersScreen(status)
-                Tab.Settings, Tab.Console -> SettingsScreen()
+                Tab.Settings -> SettingsScreen(onConsole = onConsole)
             }
         }
     }
@@ -205,11 +203,8 @@ private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: (
         items = Tab.entries.map { PillItem(it.label, it.icon) },
         selected = tab.ordinal,
         onSelect = {
-            // The console opens as its own app over this one; the tab under it stays.
-            if (Tab.entries[it] == Tab.Console) onConsole() else {
-                tab = Tab.entries[it]
-                exitOpen = false
-            }
+            tab = Tab.entries[it]
+            exitOpen = false
         },
         modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 12.dp),
         sources = listOfNotNull(light, screens),

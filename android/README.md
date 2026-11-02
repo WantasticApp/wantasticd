@@ -29,7 +29,7 @@ and Go. Build the engine first, then the app:
 ```sh
 (cd ../mobile && go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind &&
   gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 24 \
-    -javapkg app.wantastic -trimpath -ldflags="-s -w" -o ../android/app/libs/wantastic-engine.aar .)
+    -javapkg app.wantastic -trimpath -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" -o ../android/app/libs/wantastic-engine.aar .)
 ./gradlew :app:testDebugUnitTest :app:assembleRelease
 # app/build/outputs/apk/release/app-release.apk
 ```

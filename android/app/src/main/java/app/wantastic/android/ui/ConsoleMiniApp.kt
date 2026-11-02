@@ -14,7 +14,6 @@ import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -130,7 +129,6 @@ fun ConsoleMiniApp(holder: ConsoleWebHolder, onClose: () -> Unit) {
                 .padding(top = 8.dp, end = 12.dp)
                 .clip(RoundedCornerShape(50))
                 .background(Color(0xE6FFFFFF))
-                .border(0.5.dp, Color(0x260B1226), RoundedCornerShape(50))
                 .height(32.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {

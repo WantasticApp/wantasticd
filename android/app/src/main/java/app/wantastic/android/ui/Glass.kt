@@ -76,7 +76,9 @@ object Glass {
     val Blue = Color(0xFF3D8BFF)
     val Cyan = Color(0xFF22D3EE)
     val Green = Color(0xFF34D399)
-    val CardShape = RoundedCornerShape(28.dp)
+    /** One corner radius for every surface, as in Apple's apps. */
+    val Radius = 24.dp
+    val CardShape = RoundedCornerShape(Radius)
 }
 
 /** Navy with slowly drifting blue and cyan light behind every screen; glass refracts it. */
@@ -125,21 +127,21 @@ fun GlassCard(
         interaction.interactions.collect { if (it is PressInteraction.Press) touch = it.pressPosition }
     }
     val swell by animateFloatAsState(if (pressed) 1f else 0f, spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMediumLow), label = "swell")
-    // Cards are 28dp; any other shape here is a capsule.
-    val corner = if (shape == Glass.CardShape) 28.dp else 999.dp
+    // Cards share one radius; any other shape here is a capsule.
+    val corner = if (shape == Glass.CardShape) Glass.Radius else 999.dp
     Column(
         modifier
             .graphicsLayer { scaleX = 1f + 0.02f * swell; scaleY = 1f + 0.02f * swell }
             .liquidGlass(corner, Brush.verticalGradient(listOf(Color(0x24FFFFFF), Color(0x0DFFFFFF))), bulge = { swell })
+            .clip(shape)
             .drawBehind {
                 if (swell > 0.01f && touch.isSpecified) {
                     drawCircle(
-                        Brush.radialGradient(listOf(Color.White.copy(alpha = 0.18f * swell), Color.Transparent), center = touch, radius = size.maxDimension * 0.6f),
+                        Brush.radialGradient(listOf(Color.White.copy(alpha = 0.14f * swell), Color.Transparent), center = touch, radius = size.maxDimension * 0.6f),
                         radius = size.maxDimension * 0.6f, center = touch,
                     )
                 }
             }
-            .clip(shape)
             .then(if (onClick != null) Modifier.clickable(interaction, indication = null, role = Role.Button, onClick = onClick) else Modifier)
             .padding(18.dp),
         content = content,
@@ -156,7 +158,6 @@ fun ConnectOrb(on: Boolean, busy: Boolean, enabled: Boolean, label: String, onCl
     val breathe = rememberInfiniteTransition(label = "breathe")
     val pulse by breathe.animateFloat(0.9f, 1.08f, infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "pulse")
     val glow by animateFloatAsState(if (on) 1f else 0f, spring(stiffness = Spring.StiffnessVeryLow), label = "glow")
-    val ring by animateColorAsState(if (on) Glass.Cyan else Glass.Edge, spring(stiffness = Spring.StiffnessLow), label = "ring")
     Box(Modifier.size(220.dp), contentAlignment = Alignment.Center) {
         // Halo
         Box(
@@ -175,7 +176,6 @@ fun ConnectOrb(on: Boolean, busy: Boolean, enabled: Boolean, label: String, onCl
                     GlassOptics(refraction = 28.dp, zone = 64.dp, blur = 4.dp, dispersion = 0.22f),
                     bulge = { (1f - press) / 0.08f },
                 )
-                .border(1.5.dp, ring.copy(alpha = 0.25f + 0.5f * glow), CircleShape)
                 .clip(CircleShape)
                 .clickable(interaction, indication = null, enabled = enabled, role = Role.Switch) {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)

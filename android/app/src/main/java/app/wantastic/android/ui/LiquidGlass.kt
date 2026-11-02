@@ -153,23 +153,27 @@ fun Modifier.liquidGlass(
                     }
                 }
                 val swell = bulge().coerceIn(0f, 1f)
-                glass.renderEffect = (
-                    lens?.effect(
+                val blur = optics.blur.toPx()
+                val effect = if (Build.VERSION.SDK_INT >= 33 && lens != null) {
+                    lens.effect(
                         width = size.width, height = size.height, radius = radius,
                         refraction = optics.refraction.toPx() * (1f + 0.6f * swell),
                         zone = optics.zone.toPx() * (1f + 0.3f * swell),
-                        dispersion = optics.dispersion, light = l, blur = optics.blur.toPx(),
-                    ) ?: RenderEffect.createBlurEffect(optics.blur.toPx(), optics.blur.toPx(), Shader.TileMode.CLAMP)
-                    ).asComposeRenderEffect()
+                        dispersion = optics.dispersion, light = l, blur = blur,
+                    )
+                } else {
+                    RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP)
+                }
+                glass.renderEffect = effect.asComposeRenderEffect()
                 clipPath(shape) { drawLayer(glass) }
             }
             drawPath(shape, tint)
             if (lens == null) {
-                // No shader: a painted rim, brightest toward the light.
+                // No shader: a faint rim toward the light only.
                 drawPath(
                     shape,
                     Brush.linearGradient(
-                        listOf(Color(0x66FFFFFF), Color(0x0FFFFFFF), Color(0x33FFFFFF)),
+                        listOf(Color(0x33FFFFFF), Color.Transparent, Color.Transparent),
                         start = Offset(size.width * (0.5f + l.x * 0.5f), size.height * (0.5f + l.y * 0.5f)),
                         end = Offset(size.width * (0.5f - l.x * 0.5f), size.height * (0.5f - l.y * 0.5f)),
                     ),
@@ -239,11 +243,10 @@ half4 main(float2 coord) {
     c.b = content.eval(coord + shift * (1.0 - dispersion)).b;
     c.a = 1.0;
 
-    // Specular: a bright rim facing the light, a softer one opposite.
-    float edge = smoothstep(-3.0, 0.0, d);
+    // Specular: a soft sheen on the side facing the light; no outline.
+    float edge = smoothstep(-6.0, 0.0, d) * (1.0 - smoothstep(-1.0, 0.0, d) * 0.6);
     float facing = max(dot(n, light), 0.0);
-    float away = max(dot(n, -light), 0.0);
-    float spec = pow(facing, 2.5) * (0.85 * edge + 0.18 * bend) + pow(away, 3.0) * 0.32 * edge;
+    float spec = pow(facing, 3.0) * (0.32 * edge + 0.12 * bend);
     c.rgb = c.rgb + half3(spec);
     return c * coverage;
 }

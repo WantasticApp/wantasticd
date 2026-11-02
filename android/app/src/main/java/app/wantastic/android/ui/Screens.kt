@@ -138,7 +138,7 @@ fun PeersScreen(status: EngineStatus) {
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             items(status.peers, key = { it.vpnIp }) { p ->
-                GlassCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(50)) {
+                GlassCard(Modifier.fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.size(10.dp).clip(CircleShape).background(if (p.direct) Glass.Green else Color.Transparent).border(2.dp, if (p.direct) Glass.Green else Glass.TextDim, CircleShape))
                         Spacer(Modifier.size(12.dp))
@@ -196,20 +196,23 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
 }
 
 @Composable
-fun SettingsScreen() {
+fun SettingsScreen(onConsole: (path: String) -> Unit) {
     val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(NavClearance)) {
         GlassTitle("Settings")
         Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Section("Your network")
+            GlassCard(Modifier.fillMaxWidth()) {
+                SettingsRow("Console", "Everything in your Wantastic account") { onConsole("/dashboard") }
+                SettingsRow("Devices", "Add, approve and manage devices") { onConsole("/devices") }
+                SettingsRow("Account", "Profile, security and sessions") { onConsole("/accounts/profile") }
+            }
             Section("Connection")
-            GlassCard(Modifier.fillMaxWidth(), onClick = { context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }) {
-                SettingsRow("Always-on VPN", "Reconnect after reboot and network changes")
+            GlassCard(Modifier.fillMaxWidth()) {
+                SettingsRow("Always-on VPN", "Reconnect after reboot and network changes") { context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
+                SettingsRow("Battery optimization", "Keep the tunnel alive on this phone") { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
             }
-            Section("Reliability")
-            GlassCard(Modifier.fillMaxWidth(), onClick = { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }) {
-                SettingsRow("Battery optimization", "Keep the tunnel alive on this phone")
-            }
-            Text("Wantastic ${BuildConfig.VERSION_NAME}", color = Glass.TextDim, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+            Text("Wantastic ${BuildConfig.VERSION_NAME}", color = Glass.TextDim, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp, start = 6.dp))
         }
     }
 }
@@ -218,8 +221,11 @@ fun SettingsScreen() {
 private fun Section(title: String) = Text(title.uppercase(), color = Glass.TextDim, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 6.dp))
 
 @Composable
-private fun SettingsRow(label: String, hint: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+private fun SettingsRow(label: String, hint: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(Glass.Radius - 8.dp)).clickable(onClick = onClick).heightIn(min = 56.dp).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Column(Modifier.weight(1f)) {
             Text(label, color = Glass.Text, fontSize = 16.sp, fontWeight = FontWeight.Medium)
             Dim(hint, 12)

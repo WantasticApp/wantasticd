@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- The window behind Compose; Compose draws the Wantastic theme. -->
-    <style name="Theme.Wantastic" parent="android:Theme.Material.Light.NoActionBar">
-        <item name="android:statusBarColor">#0B1226</item>
-        <item name="android:navigationBarColor">#FFFFFF</item>
-        <item name="android:windowBackground">@android:color/white</item>
+    <!-- The window behind Compose: navy, so launch never flashes white. Compose draws the rest. -->
+    <style name="Theme.Wantastic" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/ink</item>
     </style>
 </resources>

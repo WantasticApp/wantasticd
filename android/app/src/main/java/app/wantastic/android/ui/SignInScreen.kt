@@ -21,7 +21,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -78,14 +77,15 @@ fun SignInScreen(claimUrl: String, onLogIn: () -> Unit, onContinue: () -> Unit) 
         Button(
             onClick = onLogIn,
             modifier = Modifier.fillMaxWidth().height(52.dp),
-            shape = RoundedCornerShape(16.dp),
+            shape = RoundedCornerShape(50),
             colors = ButtonDefaults.buttonColors(containerColor = Glass.Blue),
         ) { Text("Log in", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
-        OutlinedButton(
+        Button(
             onClick = { copy(context, claimUrl) },
             modifier = Modifier.fillMaxWidth().height(48.dp),
-            shape = RoundedCornerShape(16.dp),
-        ) { Text("Copy claim link", color = Color.White) }
+            shape = RoundedCornerShape(50),
+            colors = ButtonDefaults.buttonColors(containerColor = Glass.Fill, contentColor = Color.White),
+        ) { Text("Copy claim link") }
         Text(
             "The phone connects by itself once approved.",
             color = Color(0xFF94A6C1), fontSize = 12.sp, textAlign = TextAlign.Center,

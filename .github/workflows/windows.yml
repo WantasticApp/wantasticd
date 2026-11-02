@@ -344,7 +344,11 @@ jobs:
             Get-Content $log -Tail 40 | Out-Host
             throw "no Wantastic tunnel adapter"
           }
-          if (-not (Get-NetFirewallRule -Name Wantastic-overlay -ErrorAction SilentlyContinue)) { throw "overlay firewall rule missing" }
+          # The agent adds it in the background once the tunnel is up.
+          for ($i = 0; -not (Get-NetFirewallRule -Name Wantastic-overlay -ErrorAction SilentlyContinue); $i++) {
+            if ($i -ge 60) { Get-Content $log -Tail 40 | Out-Host; throw "overlay firewall rule missing" }
+            Start-Sleep -Seconds 1
+          }
           & $exe service stop; if ($LASTEXITCODE) { throw "service stop failed" }
           Remove-Item "$env:ProgramData\Wantastic\config.conf"
 

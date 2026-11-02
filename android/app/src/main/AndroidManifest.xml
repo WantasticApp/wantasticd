@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -13,6 +14,7 @@
 
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:banner="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -30,9 +32,13 @@
             </intent-filter>
         </activity>
 
-        <!-- The tunnel. Always-on VPN (system settings) starts it at boot. -->
+        <!-- The tunnel. Always-on VPN (system settings) starts it at boot.
+             VPN apps may use the systemExempted foreground type (Android 14
+             foreground service types); lint's generic check does not know a
+             VpnService qualifies. -->
         <service
             android:name=".vpn.WantasticVpnService"
+            tools:ignore="ForegroundServicePermission"
             android:exported="false"
             android:foregroundServiceType="systemExempted"
             android:permission="android.permission.BIND_VPN_SERVICE">
@@ -40,6 +46,18 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
             <meta-data android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON" android:value="true" />
+        </service>
+
+        <service
+            android:name=".vpn.ConnectTile"
+            android:exported="true"
+            android:icon="@drawable/ic_tile"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data android:name="android.service.quicksettings.ACTIVE_TILE" android:value="false" />
         </service>
     </application>
 </manifest>

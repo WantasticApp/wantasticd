@@ -80,7 +80,7 @@ jobs:
 
       - name: Test and build
         run: |
-          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease \
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:lintRelease :app:assembleRelease \
             -PappVersionName="${{ steps.version.outputs.name }}" \
             -PappVersionCode="${{ steps.version.outputs.code }}"
 

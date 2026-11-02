@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -50,7 +51,7 @@ private fun ScreenTitle(text: String) {
 @Composable
 private fun Notice(text: String) {
     Text(
-        text, color = Brand.Muted, fontSize = 14.sp, textAlign = TextAlign.Center,
+        text, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp, textAlign = TextAlign.Center,
         modifier = Modifier.fillMaxWidth().padding(32.dp),
     )
 }
@@ -94,15 +95,15 @@ fun HomeScreen(status: EngineStatus, deviceName: String, onToggle: () -> Unit, o
             }
         }
         Row(
-            Modifier.fillMaxWidth().background(Color.White, Card).border(1.dp, Brand.Line, Card)
+            Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, Card).border(1.dp, MaterialTheme.colorScheme.outline, Card)
                 .clickable(onClick = onExitNode).heightIn(min = 56.dp).padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
-                Text("Exit node", color = Brand.Muted, fontSize = 12.sp)
+                Text("Exit node", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
                 Text(status.usingExit?.let { "Using $it" } ?: "Off · internet goes direct", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
             }
-            Text("›", color = Brand.Muted, fontSize = 22.sp)
+            Text("›", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 22.sp)
         }
     }
 }
@@ -118,7 +119,7 @@ fun PeersScreen(status: EngineStatus) {
         LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(status.peers, key = { it.vpnIp }) { p ->
                 Row(
-                    Modifier.fillMaxWidth().background(Color.White, RoundedCornerShape(50)).border(1.dp, Brand.Line, RoundedCornerShape(50))
+                    Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(50)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(50))
                         .heightIn(min = 52.dp).padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -126,9 +127,9 @@ fun PeersScreen(status: EngineStatus) {
                     Spacer(Modifier.size(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(p.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                        Text(p.vpnIp, fontSize = 12.sp, color = Brand.Muted, fontFamily = FontFamily.Monospace)
+                        Text(p.vpnIp, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, fontFamily = FontFamily.Monospace)
                     }
-                    Text((if (p.direct) "direct" else "relay") + (p.latencyMs?.let { " · $it ms" } ?: ""), fontSize = 12.sp, color = Brand.Muted)
+                    Text((if (p.direct) "direct" else "relay") + (p.latencyMs?.let { " · $it ms" } ?: ""), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -140,20 +141,20 @@ fun ExitNodeScreen(status: EngineStatus, onUse: (String?) -> Unit, onOffer: (Boo
     Column(Modifier.fillMaxSize()) {
         ScreenTitle("Exit node")
         Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Send all of this phone's internet through another device in your network.", color = Brand.Muted, fontSize = 13.sp)
-            Column(Modifier.background(Color.White, Card).border(1.dp, Brand.Line, Card)) {
+            Text("Send all of this phone's internet through another device in your network.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+            Column(Modifier.background(MaterialTheme.colorScheme.surface, Card).border(1.dp, MaterialTheme.colorScheme.outline, Card)) {
                 ExitRow("None", "Internet goes out directly", status.usingExit == null, true) { onUse(null) }
                 status.exitCandidates.forEach { c ->
                     ExitRow(c.name, if (c.direct) "Direct path · offers exit" else "Relayed now — available once direct", status.usingExit == c.ip, c.offersExit && c.direct) { onUse(c.ip) }
                 }
             }
             Row(
-                Modifier.fillMaxWidth().background(Color.White, Card).border(1.dp, Brand.Line, Card).padding(16.dp),
+                Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, Card).border(1.dp, MaterialTheme.colorScheme.outline, Card).padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
                     Text("Allow as exit node", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                    Text("Other devices may send their internet through this phone. Your LAN and this phone stay unreachable to them.", fontSize = 12.sp, color = Brand.Muted)
+                    Text("Other devices may send their internet through this phone. Your LAN and this phone stay unreachable to them.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Switch(checked = status.offeringExit, onCheckedChange = onOffer, enabled = status.tunnel is TunnelState.Connected)
             }
@@ -169,8 +170,8 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
     ) {
         RadioButton(selected = selected, onClick = onClick, enabled = enabled)
         Column {
-            Text(name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = if (enabled) Brand.Navy else Color(0xFF64748B))
-            Text(note, fontSize = 12.sp, color = Brand.Muted)
+            Text(name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(note, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -208,7 +209,7 @@ fun SettingsScreen() {
                     context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                 }
             }
-            Text("Version ${BuildConfig.VERSION_NAME}", fontSize = 12.sp, color = Brand.Muted)
+            Text("Version ${BuildConfig.VERSION_NAME}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -216,8 +217,8 @@ fun SettingsScreen() {
 @Composable
 private fun SettingsGroup(title: String, content: @Composable () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(title.uppercase(), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Brand.Muted)
-        Column(Modifier.background(Color.White, Card).border(1.dp, Brand.Line, Card)) { content() }
+        Text(title.uppercase(), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Column(Modifier.background(MaterialTheme.colorScheme.surface, Card).border(1.dp, MaterialTheme.colorScheme.outline, Card)) { content() }
     }
 }
 
@@ -229,8 +230,8 @@ private fun SettingsLink(label: String, hint: String, onClick: () -> Unit) {
     ) {
         Column(Modifier.weight(1f)) {
             Text(label, fontSize = 15.sp, fontWeight = FontWeight.Medium)
-            Text(hint, fontSize = 12.sp, color = Brand.Muted)
+            Text(hint, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Text("›", color = Brand.Muted, fontSize = 22.sp)
+        Text("›", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 22.sp)
     }
 }

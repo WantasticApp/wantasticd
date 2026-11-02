@@ -5,6 +5,10 @@ import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -50,12 +54,19 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 
 class MainActivity : ComponentActivity() {
 
+    // Asked when the user first connects (not at launch): the connection
+    // notification is the only one Wantastic shows. Declining still connects.
+    private val notificationConsent = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        requestVpnConsent()
+    }
+
     // Android asks the user once to allow a VPN; then the service may start.
     private val vpnConsent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) startTunnel()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         val key = ClaimKey.open(this).loadOrCreate()
         val deviceName = ClaimKey.deviceName(this)
@@ -66,6 +77,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestTunnel() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
+        ) {
+            notificationConsent.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        requestVpnConsent()
+    }
+
+    private fun requestVpnConsent() {
         val consent: Intent? = VpnService.prepare(this)
         if (consent != null) vpnConsent.launch(consent) else startTunnel()
     }

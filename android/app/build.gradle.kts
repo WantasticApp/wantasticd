@@ -77,6 +77,8 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("com.google.crypto.tink:tink-android:1.15.0")
     implementation("com.google.zxing:core:3.5.3")
+    // Ships the Compose baseline profiles so first launch is compiled, not interpreted.
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.ui:ui-tooling-preview")
 

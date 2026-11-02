@@ -27,6 +27,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.togetherWith
 import app.wantastic.android.ui.GlassBackground
+import app.wantastic.android.ui.LocalBackdrops
+import app.wantastic.android.ui.backdropSource
+import app.wantastic.android.ui.rememberBackdrop
 import app.wantastic.android.ui.GlassPillNav
 import app.wantastic.android.ui.PillItem
 import androidx.compose.material.icons.Icons
@@ -176,7 +179,10 @@ private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: (
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
     var exitOpen by rememberSaveable { mutableStateOf(false) }
     BackHandler(enabled = exitOpen) { exitOpen = false }
-    Box(Modifier.fillMaxSize().statusBarsPadding()) {
+    // The screens are recorded so the tab bar's glass refracts them as they scroll under it.
+    val screens = rememberBackdrop()
+    val light = LocalBackdrops.current?.light
+    Box(Modifier.fillMaxSize().backdropSource(screens).statusBarsPadding()) {
         AnimatedContent(
             targetState = if (exitOpen) null else tab,
             transitionSpec = { (fadeIn(tween(220)) + scaleIn(initialScale = 0.98f)) togetherWith fadeOut(tween(160)) },
@@ -206,5 +212,6 @@ private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: (
             }
         },
         modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 12.dp),
+        sources = listOfNotNull(light, screens),
     )
 }

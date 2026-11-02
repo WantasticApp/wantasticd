@@ -1,6 +1,16 @@
 package app.wantastic.android.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.interaction.PressInteraction
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.isSpecified
+import androidx.compose.ui.graphics.graphicsLayer
+import kotlinx.coroutines.launch
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -69,15 +79,18 @@ object Glass {
     val CardShape = RoundedCornerShape(28.dp)
 }
 
-/** Navy with slowly drifting blue and cyan light behind every screen. */
+/** Navy with slowly drifting blue and cyan light behind every screen; glass refracts it. */
 @Composable
 fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
     val drift = rememberInfiniteTransition(label = "drift")
     val t by drift.animateFloat(0f, 1f, infiniteRepeatable(tween(18_000, easing = LinearEasing), RepeatMode.Reverse), label = "t")
+    val light = rememberBackdrop()
+    val tilt = rememberTiltLight()
     Box(Modifier.fillMaxSize().background(Glass.Ink)) {
-        Canvas(Modifier.fillMaxSize()) {
+        Canvas(Modifier.fillMaxSize().backdropSource(light)) {
             val w = size.width
             val h = size.height
+            drawRect(Glass.Ink)
             drawCircle(
                 Brush.radialGradient(listOf(Glass.Blue.copy(alpha = 0.55f), Color.Transparent), center = Offset(w * (0.15f + 0.25f * t), h * 0.18f), radius = w * 0.85f),
                 radius = w * 0.85f, center = Offset(w * (0.15f + 0.25f * t), h * 0.18f),
@@ -91,11 +104,13 @@ fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
                 radius = w * 0.6f, center = Offset(w * 0.3f, h * (0.95f - 0.1f * t)),
             )
         }
-        content()
+        CompositionLocalProvider(LocalBackdrops provides Backdrops(light, null), LocalGlassLight provides tilt) {
+            content()
+        }
     }
 }
 
-/** A frosted glass surface with a hairline edge. */
+/** A liquid glass surface: refracts the light behind it, swells and glows under a finger. */
 @Composable
 fun GlassCard(
     modifier: Modifier = Modifier,
@@ -105,13 +120,26 @@ fun GlassCard(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val scale by animateFloatAsState(if (pressed) 0.97f else 1f, spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMedium), label = "press")
+    var touch by remember { mutableStateOf(Offset.Unspecified) }
+    LaunchedEffect(interaction) {
+        interaction.interactions.collect { if (it is PressInteraction.Press) touch = it.pressPosition }
+    }
+    val swell by animateFloatAsState(if (pressed) 1f else 0f, spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMediumLow), label = "swell")
+    // Cards are 28dp; any other shape here is a capsule.
+    val corner = if (shape == Glass.CardShape) 28.dp else 999.dp
     Column(
         modifier
-            .scale(scale)
+            .graphicsLayer { scaleX = 1f + 0.02f * swell; scaleY = 1f + 0.02f * swell }
+            .liquidGlass(corner, Brush.verticalGradient(listOf(Color(0x24FFFFFF), Color(0x0DFFFFFF))), bulge = { swell })
+            .drawBehind {
+                if (swell > 0.01f && touch.isSpecified) {
+                    drawCircle(
+                        Brush.radialGradient(listOf(Color.White.copy(alpha = 0.18f * swell), Color.Transparent), center = touch, radius = size.maxDimension * 0.6f),
+                        radius = size.maxDimension * 0.6f, center = touch,
+                    )
+                }
+            }
             .clip(shape)
-            .background(Brush.verticalGradient(listOf(Glass.FillStrong, Glass.Fill)))
-            .border(1.dp, Brush.verticalGradient(listOf(Glass.Edge, Color(0x0DFFFFFF))), shape)
             .then(if (onClick != null) Modifier.clickable(interaction, indication = null, role = Role.Button, onClick = onClick) else Modifier)
             .padding(18.dp),
         content = content,
@@ -141,12 +169,14 @@ fun ConnectOrb(on: Boolean, busy: Boolean, enabled: Boolean, label: String, onCl
             Modifier
                 .size(164.dp)
                 .scale(press)
-                .clip(CircleShape)
-                .background(
-                    if (on) Brush.linearGradient(listOf(Glass.Blue, Glass.Cyan))
-                    else Brush.linearGradient(listOf(Glass.FillStrong, Glass.Fill)),
+                .liquidGlass(
+                    82.dp,
+                    Brush.linearGradient(listOf(Glass.Blue.copy(alpha = 0.08f + 0.8f * glow), Glass.Cyan.copy(alpha = 0.06f + 0.75f * glow))),
+                    GlassOptics(refraction = 28.dp, zone = 64.dp, blur = 4.dp, dispersion = 0.22f),
+                    bulge = { (1f - press) / 0.08f },
                 )
-                .border(2.dp, ring, CircleShape)
+                .border(1.5.dp, ring.copy(alpha = 0.25f + 0.5f * glow), CircleShape)
+                .clip(CircleShape)
                 .clickable(interaction, indication = null, enabled = enabled, role = Role.Switch) {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     onClick()
@@ -167,29 +197,52 @@ fun ConnectOrb(on: Boolean, busy: Boolean, enabled: Boolean, label: String, onCl
 
 data class PillItem(val label: String, val icon: ImageVector)
 
-/** Floating glass tab bar; the highlight springs to the selected tab. */
+/**
+ * Floating liquid glass tab bar. The selection is a drop of glass: its
+ * leading edge springs to the new tab first and the trailing edge follows,
+ * so it stretches, travels and settles like liquid.
+ */
 @Composable
-fun GlassPillNav(items: List<PillItem>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+fun GlassPillNav(items: List<PillItem>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier, sources: List<Backdrop>? = null) {
     val haptics = LocalHapticFeedback.current
-    val itemWidth: Dp = 78.dp
-    val x by animateDpAsState(itemWidth * selected, spring(Spring.DampingRatioLowBouncy, Spring.StiffnessMediumLow), label = "pill")
+    val itemWidth = 78f
+    val left = remember { Animatable(itemWidth * selected) }
+    val right = remember { Animatable(itemWidth * (selected + 1)) }
+    LaunchedEffect(selected) {
+        val toLeft = itemWidth * selected
+        val forward = toLeft > left.value
+        val lead = spring<Float>(Spring.DampingRatioMediumBouncy, Spring.StiffnessMedium)
+        val trail = spring<Float>(Spring.DampingRatioLowBouncy, Spring.StiffnessLow)
+        launch { left.animateTo(toLeft, if (forward) trail else lead) }
+        launch { right.animateTo(toLeft + itemWidth, if (forward) lead else trail) }
+    }
+    val stretch = ((right.value - left.value) / itemWidth - 1f).coerceAtLeast(0f)
     Box(
         modifier
-            .clip(RoundedCornerShape(40.dp))
-            .background(Brush.verticalGradient(listOf(Color(0x33FFFFFF), Color(0x1FFFFFFF))))
-            .border(1.dp, Glass.Edge, RoundedCornerShape(40.dp))
+            .liquidGlass(40.dp, Brush.verticalGradient(listOf(Color(0x1FFFFFFF), Color(0x0FFFFFFF))), GlassOptics(refraction = 14.dp, zone = 26.dp, blur = 14.dp), sources = sources)
             .padding(6.dp),
     ) {
-        Box(Modifier.offset(x = x).width(itemWidth).height(56.dp).clip(RoundedCornerShape(30.dp)).background(Glass.FillStrong))
+        Box(
+            Modifier
+                .offset(x = left.value.dp)
+                .width((right.value - left.value).dp)
+                .height(56.dp)
+                .graphicsLayer { scaleY = 1f - 0.12f * stretch.coerceAtMost(1f) }
+                .liquidGlass(
+                    30.dp, Brush.verticalGradient(listOf(Color(0x33FFFFFF), Color(0x1AFFFFFF))),
+                    GlassOptics(refraction = 18.dp, zone = 28.dp, blur = 2.dp, dispersion = 0.25f),
+                    sources = sources, bulge = { stretch },
+                ),
+        )
         Row {
             items.forEachIndexed { i, item ->
                 val tint by animateColorAsState(if (i == selected) Glass.Text else Glass.TextDim, label = "tint")
                 Column(
                     Modifier
-                        .width(itemWidth)
+                        .width(itemWidth.dp)
                         .height(56.dp)
                         .clip(RoundedCornerShape(30.dp))
-                        .clickable(role = Role.Tab) {
+                        .clickable(remember { MutableInteractionSource() }, indication = null, role = Role.Tab) {
                             if (i != selected) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             onSelect(i)
                         },

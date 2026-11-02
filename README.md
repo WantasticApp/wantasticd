@@ -72,6 +72,11 @@ To uninstall (keeps the configuration unless `--purge` is given):
 curl -fsSL https://get.wantastic.app/install.sh | sudo sh -s -- --uninstall [--purge]
 ```
 
+Prefer an installer? Download `wantastic-macos.pkg` from
+https://get.wantastic.app/latest/ (one package for Intel and Apple silicon, macOS 12+)
+and open it; then click **Log in** in the menu bar. It installs exactly what the
+script above installs, and upgrades in place.
+
 On macOS the same is built in: `sudo wantasticd uninstall [--purge]`, or
 **Uninstall Wantastic…** in the menu-bar app (asks for an administrator password).
 

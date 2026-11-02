@@ -1,0 +1,14 @@
+#!/bin/sh
+# Installs the bundled wantasticd exactly like install.sh does from the
+# network: binary, LaunchDaemon and menu-bar LaunchAgent; keeps an existing
+# login. The Installer app shows this script's failure as an install error.
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+LOG=/Library/Logs/Wantastic/install.log
+mkdir -p /Library/Logs/Wantastic
+/bin/sh "$HERE/install.sh" --binary "$HERE/wantasticd" >>"$LOG" 2>&1 || {
+  echo "Wantastic install failed; see $LOG" >&2
+  tail -n 20 "$LOG" >&2
+  exit 1
+}
+exit 0

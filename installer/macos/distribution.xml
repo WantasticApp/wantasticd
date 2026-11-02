@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Wantastic for macOS. scripts/build-darwin-pkg.sh fills VERSION. -->
+<installer-gui-script minSpecVersion="2">
+    <title>Wantastic</title>
+    <organization>app.wantastic</organization>
+    <background file="logo.png" alignment="bottomleft" scaling="proportional" mime-type="image/png"/>
+    <background-darkAqua file="logo.png" alignment="bottomleft" scaling="proportional" mime-type="image/png"/>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="license.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="x86_64,arm64"/>
+    <domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="12.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" title="Wantastic">
+        <pkg-ref id="app.wantastic.wantasticd"/>
+    </choice>
+    <pkg-ref id="app.wantastic.wantasticd" version="VERSION" onConclusion="none">wantasticd.pkg</pkg-ref>
+</installer-gui-script>

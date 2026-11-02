@@ -39,6 +39,8 @@ while [ "$#" -gt 0 ]; do
     --no-tray)  WITH_TRAY=0; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge)    UNINSTALL=1; PURGE=1; shift ;;
+    # Install this binary instead of downloading one (the macOS .pkg).
+    --binary)   LOCAL_BINARY="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -273,12 +275,21 @@ if [ "$UNINSTALL" = "1" ]; then
 fi
 
 # ── download binary ───────────────────────────────────────────────────────────
+TMP_DIR=$(mktemp -d 2>/dev/null || { mkdir -p /tmp/wantastic_install; printf '/tmp/wantastic_install'; })
+if [ -n "${LOCAL_BINARY:-}" ]; then
+  [ -f "$LOCAL_BINARY" ] || { echo "Error: $LOCAL_BINARY not found"; exit 1; }
+  # Work on a copy: installing renames it into place.
+  EXTRACTED="$TMP_DIR/wantasticd"
+  cp "$LOCAL_BINARY" "$EXTRACTED" && chmod 755 "$EXTRACTED"
+  [ "$OS" = "darwin" ] && prepare_darwin_binary "$EXTRACTED"
+  VERSION=$("$EXTRACTED" version 2>/dev/null | awk 'NR==1 {print $NF}')
+  [ -n "$VERSION" ] || { echo "Error: $LOCAL_BINARY does not run on this machine"; exit 1; }
+  echo "Version: $VERSION (bundled)"
+else
 echo "Fetching latest version…"
 VERSION=$(http_text "${BASE_URL}/latest" | tr -d '[:space:]')
 [ -n "$VERSION" ] || { echo "Error: could not determine latest version"; exit 1; }
 echo "Version: $VERSION"
-
-TMP_DIR=$(mktemp -d 2>/dev/null || { mkdir -p /tmp/wantastic_install; printf '/tmp/wantastic_install'; })
 
 RELEASE_TAG="${VERSION%%+*}"
 case "$RELEASE_TAG" in
@@ -289,7 +300,7 @@ case "$RELEASE_TAG" in
 esac
 # ?v= (full version, + escaped) skips CDN copies cached before a rebuild.
 ARCHIVE_URL="${BASE_URL}/${RELEASE_TAG}/wantasticd-${OS}-${ARCH}.tar.gz?v=$(printf '%s' "$VERSION" | sed 's/+/%2B/g')"
-echo "Downloading $ARCHIVE_URL…"
+echo "Downloading ${ARCHIVE_URL}…"
 http_get "$ARCHIVE_URL" "$TMP_DIR/pkg.tar.gz"
 tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"
 
@@ -310,6 +321,7 @@ case "$EXTRACTED_VERSION" in
     exit 1
     ;;
 esac
+fi
 
 # ── install binary (atomic) ───────────────────────────────────────────────────
 if [ "$OS" = "darwin" ]; then
@@ -324,7 +336,7 @@ else
 fi
 INSTALL_PATH="${INSTALL_DIR}/wantasticd"
 
-echo "Installing to $INSTALL_PATH…"
+echo "Installing to ${INSTALL_PATH}…"
 # Fresh Apple silicon Macs have no /usr/local/bin; ensure_writable_dir creates it.
 ensure_writable_dir "$INSTALL_DIR"
 if [ -f "$INSTALL_PATH" ]; then

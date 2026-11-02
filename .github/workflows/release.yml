@@ -140,7 +140,9 @@ jobs:
             exit 1
           fi
       - name: Build, sign and verify
-        run: sh scripts/build-darwin.sh "${{ github.ref_name }}"
+        run: |
+          sh scripts/build-darwin.sh "${{ github.ref_name }}"
+          sh scripts/build-darwin-pkg.sh "${{ github.ref_name }}"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-darwin
@@ -174,7 +176,9 @@ jobs:
             exit 1
           fi
       - name: Build, sign and verify
-        run: sh scripts/build-darwin.sh "${{ github.ref_name }}"
+        run: |
+          sh scripts/build-darwin.sh "${{ github.ref_name }}"
+          sh scripts/build-darwin-pkg.sh "${{ github.ref_name }}"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-darwin

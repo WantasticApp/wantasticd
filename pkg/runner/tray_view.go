@@ -26,12 +26,15 @@ const (
 	trayDisconnected
 	trayConnected
 	trayExitActive
+	trayNotSignedIn
 )
 
 func stateOf(st *agent.StatusResponse) trayState {
 	switch {
 	case st == nil:
 		return trayDaemonDown
+	case st.Claim != nil:
+		return trayNotSignedIn
 	case !st.Running || !st.DeviceRunning:
 		return trayDisconnected
 	case st.ExitNodeState != nil && st.ExitNodeState.Using != nil && st.ExitNodeState.Using.State == "active":
@@ -60,6 +63,8 @@ type trayView struct {
 	ToggleTitle   string
 	ToggleEnabled bool
 	PeersTitle    string
+	// LoginURL is the claim link Log in opens; empty once signed in.
+	LoginURL string
 }
 
 func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView {
@@ -71,6 +76,14 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 		v.Details = "Start it: " + daemonStartCommand()
 		v.Address, v.Traffic, v.Rate = "IP: —", "Traffic: —", "Speed: —"
 		v.PeersTitle = "Peers: —"
+		return v
+	case trayNotSignedIn:
+		v.Header = "○ Not signed in"
+		v.Tooltip = "Wantastic: not signed in"
+		v.Details = "Log in to add this device to your account"
+		v.Address, v.Traffic, v.Rate = "IP: —", "Traffic: —", "Speed: —"
+		v.PeersTitle = "Peers: —"
+		v.LoginURL = st.Claim.URL
 		return v
 	case trayDisconnected:
 		v.Header = "○ Disconnected"
@@ -284,6 +297,7 @@ var trayStateColors = map[trayState]color.NRGBA{
 	trayDisconnected: {0x9C, 0xA3, 0xAF, 0xFF}, // grey
 	trayConnected:    {0x22, 0xC5, 0x5E, 0xFF}, // green
 	trayExitActive:   {0x3B, 0x82, 0xF6, 0xFF}, // blue
+	trayNotSignedIn:  {0xF5, 0x9E, 0x0B, 0xFF}, // amber
 }
 
 // trayIconPNG draws the menu-bar icon: a disc in the state colour with a

@@ -185,6 +185,13 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mRate.Disable()
 			mDetails := systray.AddMenuItem("", "")
 			mDetails.Disable()
+			mLogin := systray.AddMenuItem("Log in…", "Open the browser to add this device to your account")
+			mLogin.Hide()
+			var (
+				loginMu    sync.Mutex
+				loginURL   string
+				loginShown bool
+			)
 
 			systray.AddSeparator()
 			mToggle := systray.AddMenuItem("Disconnect", "Connect or disconnect the tunnel; the service keeps running")
@@ -249,6 +256,17 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				setTitle(mTraffic, v.Traffic)
 				setTitle(mRate, v.Rate)
 				setTitle(mDetails, v.Details)
+				loginMu.Lock()
+				loginURL = v.LoginURL
+				if show := v.LoginURL != ""; show != loginShown {
+					if show {
+						mLogin.Show()
+					} else {
+						mLogin.Hide()
+					}
+					loginShown = show
+				}
+				loginMu.Unlock()
 				setTitle(mToggle, v.ToggleTitle)
 				setEnabled(mToggle, v.ToggleEnabled)
 				setTitle(mPeers, v.PeersTitle)
@@ -338,6 +356,14 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 					case <-mToggle.ClickedCh:
 						go toggle()
+
+					case <-mLogin.ClickedCh:
+						loginMu.Lock()
+						url := loginURL
+						loginMu.Unlock()
+						if err := openURL(url); err != nil {
+							notice.report("", "", fmt.Errorf("open the browser: %w", err))
+						}
 
 					case <-uninstallClicked:
 						if !uninstalling.CompareAndSwap(false, true) {

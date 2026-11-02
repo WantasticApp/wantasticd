@@ -552,6 +552,15 @@ func handleConnect() {
 		}
 	}
 	if _, err := os.Stat(*configPath); err != nil {
+		if os.IsNotExist(err) && !claimKeyExists(*claimKeyPath) && desktopOS() {
+			// A desktop that is not signed in yet waits for its claim; the
+			// tray's Log in opens the claim link (no login code).
+			if _, _, keyErr := loadOrCreateClaimKey(*claimKeyPath, resolveClaimServerURL(*serverURL, *server, *portalURL), false); keyErr != nil {
+				log.Printf("Could not create a claim key at %s: %v", *claimKeyPath, keyErr)
+			} else {
+				log.Printf("No login yet; created claim key %s", *claimKeyPath)
+			}
+		}
 		if os.IsNotExist(err) && claimKeyExists(*claimKeyPath) {
 			log.Printf("Config not found at %s; waiting for claim using %s", *configPath, *claimKeyPath)
 			*waitClaim = true
@@ -568,6 +577,9 @@ func handleConnect() {
 		runAgent(ctx, *configPath, *verbose, autoUpdate, tunName, useTray, localAccess)
 	})
 }
+
+// desktopOS is true where a person signs in from the tray.
+func desktopOS() bool { return runtime.GOOS == "windows" || runtime.GOOS == "darwin" }
 
 func claimKeyExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
@@ -594,8 +606,27 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		claimHost = parsed.Hostname()
 	}
 	log.Printf("Waiting for Wantastic device claim: public_key=%s server=%s", keyFile.PublicKey, serverURL)
+	claimURL := buildClaimURL(serverURL, keyFile.PublicKey)
+	log.Printf("Claim URL: %s", claimURL)
+	stopClaimAPI := func() {}
+	startClaimAPI := func() {
+		if desktopOS() {
+			stopClaimAPI = agent.StartClaimAPI(agent.ClaimStatus{URL: claimURL, PublicKey: keyFile.PublicKey})
+		}
+	}
+	startClaimAPI()
+	defer func() { stopClaimAPI() }()
+	// The agent serves the local API once claimed; free the port first.
+	apply := func(claim *auth.ClaimConfig) bool {
+		stopClaimAPI()
+		stopClaimAPI = func() {}
+		if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray, localAccess) {
+			return true
+		}
+		startClaimAPI()
+		return false
+	}
 	runner.MarkServiceReady() // nothing to connect until the claim; the service is up
-	log.Printf("Claim URL: %s", buildClaimURL(serverURL, keyFile.PublicKey))
 
 	hashedDeviceID, err := auth.HashedDeviceID()
 	if err != nil {
@@ -608,7 +639,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		platformdns.EnsureBootstrapHost(parentCtx, claimHost)
 		claim, waitErr := auth.WaitClaimConfig(parentCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
 		if waitErr == nil && claim != nil && claim.Claimed {
-			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray, localAccess) {
+			if apply(claim) {
 				return
 			}
 		} else if waitErr != nil && parentCtx.Err() == nil {
@@ -619,7 +650,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		claim, fetchErr := auth.FetchClaimConfig(pollCtx, serverURL, hashedDeviceID, keyFile.PublicKey)
 		cancel()
 		if fetchErr == nil && claim != nil && claim.Claimed {
-			if applyClaimedConfig(parentCtx, configPath, serverURL, keyFile, claim, verbose, autoUpdate, tunName, useTray, localAccess) {
+			if apply(claim) {
 				return
 			}
 		} else if fetchErr != nil && parentCtx.Err() == nil {

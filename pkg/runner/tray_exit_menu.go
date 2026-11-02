@@ -41,6 +41,11 @@ func deriveExitMenu(st *agent.StatusResponse) exitMenuState {
 		OfferTooltip: "Let other devices in this network send their internet traffic through this one",
 		NoneChecked:  true,
 	}
+	if st != nil && st.Claim != nil {
+		m.OfferTooltip = "Log in first"
+		m.UseTooltip = "Log in first"
+		return m
+	}
 	if st == nil || !st.Running {
 		m.OfferTooltip = "Daemon not running"
 		m.UseTooltip = "Daemon not running"

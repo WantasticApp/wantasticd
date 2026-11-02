@@ -101,3 +101,17 @@ func TestTrayIcons(t *testing.T) {
 		}
 	}
 }
+
+func TestTrayViewNotSignedIn(t *testing.T) {
+	st := &agent.StatusResponse{Claim: &agent.ClaimStatus{URL: "https://wantastic.app/claim?key=abc", PublicKey: "abc"}}
+	v := deriveTrayView(st, trafficSample{}, trafficSample{})
+	if v.State != trayNotSignedIn || v.LoginURL != st.Claim.URL || v.ToggleEnabled {
+		t.Fatalf("not signed in: %+v", v)
+	}
+	if m := deriveExitMenu(st); m.OfferTooltip != "Log in first" {
+		t.Errorf("exit menu while not signed in: %+v", m)
+	}
+	if v := deriveTrayView(&agent.StatusResponse{Running: true, DeviceRunning: true}, trafficSample{}, trafficSample{}); v.LoginURL != "" {
+		t.Errorf("signed-in device offers Log in: %+v", v)
+	}
+}

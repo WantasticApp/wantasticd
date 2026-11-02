@@ -178,6 +178,12 @@ func runStatus(args []string, w io.Writer) int {
 }
 
 func printStatus(w io.Writer, st agent.StatusResponse) {
+	if st.Claim != nil {
+		fmt.Fprintln(w, "Status:           Not signed in — waiting to be added to an account")
+		fmt.Fprintf(w, "Log in:           %s\n", st.Claim.URL)
+		fmt.Fprintf(w, "Version:          %s\n", orDash(st.Version))
+		return
+	}
 	state := "Stopped"
 	switch {
 	case st.Running && st.DeviceRunning:

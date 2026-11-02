@@ -129,6 +129,39 @@ type StatusResponse struct {
 	StartedAt      int64  `json:"started_at,omitempty"`
 	UptimeSec      int64  `json:"uptime_sec,omitempty"`
 	AutoUpdate     bool   `json:"auto_update"`
+	// Claim is set while the device waits to be added to an account (no
+	// login yet); the tray's Log in opens Claim.URL.
+	Claim *ClaimStatus `json:"claim,omitempty"`
+}
+
+// ClaimStatus is the claim link of a device that is not signed in yet.
+type ClaimStatus struct {
+	URL       string `json:"url"`
+	PublicKey string `json:"public_key"`
+}
+
+// StartClaimAPI serves /api/status while the daemon waits for its claim, so
+// the tray and `wantasticd status` can offer the claim link instead of
+// reporting the daemon as down. Stop it before the agent starts its own API.
+func StartClaimAPI(claim ClaimStatus) (stop func()) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(StatusResponse{
+			Version:   version.Version,
+			Commit:    version.Commit,
+			StartedAt: processStart.Unix(),
+			UptimeSec: int64(time.Since(processStart).Seconds()),
+			Claim:     &claim,
+		})
+	})
+	s := &APIServer{server: &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}}
+	_ = s.Start()
+	return func() { _ = s.Stop() }
 }
 
 // processStart approximates daemon start for uptime reporting.

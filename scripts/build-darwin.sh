@@ -29,7 +29,14 @@ for GOARCH in arm64 amd64; do
     go build -trimpath -ldflags="$LDFLAGS" -o "$OUT/wantasticd" ./cmd/wantasticd
 
   # Apple silicon refuses to run unsigned code; ad-hoc sign both builds.
-  codesign --force --sign - --identifier app.wantastic.wantasticd "$OUT/wantasticd"
+  # With MACOS_APP_IDENTITY (a "Developer ID Application" certificate in the
+  # keychain) the binary is signed for notarization: hardened runtime and a
+  # secure timestamp. Otherwise ad-hoc, which Apple silicon requires to run.
+  if [ -n "${MACOS_APP_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp --sign "$MACOS_APP_IDENTITY" --identifier app.wantastic.wantasticd "$OUT/wantasticd"
+  else
+    codesign --force --sign - --identifier app.wantastic.wantasticd "$OUT/wantasticd"
+  fi
   codesign --verify --verbose=2 "$OUT/wantasticd"
 
   ARCHS=$(lipo -archs "$OUT/wantasticd")

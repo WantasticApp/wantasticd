@@ -72,6 +72,26 @@ To uninstall (keeps the configuration unless `--purge` is given):
 curl -fsSL https://get.wantastic.app/install.sh | sudo sh -s -- --uninstall [--purge]
 ```
 
+### macOS code signing
+
+Until it is set up, macOS warns that it "could not verify `wantastic-macos.pkg`
+is free of malware" when the package comes from a browser (right-click → Open,
+or System Settings → Privacy & Security → Open Anyway). The `curl | sudo sh`
+install is not affected. To remove the warning, with an Apple Developer Program
+membership (Wantastic LLC):
+
+1. Create a **Developer ID Application** and a **Developer ID Installer**
+   certificate; export each with its private key as `.p12` (same password).
+2. Create an App Store Connect API key (Users and Access → Integrations →
+   Keys, role Developer) for notarization; download the `.p8`.
+3. Repository secrets: `MACOS_APP_CERT_P12`, `MACOS_INSTALLER_CERT_P12`,
+   `MACOS_NOTARY_KEY_P8` (base64 of each file), `MACOS_CERT_PASSWORD`,
+   `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER`.
+4. Repository variable `MACOS_SIGNING` = `apple`.
+
+Releases then sign the binary (hardened runtime) and the package, have Apple
+notarize the package and staple the ticket, so it opens with no warning.
+
 Prefer an installer? Download `wantastic-macos.pkg` from
 https://get.wantastic.app/latest/ (one package for Intel and Apple silicon, macOS 12+)
 and open it; then click **Log in** in the menu bar. It installs exactly what the

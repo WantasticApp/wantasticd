@@ -15,7 +15,11 @@ mkdir -p "$WORK/scripts" "$WORK/resources"
 
 # One binary for both architectures; Apple silicon needs a signature.
 lipo -create -output "$WORK/scripts/wantasticd" build/darwin-arm64/wantasticd build/darwin-amd64/wantasticd
-codesign --force --sign - --identifier app.wantastic.wantasticd "$WORK/scripts/wantasticd"
+if [ -n "${MACOS_APP_IDENTITY:-}" ]; then
+  codesign --force --options runtime --timestamp --sign "$MACOS_APP_IDENTITY" --identifier app.wantastic.wantasticd "$WORK/scripts/wantasticd"
+else
+  codesign --force --sign - --identifier app.wantastic.wantasticd "$WORK/scripts/wantasticd"
+fi
 codesign --verify "$WORK/scripts/wantasticd"
 lipo -archs "$WORK/scripts/wantasticd"
 
@@ -34,8 +38,23 @@ export COPYFILE_DISABLE=1
 # install.sh does from the network.
 pkgbuild --nopayload --scripts "$WORK/scripts" --identifier app.wantastic.wantasticd \
   --version "$VERSION" "$WORK/wantasticd.pkg"
-productbuild --distribution "$WORK/distribution.xml" --resources "$WORK/resources" \
-  --package-path "$WORK" "dist/wantastic-macos.pkg"
+if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
+  productbuild --distribution "$WORK/distribution.xml" --resources "$WORK/resources" \
+    --package-path "$WORK" --sign "$MACOS_INSTALLER_IDENTITY" --timestamp "dist/wantastic-macos.pkg"
+else
+  productbuild --distribution "$WORK/distribution.xml" --resources "$WORK/resources" \
+    --package-path "$WORK" "dist/wantastic-macos.pkg"
+fi
 
-pkgutil --check-signature dist/wantastic-macos.pkg || true # unsigned until a Developer ID Installer certificate is set up
+# Notarize when an App Store Connect API key is provided: Apple scans the
+# package and the ticket is stapled to it, so macOS opens it without the
+# "could not verify ... free of malware" warning, even offline.
+if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ] && [ -n "${NOTARY_KEY_PATH:-}" ]; then
+  xcrun notarytool submit dist/wantastic-macos.pkg --key "$NOTARY_KEY_PATH" \
+    --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait --timeout 30m
+  xcrun stapler staple dist/wantastic-macos.pkg
+  xcrun stapler validate dist/wantastic-macos.pkg
+  spctl --assess --type install --verbose=2 dist/wantastic-macos.pkg
+fi
+pkgutil --check-signature dist/wantastic-macos.pkg || true # unsigned until the Apple certificates are set up
 ls -l dist/wantastic-macos.pkg

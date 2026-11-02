@@ -234,6 +234,18 @@ jobs:
           source-dir: dist
           destination-dir: latest
 
+      # The MikroTik onboarding library, fetched by the console's command as
+      # https://get.wantastic.app/init.rsc (bucket root).
+      - name: Upload RouterOS library to R2 (root)
+        if: steps.newest-tag.outputs.is_newest == 'true'
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: routeros
+
       - name: Signed installer
         if: needs.windows.outputs.signed == 'true'
         uses: actions/download-artifact@v4

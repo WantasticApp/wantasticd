@@ -4,7 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ClaimLinkTest {
-    private val key = "bTJmHCbkxYq3Xg8x+S5Rr0b5pGGqP2V7ZcPmLe4/2Ac="
+    // A made-up public key (claim keys are public), with +, / and = to exercise encoding.
+    private val key = "bTJmHCbkxYq3Xg8x+S5Rr0b5pGGqP2V7ZcPmLe4/2Ac=" // gitleaks:allow
 
     @Test
     fun matchesTheDesktopAgentsClaimLink() {

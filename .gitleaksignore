@@ -1,0 +1,2 @@
+# Test fixture: a made-up X25519 public key (public by design), not a secret.
+59891961a91a1b1d9a2f15641580067e3668bc2f:android/app/src/test/java/app/wantastic/android/claim/ClaimLinkTest.kt:generic-api-key:7

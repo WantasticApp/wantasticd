@@ -339,7 +339,11 @@ jobs:
             throw "service stopped with a logged-in config"
           }
           Get-NetAdapter -IncludeHidden | Format-Table Name, InterfaceDescription, Status | Out-Host
-          if (-not (Get-NetAdapter -IncludeHidden | Where-Object InterfaceDescription -match "Wintun")) { throw "no Wintun adapter" }
+          # Wintun names the adapter (Wantastic) and describes it by tunnel type (WireGuard).
+          if (-not (Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -eq "Wantastic" -or $_.InterfaceDescription -match "WireGuard|Wintun" })) {
+            Get-Content $log -Tail 40 | Out-Host
+            throw "no Wantastic tunnel adapter"
+          }
           if (-not (Get-NetFirewallRule -Name Wantastic-overlay -ErrorAction SilentlyContinue)) { throw "overlay firewall rule missing" }
           & $exe service stop; if ($LASTEXITCODE) { throw "service stop failed" }
           Remove-Item "$env:ProgramData\Wantastic\config.conf"

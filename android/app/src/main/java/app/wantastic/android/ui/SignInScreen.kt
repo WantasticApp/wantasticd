@@ -52,24 +52,18 @@ fun SignInScreen(claimUrl: String, onContinue: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Brand.Navy)
             .safeDrawingPadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("Add this phone to Wantastic", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text("Add this phone to Wantastic", color = Glass.Text, fontSize = 30.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
         Text(
             "Approve it in your account and it joins your network. No password or code to type here.",
             color = Color(0xFFB7C6DB), fontSize = 15.sp, textAlign = TextAlign.Center,
         )
-        Box(
-            Modifier
-                .background(Brand.NavyRaised, RoundedCornerShape(22.dp))
-                .padding(20.dp),
-            contentAlignment = Alignment.Center,
-        ) {
+        GlassCard {
             Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Image(
                     bitmap = qr.asImageBitmap(),
@@ -87,7 +81,7 @@ fun SignInScreen(claimUrl: String, onContinue: () -> Unit) {
             onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(claimUrl))) },
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Brand.Blue),
+            colors = ButtonDefaults.buttonColors(containerColor = Glass.Blue),
         ) { Text("Log in with browser", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
         OutlinedButton(
             onClick = { copy(context, claimUrl) },

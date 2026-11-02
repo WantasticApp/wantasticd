@@ -13,20 +13,28 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.unit.dp
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.togetherWith
+import app.wantastic.android.ui.GlassBackground
+import app.wantastic.android.ui.GlassPillNav
+import app.wantastic.android.ui.PillItem
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBox
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -102,38 +110,38 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
     val engine = Engines.current
     val status by engine.status.collectAsStateWithLifecycle()
     var browsing by rememberSaveable { mutableStateOf(false) }
-    if (!status.claimed && !browsing) {
-        SignInScreen(claimUrl, onContinue = { browsing = true })
-        return
-    }
-    var tab by rememberSaveable { mutableStateOf(Tab.Network) }
-    var exitOpen by remember { mutableStateOf(false) }
-    Scaffold(
-        bottomBar = {
-            NavigationBar {
-                Tab.entries.forEach { t ->
-                    NavigationBarItem(
-                        selected = tab == t,
-                        onClick = { tab = t; exitOpen = false },
-                        icon = { Icon(t.icon, contentDescription = null) },
-                        label = { Text(t.label) },
+    GlassBackground {
+        if (!status.claimed && !browsing) {
+            SignInScreen(claimUrl, onContinue = { browsing = true })
+            return@GlassBackground
+        }
+        var tab by rememberSaveable { mutableStateOf(Tab.Network) }
+        var exitOpen by rememberSaveable { mutableStateOf(false) }
+        BackHandler(enabled = exitOpen) { exitOpen = false }
+        Box(Modifier.fillMaxSize().statusBarsPadding()) {
+            AnimatedContent(
+                targetState = if (exitOpen) null else tab,
+                transitionSpec = { (fadeIn(tween(220)) + scaleIn(initialScale = 0.98f)) togetherWith fadeOut(tween(160)) },
+                label = "screen",
+            ) { screen ->
+                when (screen) {
+                    null -> ExitNodeScreen(status, onUse = engine::useExit, onOffer = engine::offerExit)
+                    Tab.Network -> HomeScreen(
+                        status, deviceName,
+                        onToggle = { if (status.tunnel is TunnelState.Connected) engine.disconnect() else onConnect() },
+                        onExitNode = { exitOpen = true },
                     )
+                    Tab.Peers -> PeersScreen(status)
+                    Tab.Console -> ConsoleScreen(ClaimLink.DEFAULT_SERVER)
+                    Tab.Settings -> SettingsScreen()
                 }
             }
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
-            when {
-                exitOpen -> ExitNodeScreen(status, onUse = engine::useExit, onOffer = engine::offerExit)
-                tab == Tab.Network -> HomeScreen(
-                    status, deviceName,
-                    onToggle = { if (status.tunnel is TunnelState.Connected) engine.disconnect() else onConnect() },
-                    onExitNode = { exitOpen = true },
-                )
-                tab == Tab.Peers -> PeersScreen(status)
-                tab == Tab.Console -> ConsoleScreen(ClaimLink.DEFAULT_SERVER)
-                else -> SettingsScreen()
-            }
         }
+        GlassPillNav(
+            items = Tab.entries.map { PillItem(it.label, it.icon) },
+            selected = tab.ordinal,
+            onSelect = { tab = Tab.entries[it]; exitOpen = false },
+            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 12.dp),
+        )
     }
 }

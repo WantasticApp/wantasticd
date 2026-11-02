@@ -391,3 +391,77 @@ jobs:
           if ((Get-Service wantasticd).Status -ne "Stopped") { throw "service should not start without sign-in" }
           & "$env:RUNNER_TEMP\wi\install.ps1" -Uninstall -Purge
           if ($LASTEXITCODE) { exit 1 }
+
+  # The setup wizard (Inno Setup) per architecture, from the same archive as
+  # install.ps1 (signed when signing is on), then a real silent install,
+  # upgrade and uninstall on that architecture.
+  setup:
+    needs: [build, sign]
+    if: always() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: windows-2025
+          - arch: arm64
+            os: windows-11-arm
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist
+      - name: Build the setup wizard
+        run: |
+          Expand-Archive -Path "dist/wantasticd-windows-${{ matrix.arch }}.zip" -DestinationPath payload -Force
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup is not installed" }
+          $version = "${{ inputs.tag }}" -replace '^v', '' -replace '[^0-9.].*$', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { $version = "0.0.0" }
+          & $iscc "/DAppVersion=$version" "/DArch=${{ matrix.arch }}" "/DSourceDir=$PWD\payload" installer\windows\wantastic.iss
+          if ($LASTEXITCODE) { throw "ISCC failed ($LASTEXITCODE)" }
+          New-Item -ItemType Directory -Force -Path setup-dist | Out-Null
+          Copy-Item "installer\windows\output\wantastic-setup-windows-${{ matrix.arch }}.exe" setup-dist\
+          Get-ChildItem setup-dist
+
+      - name: Silent install, upgrade, uninstall
+        run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
+          $setup = (Resolve-Path "setup-dist\wantastic-setup-windows-${{ matrix.arch }}.exe").Path
+          $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
+          foreach ($pass in "install", "upgrade") {
+            $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$env:RUNNER_TEMP\setup-$pass.log" -Wait -PassThru
+            if ($p.ExitCode) { Get-Content "$env:RUNNER_TEMP\setup-$pass.log" -Tail 60; throw "setup $pass exited $($p.ExitCode)" }
+            $svc = Get-CimInstance Win32_Service -Filter "Name='wantasticd'"
+            if ($svc.StartMode -ne "Auto" -or $svc.State -ne "Running") { throw "service not automatic and running after $pass" }
+            $status = & $exe status | Out-String
+            Write-Host $status
+            # No login on a runner: the service waits for its claim and says so.
+            if ($status -notmatch 'Not signed in' -or $status -notmatch 'https://') { throw "status does not show the claim link after $pass" }
+            if (-not (Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run).Wantastic) { throw "tray not registered after $pass" }
+            $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if (@($path -split ';' | Where-Object { $_.TrimEnd('\') -ieq "$env:ProgramFiles\Wantastic" }).Count -ne 1) { throw "PATH entry missing or duplicated after $pass" }
+          }
+          $uninstaller = Get-ChildItem "$env:ProgramFiles\Wantastic\unins*.exe" | Select-Object -First 1
+          Start-Process $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          # The uninstaller hands off to a temporary copy of itself.
+          for ($i = 0; $i -lt 60 -and (Test-Path $exe); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $exe) { throw "program still installed" }
+          if (Get-Service wantasticd -ErrorAction SilentlyContinue) { throw "service still there" }
+          if ((Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run).Wantastic) { throw "tray still registered" }
+          if (Get-NetFirewallRule -DisplayName "Wantastic*" -ErrorAction SilentlyContinue) { throw "firewall rule still there" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if (@($path -split ';' | Where-Object { $_.TrimEnd('\') -ieq "$env:ProgramFiles\Wantastic" }).Count) { throw "still on PATH" }
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.tag != ''
+        with:
+          name: dist-windows-setup-${{ matrix.arch }}
+          path: setup-dist/
+          if-no-files-found: error

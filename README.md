@@ -137,6 +137,10 @@ for the signed-in users and keeps its logon entry, unless it was turned off with
 `-NoTray` / `--no-tray`. The service reports Running only once the agent is up,
 so `wantasticd status` answers as soon as `service start` returns.
 
+Prefer a setup wizard? Download `wantastic-setup-windows-amd64.exe` (or `-arm64.exe`)
+from https://get.wantastic.app/latest/ and run it; it installs the same service and
+tray, then click **Log in** to add the PC. Silent install: `/VERYSILENT /SUPPRESSMSGBOXES`.
+
 Requires Windows 10, Windows 11 or Windows Server 2016+ (x64, ARM64 or x86).
 Windows 7, 8 and 8.1 are not supported: the Go runtime does not run there.
 Works in Windows PowerShell 5.1 and PowerShell 7. Re-running the installer

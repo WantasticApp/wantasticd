@@ -6,11 +6,9 @@ import (
 	"errors"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -129,8 +127,9 @@ func startTrayAs(sessionID uint32, exe string) error {
 	return nil
 }
 
-// SetTrayAutostart turns the tray's logon entry on (and starts the tray for
-// the current user) or off, recording an opt-out the service respects.
+// SetTrayAutostart turns the tray's logon entry on or off, recording an
+// opt-out the service respects. It does not start the tray: installers run
+// elevated, and the service starts it as each signed-in user instead.
 func SetTrayAutostart(exe string, on bool) error {
 	if !on {
 		if err := os.MkdirAll(filepath.Dir(noTrayMarker()), 0o755); err == nil {
@@ -141,16 +140,7 @@ func SetTrayAutostart(exe string, on bool) error {
 	if err := os.Remove(noTrayMarker()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := setTrayAutostart(exe); err != nil {
-		return err
-	}
-	// A second copy for an already-running tray exits on its own (TrayAlreadyRunning).
-	cmd := exec.Command(exe, "tray")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.DETACHED_PROCESS}
-	if err := cmd.Start(); err != nil {
-		return nil // registered; it starts at the next logon
-	}
-	return cmd.Process.Release()
+	return setTrayAutostart(exe)
 }
 
 // RemoveTrayAutostart deletes the tray's logon entry.

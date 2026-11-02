@@ -1,0 +1,44 @@
+WANTASTIC - TERMS OF SERVICE AND PRIVACY POLICY
+
+By installing and using Wantastic you agree to the Terms of Service and the
+Privacy Policy below. The current versions are always available at
+https://wantastic.app/terms and https://wantastic.app/privacy.
+
+
+TERMS OF SERVICE
+The rules governing use of Wantastic services.
+
+Authorized use
+Use the service only for systems and networks you are authorized to operate.
+Protect credentials and shared-access links.
+
+Service operation
+Availability, limits, support, and billing follow the active subscription and
+applicable order terms.
+
+Responsible operation
+Do not misuse remote access, scanning, automation, or network controls to
+disrupt systems or violate law.
+
+
+PRIVACY POLICY
+How Wantastic handles tenant and network operations data.
+
+Data we process
+Account, device, topology, telemetry, support, and billing data are processed
+to provide the service and secure tenant access.
+
+Security and retention
+Access is tenant-scoped, transport is encrypted, and operational data is
+retained according to service and legal requirements.
+
+Your choices
+Account owners can update profile data, revoke sessions and API keys, export
+supported records, and request account deletion.
+
+
+THIRD-PARTY SOFTWARE
+Wantastic includes the Wintun driver (https://www.wintun.net), distributed
+under its own license, installed as wintun-LICENSE.txt.
+
+Copyright (c) Wantastic LLC. All rights reserved.

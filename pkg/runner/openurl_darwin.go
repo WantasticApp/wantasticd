@@ -1,4 +1,4 @@
-//go:build darwin && !nosystray
+//go:build darwin
 
 package runner
 

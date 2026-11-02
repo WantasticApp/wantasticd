@@ -66,6 +66,9 @@ func main() {
 		os.Exit(runServiceCommand(os.Args[2:]))
 	case "uninstall":
 		os.Exit(runUninstall(os.Args[2:]))
+	case "open-login":
+		// Internal: the Windows setup's finish page.
+		os.Exit(runOpenLogin(os.Stdout))
 	case "update":
 		handleUpdate()
 	case "update-finish":

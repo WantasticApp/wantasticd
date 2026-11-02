@@ -361,7 +361,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						loginMu.Lock()
 						url := loginURL
 						loginMu.Unlock()
-						if err := openURL(url); err != nil {
+						if err := OpenURL(url); err != nil {
 							notice.report("", "", fmt.Errorf("open the browser: %w", err))
 						}
 

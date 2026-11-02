@@ -1,4 +1,4 @@
-//go:build windows && !nosystray
+//go:build windows
 
 package runner
 

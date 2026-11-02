@@ -222,12 +222,9 @@ function Install-Tray([bool]$Skip) {
     }
     Remove-Item -Force -Path $Wantastic.NoTrayFile -ErrorAction SilentlyContinue
     Set-ItemProperty -Path $Wantastic.RunKey -Name $Wantastic.TrayValue -Value "`"$($Wantastic.InstallPath)`" tray"
-    try {
-        Start-Process -FilePath $Wantastic.InstallPath -ArgumentList "tray" -WindowStyle Hidden
-        Write-Ok "Tray app started; it also starts at every logon."
-    } catch {
-        Write-Info "Tray app registered; it starts at the next logon."
-    }
+    # The service starts the tray as each signed-in user (not elevated, as
+    # this script runs) and at every logon.
+    Write-Ok "Tray app on; the service starts it for signed-in users."
 }
 
 # The config is JSON ("private_key"); older releases wrote "PrivateKey = ...".

@@ -21,7 +21,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -58,6 +57,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.wantastic.android.BuildConfig
 import app.wantastic.android.engine.EngineStatus
+import app.wantastic.android.engine.Peer
+import androidx.compose.runtime.LaunchedEffect
 import app.wantastic.android.engine.TunnelState
 
 /** Room left for the floating tab bar. */
@@ -137,13 +138,30 @@ private fun rate(bits: Long): String = when {
     else -> "%.0f kbit/s".format(bits / 1_000.0)
 }
 
+/**
+ * The network: live peers from the tunnel when connected, otherwise the
+ * account's devices as the console lists them (refreshed on open).
+ */
 @Composable
-fun PeersScreen(status: EngineStatus) {
+fun PeersScreen(status: EngineStatus, devices: List<Peer>, signedIn: Boolean, onRefresh: suspend () -> Unit, onSignIn: () -> Unit) {
+    LaunchedEffect(Unit) { onRefresh() }
+    val live = status.peers.isNotEmpty()
+    val list = if (live) status.peers else devices
     Column(Modifier.fillMaxSize()) {
-        GlassTitle("Peers", if (status.peers.isEmpty()) null else "${status.peers.size} online · ${status.peers.count { it.direct }} direct")
-        if (status.peers.isEmpty()) {
-            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-                Text(if (status.tunnel is TunnelState.EngineUnavailable) ENGINE_PENDING else "No peers yet.", color = Glass.TextDim, fontSize = 14.sp)
+        GlassTitle(
+            "Peers",
+            when {
+                live -> "${list.size} online · ${list.count { it.direct }} direct"
+                list.isNotEmpty() -> "${list.count { it.online }} of ${list.size} devices online"
+                else -> null
+            },
+        )
+        if (list.isEmpty()) {
+            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp), onClick = if (signedIn) null else onSignIn) {
+                Text(
+                    if (signedIn) "No other devices in this account yet." else "Sign in to see your account's devices.",
+                    color = Glass.TextDim, fontSize = 14.sp,
+                )
             }
             return
         }
@@ -151,16 +169,21 @@ fun PeersScreen(status: EngineStatus) {
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 110.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            items(status.peers, key = { it.vpnIp }) { p ->
+            items(list, key = { it.vpnIp + it.name }) { p ->
                 GlassCard(Modifier.fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(10.dp).clip(CircleShape).background(if (p.direct) Glass.Green else Color.Transparent).border(2.dp, if (p.direct) Glass.Green else Glass.TextDim, CircleShape))
+                        val on = if (live) p.direct else p.online
+                        Box(Modifier.size(10.dp).clip(CircleShape).background(if (on) Glass.Green else Glass.TextDim.copy(alpha = 0.4f)))
                         Spacer(Modifier.size(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(p.name, color = Glass.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            Text(p.name + if (p.self) " · this phone" else "", color = Glass.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                             Text(p.vpnIp, color = Glass.TextDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                         }
-                        Dim((if (p.direct) "direct" else "relay") + (p.latencyMs?.let { " · $it ms" } ?: ""), 12)
+                        Dim(
+                            if (live) (if (p.direct) "direct" else "relay") + (p.latencyMs?.let { " · $it ms" } ?: "")
+                            else if (p.online) "online" else "offline",
+                            12,
+                        )
                     }
                 }
             }

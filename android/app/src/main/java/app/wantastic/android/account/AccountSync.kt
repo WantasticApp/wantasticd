@@ -28,11 +28,40 @@ class AccountSync(val client: AccountClient, private val setups: DeviceSetups, p
     val account: StateFlow<AccountState> = state.asStateFlow()
     private val lock = Mutex()
 
+    private val devicesState = MutableStateFlow<List<app.wantastic.android.engine.Peer>>(emptyList())
+    /** The active account's devices, as the console lists them. */
+    val devices: StateFlow<List<app.wantastic.android.engine.Peer>> = devicesState.asStateFlow()
+
+    /** Reloads [devices]; quietly keeps the last list when offline. */
+    suspend fun refreshDevices() {
+        if (state.value !is AccountState.SignedIn) {
+            devicesState.value = emptyList()
+            return
+        }
+        val peers = runCatching { client.peers() }.getOrNull() ?: return
+        val mine = setups.current().publicKey
+        devicesState.value = (0 until peers.length()).map { peers.getJSONObject(it) }.map { p ->
+            app.wantastic.android.engine.Peer(
+                name = p.optString("name").ifBlank { "Device" },
+                vpnIp = p.optString("assigned_ip").ifBlank { p.optString("ip_address") },
+                publicIp = p.optString("endpoint").substringBeforeLast(':').ifBlank { null },
+                direct = false,
+                latencyMs = null,
+                handshakeAgoSec = null,
+                rxBytes = p.optLong("rx_bytes"),
+                txBytes = p.optLong("tx_bytes"),
+                online = p.optBoolean("is_online"),
+                self = p.optString("public_key") == mine,
+            )
+        }.sortedWith(compareByDescending<app.wantastic.android.engine.Peer> { it.self }.thenByDescending { it.online }.thenBy { it.name.lowercase() })
+    }
+
     suspend fun sync() = lock.withLock {
         try {
             val tenant = client.activeTenant()
             if (tenant == null) {
                 state.value = AccountState.SignedOut
+                devicesState.value = emptyList()
                 Log.i(TAG, "signed out")
                 return@withLock
             }
@@ -58,6 +87,7 @@ class AccountSync(val client: AccountClient, private val setups: DeviceSetups, p
             if (ready) onSetupChanged()
             state.value = AccountState.SignedIn(tenant, email, accounts, needsSetup = !ready)
             Log.i(TAG, "signed in; ${accounts.size} account(s); setup ${if (ready) "ready" else "needed"}")
+            refreshDevices()
         } catch (e: Exception) {
             Log.w(TAG, "account sync", e)
             state.value = AccountState.Offline(e.message ?: "Offline")

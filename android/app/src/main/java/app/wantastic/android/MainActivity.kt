@@ -263,7 +263,10 @@ private fun BoxScope.Tabs(
                     onLogIn = onLogIn,
                     onExitNode = { exitOpen = true },
                 )
-                Tab.Peers -> PeersScreen(status)
+                Tab.Peers -> {
+                    val devices by sync.devices.collectAsStateWithLifecycle()
+                    PeersScreen(status, devices, account is AccountState.SignedIn, onRefresh = sync::refreshDevices, onSignIn = onAddAccount)
+                }
                 Tab.Settings -> SettingsScreen(deviceName, publicKey, onConsole = onConsole) {
                     AccountCard(sync, account, onAddAccount)
                 }

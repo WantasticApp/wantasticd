@@ -22,6 +22,9 @@ data class Peer(
     val handshakeAgoSec: Long?,
     val rxBytes: Long,
     val txBytes: Long,
+    val online: Boolean = true,
+    /** This phone itself, in the account's device list. */
+    val self: Boolean = false,
 )
 
 data class ExitCandidate(val name: String, val ip: String, val offersExit: Boolean, val direct: Boolean)

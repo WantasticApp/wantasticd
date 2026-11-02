@@ -2,6 +2,20 @@ package app.wantastic.android.ui
 
 import android.content.Intent
 import android.provider.Settings
+import android.net.Uri
+import android.text.format.DateUtils
+import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import app.wantastic.android.settings.AppSettings
+import app.wantastic.android.update.UpdateStatus
+import app.wantastic.android.update.Updates
+import kotlinx.coroutines.launch
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -196,8 +210,21 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
 }
 
 @Composable
-fun SettingsScreen(onConsole: (path: String) -> Unit) {
+fun SettingsScreen(deviceName: String, publicKey: String, onConsole: (path: String) -> Unit) {
     val context = LocalContext.current
+    val settings = remember { AppSettings.get(context) }
+    val updates = remember { Updates.get(context) }
+    val update by updates.status.collectAsState()
+    val autoUpdate by settings.autoUpdate.collectAsState()
+    val wifiOnly by settings.wifiOnly.collectAsState()
+    val motion by settings.motion.collectAsState()
+    val scope = rememberCoroutineScope()
+    var licenses by rememberSaveable { mutableStateOf(false) }
+    BackHandler(enabled = licenses) { licenses = false }
+    if (licenses) {
+        LicensesScreen()
+        return
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(NavClearance)) {
         GlassTitle("Settings")
         Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -207,13 +234,119 @@ fun SettingsScreen(onConsole: (path: String) -> Unit) {
                 SettingsRow("Devices", "Add, approve and manage devices") { onConsole("/devices") }
                 SettingsRow("Account", "Profile, security and sessions") { onConsole("/accounts/profile") }
             }
+
             Section("Connection")
             GlassCard(Modifier.fillMaxWidth()) {
                 SettingsRow("Always-on VPN", "Reconnect after reboot and network changes") { context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
                 SettingsRow("Battery optimization", "Keep the tunnel alive on this phone") { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
             }
-            Text("Wantastic ${BuildConfig.VERSION_NAME}", color = Glass.TextDim, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp, start = 6.dp))
+
+            Section("Updates")
+            GlassCard(Modifier.fillMaxWidth()) {
+                SettingsRow(updateTitle(update), updateHint(update, updates.selfUpdating, settings.lastUpdateCheck)) {
+                    val activity = context as? android.app.Activity
+                    when (update) {
+                        is UpdateStatus.Ready, is UpdateStatus.Available -> if (activity != null) {
+                            if (update is UpdateStatus.Available && updates.selfUpdating) scope.launch { updates.check(interactive = true) }
+                            else updates.install(activity)
+                        }
+                        UpdateStatus.Checking, is UpdateStatus.Downloading, UpdateStatus.Installing -> Unit
+                        else -> scope.launch { updates.check(interactive = true) }
+                    }
+                }
+                if (updates.selfUpdating) {
+                    ToggleRow("Automatic updates", "Download and install new versions by themselves", autoUpdate) {
+                        settings.setAutoUpdate(it); Updates.schedule(context)
+                    }
+                    ToggleRow("Download on Wi-Fi only", "Never use mobile data for updates", wifiOnly, enabled = autoUpdate) {
+                        settings.setWifiOnly(it); Updates.schedule(context)
+                    }
+                }
+            }
+
+            Section("Appearance")
+            GlassCard(Modifier.fillMaxWidth()) {
+                ToggleRow("Motion", "Drifting light and glass that follows the phone's tilt", motion) { settings.setMotion(it) }
+            }
+
+            Section("This device")
+            GlassCard(Modifier.fillMaxWidth()) {
+                InfoRow("Name", deviceName)
+                InfoRow("Public key", publicKey, mono = true) { copyText(context, "Wantastic public key", publicKey) }
+            }
+
+            Section("About")
+            GlassCard(Modifier.fillMaxWidth()) {
+                SettingsRow("Privacy policy", "What Wantastic collects and why") { onConsole("/privacy") }
+                SettingsRow("Terms of service", "The rules for using Wantastic") { onConsole("/terms") }
+                SettingsRow("Source code", "github.com/WantasticApp/wantasticd") {
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(SOURCE_URL)))
+                }
+                SettingsRow("Open-source licenses", "The libraries Wantastic is built with") { licenses = true }
+            }
+            Text(
+                "Wantastic ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · ${if (updates.selfUpdating) "direct" else "Google Play"}",
+                color = Glass.TextDim, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp, start = 6.dp),
+            )
         }
+    }
+}
+
+const val SOURCE_URL = "https://github.com/WantasticApp/wantasticd"
+
+private fun updateTitle(s: UpdateStatus): String = when (s) {
+    UpdateStatus.Idle, UpdateStatus.UpToDate, is UpdateStatus.Failed -> "Check for updates"
+    UpdateStatus.Checking -> "Checking…"
+    is UpdateStatus.Available -> "Update to ${s.version}"
+    is UpdateStatus.Downloading -> "Downloading ${s.version} · ${(s.fraction * 100).toInt()}%"
+    is UpdateStatus.Ready -> "Install ${s.version}"
+    UpdateStatus.Installing -> "Installing…"
+}
+
+private fun updateHint(s: UpdateStatus, self: Boolean, lastCheck: Long): String = when (s) {
+    UpdateStatus.UpToDate -> "Wantastic is up to date"
+    is UpdateStatus.Failed -> s.message
+    is UpdateStatus.Downloading -> if (s.patch) "Downloading only what changed" else "Downloading the full app"
+    is UpdateStatus.Ready -> "Restarts Wantastic; the tunnel reconnects by itself"
+    is UpdateStatus.Available -> if (self) "Tap to download" else "From Google Play"
+    else -> when {
+        !self -> "Updates come from Google Play"
+        lastCheck > 0 -> "Last checked " + DateUtils.getRelativeTimeSpanString(lastCheck)
+        else -> "From get.wantastic.app"
+    }
+}
+
+private fun copyText(context: android.content.Context, label: String, text: String) {
+    (context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+        .setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+}
+
+@Composable
+private fun ToggleRow(label: String, hint: String, checked: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(label, color = if (enabled) Glass.Text else Glass.TextDim, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Dim(hint, 12)
+        }
+        Switch(
+            checked = checked, onCheckedChange = onChange, enabled = enabled,
+            colors = SwitchDefaults.colors(checkedTrackColor = Glass.Blue, uncheckedTrackColor = Glass.Fill, uncheckedBorderColor = Color.Transparent),
+        )
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String, mono: Boolean = false, onClick: (() -> Unit)? = null) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(Glass.Radius - 8.dp))
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(vertical = 8.dp),
+    ) {
+        Dim(label, 12)
+        Text(value, color = Glass.Text, fontSize = if (mono) 13.sp else 16.sp, fontFamily = if (mono) FontFamily.Monospace else null)
     }
 }
 

@@ -11,6 +11,9 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.platform.LocalContext
+import app.wantastic.android.settings.AppSettings
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -84,10 +87,13 @@ object Glass {
 /** Navy with slowly drifting blue and cyan light behind every screen; glass refracts it. */
 @Composable
 fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
+    val context = LocalContext.current
+    val motion by remember { AppSettings.get(context) }.motion.collectAsState()
     val drift = rememberInfiniteTransition(label = "drift")
-    val t by drift.animateFloat(0f, 1f, infiniteRepeatable(tween(18_000, easing = LinearEasing), RepeatMode.Reverse), label = "t")
+    val moving by drift.animateFloat(0f, 1f, infiniteRepeatable(tween(18_000, easing = LinearEasing), RepeatMode.Reverse), label = "t")
+    val t = if (motion) moving else 0.35f
     val light = rememberBackdrop()
-    val tilt = rememberTiltLight()
+    val tilt = if (motion) rememberTiltLight() else remember { mutableStateOf(Offset(-0.42f, -0.91f)) }
     Box(Modifier.fillMaxSize().background(Glass.Ink)) {
         Canvas(Modifier.fillMaxSize().backdropSource(light)) {
             val w = size.width

@@ -4,6 +4,8 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    // Open-source notices: the license of every library, generated at build time.
+    id("com.mikepenz.aboutlibraries.plugin")
 }
 
 // CI passes the release version (android-v1.2.3 -> 1.2.3) and a build number.
@@ -58,8 +60,32 @@ android {
         compose = true
         buildConfig = true
     }
+    // go-licenses.json from mobile/cmd/golicenses, generated with the engine.
+    sourceSets["main"].assets.srcDir("libs/assets")
+
     // One universal APK for every CPU (arm64, armv7, x86_64, x86).
     splits { abi { isEnable = false } }
+
+    // Two stores, one app. Google Play only allows updates through Play, so
+    // "play" updates with Play's in-app updates (Play ships them as patches);
+    // "direct" (get.wantastic.app) updates itself with binary patches.
+    flavorDimensions += "store"
+    productFlavors {
+        create("play") {
+            dimension = "store"
+            buildConfigField("boolean", "SELF_UPDATE", "false")
+        }
+        create("direct") {
+            dimension = "store"
+            buildConfigField("boolean", "SELF_UPDATE", "true")
+        }
+    }
+}
+
+aboutLibraries {
+    // Only what ships: no network lookups at build time.
+    offlineMode = true
+    collect { configPath = file("config/aboutlibraries") }
 }
 
 dependencies {
@@ -79,6 +105,13 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("com.google.crypto.tink:tink-android:1.15.0")
     implementation("com.google.zxing:core:3.5.3")
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
+    implementation("com.mikepenz:aboutlibraries-core:12.2.4")
+    "playImplementation"("com.google.android.play:app-update-ktx:2.1.0")
+    // Play's library brings an old Fragment that breaks registerForActivityResult.
+    "playImplementation"("androidx.fragment:fragment-ktx:1.8.9")
+    // bzip2 for bsdiff patches (direct updates only).
+    "directImplementation"("org.apache.commons:commons-compress:1.28.0")
     // Ships the Compose baseline profiles so first launch is compiled, not interpreted.
     implementation("androidx.profileinstaller:profileinstaller:1.4.1")
     debugImplementation("androidx.compose.ui:ui-tooling")

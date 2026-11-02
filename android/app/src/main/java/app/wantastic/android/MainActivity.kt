@@ -42,6 +42,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import app.wantastic.android.engine.GoEngine
+import app.wantastic.android.update.Updates
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -78,6 +79,9 @@ private enum class Tab(val label: String, val icon: ImageVector) {
     Settings("Settings", Icons.Filled.Settings),
 }
 
+/** Sent by the direct build's "update ready" notification. */
+const val ACTION_INSTALL_UPDATE = "app.wantastic.android.action.INSTALL_UPDATE"
+
 class MainActivity : ComponentActivity() {
 
     // Asked when the user first connects (not at launch): the connection
@@ -112,9 +116,22 @@ class MainActivity : ComponentActivity() {
         val deviceName = ClaimKey.deviceName(this)
         val claimUrl = ClaimLink.build(null, key.publicKey, deviceName)
         if (savedInstanceState == null) VpnService.prepare(this)?.let(vpnAccess::launch)
+        Updates.schedule(this)
+        lifecycleScope.launch { Updates.get(this@MainActivity).check(interactive = false) }
+        handleUpdateIntent(intent)
         setContent {
-            WantasticTheme { App(claimUrl, deviceName, onConnect = ::requestTunnel) }
+            WantasticTheme { App(claimUrl, deviceName, key.publicKey, onConnect = ::requestTunnel) }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleUpdateIntent(intent)
+    }
+
+    // Tapping "Wantastic X is ready" installs it.
+    private fun handleUpdateIntent(intent: Intent?) {
+        if (intent?.action == ACTION_INSTALL_UPDATE) Updates.get(this).install(this)
     }
 
     private fun requestTunnel() {
@@ -139,7 +156,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
+private fun App(claimUrl: String, deviceName: String, publicKey: String, onConnect: () -> Unit) {
     val engine = Engines.current
     val status by engine.status.collectAsStateWithLifecycle()
     var browsing by rememberSaveable { mutableStateOf(false) }
@@ -159,7 +176,7 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
             // Approving happens in the console mini app: no outside browser.
             SignInScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onContinue = { browsing = true })
         } else {
-            Tabs(status, deviceName, onConnect, onLogIn = { openConsole(claimUrl) }, onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) })
+            Tabs(status, deviceName, publicKey, onConnect, onLogIn = { openConsole(claimUrl) }, onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) })
         }
         AnimatedVisibility(
             visible = consoleOpen && console != null,
@@ -172,7 +189,7 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
 }
 
 @Composable
-private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: () -> Unit, onLogIn: () -> Unit, onConsole: (String) -> Unit) {
+private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, publicKey: String, onConnect: () -> Unit, onLogIn: () -> Unit, onConsole: (String) -> Unit) {
     val engine = Engines.current
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
     var exitOpen by rememberSaveable { mutableStateOf(false) }
@@ -195,7 +212,7 @@ private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: (
                     onExitNode = { exitOpen = true },
                 )
                 Tab.Peers -> PeersScreen(status)
-                Tab.Settings -> SettingsScreen(onConsole = onConsole)
+                Tab.Settings -> SettingsScreen(deviceName, publicKey, onConsole = onConsole)
             }
         }
     }

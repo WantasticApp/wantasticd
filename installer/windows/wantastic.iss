@@ -69,10 +69,6 @@ Source: "{#SourceDir}\wintun-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversio
 Filename: "{app}\wantasticd.exe"; Parameters: "open-login"; Description: "Log in to Wantastic now (opens your browser)"; \
   Flags: postinstall runasoriginaluser runhidden nowait skipifsilent; Check: NotSignedIn
 
-[UninstallRun]
-Filename: "{app}\wantasticd.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM wantasticd.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopTray"
-
 [Code]
 const
   EnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
@@ -139,11 +135,36 @@ begin
   end;
 end;
 
+// Before files are removed: remove the service (stops it, firewall rules,
+// tray logon entry), then end every remaining wantasticd.exe (tray apps)
+// until none is left. Silent uninstalls otherwise leave a busy file behind
+// for deletion at the next restart.
+procedure StopEverything;
+var
+  Code, Attempt: Integer;
+begin
+  Exec(ExpandConstant('{app}\wantasticd.exe'), 'service uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  for Attempt := 1 to 20 do
+  begin
+    // taskkill exits 128 when no such process is left.
+    if Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM wantasticd.exe', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 128) then
+      break;
+    Sleep(500);
+  end;
+  // Let Windows release the image files of the processes just ended.
+  Sleep(2000);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Path, Dir: String;
   P: Integer;
 begin
+  if CurUninstallStep = usUninstall then
+  begin
+    StopEverything;
+    exit;
+  end;
   if CurUninstallStep <> usPostUninstall then
     exit;
   Dir := ExpandConstant('{app}');

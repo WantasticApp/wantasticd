@@ -126,9 +126,17 @@ jobs:
       - name: Vet and test (tray build)
         env:
           CGO_ENABLED: 1
+        # Failures are repeated as an annotation so they show on the run page.
         run: |
-          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
-          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+          set -o pipefail
+          status=0
+          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee vet.log || status=1
+          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee test.log || status=1
+          if [ "$status" != 0 ]; then
+            tail=$(cat vet.log test.log | grep -vE '^(ok|\?)[[:space:]]' | tail -80 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=go vet/test failed on macOS::$tail"
+            exit 1
+          fi
       - name: Build, sign and verify
         run: sh scripts/build-darwin.sh "${{ github.ref_name }}"
       - uses: actions/upload-artifact@v4
@@ -150,9 +158,17 @@ jobs:
       - name: Vet and test (tray build)
         env:
           CGO_ENABLED: 1
+        # Failures are repeated as an annotation so they show on the run page.
         run: |
-          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
-          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/...
+          set -o pipefail
+          status=0
+          go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee vet.log || status=1
+          go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee test.log || status=1
+          if [ "$status" != 0 ]; then
+            tail=$(cat vet.log test.log | grep -vE '^(ok|\?)[[:space:]]' | tail -80 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=go vet/test failed on macOS::$tail"
+            exit 1
+          fi
       - name: Build, sign and verify
         run: sh scripts/build-darwin.sh "${{ github.ref_name }}"
       - uses: actions/upload-artifact@v4

@@ -50,6 +50,7 @@ func (m *Manager) install(_, attempt context.Context, targetVersion, binaryPath,
 		os.Remove(newPath)
 		return err
 	}
+	ensureWintun(archivePath, filepath.Dir(binaryPath))
 
 	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
 		os.Remove(newPath)
@@ -125,6 +126,19 @@ func extractZipBinary(archivePath, name, dest string) error {
 		return nil
 	}
 	return fmt.Errorf("%s not found in release archive", name)
+}
+
+// ensureWintun puts the release's wintun.dll (the tunnel driver) next to the
+// binary when it is missing, e.g. on installs that predate shipping it. A
+// present copy is left alone: the running service has it loaded.
+func ensureWintun(archivePath, dir string) {
+	dest := filepath.Join(dir, "wintun.dll")
+	if _, err := os.Stat(dest); err == nil {
+		return
+	}
+	if err := extractZipBinary(archivePath, "wintun.dll", dest); err != nil {
+		log.Printf("wintun.dll not installed: %v", err)
+	}
 }
 
 // verifyVersion refuses a corrupt, wrong-architecture or mislabelled build

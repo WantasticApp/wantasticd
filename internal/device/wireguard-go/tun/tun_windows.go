@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,9 @@ func CreateTUN(ifname string, mtu int) (Device, error) {
 func CreateTUNWithRequestedGUID(ifname string, requestedGUID *windows.GUID, mtu int) (Device, error) {
 	wt, err := wintun.CreateAdapter(ifname, WintunTunnelType, requestedGUID)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "wintun") {
+			return nil, fmt.Errorf("Error creating interface: %w (wintun.dll must be next to wantasticd.exe; reinstall with install.ps1)", err)
+		}
 		return nil, fmt.Errorf("Error creating interface: %w", err)
 	}
 

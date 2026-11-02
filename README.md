@@ -101,6 +101,12 @@ Firewall: inbound UDP for direct peer connections, plus traffic from peers over
 the tunnel, so they can ping and reach this PC. The agent re-applies both
 firewall rules whenever it connects.
 
+The Windows package includes [Wintun](https://www.wintun.net) 0.14.1, the
+tunnel driver, for the matching architecture (x64, ARM64 or x86). It is the
+official build signed by WireGuard LLC, and the installer checks that signature
+before copying it next to `wantasticd.exe`. Self-update adds it to older
+installs that lack it.
+
 Options go after the scriptblock, as with `-Token` above:
 
 | Option | Effect |
@@ -154,9 +160,10 @@ Wantastic LLC version information.
      to turn signing on.
 
 Windows has its own workflow (`.github/workflows/windows.yml`). It runs the Go
-tests on Windows, builds amd64/arm64/x86, signs them, and then runs
-`install.ps1` for real (fresh install, upgrade, uninstall) in both Windows
-PowerShell 5.1 and PowerShell 7. It runs on every push or pull request that
+tests on Windows, builds amd64/arm64/x86 with Wintun, signs them, and then runs `install.ps1`
+for real on Windows Server 2022, Windows Server 2025 and Windows 11 ARM64,
+in both Windows PowerShell 5.1 and PowerShell 7: fresh install, the service
+bringing a real tunnel up, upgrade and uninstall. It runs on every push or pull request that
 touches Windows code, and the release calls it for each tag. With signing on,
 it signs and verifies every Windows executable and `install.ps1`. If signing
 or the installer test fails, nothing is published.

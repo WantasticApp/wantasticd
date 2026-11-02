@@ -46,6 +46,10 @@ permissions:
 
 env:
   GO_VERSION: '1.25.12'
+  # Wintun, the tunnel driver wantasticd loads (official prebuilt, signed by
+  # WireGuard LLC, shipped unmodified next to wantasticd.exe).
+  WINTUN_VERSION: '0.14.1'
+  WINTUN_SHA256: '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
 
 jobs:
   test:
@@ -124,10 +128,16 @@ jobs:
           LDFLAGS="-s -w -X wantastic-agent/pkg/version.Version=${TAG}+${SHA} -X wantastic-agent/pkg/version.Commit=${SHA} -X wantastic-agent/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           go build -v -trimpath -ldflags="$LDFLAGS" -o wantasticd.exe ./cmd/wantasticd
 
-      - name: Package
+      - name: Package (with Wintun)
         run: |
+          curl -sSfL -o wintun.zip "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          echo "${WINTUN_SHA256}  wintun.zip" | sha256sum -c -
+          unzip -q wintun.zip
+          case "${{ matrix.goarch }}" in 386) WARCH=x86 ;; *) WARCH=${{ matrix.goarch }} ;; esac
+          cp "wintun/bin/${WARCH}/wintun.dll" wintun.dll
+          cp wintun/LICENSE.txt wintun-LICENSE.txt
           mkdir -p dist
-          zip "dist/wantasticd-windows-${{ matrix.goarch }}.zip" wantasticd.exe README.md
+          zip "dist/wantasticd-windows-${{ matrix.goarch }}.zip" wantasticd.exe wintun.dll wintun-LICENSE.txt README.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -188,7 +198,7 @@ jobs:
             }
           }
           Remove-Item dist/*.zip
-          Compress-Archive -Path sign/wantasticd.exe, sign/README.md -DestinationPath "dist/wantasticd-windows-${{ matrix.goarch }}.zip"
+          Compress-Archive -Path sign/wantasticd.exe, sign/wintun.dll, sign/wintun-LICENSE.txt, sign/README.md -DestinationPath "dist/wantasticd-windows-${{ matrix.goarch }}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-windows-${{ matrix.goarch }}
@@ -212,11 +222,22 @@ jobs:
   installer:
     needs: [build, sign]
     if: always() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
-    runs-on: windows-latest
+    # Every Windows the runners offer: Server 2022, Server 2025 (Windows 11
+    # 24H2 core) and Windows 11 on ARM64.
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-2022, windows-2025]
         shell: [powershell, pwsh]
+        arch: [amd64]
+        include:
+          - os: windows-11-arm
+            shell: powershell
+            arch: arm64
+          - os: windows-11-arm
+            shell: pwsh
+            arch: arm64
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -226,7 +247,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: dist-windows-amd64
+          name: dist-windows-${{ matrix.arch }}
           path: dist
       - name: Signed installer
         if: needs.sign.result == 'success'
@@ -240,7 +261,7 @@ jobs:
           $src = if (Test-Path signed-installer/install.ps1) { "signed-installer/install.ps1" } else { "install.ps1" }
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\wi" | Out-Null
           Copy-Item $src "$env:RUNNER_TEMP\wi\install.ps1"
-          Copy-Item "dist/wantasticd-windows-amd64.zip" "$env:RUNNER_TEMP\wi\wantasticd.zip"
+          Copy-Item "dist/wantasticd-windows-${{ matrix.arch }}.zip" "$env:RUNNER_TEMP\wi\wantasticd.zip"
 
       # Default install: claim mode. With no login the service waits for the
       # device's claim, so it must start for real and stay Running.
@@ -263,6 +284,9 @@ jobs:
           if ($svc.StartMode -ne "Auto") { throw "service is not automatic" }
           if ((& sc.exe qfailure wantasticd | Out-String) -notmatch "RESTART") { throw "no recovery actions" }
           if (-not (Test-Path "$env:ProgramData\Wantastic\device-claim-key.json")) { throw "no claim key" }
+          $dll = Get-AuthenticodeSignature "$env:ProgramFiles\Wantastic\wintun.dll"
+          Write-Host "wintun.dll: $($dll.Status) $($dll.SignerCertificate.Subject)"
+          if ($dll.Status -ne "Valid" -or $dll.SignerCertificate.Subject -notmatch "WireGuard LLC") { throw "wintun.dll missing or not signed by WireGuard LLC" }
           $rule = Get-NetFirewallRule -DisplayName "Wantastic (wantasticd)" -ErrorAction SilentlyContinue
           if (-not $rule) { throw "firewall rule missing" }
           if (($rule | Get-NetFirewallApplicationFilter).Program -ne $exe) { throw "firewall rule has the wrong program" }
@@ -287,6 +311,38 @@ jobs:
           & $exe service start;   if ($LASTEXITCODE) { throw "service start failed" }
           & $exe service restart; if ($LASTEXITCODE) { throw "service restart failed" }
           if ((Get-Service wantasticd).Status -ne "Running") { throw "not running after restart" }
+
+      # A logged-in device: the service creates the Wintun adapter and opens
+      # the firewall for its overlay IP. Random keys and an unroutable
+      # endpoint (TEST-NET-1), so nothing is contacted.
+      - name: Tunnel comes up as a service
+        run: |
+          trap { Write-Host "::error::$($_.Exception.Message)"; exit 1 }
+          $ErrorActionPreference = "Stop"
+          $exe = "$env:ProgramFiles\Wantastic\wantasticd.exe"
+          $key = { [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 }) -as [byte[]]) }
+          $cfg = @{
+            device_id = "ci"; private_key = (& $key); public_key = ""
+            server = @{ endpoint = "192.0.2.1"; port = 51820; public_key = (& $key); allowed_ips = @("10.99.0.0/24"); persistent_keepalive = 25 }
+            interface = @{ addresses = @("10.99.0.2/32"); listen_port = 0; mtu = 1420; dns = @(); tun_mode = $true; tun_name = "" }
+            auth = @{ token = "" }; auto_update = $false
+          } | ConvertTo-Json -Depth 5
+          [IO.File]::WriteAllText("$env:ProgramData\Wantastic\config.conf", $cfg)
+          & $exe service restart
+          $code = $LASTEXITCODE
+          $log = "$env:ProgramData\Wantastic\wantasticd.log"
+          if (Test-Path $log) { Get-Content $log -Tail 40 | Out-Host }
+          if ($code) { throw "service did not start with a logged-in config" }
+          Start-Sleep -Seconds 15
+          if ((Get-Service wantasticd).Status -ne "Running") {
+            if (Test-Path $log) { Get-Content $log -Tail 40 | Out-Host }
+            throw "service stopped with a logged-in config"
+          }
+          Get-NetAdapter -IncludeHidden | Format-Table Name, InterfaceDescription, Status | Out-Host
+          if (-not (Get-NetAdapter -IncludeHidden | Where-Object InterfaceDescription -match "Wintun")) { throw "no Wintun adapter" }
+          if (-not (Get-NetFirewallRule -Name Wantastic-overlay -ErrorAction SilentlyContinue)) { throw "overlay firewall rule missing" }
+          & $exe service stop; if ($LASTEXITCODE) { throw "service stop failed" }
+          Remove-Item "$env:ProgramData\Wantastic\config.conf"
 
       - name: Upgrade in place
         run: |

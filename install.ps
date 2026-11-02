@@ -310,6 +310,30 @@ function Install-Wantasticd {
         # Downloaded files carry a "from the internet" mark; this copy was verified.
         Unblock-File -Path $target -ErrorAction SilentlyContinue
         Write-Ok "Installed to $target"
+
+        # Wintun: the tunnel driver wantasticd loads from its own folder. The
+        # release ships the build for this architecture, signed by WireGuard LLC.
+        $dll = Get-ChildItem -Path $extractDir -Filter "wintun.dll" -Recurse | Select-Object -First 1
+        $dllTarget = Join-Path $Wantastic.InstallDir "wintun.dll"
+        if ($dll) {
+            $sig = Get-AuthenticodeSignature -FilePath $dll.FullName
+            if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "WireGuard LLC") {
+                throw "wintun.dll in the archive is not validly signed by WireGuard LLC ($($sig.Status))."
+            }
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    Copy-Item -Path $dll.FullName -Destination $dllTarget -Force
+                    break
+                } catch {
+                    if ($attempt -ge 10) { throw "Could not replace ${dllTarget}: $($_.Exception.Message)" }
+                    Start-Sleep -Seconds 1
+                }
+            }
+            Unblock-File -Path $dllTarget -ErrorAction SilentlyContinue
+            Write-Ok "Tunnel driver: wintun.dll ($($dll.VersionInfo.FileVersion), $arch)"
+        } elseif (-not (Test-Path $dllTarget)) {
+            Write-Warning "This release does not include wintun.dll; the tunnel cannot start until it is installed."
+        }
     } finally {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $TempDir
     }

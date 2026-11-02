@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -65,6 +66,9 @@ func RunServiceHook(runFunc func(context.Context)) {
 	}
 }
 
+// serviceStopWait bounds a service stop; the SCM gives up on its own at 30 s.
+const serviceStopWait = 25 * time.Second
+
 type wantasticService struct {
 	runFunc func(context.Context)
 }
@@ -93,8 +97,16 @@ loop:
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
+				// Report the stop at once, then wait a bounded time: the SCM
+				// otherwise shows the service RUNNING while it waits, and a
+				// component that ignores cancellation would hang it forever.
+				changes <- svc.Status{State: svc.StopPending, WaitHint: uint32(serviceStopWait / time.Millisecond)}
 				cancel()
-				<-done
+				select {
+				case <-done:
+				case <-time.After(serviceStopWait):
+					log.Printf("service stop: the agent did not finish within %s; exiting anyway", serviceStopWait)
+				}
 				break loop
 			default:
 				log.Printf("unexpected control request #%d", c)

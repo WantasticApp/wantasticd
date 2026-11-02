@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"wantastic-agent/internal/wusp"
 )
@@ -177,6 +180,33 @@ func (b *hostBackend) collectDesktop(ctx context.Context, snap *desktopSnapshot)
 	return msg
 }
 
+// lastDesktopSnapshot is the reading the console last saw, so a Set resolves
+// indexes the way they were reported and does not re-collect inside its
+// request deadline.
+func (b *hostBackend) lastDesktopSnapshot(ctx context.Context) *desktopSnapshot {
+	if snap := b.desktopLast.Load(); snap != nil {
+		return snap
+	}
+	return b.desktop.collect(ctx)
+}
+
+// desktopCommandRunner is defaultCommandRunner for the desktop probes, with
+// a WaitDelay: system_profiler and friends start helpers that can keep the
+// output pipe open after the timeout, which would otherwise block forever
+// while the probe holds its lock.
+func desktopCommandRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 2 * time.Second
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return output, nil
+}
+
 // setDesktop applies the settings a desktop probe owns; handled is false for
 // paths the generic host backend applies (DNS, firewall, IP interfaces).
 func (b *hostBackend) setDesktop(ctx context.Context, path string, value wusp.Value) (handled bool, err error) {
@@ -192,7 +222,7 @@ func (b *hostBackend) setDesktop(ctx context.Context, path string, value wusp.Va
 	}
 	if index, ok := ntpServerIndex(path); ok {
 		var current []string
-		if snap := b.desktop.collect(ctx); snap != nil {
+		if snap := b.lastDesktopSnapshot(ctx); snap != nil {
 			current = snap.NTPServers
 		}
 		return true, b.desktop.setNTPServers(ctx, replaceNTPServerAt(current, index, wusp.ValueToString(value)))
@@ -202,7 +232,7 @@ func (b *hostBackend) setDesktop(ctx context.Context, path string, value wusp.Va
 		if !ok || leaf != "Enable" {
 			continue
 		}
-		snap := b.desktop.collect(ctx)
+		snap := b.lastDesktopSnapshot(ctx)
 		if snap == nil || index == 0 || index > uint64(len(snap.WiFi)) {
 			return true, wusp.ErrUSPPathNotFound
 		}
@@ -241,10 +271,11 @@ func tr181Architecture(arch string) string {
 // desktopProcessorAlias fits the CPU name into a TR-181 Alias (64 chars).
 func desktopProcessorAlias(model string) string {
 	model = strings.Join(strings.Fields(model), " ")
-	if len(model) > 64 {
-		model = strings.TrimSpace(model[:64])
+	for len(model) > 64 {
+		_, size := utf8.DecodeLastRuneInString(model)
+		model = model[:len(model)-size]
 	}
-	return model
+	return strings.TrimSpace(model)
 }
 
 // ipInterfaceOrder is the Device.IP.Interface.{i} order, shared by the
@@ -444,7 +475,7 @@ var errLastUplink = errors.New("refusing to turn off the only connected network:
 // IPv4 address other than link-local, loopback and tunnels.
 func isLastUplink(name string, ifaces []net.Interface, addrs func(net.Interface) ([]net.Addr, error)) bool {
 	connected := func(iface net.Interface) bool {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || len(iface.HardwareAddr) == 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || len(iface.HardwareAddr) == 0 || virtualAdapter(iface.Name) {
 			return false
 		}
 		list, err := addrs(iface)
@@ -472,6 +503,19 @@ func isLastUplink(name string, ifaces []net.Interface, addrs func(net.Interface)
 		return false
 	}
 	return target
+}
+
+// virtualAdapter names host-only and VM networks (Hyper-V/WSL vEthernet,
+// macOS bridge100 for Internet Sharing and VMs, VMware, VirtualBox, Docker):
+// they carry an address but no way out, so they are not an uplink.
+func virtualAdapter(name string) bool {
+	n := strings.ToLower(name)
+	for _, prefix := range []string{"vethernet", "bridge", "vmnet", "vboxnet", "docker", "veth", "virbr", "awdl", "llw", "anpi", "ap1"} {
+		if strings.HasPrefix(n, prefix) {
+			return true
+		}
+	}
+	return strings.Contains(n, "virtualbox") || strings.Contains(n, "vmware") || strings.Contains(n, "hyper-v")
 }
 
 func ensureNotLastUplink(name string) error {

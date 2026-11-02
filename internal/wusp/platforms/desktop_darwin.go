@@ -50,11 +50,14 @@ func (p *macProbe) collect(ctx context.Context) *desktopSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.hwDone {
+	slow := time.Since(p.slowAt) > macSlowRefresh
+	// Read once; a Mac (or VM) that reports no model retries only with the
+	// slow refresh, not on every collect.
+	if !p.hwDone || slow && p.hw.MachineModel == "" {
 		p.hw = parseSPHardware([]byte(p.output(ctx, 10*time.Second, "system_profiler", "SPHardwareDataType", "-json")))
-		p.hwDone = p.hw.MachineModel != ""
+		p.hwDone = true
 	}
-	if time.Since(p.slowAt) > macSlowRefresh {
+	if slow {
 		p.ports = parseHardwarePorts(p.output(ctx, 5*time.Second, "networksetup", "-listallhardwareports"))
 		p.computer = p.output(ctx, 3*time.Second, "scutil", "--get", "ComputerName")
 		switch out := strings.ToLower(p.output(ctx, 10*time.Second, "systemsetup", "-getusingnetworktime")); {

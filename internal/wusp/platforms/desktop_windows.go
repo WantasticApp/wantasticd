@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -259,8 +260,10 @@ func windowsAdapters() []windowsAdapter {
 		if speed := a.TransmitLinkSpeed; speed > 0 && speed != ^uint64(0) {
 			ad.info.SpeedMbps = speed / 1_000_000
 		}
+		// x/sys lays MibIfRow2 out 4 bytes short of MIB_IF_ROW2 on 386
+		// (uint64 alignment), so the call would overrun it there.
 		row := windows.MibIfRow2{InterfaceLuid: a.Luid}
-		if windows.GetIfEntry2Ex(windows.MibIfEntryNormal, &row) == nil {
+		if runtime.GOARCH != "386" && windows.GetIfEntry2Ex(windows.MibIfEntryNormal, &row) == nil {
 			ad.info.StatsKnown = true
 			ad.info.Stats = desktopCounters{
 				BytesReceived: row.InOctets, BytesSent: row.OutOctets,

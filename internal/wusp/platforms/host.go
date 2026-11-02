@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wantastic-agent/internal/linkdiscovery"
@@ -62,7 +63,8 @@ type hostBackend struct {
 	linkSetMTU     func(string, int) error
 	// desktop is the native macOS / Windows collector; nil elsewhere and
 	// with an injected command runner.
-	desktop desktopProbe
+	desktop     desktopProbe
+	desktopLast atomic.Pointer[desktopSnapshot]
 }
 
 type timeState struct {
@@ -131,7 +133,7 @@ func newHostBackend(kind Kind, opts Options) *hostBackend {
 		backend.useSystemd = true
 		backend.ntp = defaultNTPEnv()
 		if desktopKind(kind) {
-			backend.desktop = newDesktopProbe(backend.commandRunner)
+			backend.desktop = newDesktopProbe(desktopCommandRunner)
 		}
 	}
 	if backend.now == nil {
@@ -264,6 +266,7 @@ func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, valu
 func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	if b.desktop != nil {
 		if snap := b.desktop.collect(ctx); snap != nil {
+			b.desktopLast.Store(snap)
 			return b.collectDesktop(ctx, snap)
 		}
 	}

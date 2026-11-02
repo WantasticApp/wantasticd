@@ -197,6 +197,11 @@ func TestDesktopLastUplinkGuard(t *testing.T) {
 	if isLastUplink("en1", ifaces, lookup) {
 		t.Error("en1 carries no routable address; turning it off cannot cut the device off")
 	}
+	ifaces = append(ifaces, net.Interface{Name: "bridge100", Flags: up, HardwareAddr: mac})
+	addrs["bridge100"] = "192.168.64.1/24"
+	if !isLastUplink("en0", ifaces, lookup) {
+		t.Error("a VM bridge (bridge100) is not a way out; en0 is still the last uplink")
+	}
 	addrs["en1"] = "10.1.1.9/24"
 	if isLastUplink("en0", ifaces, lookup) {
 		t.Error("en1 is also connected; en0 is not the last uplink")

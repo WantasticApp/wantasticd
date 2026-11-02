@@ -1,0 +1,133 @@
+name: Android
+
+# The Wantastic Android app (android/). Every push builds and tests it; a tag
+# android-vX.Y.Z publishes the signed universal APK to R2 next to the agent
+# releases, in its own folder:
+#   https://get.wantastic.app/android/latest/wantastic-android.apk
+#   https://get.wantastic.app/android/X.Y.Z/wantastic-android-X.Y.Z.apk
+
+on:
+  push:
+    branches: [android]
+    tags: ['android-v*']
+    paths:
+      - android/**
+      - .github/workflows/android.yml
+  pull_request:
+    paths:
+      - android/**
+      - .github/workflows/android.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/android-v* ]]; then
+            NAME="${GITHUB_REF#refs/tags/android-v}"
+            [[ "$NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must be android-vX.Y.Z"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            NAME="0.0.0-dev+$(git rev-parse --short HEAD)"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Monotonic across builds, as Android requires for upgrades.
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_OUTPUT"
+
+      # The release key never lives in the repository. Tagged releases need
+      # it: an APK signed with another key could never be upgraded.
+      - name: Release signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            if [ "${{ steps.version.outputs.release }}" = "true" ]; then
+              echo "::error::ANDROID_KEYSTORE_B64 is not set; refusing to publish a release signed with the debug key"
+              exit 1
+            fi
+            echo "No release key: this build is signed with the debug key (testing only)."
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 --decode > release.keystore
+          {
+            echo "storeFile=release.keystore"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: Test and build
+        run: |
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease \
+            -PappVersionName="${{ steps.version.outputs.name }}" \
+            -PappVersionCode="${{ steps.version.outputs.code }}"
+
+      - name: Package
+        run: |
+          set -eu
+          NAME="${{ steps.version.outputs.name }}"
+          mkdir -p dist/versioned dist/latest
+          cp app/build/outputs/apk/release/app-release.apk "dist/versioned/wantastic-android-${NAME}.apk"
+          cp app/build/outputs/apk/release/app-release.apk dist/latest/wantastic-android.apk
+          echo "$NAME" > dist/latest/version
+          (cd dist/versioned && sha256sum "wantastic-android-${NAME}.apk" > "wantastic-android-${NAME}.apk.sha256")
+          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs dist/latest/wantastic-android.apk | head -3
+          rm -f release.keystore keystore.properties
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wantastic-android-${{ steps.version.outputs.name }}
+          path: android/dist/versioned/
+          if-no-files-found: error
+
+      - name: GitHub release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "Wantastic for Android ${{ steps.version.outputs.name }}" --generate-notes --verify-tag
+          gh release upload "$GITHUB_REF_NAME" dist/versioned/* --clobber
+
+      - name: Upload to R2 (versioned)
+        if: steps.version.outputs.release == 'true'
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: android/dist/versioned
+          destination-dir: android/${{ steps.version.outputs.name }}
+
+      - name: Upload to R2 (latest)
+        if: steps.version.outputs.release == 'true'
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: android/dist/latest
+          destination-dir: android/latest

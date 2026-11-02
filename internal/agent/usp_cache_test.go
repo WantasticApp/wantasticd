@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -373,5 +375,34 @@ func TestPersistentDataModelCacheRefreshDueWhileWatched(t *testing.T) {
 	cache.lastRefresh = now.Add(-2 * time.Second)
 	if cache.refreshDue(now) {
 		t.Fatal("watched cache refreshed again after 2s")
+	}
+}
+
+// TestReplaceFileConcurrent: saves running at once must all succeed and
+// leave one complete file (a shared temp name made one of them fail).
+func TestReplaceFileConcurrent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wusp-datamodel.cache")
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- replaceFile(path, []byte(strings.Repeat(string(rune('a'+i%26)), 4096)))
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent save failed: %v", err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) != 4096 || strings.Count(string(data), string(data[0])) != 4096 {
+		t.Fatalf("file is not one complete write: len=%d err=%v", len(data), err)
+	}
+	if left, _ := filepath.Glob(path + ".*.tmp"); len(left) != 0 {
+		t.Fatalf("temporary files left behind: %v", left)
 	}
 }

@@ -329,12 +329,7 @@ func writeDataModelCacheRefreshStatus(cachePath string, status dataModelCacheRef
 	if err != nil {
 		return
 	}
-	path := cachePath + ".status.json"
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	_ = replaceFile(cachePath+".status.json", data)
 }
 
 var cellularSnapshotPrefixes = []string{
@@ -531,14 +526,33 @@ func writeCacheAtomically(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create data model cache directory: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write data model cache: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceFile(path, data); err != nil {
 		return fmt.Errorf("commit data model cache: %w", err)
 	}
 	return nil
+}
+
+// replaceFile atomically replaces path with data (mode 0600). Each write uses
+// its own temporary file: with one fixed name, two saves running at once
+// (a periodic refresh and a post-change refresh) renamed each other's file
+// away and one failed.
+func replaceFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	_, err = tmp.Write(data)
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	if err != nil {
+		os.Remove(name)
+	}
+	return err
 }
 
 func cloneCachedMessage(msg *wusp.Message) *wusp.Message {

@@ -93,3 +93,5 @@ android/local.properties
 android/keystore.properties
 android/*.keystore
 android/*.jks
+# gomobile output, built in CI from mobile/
+android/app/libs/

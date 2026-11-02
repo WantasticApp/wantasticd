@@ -63,6 +63,8 @@ android {
 }
 
 dependencies {
+    // The Go engine, built from ../mobile by `gomobile bind` (see android/README.md).
+    implementation(files("libs/wantastic-engine.aar"))
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)
     implementation("androidx.core:core-ktx:1.15.0")

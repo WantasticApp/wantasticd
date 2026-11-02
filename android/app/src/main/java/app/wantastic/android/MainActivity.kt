@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -34,6 +35,12 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import app.wantastic.android.engine.GoEngine
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -54,6 +61,7 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.remember
+import app.wantastic.android.engine.EngineStatus
 import app.wantastic.android.ui.ExitNodeScreen
 import app.wantastic.android.ui.HomeScreen
 import app.wantastic.android.ui.PeersScreen
@@ -82,6 +90,10 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == RESULT_OK) startTunnel()
     }
 
+    // Asked at launch: Wantastic is meant to stay on, so get Android's one-time
+    // VPN approval up front. Nothing connects from this; declined asks again next launch.
+    private val vpnAccess = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {}
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // The app is always dark glass: light bar icons whatever the system theme.
         enableEdgeToEdge(
@@ -89,9 +101,16 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
-        val key = ClaimKey.open(this).loadOrCreate()
+        val identity = ClaimKey.open(this)
+        val key = identity.loadOrCreate()
+        val engine = GoEngine.install(this, identity)
+        // While the app is open and not yet approved, wait for the console's claim.
+        if (engine is GoEngine) lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) { engine.awaitClaim(ClaimLink.DEFAULT_SERVER, key.publicKey) }
+        }
         val deviceName = ClaimKey.deviceName(this)
         val claimUrl = ClaimLink.build(null, key.publicKey, deviceName)
+        if (savedInstanceState == null) VpnService.prepare(this)?.let(vpnAccess::launch)
         setContent {
             WantasticTheme { App(claimUrl, deviceName, onConnect = ::requestTunnel) }
         }
@@ -123,51 +142,24 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
     val engine = Engines.current
     val status by engine.status.collectAsStateWithLifecycle()
     var browsing by rememberSaveable { mutableStateOf(false) }
+    val context = LocalContext.current
+    // Created on first open, then kept: reopening is instant and signed in.
+    var console by remember { mutableStateOf<ConsoleWebHolder?>(null) }
+    var consoleOpen by rememberSaveable { mutableStateOf(false) }
+    fun openConsole(url: String? = null) {
+        val holder = console ?: ConsoleWebHolder(context, url ?: ClaimLink.DEFAULT_SERVER).also { console = it }
+        if (url != null && holder.url != url) holder.open(url)
+        consoleOpen = true
+    }
+    // Approved: close the console the claim was made in and show the network.
+    LaunchedEffect(status.claimed) { if (status.claimed) consoleOpen = false }
     GlassBackground {
         if (!status.claimed && !browsing) {
-            SignInScreen(claimUrl, onContinue = { browsing = true })
-            return@GlassBackground
+            // Approving happens in the console mini app: no outside browser.
+            SignInScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onContinue = { browsing = true })
+        } else {
+            Tabs(status, deviceName, onConnect, onLogIn = { openConsole(claimUrl) }, onConsole = { openConsole() })
         }
-        var tab by rememberSaveable { mutableStateOf(Tab.Network) }
-        var exitOpen by rememberSaveable { mutableStateOf(false) }
-        var consoleOpen by rememberSaveable { mutableStateOf(false) }
-        val context = LocalContext.current
-        // Created on first open, then kept: reopening is instant and signed in.
-        var console by remember { mutableStateOf<ConsoleWebHolder?>(null) }
-        BackHandler(enabled = exitOpen) { exitOpen = false }
-        Box(Modifier.fillMaxSize().statusBarsPadding()) {
-            AnimatedContent(
-                targetState = if (exitOpen) null else tab,
-                transitionSpec = { (fadeIn(tween(220)) + scaleIn(initialScale = 0.98f)) togetherWith fadeOut(tween(160)) },
-                label = "screen",
-            ) { screen ->
-                when (screen) {
-                    null -> ExitNodeScreen(status, onUse = engine::useExit, onOffer = engine::offerExit)
-                    Tab.Network -> HomeScreen(
-                        status, deviceName,
-                        onToggle = { if (status.tunnel is TunnelState.Connected) engine.disconnect() else onConnect() },
-                        onExitNode = { exitOpen = true },
-                    )
-                    Tab.Peers -> PeersScreen(status)
-                    Tab.Settings, Tab.Console -> SettingsScreen()
-                }
-            }
-        }
-        GlassPillNav(
-            items = Tab.entries.map { PillItem(it.label, it.icon) },
-            selected = tab.ordinal,
-            onSelect = {
-                // The console opens as its own app over this one; the tab under it stays.
-                if (Tab.entries[it] == Tab.Console) {
-                    if (console == null) console = ConsoleWebHolder(context, ClaimLink.DEFAULT_SERVER)
-                    consoleOpen = true
-                } else {
-                    tab = Tab.entries[it]
-                    exitOpen = false
-                }
-            },
-            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 12.dp),
-        )
         AnimatedVisibility(
             visible = consoleOpen && console != null,
             enter = slideInVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow)) { it } + fadeIn(),
@@ -176,4 +168,43 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
             console?.let { ConsoleMiniApp(it, onClose = { consoleOpen = false }) }
         }
     }
+}
+
+@Composable
+private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, onConnect: () -> Unit, onLogIn: () -> Unit, onConsole: () -> Unit) {
+    val engine = Engines.current
+    var tab by rememberSaveable { mutableStateOf(Tab.Network) }
+    var exitOpen by rememberSaveable { mutableStateOf(false) }
+    BackHandler(enabled = exitOpen) { exitOpen = false }
+    Box(Modifier.fillMaxSize().statusBarsPadding()) {
+        AnimatedContent(
+            targetState = if (exitOpen) null else tab,
+            transitionSpec = { (fadeIn(tween(220)) + scaleIn(initialScale = 0.98f)) togetherWith fadeOut(tween(160)) },
+            label = "screen",
+        ) { screen ->
+            when (screen) {
+                null -> ExitNodeScreen(status, onUse = engine::useExit, onOffer = engine::offerExit)
+                Tab.Network -> HomeScreen(
+                    status, deviceName,
+                    onToggle = { if (status.tunnel is TunnelState.Connected) engine.disconnect() else onConnect() },
+                    onLogIn = onLogIn,
+                    onExitNode = { exitOpen = true },
+                )
+                Tab.Peers -> PeersScreen(status)
+                Tab.Settings, Tab.Console -> SettingsScreen()
+            }
+        }
+    }
+    GlassPillNav(
+        items = Tab.entries.map { PillItem(it.label, it.icon) },
+        selected = tab.ordinal,
+        onSelect = {
+            // The console opens as its own app over this one; the tab under it stays.
+            if (Tab.entries[it] == Tab.Console) onConsole() else {
+                tab = Tab.entries[it]
+                exitOpen = false
+            }
+        },
+        modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 12.dp),
+    )
 }

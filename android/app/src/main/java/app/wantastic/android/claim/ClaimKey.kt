@@ -29,9 +29,15 @@ class ClaimKey(private val prefs: SharedPreferences) {
         return pair
     }
 
+    /** The console's approval (addresses, hub, keys), as the engine returned it; null until claimed. */
+    fun claim(): String? = prefs.getString(CLAIM, null)
+
+    fun saveClaim(json: String) = prefs.edit().putString(CLAIM, json).apply()
+
     companion object {
         private const val PRIVATE = "private_key"
         private const val PUBLIC = "public_key"
+        private const val CLAIM = "claim_config"
 
         private fun encode(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
 

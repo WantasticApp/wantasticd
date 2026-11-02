@@ -84,6 +84,8 @@ class ConsoleWebHolder(context: Context, private val home: String) {
     }
 
     val url: String get() = web.url ?: home
+
+    fun open(url: String) = web.loadUrl(url)
 }
 
 /**

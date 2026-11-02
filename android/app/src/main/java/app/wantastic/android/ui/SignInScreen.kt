@@ -3,9 +3,7 @@ package app.wantastic.android.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
-import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -46,7 +44,7 @@ import com.google.zxing.qrcode.QRCodeWriter
  * code on a computer. Nothing to type.
  */
 @Composable
-fun SignInScreen(claimUrl: String, onContinue: () -> Unit) {
+fun SignInScreen(claimUrl: String, onLogIn: () -> Unit, onContinue: () -> Unit) {
     val context = LocalContext.current
     val qr = remember(claimUrl) { qrBitmap(claimUrl, 512) }
     Column(
@@ -78,11 +76,11 @@ fun SignInScreen(claimUrl: String, onContinue: () -> Unit) {
         }
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(claimUrl))) },
+            onClick = onLogIn,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Glass.Blue),
-        ) { Text("Log in with browser", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
+        ) { Text("Log in", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
         OutlinedButton(
             onClick = { copy(context, claimUrl) },
             modifier = Modifier.fillMaxWidth().height(48.dp),

@@ -8,9 +8,9 @@ class ClaimLinkTest {
     private val key = "bTJmHCbkxYq3Xg8x+S5Rr0b5pGGqP2V7ZcPmLe4/2Ac=" // gitleaks:allow
 
     @Test
-    fun matchesTheDesktopAgentsClaimLink() {
+    fun carriesTheDesktopAgentsClaimParametersToDevices() {
         assertEquals(
-            "https://console.wantastic.app/#desktop?claim_public_key=bTJmHCbkxYq3Xg8x%2BS5Rr0b5pGGqP2V7ZcPmLe4%2F2Ac%3D" +
+            "https://console.wantastic.app/devices?claim_public_key=bTJmHCbkxYq3Xg8x%2BS5Rr0b5pGGqP2V7ZcPmLe4%2F2Ac%3D" +
                 "&wantastic_server=https%3A%2F%2Fconsole.wantastic.app&hostname=Kimo%27s+Pixel+8",
             ClaimLink.build(null, key, "Kimo's Pixel 8"),
         )
@@ -34,7 +34,7 @@ class ClaimLinkTest {
     @Test
     fun omitsAnEmptyHostname() {
         assertEquals(
-            "https://console.wantastic.app/#desktop?claim_public_key=abc&wantastic_server=https%3A%2F%2Fconsole.wantastic.app",
+            "https://console.wantastic.app/devices?claim_public_key=abc&wantastic_server=https%3A%2F%2Fconsole.wantastic.app",
             ClaimLink.build("", "abc", "localhost"),
         )
     }

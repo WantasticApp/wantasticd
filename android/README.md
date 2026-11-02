@@ -8,19 +8,28 @@ the "Wantastic for Android" canvas.
 
 - Sign-in by genkey claim: the phone makes its WireGuard key (X25519, kept in
   preferences encrypted with an Android Keystore key) and shows the same claim
-  link as the desktop agent, as a QR code, "Log in with browser" and "Copy".
+  link as the desktop agent, as a QR code, "Log in" (approves inside the
+  console mini app, no outside browser) and "Copy". The Go engine waits for
+  the console's approval and the app moves on by itself.
+- VPN access is requested at launch, once.
 - The four tabs: Network, Peers, Console (the portal at console.wantastic.app),
   Settings (always-on VPN, battery optimization).
 - The VPN permission flow and the system VPN service entry point.
 
-The tunnel engine is not in this build yet: the screens say so rather than
-show invented data. It plugs in behind `engine/Engine.kt`.
+The Go engine is `../mobile`, the agent's own code built with `gomobile bind`
+into `app/libs/wantastic-engine.aar`; it has its own `go.mod`, so the agent's
+dependencies never change for Android. So far it does the claim; the tunnel
+is next, and the screens say so rather than show invented data.
 
 ## Build
 
-JDK 17 and the Android SDK (`ANDROID_HOME`):
+JDK 17, the Android SDK (`ANDROID_HOME`) with the NDK (`ANDROID_NDK_HOME`),
+and Go. Build the engine first, then the app:
 
 ```sh
+(cd ../mobile && go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind &&
+  gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 24 \
+    -javapkg app.wantastic -trimpath -ldflags="-s -w" -o ../android/app/libs/wantastic-engine.aar .)
 ./gradlew :app:testDebugUnitTest :app:assembleRelease
 # app/build/outputs/apk/release/app-release.apk
 ```

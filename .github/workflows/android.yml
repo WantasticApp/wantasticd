@@ -12,10 +12,14 @@ on:
     tags: ['android-v*']
     paths:
       - android/**
+      - mobile/**
+      - internal/**
       - .github/workflows/android.yml
   pull_request:
     paths:
       - android/**
+      - mobile/**
+      - internal/**
       - .github/workflows/android.yml
   workflow_dispatch:
 
@@ -37,6 +41,23 @@ jobs:
           java-version: '17'
 
       - uses: gradle/actions/setup-gradle@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: mobile/go.sum
+
+      # The Go engine (../mobile, the agent's own code) as an Android library.
+      - name: Engine (gomobile)
+        working-directory: mobile
+        run: |
+          set -euo pipefail
+          MOBILE=$(go list -m -f '{{.Version}}' golang.org/x/mobile)
+          go install "golang.org/x/mobile/cmd/gomobile@$MOBILE" "golang.org/x/mobile/cmd/gobind@$MOBILE"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          mkdir -p ../android/app/libs
+          gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 24 \
+            -javapkg app.wantastic -trimpath -ldflags="-s -w" -o ../android/app/libs/wantastic-engine.aar .
 
       - name: Version
         id: version

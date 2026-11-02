@@ -49,13 +49,13 @@ import app.wantastic.android.engine.TunnelState
 /** Room left for the floating tab bar. */
 val NavClearance = PaddingValues(bottom = 104.dp)
 
-private const val ENGINE_PENDING = "The tunnel engine arrives in the next build. Sign-in and the console already work."
+private const val ENGINE_PENDING = "This phone is approved. Connecting arrives in the next build; the console already works."
 
 @Composable
 private fun Dim(text: String, size: Int = 13) = Text(text, color = Glass.TextDim, fontSize = size.sp)
 
 @Composable
-fun HomeScreen(status: EngineStatus, deviceName: String, onToggle: () -> Unit, onExitNode: () -> Unit) {
+fun HomeScreen(status: EngineStatus, deviceName: String, onToggle: () -> Unit, onLogIn: () -> Unit, onExitNode: () -> Unit) {
     val tunnel = status.tunnel
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(NavClearance).padding(horizontal = 20.dp),
@@ -66,21 +66,24 @@ fun HomeScreen(status: EngineStatus, deviceName: String, onToggle: () -> Unit, o
             Text("Wantastic", color = Glass.Text, fontSize = 34.sp, fontWeight = FontWeight.Bold)
             Dim("$deviceName · this phone", 15)
         }
+        // Not approved yet: the button is the way in, straight to the Claim form.
         ConnectOrb(
             on = tunnel is TunnelState.Connected,
             busy = tunnel is TunnelState.Connecting,
-            enabled = tunnel !is TunnelState.EngineUnavailable,
-            label = when (tunnel) {
-                is TunnelState.Connected -> "Connected"
-                TunnelState.Connecting -> "Connecting"
-                TunnelState.Disconnected -> "Connect"
-                TunnelState.EngineUnavailable -> "Not available"
+            enabled = !status.claimed || tunnel !is TunnelState.EngineUnavailable,
+            label = when {
+                !status.claimed -> "Log in"
+                tunnel is TunnelState.Connected -> "Connected"
+                tunnel is TunnelState.Connecting -> "Connecting"
+                tunnel is TunnelState.Disconnected -> "Connect"
+                else -> "Not available"
             },
-            onClick = onToggle,
+            onClick = if (status.claimed) onToggle else onLogIn,
         )
-        AnimatedContent(tunnel, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "state") { t ->
+        AnimatedContent(tunnel.takeIf { status.claimed }, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "state") { t ->
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 when (t) {
+                    null -> Text("Log in to your account and press Claim to add this phone.", color = Glass.TextDim, fontSize = 13.sp, textAlign = TextAlign.Center)
                     is TunnelState.Connected -> {
                         Text(t.address, color = Glass.Text, fontSize = 26.sp, fontFamily = FontFamily.Monospace)
                         Dim("via ${t.hub}")

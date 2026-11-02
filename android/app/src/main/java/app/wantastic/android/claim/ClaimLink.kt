@@ -4,9 +4,11 @@ import java.net.URI
 import java.net.URLEncoder
 
 /**
- * The claim link the console approves a device with, exactly as the desktop
- * agent builds it (cmd/wantasticd buildClaimURL), so the console's claim
- * screen needs no change for phones.
+ * The claim link the console approves a device with: the desktop agent's
+ * parameters (cmd/wantasticd buildClaimURL) on the console's Devices page.
+ * A real page path, unlike the agent's "/#desktop?...", survives the login
+ * redirect, so a signed-out console logs in and lands on the filled-in
+ * Claim form: log in, press Claim.
  */
 object ClaimLink {
     const val DEFAULT_SERVER = "https://console.wantastic.app"
@@ -41,7 +43,7 @@ object ClaimLink {
     fun build(server: String?, publicKey: String, deviceName: String?): String {
         val base = normalizeServer(server)
         val sb = StringBuilder(base)
-            .append("/#desktop?claim_public_key=").append(escape(publicKey.trim()))
+            .append("/devices?claim_public_key=").append(escape(publicKey.trim()))
             .append("&wantastic_server=").append(escape(base))
         val host = cleanHostname(deviceName)
         if (host.isNotEmpty()) sb.append("&hostname=").append(escape(host))

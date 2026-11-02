@@ -44,7 +44,15 @@ import app.wantastic.android.claim.ClaimKey
 import app.wantastic.android.claim.ClaimLink
 import app.wantastic.android.engine.Engines
 import app.wantastic.android.engine.TunnelState
-import app.wantastic.android.ui.ConsoleScreen
+import app.wantastic.android.ui.ConsoleMiniApp
+import app.wantastic.android.ui.ConsoleWebHolder
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.remember
 import app.wantastic.android.ui.ExitNodeScreen
 import app.wantastic.android.ui.HomeScreen
 import app.wantastic.android.ui.PeersScreen
@@ -117,6 +125,10 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
         }
         var tab by rememberSaveable { mutableStateOf(Tab.Network) }
         var exitOpen by rememberSaveable { mutableStateOf(false) }
+        var consoleOpen by rememberSaveable { mutableStateOf(false) }
+        val context = LocalContext.current
+        // Created on first open, then kept: reopening is instant and signed in.
+        var console by remember { mutableStateOf<ConsoleWebHolder?>(null) }
         BackHandler(enabled = exitOpen) { exitOpen = false }
         Box(Modifier.fillMaxSize().statusBarsPadding()) {
             AnimatedContent(
@@ -132,16 +144,31 @@ private fun App(claimUrl: String, deviceName: String, onConnect: () -> Unit) {
                         onExitNode = { exitOpen = true },
                     )
                     Tab.Peers -> PeersScreen(status)
-                    Tab.Console -> ConsoleScreen(ClaimLink.DEFAULT_SERVER)
-                    Tab.Settings -> SettingsScreen()
+                    Tab.Settings, Tab.Console -> SettingsScreen()
                 }
             }
         }
         GlassPillNav(
             items = Tab.entries.map { PillItem(it.label, it.icon) },
             selected = tab.ordinal,
-            onSelect = { tab = Tab.entries[it]; exitOpen = false },
+            onSelect = {
+                // The console opens as its own app over this one; the tab under it stays.
+                if (Tab.entries[it] == Tab.Console) {
+                    if (console == null) console = ConsoleWebHolder(context, ClaimLink.DEFAULT_SERVER)
+                    consoleOpen = true
+                } else {
+                    tab = Tab.entries[it]
+                    exitOpen = false
+                }
+            },
             modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 12.dp),
         )
+        AnimatedVisibility(
+            visible = consoleOpen && console != null,
+            enter = slideInVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow)) { it } + fadeIn(),
+            exit = slideOutVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMedium)) { it } + fadeOut(),
+        ) {
+            console?.let { ConsoleMiniApp(it, onClose = { consoleOpen = false }) }
+        }
     }
 }

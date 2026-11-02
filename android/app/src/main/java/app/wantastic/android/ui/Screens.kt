@@ -1,10 +1,7 @@
 package app.wantastic.android.ui
 
-import android.annotation.SuppressLint
 import android.content.Intent
 import android.provider.Settings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -21,7 +18,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -46,7 +42,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import app.wantastic.android.BuildConfig
 import app.wantastic.android.engine.EngineStatus
 import app.wantastic.android.engine.TunnelState
@@ -193,32 +188,6 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
         Column {
             Text(name, color = if (enabled) Glass.Text else Glass.TextDim, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Dim(note, 12)
-        }
-    }
-}
-
-/** The portal console, signed in with the same account as the web. */
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-fun ConsoleScreen(url: String) {
-    Column(Modifier.fillMaxSize().imePadding().padding(NavClearance)) {
-        GlassTitle("Console")
-        Box(
-            Modifier.fillMaxSize().padding(horizontal = 12.dp)
-                .clip(RoundedCornerShape(28.dp))
-                .border(1.dp, Glass.Edge, RoundedCornerShape(28.dp)),
-        ) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        webViewClient = WebViewClient()
-                        loadUrl(url)
-                    }
-                },
-            )
         }
     }
 }

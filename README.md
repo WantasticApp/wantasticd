@@ -116,7 +116,6 @@ Options go after the scriptblock, as with `-Token` above:
 | --- | --- |
 | *(none)* | claim with the QR code; connects once approved |
 | `-Token <TOKEN>` | log in with a token instead |
-| `-Login` | sign in through the browser (device code) instead |
 | `-NoLogin` | install only; add the device later (`wantasticd genkey --no-wait`, then `wantasticd service start`) |
 | `-NoTray` | do not start the tray app at logon |
 | `-Version v1.0.59` | install that release instead of the latest |
@@ -133,9 +132,10 @@ wantasticd service uninstall   # remove the service, its firewall rules and the 
 wantasticd uninstall [--purge] # remove everything the installer added; --purge also the login
 ```
 
-The tray app is on by default: the service re-registers it at logon if the entry
-goes missing, unless it was turned off with `-NoTray` / `--no-tray`. The tray menu
-also has **Uninstall Wantastic…** (asks for UAC approval).
+The tray app is on by default: every time the service starts it starts the tray
+for the signed-in users and keeps its logon entry, unless it was turned off with
+`-NoTray` / `--no-tray`. The service reports Running only once the agent is up,
+so `wantasticd status` answers as soon as `service start` returns.
 
 Requires Windows 10, Windows 11 or Windows Server 2016+ (x64, ARM64 or x86).
 Windows 7, 8 and 8.1 are not supported: the Go runtime does not run there.

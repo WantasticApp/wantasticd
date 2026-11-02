@@ -201,13 +201,19 @@ func pingSummary(pr *agent.PingResponse, err error) string {
 	return fmt.Sprintf("Ping: %d/%d peers answered · avg %.0f ms", up, len(pr.Results), sum/float64(up))
 }
 
-// peerMenuEntry is one row under Peers; its submenu copies VPNIP or PublicIP.
+// peerMenuEntry is one row under Peers; its submenu shows Detail and copies
+// VPNIP or PublicIP. Tooltip never carries live values: a tooltip whose text
+// changes every refresh flickers while the pointer rests on it.
 type peerMenuEntry struct {
 	Title    string
 	Tooltip  string
+	Detail   string
 	VPNIP    string
 	PublicIP string
 }
+
+// peerRowTooltip is the fixed hint on every peer row.
+const peerRowTooltip = "Open for live link details; click an address to copy it"
 
 // buildPeerMenuEntries lists every peer except the server, direct ones first,
 // with the latency of the last "Ping all peers" when there is one.
@@ -236,16 +242,14 @@ func buildPeerMenuEntries(peers []device.PeerInfo, latency map[string]agent.Ping
 				title += " · no reply"
 			}
 		}
-		var tip []string
+		handshake := "Handshake never"
 		if p.LastHandshake > 0 {
-			tip = append(tip, "Handshake: "+trayDuration(now.Sub(time.Unix(p.LastHandshake, 0)))+" ago")
-		} else {
-			tip = append(tip, "Handshake: never")
+			handshake = "Handshake " + trayDuration(now.Sub(time.Unix(p.LastHandshake, 0))) + " ago"
 		}
-		tip = append(tip, fmt.Sprintf("Traffic: ↓ %s ↑ %s", trayBytes(p.RxBytes), trayBytes(p.TxBytes)))
 		out = append(out, peerMenuEntry{
 			Title:    "( " + title + " )",
-			Tooltip:  strings.Join(tip, "\n"),
+			Tooltip:  peerRowTooltip,
+			Detail:   fmt.Sprintf("%s · ↓ %s ↑ %s", handshake, trayBytes(p.RxBytes), trayBytes(p.TxBytes)),
 			VPNIP:    strings.TrimSpace(p.AssignedIP),
 			PublicIP: endpointHost(p.Endpoint),
 		})

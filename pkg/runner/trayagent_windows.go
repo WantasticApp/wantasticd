@@ -8,7 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -31,35 +34,99 @@ func noTrayMarker() string {
 	return filepath.Join(dir, "Wantastic", "no-tray")
 }
 
-// EnsureTrayAgent registers the tray to start at every logon when the daemon
-// runs as the Windows service and the entry is missing: installs from before
-// the tray existed, or made with the service command alone, get it on their
-// next start. The service runs in session 0, so the tray appears at the next
-// logon.
+// EnsureTrayAgent runs when the service starts: it keeps the tray's logon
+// entry in place and starts the tray in every signed-in user's session, so
+// the tray is always on while the daemon runs. A copy already running in a
+// session exits on its own (TrayAlreadyRunning). The admin opt-out
+// (install.ps1 -NoTray, service install --no-tray) is respected.
 func EnsureTrayAgent() {
+	ensureTrayOnce.Do(ensureTrayAgent)
+}
+
+var ensureTrayOnce sync.Once
+
+func ensureTrayAgent() {
 	if isService, err := svc.IsWindowsService(); err != nil || !isService {
 		return
 	}
 	if _, err := os.Stat(noTrayMarker()); err == nil {
 		return
 	}
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, trayRunKey, registry.QUERY_VALUE)
-	if err == nil {
-		_, _, err = k.GetStringValue(trayRunValue)
-		k.Close()
-		if err == nil {
-			return
-		}
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return
 	}
-	if err := setTrayAutostart(exe); err != nil {
-		log.Printf("tray agent: %v", err)
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	want := `"` + exe + `" tray`
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, trayRunKey, registry.QUERY_VALUE)
+	current := ""
+	if err == nil {
+		current, _, _ = k.GetStringValue(trayRunValue)
+		k.Close()
+	}
+	if !strings.EqualFold(current, want) {
+		if err := setTrayAutostart(exe); err != nil {
+			log.Printf("tray agent: %v", err)
+		} else {
+			log.Printf("Registered the tray app to start at logon")
+		}
+	}
+	startTrayInUserSessions(exe)
+}
+
+// startTrayInUserSessions starts `exe tray` as the user of each active
+// session; the service itself runs in session 0, which has no desktop.
+func startTrayInUserSessions(exe string) {
+	var sessions *windows.WTS_SESSION_INFO
+	var count uint32
+	if err := windows.WTSEnumerateSessions(0, 0, 1, &sessions, &count); err != nil {
+		log.Printf("tray agent: list sessions: %v", err)
 		return
 	}
-	log.Printf("Registered the tray app to start at logon")
+	defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(sessions)))
+	for _, session := range unsafe.Slice(sessions, count) {
+		if session.State != windows.WTSActive || session.SessionID == 0 {
+			continue
+		}
+		if err := startTrayAs(session.SessionID, exe); err != nil {
+			log.Printf("tray agent: session %d: %v", session.SessionID, err)
+		}
+	}
+}
+
+func startTrayAs(sessionID uint32, exe string) error {
+	var token windows.Token
+	if err := windows.WTSQueryUserToken(sessionID, &token); err != nil {
+		return err // no user signed in to this session
+	}
+	defer token.Close()
+	var env *uint16
+	if err := windows.CreateEnvironmentBlock(&env, token, false); err != nil {
+		return err
+	}
+	defer windows.DestroyEnvironmentBlock(env)
+
+	app, err := windows.UTF16PtrFromString(exe)
+	if err != nil {
+		return err
+	}
+	cmdLine, err := windows.UTF16PtrFromString(`"` + exe + `" tray`)
+	if err != nil {
+		return err
+	}
+	desktop, _ := windows.UTF16PtrFromString(`winsta0\default`)
+	si := windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{})), Desktop: desktop}
+	var pi windows.ProcessInformation
+	if err := windows.CreateProcessAsUser(token, app, cmdLine, nil, nil, false,
+		windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_NO_WINDOW, env, nil, &si, &pi); err != nil {
+		return err
+	}
+	windows.CloseHandle(pi.Thread)
+	windows.CloseHandle(pi.Process)
+	log.Printf("Started the tray app in session %d", sessionID)
+	return nil
 }
 
 // SetTrayAutostart turns the tray's logon entry on (and starts the tray for

@@ -390,6 +390,7 @@ type peerMenuGroup struct {
 // peer's VPN IP and public IP, each copied on click.
 type peerMenuItemState struct {
 	item     *systray.MenuItem
+	detail   *systray.MenuItem
 	vpnIP    *copyMenuItem
 	publicIP *copyMenuItem
 }
@@ -425,8 +426,11 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 	group.emptyItem.Hide()
 	for len(group.peerItems) < len(entries) {
 		item := group.parent.AddSubMenuItem("", "")
+		detail := item.AddSubMenuItem("", "")
+		detail.Disable()
 		state := &peerMenuItemState{
 			item:     item,
+			detail:   detail,
 			vpnIP:    newCopyMenuItem(item),
 			publicIP: newCopyMenuItem(item),
 		}
@@ -436,6 +440,7 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 		row := group.peerItems[i]
 		setTitle(row.item, entry.Title)
 		setTooltip(row.item, entry.Tooltip)
+		setTitle(row.detail, entry.Detail)
 		row.vpnIP.set("VPN IP", entry.VPNIP)
 		row.publicIP.set("Public IP", entry.PublicIP)
 		row.item.Show()

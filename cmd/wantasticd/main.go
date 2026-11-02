@@ -594,6 +594,7 @@ func runWaitClaim(parentCtx context.Context, claimKeyPath, configPath, serverURL
 		claimHost = parsed.Hostname()
 	}
 	log.Printf("Waiting for Wantastic device claim: public_key=%s server=%s", keyFile.PublicKey, serverURL)
+	runner.MarkServiceReady() // nothing to connect until the claim; the service is up
 	log.Printf("Claim URL: %s", buildClaimURL(serverURL, keyFile.PublicKey))
 
 	hashedDeviceID, err := auth.HashedDeviceID()
@@ -698,6 +699,7 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 	}
 
 	log.Printf("Wantastic agent started successfully")
+	runner.MarkServiceReady()
 	log.Printf("Mode: System TUN (%s)", cfg.Interface.TUNName)
 	if !useTray {
 		// The service itself never shows a tray; make sure the per-user

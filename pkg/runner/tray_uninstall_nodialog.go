@@ -1,10 +1,11 @@
-//go:build linux && cgo && (amd64 || arm64) && !nosystray
+//go:build (windows || (linux && cgo && (amd64 || arm64))) && !nosystray
 
 package runner
 
 import "errors"
 
-// Linux installs are removed with install.sh --uninstall.
+// The tray offers no uninstall here: Linux uses install.sh --uninstall,
+// Windows `wantasticd uninstall` or install.ps1 -Uninstall.
 const trayCanUninstall = false
 
 var errUninstallCanceled = errors.New("uninstall canceled")

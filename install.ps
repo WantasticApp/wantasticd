@@ -10,8 +10,7 @@
 # Options:
 #   (default)          claim: shows a QR code; the device connects once you
 #                      approve it in the console. Nothing waits here.
-#   -Token <TOKEN>     log in with a token instead
-#   -Login             sign in through the browser (device code) instead
+#   -Token <TOKEN>     log in with a token instead (scripted deployments)
 #   -NoLogin           install only; add the device later
 #   -NoTray            do not start the tray app at logon
 #   -Version <vX.Y.Z>  install that release instead of the latest
@@ -354,10 +353,14 @@ function Install-Wantasticd {
     Write-Step "Sign-in"
     $mode = "none"
     $claimUrl = $null
+    if ($Login) {
+        # Windows devices join by claim; a reinstall keeps the existing login.
+        Write-Info "-Login is not used on Windows: the device is added with its claim QR code."
+    }
     if (-not $Token -and (Test-LoggedIn)) {
-        Write-Ok "Keeping the existing login (run 'wantasticd login' to switch accounts)."
+        Write-Ok "Keeping the existing login; no sign-in needed."
         $mode = "loggedin"
-    } elseif ($Token -or $Login) {
+    } elseif ($Token) {
         # --no-connect: save the configuration and exit; the service connects.
         $loginArgs = @("login", "--no-connect")
         if ($Token) { $loginArgs += @("--token", $Token) }
@@ -397,9 +400,9 @@ function Install-Wantasticd {
         if ($start) {
             Start-Service -Name $Wantastic.ServiceName
             try {
-                (Get-Service -Name $Wantastic.ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+                (Get-Service -Name $Wantastic.ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(75))
             } catch {
-                throw "The service did not reach the Running state within 30 seconds. Check Event Viewer > Windows Logs > Application."
+                throw "The service did not reach the Running state within 75 seconds. Check Event Viewer > Windows Logs > Application."
             }
             Write-Ok "Service running."
         }
@@ -417,12 +420,11 @@ function Install-Wantasticd {
             Write-Host "Scan the QR code above, or open this link, and approve the device:"
             if ($claimUrl) { Write-Host "  $claimUrl" -ForegroundColor Cyan }
             Write-Host "It connects by itself as soon as it is claimed (the tray icon turns green)."
-            Write-Host "Prefer signing in here instead? Run: wantasticd login --no-connect; wantasticd service restart"
         }
         default {
             Write-Host "`nwantasticd $Version is installed but not connected yet." -ForegroundColor Yellow
             Write-Host "Add this device, then start the service (PowerShell as administrator):"
-            Write-Host "  wantasticd genkey --no-wait     (claim with the QR code)   or   wantasticd login --no-connect"
+            Write-Host "  wantasticd genkey --no-wait     (claim with the QR code)"
             Write-Host "  wantasticd service start"
         }
     }

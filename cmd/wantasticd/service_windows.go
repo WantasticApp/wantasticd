@@ -25,7 +25,7 @@ const (
 	winServiceName        = "wantasticd"
 	winServiceDisplayName = "Wantastic Overlay Networking"
 	winServiceDescription = "Wantastic secure overlay networking agent."
-	winServiceWait        = 30 * time.Second
+	winServiceWait        = 75 * time.Second // past the service's 60 s start window
 )
 
 // runServiceCommand registers and controls the Windows service through the

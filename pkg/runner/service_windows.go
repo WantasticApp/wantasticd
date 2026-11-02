@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,10 +74,26 @@ type wantasticService struct {
 	runFunc func(context.Context)
 }
 
+// serviceStartWait bounds how long the service reports START_PENDING while
+// the agent brings the tunnel and its local API up.
+const serviceStartWait = 60 * time.Second
+
+var (
+	serviceReady     = make(chan struct{})
+	serviceReadyOnce sync.Once
+)
+
+// MarkServiceReady tells the SCM the agent is up: its local API answers, or
+// it is waiting for this device to be claimed. Until then the service is
+// START_PENDING, so `sc start`, `wantasticd service start` and the installer
+// return only once `wantasticd status` can reach the daemon.
+func MarkServiceReady() {
+	serviceReadyOnce.Do(func() { close(serviceReady) })
+}
+
 func (m *wantasticService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
-	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+	changes <- svc.Status{State: svc.StartPending, WaitHint: uint32(serviceStartWait / time.Millisecond)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -86,6 +103,47 @@ func (m *wantasticService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 		m.runFunc(ctx)
 		close(done)
 	}()
+	// The tray belongs to the logged-in users, not to session 0; start it
+	// for them now rather than at their next logon.
+	go EnsureTrayAgent()
+
+	stop := func() {
+		// Report the stop at once, then wait a bounded time: the SCM
+		// otherwise shows the service RUNNING while it waits, and a
+		// component that ignores cancellation would hang it forever.
+		changes <- svc.Status{State: svc.StopPending, WaitHint: uint32(serviceStopWait / time.Millisecond)}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(serviceStopWait):
+			log.Printf("service stop: the agent did not finish within %s; exiting anyway", serviceStopWait)
+		}
+	}
+
+	startDeadline := time.NewTimer(serviceStartWait)
+	defer startDeadline.Stop()
+starting:
+	for {
+		select {
+		case <-serviceReady:
+			break starting
+		case <-startDeadline.C:
+			log.Printf("service start: the agent is not ready after %s; reporting it running", serviceStartWait)
+			break starting
+		case <-done:
+			changes <- svc.Status{State: svc.StopPending}
+			return
+		case c := <-r:
+			switch c.Cmd {
+			case svc.Interrogate:
+				changes <- c.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				stop()
+				return
+			}
+		}
+	}
+	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
 loop:
 	for {
@@ -97,16 +155,7 @@ loop:
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				// Report the stop at once, then wait a bounded time: the SCM
-				// otherwise shows the service RUNNING while it waits, and a
-				// component that ignores cancellation would hang it forever.
-				changes <- svc.Status{State: svc.StopPending, WaitHint: uint32(serviceStopWait / time.Millisecond)}
-				cancel()
-				select {
-				case <-done:
-				case <-time.After(serviceStopWait):
-					log.Printf("service stop: the agent did not finish within %s; exiting anyway", serviceStopWait)
-				}
+				stop()
 				break loop
 			default:
 				log.Printf("unexpected control request #%d", c)

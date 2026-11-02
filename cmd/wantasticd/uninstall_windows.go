@@ -19,23 +19,13 @@ const machineEnvKey = `SYSTEM\CurrentControlSet\Control\Session Manager\Environm
 
 // runUninstall removes what install.ps1 installs: the service, firewall
 // rules, tray logon entry, running tray apps, the PATH entry and the program
-// folder; --purge also the login. --from-tray reports the result in a dialog
-// because the tray starts it without a console.
+// folder; --purge also the login.
 func runUninstall(args []string) int {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	purge := fs.Bool("purge", false, "Also remove the login, claim key, settings and logs")
-	fromTray := fs.Bool("from-tray", false, "Report the result in a dialog (used by the tray app)")
 	fs.Parse(args)
 
-	err := uninstallWindows(*purge)
-	if *fromTray {
-		text, flags := "Wantastic was uninstalled. Your login is kept for a reinstall.", uint32(windows.MB_ICONINFORMATION)
-		if err != nil {
-			text, flags = "Wantastic could not be fully uninstalled:\n\n"+err.Error(), windows.MB_ICONERROR
-		}
-		messageBox(text, flags)
-	}
-	if err != nil {
+	if err := uninstallWindows(*purge); err != nil {
 		fmt.Fprintf(os.Stderr, "wantasticd uninstall: %v\n", err)
 		return 1
 	}
@@ -187,10 +177,4 @@ func removeAllRetry(dir string) error {
 		time.Sleep(time.Second)
 	}
 	return fmt.Errorf("could not remove %s: %w", dir, err)
-}
-
-func messageBox(text string, flags uint32) {
-	t, _ := windows.UTF16PtrFromString(text)
-	c, _ := windows.UTF16PtrFromString("Wantastic")
-	_, _ = windows.MessageBox(0, t, c, flags|windows.MB_SETFOREGROUND)
 }

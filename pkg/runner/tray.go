@@ -5,6 +5,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wantastic-agent/internal/agent"
@@ -205,6 +207,11 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			systray.AddSeparator()
 			mVersion := systray.AddMenuItem("Version "+version.Version, "Installed version")
 			mVersion.Disable()
+			var uninstallClicked chan struct{} // nil: never fires
+			if trayCanUninstall {
+				uninstallClicked = systray.AddMenuItem("Uninstall Wantastic…", "Remove the VPN service, this menu and the program; your login is kept").ClickedCh
+			}
+			var uninstalling atomic.Bool
 			mQuit := systray.AddMenuItem("Quit tray", "Close this menu; the VPN service keeps running")
 
 			var (
@@ -331,6 +338,19 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 					case <-mToggle.ClickedCh:
 						go toggle()
+
+					case <-uninstallClicked:
+						if !uninstalling.CompareAndSwap(false, true) {
+							continue
+						}
+						go func() {
+							defer uninstalling.Store(false)
+							if err := trayUninstall(); errors.Is(err, errUninstallCanceled) {
+								return
+							} else if err != nil {
+								notice.report("", "", fmt.Errorf("uninstall: %w", err))
+							}
+						}()
 
 					case <-mPing.ClickedCh:
 						go pingAll()

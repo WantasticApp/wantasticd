@@ -12,11 +12,12 @@ import (
 	"syscall"
 )
 
+// Launchd jobs and paths shared by install.sh, the daemon and uninstall.
 const (
-	daemonLaunchdLabel = "com.wantastic.wantasticd"
-	trayAgentLabel     = "com.wantastic.tray"
-	trayAgentPlist     = "/Library/LaunchAgents/" + trayAgentLabel + ".plist"
-	noTrayMarker       = "/Library/Application Support/Wantastic/no-tray"
+	DaemonLaunchdLabel = "com.wantastic.wantasticd"
+	TrayAgentLabel     = "com.wantastic.tray"
+	TrayAgentPlist     = "/Library/LaunchAgents/" + TrayAgentLabel + ".plist"
+	NoTrayMarker       = "/Library/Application Support/Wantastic/no-tray"
 )
 
 // EnsureTrayAgent installs the menu-bar LaunchAgent when the daemon runs as
@@ -24,13 +25,13 @@ const (
 // menu-bar app existed get it on their first update. An admin opt-out
 // (install.sh --no-tray) leaves a marker that is respected.
 func EnsureTrayAgent() {
-	if os.Geteuid() != 0 || os.Getenv("XPC_SERVICE_NAME") != daemonLaunchdLabel {
+	if os.Geteuid() != 0 || os.Getenv("XPC_SERVICE_NAME") != DaemonLaunchdLabel {
 		return
 	}
-	if _, err := os.Stat(noTrayMarker); err == nil {
+	if _, err := os.Stat(NoTrayMarker); err == nil {
 		return
 	}
-	if _, err := os.Stat(trayAgentPlist); err == nil {
+	if _, err := os.Stat(TrayAgentPlist); err == nil {
 		return
 	}
 	exe, err := os.Executable()
@@ -41,35 +42,44 @@ func EnsureTrayAgent() {
 		exe = resolved
 	}
 	plist := trayAgentPlistContent(exe)
-	if err := os.MkdirAll(filepath.Dir(trayAgentPlist), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(TrayAgentPlist), 0o755); err != nil {
 		log.Printf("tray agent: %v", err)
 		return
 	}
-	tmp := trayAgentPlist + ".tmp"
+	tmp := TrayAgentPlist + ".tmp"
 	if err := os.WriteFile(tmp, []byte(plist), 0o644); err != nil {
 		log.Printf("tray agent: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, trayAgentPlist); err != nil {
+	if err := os.Rename(tmp, TrayAgentPlist); err != nil {
 		os.Remove(tmp)
 		log.Printf("tray agent: %v", err)
 		return
 	}
-	log.Printf("Installed menu-bar agent %s", trayAgentPlist)
+	log.Printf("Installed menu-bar agent %s", TrayAgentPlist)
 
 	// Start it now for the logged-in user; otherwise it starts at next login.
+	uid, ok := ConsoleUID()
+	if !ok {
+		return
+	}
+	domain := "gui/" + strconv.FormatUint(uint64(uid), 10)
+	if out, err := exec.Command("launchctl", "bootstrap", domain, TrayAgentPlist).CombinedOutput(); err != nil {
+		log.Printf("tray agent: bootstrap %s: %v: %s", domain, err, out)
+	}
+}
+
+// ConsoleUID is the user logged in at the Mac's screen, if any.
+func ConsoleUID() (uint32, bool) {
 	fi, err := os.Stat("/dev/console")
 	if err != nil {
-		return
+		return 0, false
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok || st.Uid == 0 {
-		return
+		return 0, false
 	}
-	domain := "gui/" + strconv.FormatUint(uint64(st.Uid), 10)
-	if out, err := exec.Command("launchctl", "bootstrap", domain, trayAgentPlist).CombinedOutput(); err != nil {
-		log.Printf("tray agent: bootstrap %s: %v: %s", domain, err, out)
-	}
+	return st.Uid, true
 }
 
 func trayAgentPlistContent(exe string) string {
@@ -85,7 +95,7 @@ func trayAgentPlistContent(exe string) string {
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
 </dict></plist>
-`, trayAgentLabel, xmlEscape(exe))
+`, TrayAgentLabel, xmlEscape(exe))
 }
 
 func xmlEscape(s string) string {

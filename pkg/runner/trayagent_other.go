@@ -1,7 +1,7 @@
-//go:build !darwin
+//go:build !windows
 
 package runner
 
-// EnsureTrayAgent is a no-op outside macOS: the Windows installer registers
-// the tray, and Linux builds are headless.
-func EnsureTrayAgent() {}
+// TrayAlreadyRunning is false outside Windows: launchd runs one menu-bar
+// agent per user, and Linux builds are headless.
+func TrayAlreadyRunning() bool { return false }

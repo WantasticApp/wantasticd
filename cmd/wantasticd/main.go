@@ -64,6 +64,8 @@ func main() {
 		handleTray()
 	case "service":
 		os.Exit(runServiceCommand(os.Args[2:]))
+	case "uninstall":
+		os.Exit(runUninstall(os.Args[2:]))
 	case "update":
 		handleUpdate()
 	case "update-finish":
@@ -82,7 +84,7 @@ func main() {
 	}
 }
 
-var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "service", "update", "version"}
+var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "service", "uninstall", "update", "version"}
 
 // suggestCommand returns the command within two typos of name, if any.
 func suggestCommand(name string) string {
@@ -733,6 +735,10 @@ func printVersion() {
 }
 
 func handleTray() {
+	if runner.TrayAlreadyRunning() {
+		log.Println("The tray app is already running")
+		return
+	}
 	log.Println("Starting Wantastic system tray client...")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -820,6 +826,9 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  tray       Run the system tray client")
 	if runtime.GOOS == "windows" {
 		fmt.Fprintln(os.Stderr, "  service    Windows service: install | uninstall | start | stop | restart | status")
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		fmt.Fprintln(os.Stderr, "  uninstall  Remove the service, tray and app (--purge also removes the login)")
 	}
 	fmt.Fprintln(os.Stderr, "  update     Self-update to the latest version")
 	fmt.Fprintln(os.Stderr, "  version    Show version information")

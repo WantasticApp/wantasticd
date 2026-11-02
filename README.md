@@ -72,6 +72,9 @@ To uninstall (keeps the configuration unless `--purge` is given):
 curl -fsSL https://get.wantastic.app/install.sh | sudo sh -s -- --uninstall [--purge]
 ```
 
+On macOS the same is built in: `sudo wantasticd uninstall [--purge]`, or
+**Uninstall Wantastic…** in the menu-bar app (asks for an administrator password).
+
 The installer automatically:
 - Detects your OS and architecture (`linux/amd64`, `arm64`, `arm`, `mips`, `riscv64`, `ppc64le`, ...)
 - Remounts read-only filesystems (OpenWrt)
@@ -123,11 +126,16 @@ Options go after the scriptblock, as with `-Token` above:
 The service is managed by `wantasticd` itself (Administrator):
 
 ```powershell
-wantasticd service install     # register or repair: automatic start, restart on failure, firewall
+wantasticd service install     # register or repair: automatic start, restart on failure, firewall, tray (--no-tray to skip)
 wantasticd service status      # state, startup type, command line
 wantasticd service start | stop | restart
-wantasticd service uninstall   # remove the service and its firewall rules
+wantasticd service uninstall   # remove the service, its firewall rules and the tray logon entry
+wantasticd uninstall [--purge] # remove everything the installer added; --purge also the login
 ```
+
+The tray app is on by default: the service re-registers it at logon if the entry
+goes missing, unless it was turned off with `-NoTray` / `--no-tray`. The tray menu
+also has **Uninstall Wantastic…** (asks for UAC approval).
 
 Requires Windows 10, Windows 11 or Windows Server 2016+ (x64, ARM64 or x86).
 Windows 7, 8 and 8.1 are not supported: the Go runtime does not run there.

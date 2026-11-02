@@ -49,6 +49,8 @@ $Wantastic = @{
 }
 $Wantastic.InstallPath = Join-Path $Wantastic.InstallDir "wantasticd.exe"
 $Wantastic.ConfigFile  = Join-Path $Wantastic.ConfigDir "config.conf"
+# Opt-out marker: the service re-adds a missing tray logon entry unless it exists.
+$Wantastic.NoTrayFile  = Join-Path $Wantastic.ConfigDir "no-tray"
 
 function Write-Step([string]$Text) { Write-Host "`n== $Text" -ForegroundColor Cyan }
 function Write-Ok([string]$Text)   { Write-Host "   $Text" -ForegroundColor Green }
@@ -215,9 +217,11 @@ function Set-FirewallRule {
 function Install-Tray([bool]$Skip) {
     if ($Skip) {
         Remove-ItemProperty -Path $Wantastic.RunKey -Name $Wantastic.TrayValue -ErrorAction SilentlyContinue
+        New-Item -ItemType File -Force -Path $Wantastic.NoTrayFile | Out-Null
         Write-Info "Tray app disabled (-NoTray)."
         return
     }
+    Remove-Item -Force -Path $Wantastic.NoTrayFile -ErrorAction SilentlyContinue
     Set-ItemProperty -Path $Wantastic.RunKey -Name $Wantastic.TrayValue -Value "`"$($Wantastic.InstallPath)`" tray"
     try {
         Start-Process -FilePath $Wantastic.InstallPath -ArgumentList "tray" -WindowStyle Hidden
@@ -381,6 +385,7 @@ function Install-Wantasticd {
     if ($native) {
         $svcArgs = @("service", "install", "--config", $Wantastic.ConfigFile)
         if (-not $start) { $svcArgs += "--no-start" }
+        if ($NoTray) { $svcArgs += "--no-tray" }
         $r = Invoke-Exe $exe $svcArgs
         $r.Output -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Info $_ }
         if ($r.Code -ne 0) { throw "Service setup failed (exit $($r.Code)). Check Event Viewer > Windows Logs > Application." }

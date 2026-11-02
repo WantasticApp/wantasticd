@@ -68,7 +68,8 @@ func runServiceCommand(args []string) int {
 
 func serviceUsage() {
 	fmt.Fprintln(os.Stderr, "Usage: wantasticd service <command>")
-	fmt.Fprintln(os.Stderr, "  install [--config PATH] [--no-start]   register (or repair) the service, firewall rules and recovery, then start it")
+	fmt.Fprintln(os.Stderr, "  install [--config PATH] [--no-start] [--no-tray]")
+	fmt.Fprintln(os.Stderr, "                                         register (or repair) the service, firewall rules, recovery and tray, then start it")
 	fmt.Fprintln(os.Stderr, "  uninstall                              stop and remove the service and its firewall rules")
 	fmt.Fprintln(os.Stderr, "  start | stop | restart | status")
 }
@@ -77,6 +78,7 @@ func serviceInstall(args []string) error {
 	fs := flag.NewFlagSet("service install", flag.ExitOnError)
 	configPath := fs.String("config", auth.DefaultConfigPath(), "Configuration file the service connects with")
 	noStart := fs.Bool("no-start", false, "Register the service without starting it")
+	noTray := fs.Bool("no-tray", false, "Do not start the tray app at logon")
 	fs.Parse(args)
 
 	exe, err := os.Executable()
@@ -151,6 +153,14 @@ func serviceInstall(args []string) error {
 		fmt.Println("Windows Firewall: inbound UDP allowed for wantasticd.")
 	}
 
+	if err := runner.SetTrayAutostart(exe, !*noTray); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: tray app setting not saved: %v\n", err)
+	} else if *noTray {
+		fmt.Println("Tray app disabled (--no-tray).")
+	} else {
+		fmt.Println("Tray app on; it also starts at every logon.")
+	}
+
 	if *noStart {
 		return nil
 	}
@@ -184,6 +194,9 @@ func serviceUninstall() error {
 		return err
 	}
 	fmt.Println("Firewall rules removed.")
+	if err := runner.RemoveTrayAutostart(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: tray logon entry not removed: %v\n", err)
+	}
 	return nil
 }
 

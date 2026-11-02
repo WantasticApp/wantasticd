@@ -269,6 +269,19 @@ jobs:
           r2-secret-access-key: ${{ secrets.R2_SECRET }}
           r2-bucket: ${{ secrets.R2_BUCKET }}
           source-dir: routeros
+          # Both paths: /routeros/init.rsc (what the console uses) and the
+          # bucket root /init.rsc (older copied commands). Without a
+          # destination the action keeps the source folder name.
+      - name: Upload RouterOS library to R2 (bucket root)
+        if: steps.newest-tag.outputs.is_newest == 'true'
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: routeros
+          destination-dir: .
 
       - name: Signed installer
         if: needs.windows.outputs.signed == 'true'

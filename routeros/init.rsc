@@ -2,7 +2,7 @@
 # Compatible: RouterOS v7.1+ (backup upload requires v7.13+ for /file/read)
 #
 # Usage:
-#   /tool fetch url="https://get.wantastic.app/init.rsc" mode=https check-certificate=no
+#   /tool fetch url="https://get.wantastic.app/routeros/init.rsc" mode=https check-certificate=no
 #   /import init.rsc
 #   :global wantasticDeploy
 #   $wantasticDeploy privateKey=... publicKey=... endpoint=... address=... ...

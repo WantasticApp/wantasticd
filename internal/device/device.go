@@ -670,20 +670,36 @@ func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
 		}
 	}
 
-	// Create native TUN device
-	nativeTun, err := tun.CreateTUN(tunName, d.config.Interface.MTU)
-	if err != nil {
-		return nil, fmt.Errorf("create native TUN device: %w", err)
+	var nativeTun tun.Device
+	var actualName string
+	if ExternalTUN != nil {
+		// The platform (Android VpnService) builds the interface with these
+		// addresses, routes and DNS, and owns them.
+		fd, err := ExternalTUN(tunRequest(d.config.Interface.MTU, d.config.Interface.Addresses, d.config.Server.AllowedIPs, d.config.Interface.DNS))
+		if err != nil {
+			return nil, fmt.Errorf("platform TUN: %w", err)
+		}
+		if nativeTun, actualName, err = openExternalTUN(fd); err != nil {
+			return nil, fmt.Errorf("platform TUN: %w", err)
+		}
+	} else {
+		var err error
+		nativeTun, err = tun.CreateTUN(tunName, d.config.Interface.MTU)
+		if err != nil {
+			return nil, fmt.Errorf("create native TUN device: %w", err)
+		}
+		actualName, _ = nativeTun.Name()
 	}
 
 	d.nativeTun = nativeTun
-	actualName, _ := nativeTun.Name()
 	d.exitGuard.setTenant(d.config.Interface.Addresses, d.config.Server.AllowedIPs)
 	d.tunName = actualName
 	log.Printf("Created TUN interface: %s", actualName)
 
-	if err := setupTUNInterface(actualName, d.config.Interface.Addresses); err != nil {
-		log.Printf("Warning: failed to setup TUN interface networking: %v", err)
+	if ExternalTUN == nil {
+		if err := setupTUNInterface(actualName, d.config.Interface.Addresses); err != nil {
+			log.Printf("Warning: failed to setup TUN interface networking: %v", err)
+		}
 	}
 
 	// Create a parallel Userspace Netstack bound to the native TUN IP

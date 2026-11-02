@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -180,8 +181,10 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun ConsoleScreen(url: String) {
+    // imePadding: edge to edge, the window no longer resizes for the keyboard,
+    // so the console's sign-in fields would sit under it.
     AndroidView(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.fillMaxSize().imePadding(),
         factory = { ctx ->
             WebView(ctx).apply {
                 settings.javaScriptEnabled = true

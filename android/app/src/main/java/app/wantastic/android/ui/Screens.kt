@@ -210,7 +210,7 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
 }
 
 @Composable
-fun SettingsScreen(deviceName: String, publicKey: String, onConsole: (path: String) -> Unit) {
+fun SettingsScreen(deviceName: String, publicKey: String, onConsole: (path: String) -> Unit, accountCard: @Composable () -> Unit) {
     val context = LocalContext.current
     val settings = remember { AppSettings.get(context) }
     val updates = remember { Updates.get(context) }
@@ -228,6 +228,9 @@ fun SettingsScreen(deviceName: String, publicKey: String, onConsole: (path: Stri
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(NavClearance)) {
         GlassTitle("Settings")
         Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Section("Account")
+            accountCard()
+
             Section("Your network")
             GlassCard(Modifier.fillMaxWidth()) {
                 SettingsRow("Console", "Everything in your Wantastic account") { onConsole("/dashboard") }

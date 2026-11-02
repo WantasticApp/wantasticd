@@ -85,7 +85,6 @@ android {
 aboutLibraries {
     // Only what ships: no network lookups at build time.
     offlineMode = true
-    collect { configPath = file("config/aboutlibraries") }
 }
 
 dependencies {
@@ -106,6 +105,8 @@ dependencies {
     implementation("com.google.crypto.tink:tink-android:1.15.0")
     implementation("com.google.zxing:core:3.5.3")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
+    // The console channel (websocket) and its HTTP endpoints.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.mikepenz:aboutlibraries-core:12.2.4")
     "playImplementation"("com.google.android.play:app-update-ktx:2.1.0")
     // Play's library brings an old Fragment that breaks registerForActivityResult.

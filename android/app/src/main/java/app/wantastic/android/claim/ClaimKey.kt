@@ -16,28 +16,12 @@ import com.google.crypto.tink.subtle.X25519
  */
 class ClaimKey(private val prefs: SharedPreferences) {
 
-    data class KeyPair(val privateKey: String, val publicKey: String)
-
-    fun loadOrCreate(): KeyPair {
-        val priv = prefs.getString(PRIVATE, null)
-        val pub = prefs.getString(PUBLIC, null)
-        if (priv != null && pub != null) return KeyPair(priv, pub)
-        val privateBytes = X25519.generatePrivateKey()
-        val publicBytes = X25519.publicFromPrivate(privateBytes)
-        val pair = KeyPair(encode(privateBytes), encode(publicBytes))
-        prefs.edit().putString(PRIVATE, pair.privateKey).putString(PUBLIC, pair.publicKey).apply()
-        return pair
-    }
-
-    /** The console's approval (addresses, hub, keys), as the engine returned it; null until claimed. */
-    fun claim(): String? = prefs.getString(CLAIM, null)
-
-    fun saveClaim(json: String) = prefs.edit().putString(CLAIM, json).apply()
+    /** This phone's key and approval per account, in the same encrypted preferences. */
+    fun setups() = app.wantastic.android.account.DeviceSetups(prefs)
 
     companion object {
         private const val PRIVATE = "private_key"
         private const val PUBLIC = "public_key"
-        private const val CLAIM = "claim_config"
 
         private fun encode(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
 

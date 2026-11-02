@@ -38,12 +38,12 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 
 /**
- * Adds the phone by genkey claim: its key was made on the phone; the owner
- * approves it in the console, in this phone's browser or by scanning the QR
- * code on a computer. Nothing to type.
+ * Adds the phone by genkey claim, without signing in here: its key was made
+ * on the phone; the owner approves it in the console mini app or by scanning
+ * the QR code on a computer that is signed in.
  */
 @Composable
-fun SignInScreen(claimUrl: String, onLogIn: () -> Unit, onContinue: () -> Unit) {
+fun ClaimByLinkScreen(claimUrl: String, onLogIn: () -> Unit, onBack: () -> Unit) {
     val context = LocalContext.current
     val qr = remember(claimUrl) { qrBitmap(claimUrl, 512) }
     Column(
@@ -79,7 +79,7 @@ fun SignInScreen(claimUrl: String, onLogIn: () -> Unit, onContinue: () -> Unit) 
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(50),
             colors = ButtonDefaults.buttonColors(containerColor = Glass.Blue),
-        ) { Text("Log in", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
+        ) { Text("Approve in the console", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
         Button(
             onClick = { copy(context, claimUrl) },
             modifier = Modifier.fillMaxWidth().height(48.dp),
@@ -90,7 +90,7 @@ fun SignInScreen(claimUrl: String, onLogIn: () -> Unit, onContinue: () -> Unit) 
             "The phone connects by itself once approved.",
             color = Color(0xFF94A6C1), fontSize = 12.sp, textAlign = TextAlign.Center,
         )
-        TextButton(onClick = onContinue) { Text("Look around first", color = Color(0xFF7DB4FF)) }
+        TextButton(onClick = onBack) { Text("Sign in instead", color = Color(0xFF7DB4FF)) }
     }
 }
 

@@ -69,7 +69,15 @@ import app.wantastic.android.ui.ExitNodeScreen
 import app.wantastic.android.ui.HomeScreen
 import app.wantastic.android.ui.PeersScreen
 import app.wantastic.android.ui.SettingsScreen
-import app.wantastic.android.ui.SignInScreen
+import androidx.compose.runtime.rememberCoroutineScope
+import app.wantastic.android.account.AccountClient
+import app.wantastic.android.account.AccountState
+import app.wantastic.android.account.AccountSync
+import app.wantastic.android.account.DeviceSetups
+import app.wantastic.android.ui.AccountCard
+import app.wantastic.android.ui.AddThisPhoneScreen
+import app.wantastic.android.ui.AuthScreen
+import app.wantastic.android.ui.ClaimByLinkScreen
 import app.wantastic.android.ui.WantasticTheme
 import app.wantastic.android.vpn.WantasticVpnService
 
@@ -106,21 +114,26 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
-        val identity = ClaimKey.open(this)
-        val key = identity.loadOrCreate()
-        val engine = GoEngine.install(this, identity)
-        // While the app is open and not yet approved, wait for the console's claim.
-        if (engine is GoEngine) lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) { engine.awaitClaim(ClaimLink.DEFAULT_SERVER, key.publicKey) }
-        }
+        val setups = ClaimKey.open(this).setups()
+        val engine = GoEngine.install(this, setups)
         val deviceName = ClaimKey.deviceName(this)
-        val claimUrl = ClaimLink.build(null, key.publicKey, deviceName)
+        // A stable, non-identifying id for the server's sign-in checks.
+        val fingerprint = "android:" + setups.current().publicKey.hashCode().toUInt().toString(16)
+        val sync = AccountSync(AccountClient(ClaimLink.DEFAULT_SERVER, fingerprint), setups) { (engine as? GoEngine)?.refresh() }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                // Each time the app comes back: who is signed in (here or in the console), and that account's setup.
+                launch { sync.sync() }
+                // Wait for the active setup's approval while open.
+                if (engine is GoEngine) engine.awaitClaims(ClaimLink.DEFAULT_SERVER)
+            }
+        }
         if (savedInstanceState == null) VpnService.prepare(this)?.let(vpnAccess::launch)
         Updates.schedule(this)
         lifecycleScope.launch { Updates.get(this@MainActivity).check(interactive = false) }
         handleUpdateIntent(intent)
         setContent {
-            WantasticTheme { App(claimUrl, deviceName, key.publicKey, onConnect = ::requestTunnel) }
+            WantasticTheme { App(sync, setups, deviceName, onConnect = ::requestTunnel) }
         }
     }
 
@@ -156,10 +169,16 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun App(claimUrl: String, deviceName: String, publicKey: String, onConnect: () -> Unit) {
+private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onConnect: () -> Unit) {
     val engine = Engines.current
     val status by engine.status.collectAsStateWithLifecycle()
+    val account by sync.account.collectAsStateWithLifecycle()
+    val activeSetup by setups.active.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
     var browsing by rememberSaveable { mutableStateOf(false) }
+    var byLink by rememberSaveable { mutableStateOf(false) }
+    var signingIn by rememberSaveable { mutableStateOf(false) }
+    var notNow by rememberSaveable { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     // Created on first open, then kept: reopening is instant and signed in.
     var console by remember { mutableStateOf<ConsoleWebHolder?>(null) }
@@ -169,27 +188,60 @@ private fun App(claimUrl: String, deviceName: String, publicKey: String, onConne
         if (url != null && holder.url != url) holder.open(url)
         consoleOpen = true
     }
+    val publicKey = remember(activeSetup, status.claimed) { setups.current().publicKey }
+    val claimUrl = remember(publicKey) { ClaimLink.build(null, publicKey, deviceName) }
+    fun signedIn() {
+        signingIn = false
+        // The console mini app shares the session; show it as the new account.
+        console?.web?.reload()
+        scope.launch { sync.sync() }
+    }
     // Approved: close the console the claim was made in and show the network.
     LaunchedEffect(status.claimed) { if (status.claimed) consoleOpen = false }
+    val signedInState = account as? AccountState.SignedIn
+    BackHandler(enabled = signingIn || byLink) { signingIn = false; byLink = false }
     GlassBackground {
-        if (!status.claimed && !browsing) {
-            // Approving happens in the console mini app: no outside browser.
-            SignInScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onContinue = { browsing = true })
-        } else {
-            Tabs(status, deviceName, publicKey, onConnect, onLogIn = { openConsole(claimUrl) }, onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) })
+        when {
+            signingIn -> AuthScreen(
+                sync.client, title = if (signedInState != null) "Add an account" else "Sign in to Wantastic",
+                onSignedIn = ::signedIn, onUseConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) },
+                onClaimByLink = null, onBrowse = { signingIn = false }, browseLabel = "Not now",
+            )
+            // Signed in to an account this phone is not in yet: ask first.
+            signedInState?.needsSetup == true && notNow != signedInState.tenantId -> AddThisPhoneScreen(
+                sync, signedInState.email, deviceName,
+                onOtherAccount = { signingIn = true },
+                onNotNow = if (status.claimed) ({ notNow = signedInState.tenantId }) else null,
+            )
+            status.claimed || browsing -> Tabs(
+                status, sync, account, deviceName, publicKey, onConnect,
+                onLogIn = { if (signedInState == null) signingIn = true else notNow = null },
+                onAddAccount = { signingIn = true },
+                onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) },
+            )
+            byLink -> ClaimByLinkScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onBack = { byLink = false })
+            account == AccountState.Checking -> Unit
+            else -> AuthScreen(
+                sync.client, onSignedIn = ::signedIn, onUseConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) },
+                onClaimByLink = { byLink = true }, onBrowse = { browsing = true },
+            )
         }
         AnimatedVisibility(
             visible = consoleOpen && console != null,
             enter = slideInVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow)) { it } + fadeIn(),
             exit = slideOutVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMedium)) { it } + fadeOut(),
         ) {
-            console?.let { ConsoleMiniApp(it, onClose = { consoleOpen = false }) }
+            // Closing the console may follow a sign-in or account switch made there.
+            console?.let { ConsoleMiniApp(it, onClose = { consoleOpen = false; scope.launch { sync.sync() } }) }
         }
     }
 }
 
 @Composable
-private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, publicKey: String, onConnect: () -> Unit, onLogIn: () -> Unit, onConsole: (String) -> Unit) {
+private fun BoxScope.Tabs(
+    status: EngineStatus, sync: AccountSync, account: AccountState, deviceName: String, publicKey: String,
+    onConnect: () -> Unit, onLogIn: () -> Unit, onAddAccount: () -> Unit, onConsole: (String) -> Unit,
+) {
     val engine = Engines.current
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
     var exitOpen by rememberSaveable { mutableStateOf(false) }
@@ -212,7 +264,9 @@ private fun BoxScope.Tabs(status: EngineStatus, deviceName: String, publicKey: S
                     onExitNode = { exitOpen = true },
                 )
                 Tab.Peers -> PeersScreen(status)
-                Tab.Settings -> SettingsScreen(deviceName, publicKey, onConsole = onConsole)
+                Tab.Settings -> SettingsScreen(deviceName, publicKey, onConsole = onConsole) {
+                    AccountCard(sync, account, onAddAccount)
+                }
             }
         }
     }

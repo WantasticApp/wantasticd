@@ -66,10 +66,6 @@ Source: "{#SourceDir}\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\wintun-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Run]
-; Registers or repairs the service, firewall rules, recovery and tray, then
-; starts it; it returns once `wantasticd status` can reach the agent.
-Filename: "{app}\wantasticd.exe"; Parameters: "service install --config ""{commonappdata}\Wantastic\config.conf"""; \
-  StatusMsg: "Starting the Wantastic service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\wantasticd.exe"; Parameters: "open-login"; Description: "Log in to Wantastic now (opens your browser)"; \
   Flags: postinstall runasoriginaluser runhidden nowait skipifsilent; Check: NotSignedIn
 
@@ -86,17 +82,38 @@ begin
   Result := not FileExists(ExpandConstant('{commonappdata}\Wantastic\config.conf'));
 end;
 
-// Stop the running service and tray apps so their files can be replaced.
+// Stop the running service and tray apps so their files can be replaced. A
+// service still starting refuses a stop, so retry while it comes up; killing
+// it instead would let its recovery restart it mid-copy.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Code: Integer;
+  Code, Attempt: Integer;
   Exe: String;
 begin
   Result := '';
   Exe := ExpandConstant('{app}\wantasticd.exe');
-  if FileExists(Exe) then
-    Exec(Exe, 'service stop', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if FileExists(Exe) and RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\wantasticd') then
+    for Attempt := 1 to 16 do
+    begin
+      if Exec(Exe, 'service stop', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
+        break;
+      Sleep(5000);
+    end;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM wantasticd.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+// Registers or repairs the service, firewall rules, recovery and tray and
+// starts it; it returns once `wantasticd status` can reach the agent.
+procedure InstallService;
+var
+  Code: Integer;
+begin
+  WizardForm.StatusLabel.Caption := 'Starting the Wantastic service...';
+  if not Exec(ExpandConstant('{app}\wantasticd.exe'),
+      'service install --config "' + ExpandConstant('{commonappdata}\Wantastic\config.conf') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+    RaiseException('The Wantastic service could not be started (exit ' + IntToStr(Code) + '). ' +
+      'See C:\ProgramData\Wantastic\wantasticd.log, then run this setup again.');
 end;
 
 function PathHasDir(Path, Dir: String): Boolean;
@@ -110,6 +127,7 @@ var
 begin
   if CurStep <> ssPostInstall then
     exit;
+  InstallService;
   Dir := ExpandConstant('{app}');
   if not RegQueryStringValue(HKLM, EnvKey, 'Path', Path) then
     Path := '';

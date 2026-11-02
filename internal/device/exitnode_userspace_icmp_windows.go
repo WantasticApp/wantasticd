@@ -5,6 +5,7 @@ package device
 import (
 	"encoding/binary"
 	"net/netip"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -51,6 +52,7 @@ func (windowsEchoer) echo(dst netip.Addr, payload []byte, timeout time.Duration)
 	reply := make([]byte, 64+len(payload)+8)
 	n, _, _ := procIcmpSendEcho.Call(h, uintptr(addr), data, uintptr(len(payload)), 0,
 		uintptr(unsafe.Pointer(&reply[0])), uintptr(len(reply)), uintptr(timeout.Milliseconds()))
+	runtime.KeepAlive(payload)
 	// Status (offset 4) 0 is IP_SUCCESS: an echo reply, not an error.
 	return n > 0 && binary.LittleEndian.Uint32(reply[4:8]) == 0
 }

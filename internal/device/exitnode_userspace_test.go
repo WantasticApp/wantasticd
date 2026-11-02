@@ -98,6 +98,7 @@ func TestUserspaceExitForwardsTCPAndUDP(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ux.close()
+	ux.landed = func(net.Conn) bool { return false } // the echo servers are local
 	var dialed []string
 	ux.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		dialed = append(dialed, network+" "+address)
@@ -252,5 +253,38 @@ func TestExitGuardDivertsOnlyExitTraffic(t *testing.T) {
 	w.Write([][]byte{internet, tenant}, 0)
 	if len(rec.written) != 1 || !bytes.Equal(rec.written[0], tenant) {
 		t.Fatalf("with sharing off the OS got %d packets", len(rec.written))
+	}
+}
+
+// TestUserspaceExitRefusesTheHostItself: a peer must not reach the exit host
+// through the forwarder (that would bypass the host's firewall).
+func TestUserspaceExitRefusesTheHostItself(t *testing.T) {
+	ux, err := newUserspaceExit(1420, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ux.close()
+	host := netip.MustParseAddr("203.0.113.5")
+	ux.isOwn = func(ip netip.Addr) bool { return ip == host }
+	dialed := 0
+	ux.dial = func(context.Context, string, string) (net.Conn, error) { dialed++; return nil, io.EOF }
+	peer := peerStack(t, ux, netip.MustParseAddr("10.255.255.9"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := gonet.DialContextTCP(ctx, peer, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(host.As4()), Port: 3389}, ipv4.ProtocolNumber); err == nil {
+		t.Fatal("connected to the exit host's own address")
+	}
+	if dialed != 0 {
+		t.Fatalf("the exit dialed its own address %d time(s)", dialed)
+	}
+	if !ux.hostAddress(netip.MustParseAddr("127.0.0.1")) || !ux.hostAddress(netip.IPv4Unspecified()) {
+		t.Error("loopback/unspecified must count as the host")
+	}
+	c, err := net.Dial("udp", "127.0.0.1:9")
+	if err == nil {
+		defer c.Close()
+		if !landedOnHost(c) {
+			t.Error("a connection from the host to itself was not detected")
+		}
 	}
 }

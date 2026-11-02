@@ -4,7 +4,14 @@ package device
 // allowed IPs hold its destination, exactly as if it had been read from the
 // TUN. The userspace exit-node stack uses it to return internet replies to
 // peers without a kernel NAT. It reports whether the packet was queued.
-func (device *Device) InjectOutbound(packet []byte) bool {
+func (device *Device) InjectOutbound(packet []byte) (ok bool) {
+	// The device may be closing: its encryption queue is then closed under
+	// us. Callers outside the device's own routines must not crash it.
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
 	if len(packet) == 0 || len(packet) > MaxContentSize {
 		return false
 	}

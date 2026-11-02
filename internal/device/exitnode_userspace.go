@@ -30,6 +30,8 @@ const (
 	uxUDPIdle                    = 2 * time.Minute
 	uxDNSIdle                    = 15 * time.Second
 	uxQueue                      = 1024
+	uxMaxUDPFlows                = 1024
+	uxOwnAddrTTL                 = 10 * time.Second
 )
 
 // userspaceExit is exit-node NAT for hosts without a kernel NAT the agent can
@@ -56,6 +58,15 @@ type userspaceExit struct {
 	pings  chan struct{} // bounds concurrent ICMP echoes
 	// dial opens the host side of a flow; tests point it at a local server.
 	dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// isOwn reports this host's own addresses and landed a connection that
+	// reached the host itself (tests replace both).
+	isOwn    func(netip.Addr) bool
+	landed   func(net.Conn) bool
+	udpFlows chan struct{} // bounds concurrent UDP flows
+
+	ownMu sync.Mutex
+	own   map[netip.Addr]bool
+	ownAt time.Time
 }
 
 // icmpEchoer sends one ICMP echo and reports whether a reply came back.
@@ -94,7 +105,8 @@ func newUserspaceExit(mtu int, send func([]byte) bool) (*userspaceExit, error) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := &net.Dialer{Timeout: uxDialTimeout, KeepAlive: 30 * time.Second}
-	u := &userspaceExit{stack: s, ep: ep, send: send, ctx: ctx, cancel: cancel, echo: newICMPEchoer(), pings: make(chan struct{}, 64), dial: dialer.DialContext}
+	u := &userspaceExit{stack: s, ep: ep, send: send, ctx: ctx, cancel: cancel, echo: newICMPEchoer(), pings: make(chan struct{}, 64), dial: dialer.DialContext, udpFlows: make(chan struct{}, uxMaxUDPFlows)}
+	u.isOwn, u.landed = u.hostAddress, landedOnHost
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcp.NewForwarder(s, 0, uxTCPMaxInFlight, u.handleTCP).HandlePacket)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udp.NewForwarder(s, u.handleUDP).HandlePacket)
 	u.wg.Add(1)
@@ -111,12 +123,18 @@ func (u *userspaceExit) inject(pkt []byte) {
 	var proto tcpip.NetworkProtocolNumber
 	switch pkt[0] >> 4 {
 	case 4:
-		if u.echo != nil && isICMPv4EchoRequest(pkt) {
-			u.ping(append([]byte(nil), pkt...))
+		if isICMPv4EchoRequest(pkt) {
+			// Only a real ping answers: the stack would reply to anything.
+			if u.echo != nil {
+				u.ping(append([]byte(nil), pkt...))
+			}
 			return
 		}
 		proto = header.IPv4ProtocolNumber
 	case 6:
+		if isICMPv6EchoRequest(pkt) {
+			return // no IPv6 ping through the userspace exit
+		}
 		proto = header.IPv6ProtocolNumber
 	default:
 		return
@@ -151,17 +169,62 @@ func (u *userspaceExit) close() {
 	}
 }
 
-func uxHostPort(addr tcpip.Address, port uint16) string {
+func uxAddr(addr tcpip.Address) netip.Addr {
 	ip, _ := netip.AddrFromSlice(addr.AsSlice())
-	return net.JoinHostPort(ip.Unmap().String(), strconv.Itoa(int(port)))
+	return ip.Unmap()
+}
+
+func uxHostPort(addr tcpip.Address, port uint16) string {
+	return net.JoinHostPort(uxAddr(addr).String(), strconv.Itoa(int(port)))
+}
+
+// hostAddress reports whether ip is one of this host's own addresses. A peer
+// must not reach the exit host itself through the forwarder: a connection
+// the host makes to its own public or IPv6 address would bypass its
+// firewall and expose local services.
+func (u *userspaceExit) hostAddress(ip netip.Addr) bool {
+	if !ip.IsValid() || ip.IsUnspecified() || ip.IsLoopback() {
+		return true
+	}
+	u.ownMu.Lock()
+	defer u.ownMu.Unlock()
+	if u.own == nil || time.Since(u.ownAt) > uxOwnAddrTTL {
+		own := make(map[netip.Addr]bool)
+		if addrs, err := net.InterfaceAddrs(); err == nil {
+			for _, a := range addrs {
+				if p, err := netip.ParsePrefix(a.String()); err == nil {
+					own[p.Addr().Unmap()] = true
+				}
+			}
+		}
+		u.own, u.ownAt = own, time.Now()
+	}
+	return u.own[ip]
+}
+
+// landedOnHost reports a connection that reached this host itself (source
+// and destination equal), which the address check above should prevent.
+func landedOnHost(c net.Conn) bool {
+	local, lok := netip.ParseAddrPort(c.LocalAddr().String())
+	remote, rok := netip.ParseAddrPort(c.RemoteAddr().String())
+	return lok == nil && rok == nil && local.Addr().Unmap() == remote.Addr().Unmap()
 }
 
 // handleTCP connects to the destination first, so a refused or unreachable
 // destination is answered with a reset rather than a hanging handshake.
 func (u *userspaceExit) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
+	if u.isOwn(uxAddr(id.LocalAddress)) {
+		r.Complete(true)
+		return
+	}
 	conn, err := u.dial(u.ctx, "tcp", uxHostPort(id.LocalAddress, id.LocalPort))
 	if err != nil {
+		r.Complete(true)
+		return
+	}
+	if u.landed(conn) {
+		conn.Close()
 		r.Complete(true)
 		return
 	}
@@ -211,15 +274,29 @@ func uxPipeTCP(ctx context.Context, in *gonet.TCPConn, out halfCloser) {
 // it has been idle for a while; DNS flows close sooner.
 func (u *userspaceExit) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
+	if u.isOwn(uxAddr(id.LocalAddress)) {
+		return
+	}
+	select {
+	case u.udpFlows <- struct{}{}:
+	default:
+		return // flow table full: drop, like a NAT out of entries
+	}
+	release := func() { <-u.udpFlows }
 	var wq waiter.Queue
 	ep, udpErr := r.CreateEndpoint(&wq)
 	if udpErr != nil {
+		release()
 		return
 	}
 	in := gonet.NewUDPConn(&wq, ep)
 	out, err := u.dial(u.ctx, "udp", uxHostPort(id.LocalAddress, id.LocalPort))
-	if err != nil {
+	if err != nil || u.landed(out) {
+		if out != nil {
+			out.Close()
+		}
 		in.Close()
+		release()
 		return
 	}
 	idle := uxUDPIdle
@@ -229,6 +306,7 @@ func (u *userspaceExit) handleUDP(r *udp.ForwarderRequest) {
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
+		defer release()
 		uxPipeUDP(u.ctx, in, out, idle)
 	}()
 }
@@ -293,6 +371,11 @@ func isICMPv4EchoRequest(pkt []byte) bool {
 		pkt[9] == uint8(header.ICMPv4ProtocolNumber) && pkt[ihl] == uint8(header.ICMPv4Echo) &&
 		// not a fragment
 		pkt[6]&0x3f == 0 && pkt[7] == 0
+}
+
+func isICMPv6EchoRequest(pkt []byte) bool {
+	return len(pkt) >= header.IPv6MinimumSize+header.ICMPv6MinimumSize &&
+		pkt[6] == uint8(header.ICMPv6ProtocolNumber) && pkt[header.IPv6MinimumSize] == uint8(header.ICMPv6EchoRequest)
 }
 
 // icmpv4EchoTarget returns the destination and the echo payload (after the

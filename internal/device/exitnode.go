@@ -317,16 +317,27 @@ func (e *exitEngine) enableOffer() error {
 		return err
 	}
 	tun := e.d.GetTUNName()
-	gw, err := exitnode.DefaultGateway(e.host, tun)
-	if err != nil {
-		e.offerErr = "no default route: " + err.Error()
-		return fmt.Errorf("find uplink: %w", err)
-	}
-	plan := exitnode.NATPlan{Backend: backend, Mode: exitnode.ModeExit, Tun: tun, Uplink: gw.Interface, Sources: e.overlaySources()}
-	ns, err := exitnode.EnableNAT(e.host, plan)
-	if err != nil {
-		e.offerErr = err.Error()
-		return err
+	var plan exitnode.NATPlan
+	var ns exitnode.NATState
+	if backend == exitnode.BackendUserspace {
+		// The agent forwards exit traffic itself; the OS routes it out.
+		if err := e.startUserspaceExitLocked(); err != nil {
+			e.offerErr = err.Error()
+			return err
+		}
+		plan = exitnode.NATPlan{Backend: backend, Mode: exitnode.ModeExit, Tun: tun, Uplink: "host", Sources: e.overlaySources()}
+		ns = exitnode.NATState{Plan: plan}
+	} else {
+		gw, err := exitnode.DefaultGateway(e.host, tun)
+		if err != nil {
+			e.offerErr = "no default route: " + err.Error()
+			return fmt.Errorf("find uplink: %w", err)
+		}
+		plan = exitnode.NATPlan{Backend: backend, Mode: exitnode.ModeExit, Tun: tun, Uplink: gw.Interface, Sources: e.overlaySources()}
+		if ns, err = exitnode.EnableNAT(e.host, plan); err != nil {
+			e.offerErr = err.Error()
+			return err
+		}
 	}
 	e.st.NAT = &ns
 	e.st.Offer = true
@@ -358,6 +369,11 @@ func (e *exitEngine) disableOffer() error {
 
 func (e *exitEngine) disableNATLocked() error {
 	ns := *e.st.NAT
+	if ns.Plan.Backend == exitnode.BackendUserspace {
+		e.stopUserspaceExit()
+		e.st.NAT = nil
+		return nil
+	}
 	e.d.mu.RLock()
 	localAccess := e.d.localAccessShared
 	e.d.mu.RUnlock()
@@ -374,7 +390,13 @@ func (e *exitEngine) disableNATLocked() error {
 func (e *exitEngine) ensureNAT() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.st.NAT != nil {
+	if e.st.NAT != nil && e.st.NAT.Plan.Backend == exitnode.BackendUserspace {
+		if e.d.exitGuard.ux.Load() == nil {
+			if err := e.startUserspaceExitLocked(); err != nil {
+				log.Printf("[EXIT] Restarting the userspace exit failed: %v", err)
+			}
+		}
+	} else if e.st.NAT != nil {
 		if gw, err := exitnode.DefaultGateway(e.host, e.d.GetTUNName()); err == nil && gw.Interface != "" && gw.Interface != e.st.NAT.Plan.Uplink {
 			log.Printf("[EXIT] Uplink changed %s -> %s; moving exit NAT", e.st.NAT.Plan.Uplink, gw.Interface)
 			plan := e.st.NAT.Plan
@@ -405,6 +427,32 @@ func (e *exitEngine) ensureNAT() {
 			log.Printf("[EXIT] Client masquerade rules restored")
 		}
 	}
+}
+
+// startUserspaceExitLocked starts the agent's own exit forwarder.
+func (e *exitEngine) startUserspaceExitLocked() error {
+	ux, err := newUserspaceExit(e.d.config.Interface.MTU, e.d.injectOutbound)
+	if err != nil {
+		return fmt.Errorf("userspace exit: %w", err)
+	}
+	if old := e.d.exitGuard.ux.Swap(ux); old != nil {
+		old.close()
+	}
+	return nil
+}
+
+func (e *exitEngine) stopUserspaceExit() {
+	if ux := e.d.exitGuard.ux.Swap(nil); ux != nil {
+		ux.close()
+	}
+}
+
+// injectOutbound sends a reply from the userspace exit to the peer it is for.
+func (d *Device) injectOutbound(pkt []byte) bool {
+	d.mu.RLock()
+	wd := d.device
+	d.mu.RUnlock()
+	return wd != nil && wd.InjectOutbound(pkt)
 }
 
 func pfConfHasAppleNATAnchor() bool {

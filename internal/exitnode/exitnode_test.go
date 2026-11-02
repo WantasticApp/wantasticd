@@ -429,8 +429,20 @@ func TestDetectBackendLinuxPrefersFW4(t *testing.T) {
 	if _, err := DetectBackend(f.host("linux")); err == nil {
 		t.Fatal("want error without iptables/nft")
 	}
-	if _, err := DetectBackend(f.host("windows")); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("windows: %v", err)
+	if b, err := DetectBackend(f.host("windows")); err != nil || b != BackendUserspace {
+		t.Fatalf("windows: %v %v", b, err)
+	}
+	if _, err := DetectBackend(f.host("plan9")); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("plan9: %v", err)
+	}
+	// The userspace backend never touches the host.
+	f = &fakeHost{}
+	st, err := EnableNAT(f.host("windows"), NATPlan{Backend: BackendUserspace, Mode: ModeExit})
+	if err != nil || DisableNAT(f.host("windows"), st) != nil || len(f.cmds) != 0 {
+		t.Fatalf("userspace backend ran %v (err %v)", f.cmds, err)
+	}
+	if repaired, err := EnsureNAT(f.host("windows"), &st); repaired || err != nil {
+		t.Fatalf("userspace EnsureNAT: %v %v", repaired, err)
 	}
 }
 

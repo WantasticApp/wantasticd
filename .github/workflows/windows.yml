@@ -85,6 +85,12 @@ jobs:
           CGO_ENABLED: 0
         # Reads this machine through the native APIs and validates every field.
         run: go test -count=1 -v -run 'Desktop|SMBIOS|TR181' ./internal/wusp/platforms/
+      - name: Userspace exit node on real Windows
+        env:
+          CGO_ENABLED: 0
+        # The exit forwarder (TCP, UDP, resets), the guard's divert and the
+        # Windows ping API.
+        run: go test -count=1 -v -run 'UserspaceExit|ICMPv4Echo|ExitGuard|WindowsICMPEcho' ./internal/device/
       - name: Parse install.ps1 (PowerShell 5.1 and 7)
         run: |
           if ((Get-FileHash install.ps1).Hash -ne (Get-FileHash install.ps).Hash) { throw "install.ps must be a copy of install.ps1" }

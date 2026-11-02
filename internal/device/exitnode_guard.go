@@ -24,6 +24,9 @@ type exitGuard struct {
 	onNew    atomic.Pointer[func(netip.Addr)]
 	lastDrop atomic.Int64
 	dropped  atomic.Uint64
+
+	// ux, when set, carries exit traffic instead of the OS (Windows).
+	ux atomic.Pointer[userspaceExit]
 }
 
 func newExitGuard() *exitGuard { return &exitGuard{} }
@@ -39,6 +42,23 @@ func (g *exitGuard) setTenant(addrs []netip.Prefix, allowed []string) {
 		}
 	}
 	g.tenant.Store(&ps)
+}
+
+// exitBound reports whether pkt is headed for the internet rather than the
+// tenant, a LAN or this host: the only traffic exit-node sharing carries.
+func (g *exitGuard) exitBound(pkt []byte) bool {
+	_, dst, ok := exitnode.PacketAddrs(pkt)
+	if !ok || !exitnode.IsInternet(dst) {
+		return false
+	}
+	if t := g.tenant.Load(); t != nil {
+		for _, p := range *t {
+			if p.Contains(dst) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // forwardable reports whether a packet written toward the host may pass.
@@ -110,10 +130,21 @@ type exitGuardTUN struct {
 
 func (t *exitGuardTUN) Write(bufs [][]byte, offset int) (int, error) {
 	now := time.Now().Unix()
+	ux := t.guard.ux.Load()
 	keep := bufs
 	filtered := false
 	for i, b := range bufs {
-		if len(b) <= offset || t.guard.forwardable(b[offset:], now) {
+		pass := len(b) <= offset
+		if !pass && ux != nil && t.guard.exitBound(b[offset:]) {
+			// The userspace exit carries it (or the guard refuses it); the
+			// OS has no NAT to do anything useful with it.
+			if t.guard.forwardable(b[offset:], now) {
+				ux.inject(b[offset:])
+			}
+		} else if !pass {
+			pass = t.guard.forwardable(b[offset:], now)
+		}
+		if pass {
 			if filtered {
 				keep = append(keep, b)
 			}

@@ -17,6 +17,9 @@ const (
 	BackendIPTables NATBackend = "iptables" // Linux iptables (legacy or -nft)
 	BackendFW4      NATBackend = "nft-fw4"  // OpenWrt fw4: rules inserted into inet fw4
 	BackendNft      NATBackend = "nft"      // plain nftables: own table
+	// BackendUserspace: no OS rules; the agent forwards exit traffic itself
+	// (Windows). EnableNAT/DisableNAT/EnsureNAT do nothing for it.
+	BackendUserspace NATBackend = "userspace"
 )
 
 // NAT modes.
@@ -307,13 +310,16 @@ func DetectBackend(h Host) (NATBackend, error) {
 		}
 		return "", errors.New("neither iptables nor nft is installed")
 	case "windows":
-		return "", fmt.Errorf("exit-node NAT is %w (Windows has no built-in NAT without Hyper-V WinNAT or Internet Connection Sharing)", ErrUnsupported)
+		return BackendUserspace, nil
 	}
 	return "", fmt.Errorf("exit-node NAT is %w (%s)", ErrUnsupported, h.OS)
 }
 
 // EnableNAT applies plan. On failure it rolls back what it applied.
 func EnableNAT(h Host, plan NATPlan) (NATState, error) {
+	if plan.Backend == BackendUserspace {
+		return NATState{Plan: plan}, nil
+	}
 	if err := plan.validate(); err != nil {
 		return NATState{}, err
 	}
@@ -388,6 +394,9 @@ func removeFW4(h Host, p NATPlan) int {
 
 // DisableNAT removes everything st applied; safe to call repeatedly.
 func DisableNAT(h Host, st NATState) error {
+	if st.Plan.Backend == BackendUserspace {
+		return nil
+	}
 	p := st.Plan
 	var firstErr error
 	note := func(err error) {
@@ -429,6 +438,9 @@ func DisableNAT(h Host, st NATState) error {
 // EnsureNAT re-applies rules a firewall reload removed. It reports whether a
 // repair was needed.
 func EnsureNAT(h Host, st *NATState) (bool, error) {
+	if st == nil || st.Plan.Backend == BackendUserspace {
+		return false, nil
+	}
 	p := st.Plan
 	present := true
 	switch p.Backend {

@@ -6,11 +6,44 @@ package runner
 import (
 	"context"
 	"log"
+	"os"
+	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 )
+
+// ServiceLogPath is where the service writes its log: a service has no
+// console, so without it every startup error is lost.
+func ServiceLogPath() string {
+	dir := os.Getenv("ProgramData")
+	if dir == "" {
+		dir = `C:\ProgramData`
+	}
+	return filepath.Join(dir, "Wantastic", "wantasticd.log")
+}
+
+// logToServiceFile sends the log, and stderr (panics, fatal errors), to
+// ServiceLogPath. The previous log is kept as .1 once it passes 5 MB.
+func logToServiceFile() {
+	path := ServiceLogPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Size() > 5<<20 {
+		os.Rename(path, path+".1")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	log.SetOutput(f)
+	os.Stdout, os.Stderr = f, f
+	windows.SetStdHandle(windows.STD_OUTPUT_HANDLE, windows.Handle(f.Fd()))
+	windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(f.Fd()))
+	log.Printf("wantasticd service starting (pid %d)", os.Getpid())
+}
 
 func RunServiceHook(runFunc func(context.Context)) {
 	// IsWindowsService is true only when the Service Control Manager started
@@ -24,6 +57,7 @@ func RunServiceHook(runFunc func(context.Context)) {
 		runFunc(context.Background())
 		return
 	}
+	logToServiceFile()
 
 	err = svc.Run("wantasticd", &wantasticService{runFunc: runFunc})
 	if err != nil {

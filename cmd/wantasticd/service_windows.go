@@ -14,6 +14,7 @@ import (
 
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/platform/firewall"
+	"wantastic-agent/pkg/runner"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -219,10 +220,24 @@ func startAndWait(s *mgr.Service) error {
 		}
 	}
 	if err := waitState(s, svc.Running); err != nil {
-		return fmt.Errorf("%w; see Event Viewer > Windows Logs > Application", err)
+		return fmt.Errorf("%w\n%s", err, serviceLogTail(25))
 	}
 	fmt.Println("Service running.")
 	return nil
+}
+
+// serviceLogTail is the end of the service log, for start failures.
+func serviceLogTail(lines int) string {
+	path := runner.ServiceLogPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "No service log at " + path + "."
+	}
+	all := strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
+	if len(all) > lines {
+		all = all[len(all)-lines:]
+	}
+	return "Last lines of " + path + ":\n  " + strings.Join(all, "\n  ")
 }
 
 func stopAndWait(s *mgr.Service) error {

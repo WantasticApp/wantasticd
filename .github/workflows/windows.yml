@@ -80,6 +80,11 @@ jobs:
             Write-Host "::error title=go vet/test failed (vet $vet, test $test)::$(($tail -join '%0A') -replace '\r', '')"
             exit 1
           }
+      - name: Desktop collector on real Windows
+        env:
+          CGO_ENABLED: 0
+        # Reads this machine through the native APIs and validates every field.
+        run: go test -count=1 -v -run 'Desktop|SMBIOS|TR181' ./internal/wusp/platforms/
       - name: Parse install.ps1 (PowerShell 5.1 and 7)
         run: |
           if ((Get-FileHash install.ps1).Hash -ne (Get-FileHash install.ps).Hash) { throw "install.ps must be a copy of install.ps1" }

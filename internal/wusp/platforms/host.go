@@ -60,6 +60,9 @@ type hostBackend struct {
 	linkSetUp      func(string) error
 	linkSetDown    func(string) error
 	linkSetMTU     func(string, int) error
+	// desktop is the native macOS / Windows collector; nil elsewhere and
+	// with an injected command runner.
+	desktop desktopProbe
 }
 
 type timeState struct {
@@ -127,6 +130,9 @@ func newHostBackend(kind Kind, opts Options) *hostBackend {
 		backend.commandRunner = defaultCommandRunner
 		backend.useSystemd = true
 		backend.ntp = defaultNTPEnv()
+		if desktopKind(kind) {
+			backend.desktop = newDesktopProbe(backend.commandRunner)
+		}
 	}
 	if backend.now == nil {
 		backend.now = time.Now
@@ -143,6 +149,11 @@ func (b *hostBackend) Collect(ctx context.Context, paths ...string) (*wusp.Messa
 }
 
 func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) error {
+	if b.desktop != nil {
+		if handled, err := b.setDesktop(ctx, strings.TrimSpace(path), value); handled {
+			return err
+		}
+	}
 	if strings.HasPrefix(strings.TrimSpace(path), "Device.IP.Interface.") {
 		return b.setIPInterfaceParam(ctx, path, value)
 	}
@@ -223,16 +234,7 @@ func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, valu
 	if err != nil {
 		return err
 	}
-	filtered := make([]net.Interface, 0, len(ifaces))
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if len(iface.HardwareAddr) == 0 && !isCellularNetdev(iface.Name) {
-			continue
-		}
-		filtered = append(filtered, iface)
-	}
+	filtered := ipInterfaceOrder(ifaces)
 	if index == 0 || index > uint64(len(filtered)) {
 		return wusp.ErrUSPPathNotFound
 	}
@@ -241,6 +243,11 @@ func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, valu
 	case "Enable":
 		if value.AsBool() {
 			return b.linkSetUp(name)
+		}
+		if b.desktop != nil {
+			if err := ensureNotLastUplink(name); err != nil {
+				return err
+			}
 		}
 		return b.linkSetDown(name)
 	case "MaxMTUSize":
@@ -255,6 +262,11 @@ func (b *hostBackend) setIPInterfaceParam(ctx context.Context, path string, valu
 }
 
 func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
+	if b.desktop != nil {
+		if snap := b.desktop.collect(ctx); snap != nil {
+			return b.collectDesktop(ctx, snap)
+		}
+	}
 	if hostKindSupportsLinuxWiFi(b.kind) {
 		linkdiscovery.StartDefault()
 	}
@@ -505,19 +517,9 @@ func collectCPUInfoStatic(ctx context.Context, runner func(context.Context, stri
 		return
 	}
 	if out, err := runner(ctx, "uname", "-m"); err == nil {
-		arch := strings.TrimSpace(string(out))
-		if arch != "" {
+		if arch := tr181Architecture(string(out)); arch != "" {
 			msg.Set("Device.DeviceInfo.ProcessorNumberOfEntries", wusp.Uint(1))
 			msg.Set("Device.DeviceInfo.Processor.1.Architecture", wusp.String(arch))
-		}
-	}
-	if out, err := runner(ctx, "nproc"); err == nil {
-		if n, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); err == nil && n > 0 {
-			msg.Set("Device.DeviceInfo.Processor.1.MaxNumberOfEntries", wusp.Uint(n))
-		}
-	} else if out, err := runner(ctx, "sysctl", "-n", "hw.ncpu"); err == nil {
-		if n, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); err == nil && n > 0 {
-			msg.Set("Device.DeviceInfo.Processor.1.MaxNumberOfEntries", wusp.Uint(n))
 		}
 	}
 }

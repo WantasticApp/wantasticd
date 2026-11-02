@@ -133,7 +133,9 @@ jobs:
           go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee vet.log || status=1
           go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee test.log || status=1
           if [ "$status" != 0 ]; then
-            tail=$(cat vet.log test.log | grep -vE '^(ok|\?)[[:space:]]' | tail -80 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            # Only the failures (annotations are capped at 4 KiB): vet errors
+            # and failing tests with a little context, not the test logs.
+            tail=$( { grep -vE '^(ok|#)' vet.log; grep -E -B6 -A2 -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' test.log | grep -v '^\[USP\]\|\[USP\]'; } | tail -45 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=go vet/test failed on macOS::$tail"
             exit 1
           fi
@@ -165,7 +167,9 @@ jobs:
           go vet ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee vet.log || status=1
           go test ./cmd/... ./pkg/... ./internal/update/... ./internal/agent/... 2>&1 | tee test.log || status=1
           if [ "$status" != 0 ]; then
-            tail=$(cat vet.log test.log | grep -vE '^(ok|\?)[[:space:]]' | tail -80 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            # Only the failures (annotations are capped at 4 KiB): vet errors
+            # and failing tests with a little context, not the test logs.
+            tail=$( { grep -vE '^(ok|#)' vet.log; grep -E -B6 -A2 -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' test.log | grep -v '^\[USP\]\|\[USP\]'; } | tail -45 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=go vet/test failed on macOS::$tail"
             exit 1
           fi

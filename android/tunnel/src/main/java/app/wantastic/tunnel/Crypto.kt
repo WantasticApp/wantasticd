@@ -1,4 +1,4 @@
-package app.wantastic.android.wg
+package app.wantastic.tunnel
 
 import com.google.crypto.tink.aead.internal.InsecureNonceChaCha20Poly1305
 import com.google.crypto.tink.aead.internal.InsecureNonceXChaCha20Poly1305

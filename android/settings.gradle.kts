@@ -14,3 +14,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "wantastic-android"
 include(":app")
+// The Kotlin tunnel engine: WireGuard, P2P, WUSP (app.wantastic.tunnel).
+include(":tunnel")

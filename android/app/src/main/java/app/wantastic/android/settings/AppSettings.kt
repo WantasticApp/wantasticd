@@ -27,6 +27,12 @@ class AppSettings private constructor(private val prefs: SharedPreferences, syst
     fun setWifiOnly(on: Boolean) = put(WIFI_ONLY, on) { _wifiOnly.value = it }
     fun setMotion(on: Boolean) = put(MOTION, on) { _motion.value = it }
 
+    private val _kotlinEngine = MutableStateFlow(prefs.getBoolean(KOTLIN_ENGINE, false))
+
+    /** Beta: run the tunnel on the Kotlin engine (app.wantastic.tunnel) instead of Go. */
+    val kotlinEngine: StateFlow<Boolean> = _kotlinEngine.asStateFlow()
+    fun setKotlinEngine(on: Boolean) = put(KOTLIN_ENGINE, on) { _kotlinEngine.value = it }
+
     var lastUpdateCheck: Long
         get() = prefs.getLong(LAST_CHECK, 0L)
         set(value) = prefs.edit().putLong(LAST_CHECK, value).apply()
@@ -40,6 +46,7 @@ class AppSettings private constructor(private val prefs: SharedPreferences, syst
         private const val AUTO_UPDATE = "auto_update"
         private const val WIFI_ONLY = "update_wifi_only"
         private const val MOTION = "motion"
+        private const val KOTLIN_ENGINE = "kotlin_engine"
         private const val LAST_CHECK = "last_update_check"
 
         @Volatile

@@ -1,4 +1,4 @@
-package app.wantastic.android.wg
+package app.wantastic.tunnel
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder

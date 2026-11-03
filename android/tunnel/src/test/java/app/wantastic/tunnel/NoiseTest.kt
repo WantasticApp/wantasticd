@@ -1,4 +1,4 @@
-package app.wantastic.android.wg
+package app.wantastic.tunnel
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals

@@ -3,6 +3,7 @@ package app.wantastic.android.engine
 import android.content.Context
 import android.util.Log
 import app.wantastic.android.account.DeviceSetups
+import app.wantastic.android.settings.AppSettings
 import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
@@ -80,12 +81,16 @@ class GoEngine private constructor(private val context: Context, private val set
     }
 
     /** Runs the tunnel inside [service]; returns false (with the reason logged) if it cannot. */
+    /** The Kotlin engine's tunnel while it runs (Settings: Kotlin engine). */
+    @Volatile private var kotlin: KotlinTunnel? = null
+
     fun startIn(service: VpnService, server: String): Boolean {
         val setup = setups.current()
         val claim = setup.claim ?: return false.also { Log.w(TAG, "not approved yet") }
         state.update { it.copy(tunnel = TunnelState.Connecting) }
         this.service = service
         this.server = server
+        if (AppSettings.get(context).kotlinEngine.value) return startKotlin(service, setup.privateKey, claim)
         return try {
             val config = Mobile.configFromClaim(server, setup.privateKey, setup.publicKey, claim)
             report()
@@ -132,6 +137,56 @@ class GoEngine private constructor(private val context: Context, private val set
         }
     }
 
+    private fun startKotlin(service: VpnService, privateKey: String, claim: String): Boolean = try {
+        kotlin?.stop()
+        kotlin = KotlinTunnel.start(service, privateKey, claim)
+        since = System.currentTimeMillis()
+        last = null
+        poller?.cancel()
+        poller = scope.launch {
+            while (true) {
+                pollKotlin()
+                delay(2_000)
+            }
+        }
+        true
+    } catch (e: Exception) {
+        Log.e(TAG, "could not start the Kotlin engine", e)
+        state.update { it.copy(tunnel = TunnelState.Disconnected) }
+        false
+    }
+
+    /** Status from the Kotlin engine: the hub only, until P2P lands (phase 2). */
+    private fun pollKotlin() {
+        val k = kotlin ?: return
+        val s = k.stats
+        val now = System.currentTimeMillis()
+        val prev = last
+        last = Triple(now, s.rxBytes, s.txBytes)
+        val secs = prev?.let { (now - it.first) / 1000.0 }?.takeIf { it > 0 }
+        val hubAgo = if (s.lastHandshakeMs > 0) (now - s.lastHandshakeMs) / 1000 else null
+        val hubAnswers = hubAgo != null && hubAgo < HUB_HANDSHAKE_FRESH_SEC
+        val address = k.config.addresses.firstOrNull()?.address?.hostAddress.orEmpty()
+        state.update {
+            val down = if (prev != null && secs != null) ((s.rxBytes - prev.second) * 8 / secs).toLong().coerceAtLeast(0) else 0
+            val up = if (prev != null && secs != null) ((s.txBytes - prev.third) * 8 / secs).toLong().coerceAtLeast(0) else 0
+            it.copy(
+                tunnel = if (hubAnswers) TunnelState.Connected(address, since, k.config.server.endpointHost) else TunnelState.Connecting,
+                serverSilent = !hubAnswers && now - since > SERVER_SILENT_AFTER_MS,
+                peers = listOf(
+                    Peer(
+                        name = "Wantastic hub · Kotlin engine", vpnIp = "", publicIp = s.endpoint?.substringBeforeLast(':'),
+                        direct = false, latencyMs = null, handshakeAgoSec = hubAgo, rxBytes = s.rxBytes, txBytes = s.txBytes,
+                    ),
+                ),
+                downBitsPerSec = down,
+                upBitsPerSec = up,
+                downHistory = (it.downHistory + down).takeLast(HISTORY),
+                upHistory = (it.upHistory + up).takeLast(HISTORY),
+            )
+        }
+    }
+
     override fun reconnect() {
         val svc = service ?: return
         val t = state.value.tunnel
@@ -141,6 +196,8 @@ class GoEngine private constructor(private val context: Context, private val set
             Log.i(TAG, "reconnecting on the active setup")
             poller?.cancel()
             runCatching { Mobile.stop() }
+            kotlin?.stop()
+            kotlin = null
             startIn(svc, server)
         }
     }
@@ -148,6 +205,8 @@ class GoEngine private constructor(private val context: Context, private val set
     fun stop() {
         routeJob?.cancel()
         poller?.cancel()
+        kotlin?.stop()
+        kotlin = null
         runCatching { Mobile.stop() }
         state.update { it.copy(tunnel = TunnelState.Disconnected, peers = emptyList(), downBitsPerSec = 0, upBitsPerSec = 0, downHistory = emptyList(), upHistory = emptyList()) }
     }

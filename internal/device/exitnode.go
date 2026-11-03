@@ -101,16 +101,17 @@ type exitEngine struct {
 	offerErr string
 
 	// client runtime
-	useKey      wgdevice.NoisePublicKey
-	phase       exitnode.ClientPhase
-	reason      string
-	since       time.Time
-	granted     bool
-	lastRequest time.Time
-	lastTry     time.Time
-	retryAt     time.Time // backoff after a failed activation
-	allowedSet  bool      // 0.0.0.0/0 was given to a peer
-	offered     map[wgdevice.NoisePublicKey]bool
+	useKey          wgdevice.NoisePublicKey
+	phase           exitnode.ClientPhase
+	reason          string
+	since           time.Time
+	granted         bool
+	lastRequest     time.Time
+	lastTry         time.Time
+	retryAt         time.Time // backoff after a failed activation
+	allowedSet      bool      // 0.0.0.0/0 was given to a peer
+	platformDefault bool      // the platform (ExternalTUN) routes the default into the tunnel
+	offered         map[wgdevice.NoisePublicKey]bool
 
 	kick chan struct{}
 	stop chan struct{}
@@ -570,7 +571,7 @@ func (d *Device) UseExitNode(target string, wait time.Duration) (*ExitUse, error
 	if e == nil {
 		return nil, errors.New("tunnel is not running")
 	}
-	if e.host.OS != "darwin" && e.host.OS != "linux" && e.host.OS != "windows" {
+	if e.host.OS != "darwin" && e.host.OS != "linux" && e.host.OS != "windows" && ExternalTUN == nil {
 		return nil, fmt.Errorf("exit-node client mode is not supported on %s", e.host.OS)
 	}
 	dp, err := e.resolveTarget(target)
@@ -909,6 +910,9 @@ func (e *exitEngine) overlayPrefixes() []netip.Prefix {
 
 // activateLocked installs (or refreshes) client routing through dp.
 func (e *exitEngine) activateLocked(dp *wgdevice.DiscoveredPeer, peers map[string]ipcPeer) error {
+	if ExternalTUN != nil {
+		return e.activatePlatformLocked(dp, peers)
+	}
 	tun := e.d.GetTUNName()
 	gw, err := exitnode.DefaultGateway(e.host, tun)
 	if err != nil {
@@ -997,6 +1001,28 @@ func (e *exitEngine) activateLocked(dp *wgdevice.DiscoveredPeer, peers map[strin
 	return nil
 }
 
+// activatePlatformLocked is activation when the platform owns the interface
+// (Android's VpnService): the exit peer takes 0.0.0.0/0 in WireGuard and the
+// platform routes the default into the tunnel. No OS routes are touched; the
+// app's own sockets (WireGuard, the peers' endpoints) already bypass the tunnel.
+func (e *exitEngine) activatePlatformLocked(dp *wgdevice.DiscoveredPeer, peers map[string]ipcPeer) error {
+	exitHex := hex.EncodeToString(dp.PublicKey[:])
+	if !contains(peers[exitHex].allowedIPs, "0.0.0.0/0") {
+		if err := e.d.device.IpcSet(addAllowedIPCmd(exitHex, "0.0.0.0/0")); err != nil {
+			return fmt.Errorf("route 0.0.0.0/0 to the exit peer: %v", err)
+		}
+		e.allowedSet = true
+	}
+	if !e.platformDefault {
+		e.platformDefault = true
+		if ExternalDefaultRoute != nil {
+			go ExternalDefaultRoute(true)
+		}
+		log.Printf("[EXIT] Internet traffic now goes through exit node %s", e.st.Use)
+	}
+	return nil
+}
+
 // enableClientNATLocked lets hosts behind a Linux router use the exit too.
 func (e *exitEngine) enableClientNATLocked(tun string) {
 	var own netip.Addr
@@ -1043,6 +1069,12 @@ func addAllowedIPCmd(peerHex, prefix string) string {
 
 // deactivateLocked restores normal routing; the exit choice is kept.
 func (e *exitEngine) deactivateLocked(reason string) {
+	if e.platformDefault {
+		e.platformDefault = false
+		if ExternalDefaultRoute != nil {
+			go ExternalDefaultRoute(false)
+		}
+	}
 	if len(e.st.Routes) == 0 && e.st.ClientNAT == nil && !e.allowedSet {
 		return
 	}
@@ -1131,7 +1163,7 @@ func (e *exitEngine) useStatusLocked() *ExitUse {
 
 // ExitStatus reports exit-node state for the local API.
 func (d *Device) ExitStatus() ExitNodeStatus {
-	st := ExitNodeStatus{ClientSupported: runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows"}
+	st := ExitNodeStatus{ClientSupported: runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows" || ExternalTUN != nil}
 	// Only the OS decides support here; backend detection runs commands and
 	// happens when sharing is actually enabled.
 	if _, err := exitnode.DetectBackend(exitnode.Host{OS: runtime.GOOS}); err != nil && errors.Is(err, exitnode.ErrUnsupported) {

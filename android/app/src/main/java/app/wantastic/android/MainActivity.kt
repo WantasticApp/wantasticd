@@ -163,9 +163,7 @@ class MainActivity : ComponentActivity() {
         if (consent != null) vpnConsent.launch(consent) else startTunnel()
     }
 
-    private fun startTunnel() {
-        startService(Intent(this, WantasticVpnService::class.java).setAction(WantasticVpnService.ACTION_CONNECT))
-    }
+    private fun startTunnel() = Engines.current.connect()
 }
 
 @Composable
@@ -183,6 +181,8 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
     // Created on first open, then kept: reopening is instant and signed in.
     var console by remember { mutableStateOf<ConsoleWebHolder?>(null) }
     var consoleOpen by rememberSaveable { mutableStateOf(false) }
+    // A peer's web page, through the tunnel; a fresh browser each time.
+    var browser by remember { mutableStateOf<ConsoleWebHolder?>(null) }
     fun openConsole(url: String? = null) {
         val holder = console ?: ConsoleWebHolder(context, url ?: ClaimLink.DEFAULT_SERVER).also { console = it }
         if (url != null && holder.url != url) holder.open(url)
@@ -218,6 +218,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
                 onLogIn = { if (signedInState == null) signingIn = true else notNow = null },
                 onAddAccount = { signingIn = true },
                 onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) },
+                onBrowse = { url -> browser = ConsoleWebHolder(context, url) },
             )
             byLink -> ClaimByLinkScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onBack = { byLink = false })
             account == AccountState.Checking -> Unit
@@ -234,6 +235,13 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
             // Closing the console may follow a sign-in or account switch made there.
             console?.let { ConsoleMiniApp(it, onClose = { consoleOpen = false; scope.launch { sync.sync() } }) }
         }
+        AnimatedVisibility(
+            visible = browser != null,
+            enter = slideInVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow)) { it } + fadeIn(),
+            exit = slideOutVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMedium)) { it } + fadeOut(),
+        ) {
+            browser?.let { b -> ConsoleMiniApp(b, onClose = { b.web.destroy(); browser = null }) }
+        }
     }
 }
 
@@ -241,6 +249,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
 private fun BoxScope.Tabs(
     status: EngineStatus, sync: AccountSync, account: AccountState, deviceName: String, publicKey: String,
     onConnect: () -> Unit, onLogIn: () -> Unit, onAddAccount: () -> Unit, onConsole: (String) -> Unit,
+    onBrowse: (String) -> Unit,
 ) {
     val engine = Engines.current
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
@@ -265,7 +274,10 @@ private fun BoxScope.Tabs(
                 )
                 Tab.Peers -> {
                     val devices by sync.devices.collectAsStateWithLifecycle()
-                    PeersScreen(status, devices, account is AccountState.SignedIn, onRefresh = sync::refreshDevices, onSignIn = onAddAccount)
+                    PeersScreen(
+                        status, devices, account is AccountState.SignedIn, onRefresh = sync::refreshDevices, onSignIn = onAddAccount,
+                        onPing = engine::ping, onBrowse = onBrowse,
+                    )
                 }
                 Tab.Settings -> SettingsScreen(deviceName, publicKey, onConsole = onConsole) {
                     AccountCard(sync, account, onAddAccount)

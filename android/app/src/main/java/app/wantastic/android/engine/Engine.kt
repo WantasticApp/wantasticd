@@ -38,6 +38,15 @@ data class EngineStatus(
     val offeringExit: Boolean = false,
     val downBitsPerSec: Long = 0,
     val upBitsPerSec: Long = 0,
+    /** Recent throughput, oldest first, for the home graphs. */
+    val downHistory: List<Long> = emptyList(),
+    val upHistory: List<Long> = emptyList(),
+    /** pending | active | standby while an exit node is chosen. */
+    val exitState: String? = null,
+    /** The last exit-node problem, in words (e.g. "that device does not share"). */
+    val exitNotice: String? = null,
+    /** Whether this phone can share its internet as an exit node. */
+    val canShareExit: Boolean = false,
 )
 
 /**
@@ -52,6 +61,8 @@ interface Engine {
     /** null stops using an exit node. */
     fun useExit(ip: String?)
     fun offerExit(on: Boolean)
+    /** Pings a peer through the tunnel; a short line for the person ("4/4 · 23 ms"). */
+    suspend fun ping(ip: String): String = "Not connected"
 }
 
 /** Stands in until the engine lands: everything reports "not available". */

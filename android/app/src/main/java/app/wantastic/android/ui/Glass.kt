@@ -81,7 +81,7 @@ object Glass {
     val Cyan = Color(0xFF22D3EE)
     val Green = Color(0xFF34D399)
     /** One corner radius for every surface, as in Apple's apps. */
-    val Radius = 14.dp
+    val Radius = 10.dp
     val CardShape = RoundedCornerShape(Radius)
 }
 

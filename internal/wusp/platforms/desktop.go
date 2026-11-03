@@ -98,7 +98,8 @@ type desktopWiFi struct {
 // desktopKind reports whether kind is the desktop OS this binary runs on, so
 // tests building a macOS backend on Linux keep the generic path.
 func desktopKind(kind Kind) bool {
-	return (kind == KindMacOS && runtime.GOOS == "darwin") || (kind == KindWindows && runtime.GOOS == "windows")
+	return (kind == KindMacOS && runtime.GOOS == "darwin") || (kind == KindWindows && runtime.GOOS == "windows") ||
+		(kind == KindAndroid && runtime.GOOS == "android")
 }
 
 // collectDesktop is collectAll for a native desktop probe.

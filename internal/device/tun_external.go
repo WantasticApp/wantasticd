@@ -15,6 +15,11 @@ type TUNRequest struct {
 // hands over the file descriptor. The device then configures nothing itself.
 var ExternalTUN func(TUNRequest) (fd int, err error)
 
+// ExternalDefaultRoute, with ExternalTUN, asks the platform to route (or stop
+// routing) the default into the tunnel when an exit node starts or stops
+// carrying this device's internet. Called on its own goroutine.
+var ExternalDefaultRoute func(on bool)
+
 func tunRequest(mtu int, addrs []netip.Prefix, allowed []string, dns []string) TUNRequest {
 	req := TUNRequest{MTU: mtu, Addresses: addrs, DNS: dns}
 	for _, s := range allowed {

@@ -309,7 +309,8 @@ func DetectBackend(h Host) (NATBackend, error) {
 			return BackendNft, nil
 		}
 		return "", errors.New("neither iptables nor nft is installed")
-	case "windows":
+	case "windows", "android":
+		// No kernel NAT to use: the agent forwards exit traffic itself.
 		return BackendUserspace, nil
 	}
 	return "", fmt.Errorf("exit-node NAT is %w (%s)", ErrUnsupported, h.OS)

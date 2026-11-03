@@ -454,13 +454,42 @@ func (d *Device) SetPunchHandler(handler func(*wgdevice.Peer, []byte)) {
 	d.mu.Unlock()
 }
 
-// addRoute adds a system route dynamically
+// SocketFDs returns WireGuard's UDP socket descriptors where the bind
+// exposes them (Android), so the platform can keep them out of its own VPN.
+// Elsewhere it returns nothing.
+func (d *Device) SocketFDs() []int {
+	dev := d.wg.Load()
+	if dev == nil {
+		return nil
+	}
+	peek, ok := dev.Bind().(conn.PeekLookAtSocketFd)
+	if !ok {
+		return nil
+	}
+	var fds []int
+	if fd, err := peek.PeekLookAtSocketFd4(); err == nil && fd >= 0 {
+		fds = append(fds, fd)
+	}
+	if fd, err := peek.PeekLookAtSocketFd6(); err == nil && fd >= 0 {
+		fds = append(fds, fd)
+	}
+	return fds
+}
+
+// addRoute adds a system route dynamically. With an ExternalTUN (Android)
+// the platform set the routes when it built the interface.
 func (d *Device) addRoute(network string) error {
+	if ExternalTUN != nil {
+		return nil
+	}
 	return addRouteOS(d.tunName, network)
 }
 
 // removeRoute removes a system route dynamically
 func (d *Device) removeRoute(network string) error {
+	if ExternalTUN != nil {
+		return nil
+	}
 	return removeRouteOS(d.tunName, network)
 }
 

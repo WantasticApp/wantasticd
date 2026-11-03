@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -53,8 +54,24 @@ func NewAPIServer(a *Agent) *APIServer {
 	return s
 }
 
+// SocketFDs are WireGuard's UDP sockets, for the platform to protect
+// (Android: VpnService.protect keeps them out of the tunnel).
+func (a *Agent) SocketFDs() []int {
+	return a.device.SocketFDs()
+}
+
+// LocalAPI is the local API itself, for callers in the same process (the
+// Android app), which have no need of a port.
+func (a *Agent) LocalAPI() http.Handler {
+	return a.apiServer.server.Handler
+}
+
 // Start begins serving the local IPC API
 func (s *APIServer) Start() error {
+	// On Android any app can reach 127.0.0.1; the app calls LocalAPI in-process instead.
+	if runtime.GOOS == "android" {
+		return nil
+	}
 	port := 9034
 
 	// Support dynamic IPC ports via WTC_IPC_PORT env to avoid conflicts in localized e2e

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Devices in your network often serve their admin page over plain http://
+     (routers, printers); the in-app browser must open them through the tunnel.
+     Wantastic's own services are HTTPS only. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

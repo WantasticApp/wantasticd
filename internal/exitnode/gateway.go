@@ -71,28 +71,50 @@ func ParseLinuxProcRoute(data, tun string) (Gateway, error) {
 	return gw, nil
 }
 
-// WindowsDefaultGatewayCmd prints "ifIndex nexthop alias" for the preferred
-// IPv4 default route.
+// WindowsDefaultGatewayCmd prints "ifIndex nexthop metric alias" for every
+// IPv4 default route; metric is the effective one (route + interface).
 func WindowsDefaultGatewayCmd() Cmd {
 	return Cmd{Name: "powershell.exe", Args: []string{"-NoProfile", "-NonInteractive", "-Command",
-		"Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1 | ForEach-Object { \"$($_.ifIndex) $($_.NextHop) $($_.InterfaceAlias)\" }"}}
+		"Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 -ErrorAction SilentlyContinue | ForEach-Object { $m = $_.RouteMetric; $i = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.ifIndex -ErrorAction SilentlyContinue; if ($i) { $m += $i.InterfaceMetric }; \"$($_.ifIndex) $($_.NextHop) $m $($_.InterfaceAlias)\" }"}}
 }
 
-// ParseWindowsGateway parses WindowsDefaultGatewayCmd output.
-func ParseWindowsGateway(out string) (Gateway, error) {
-	f := strings.Fields(strings.TrimSpace(out))
-	if len(f) < 2 {
-		return Gateway{}, fmt.Errorf("no IPv4 default route")
+// ParseWindowsGateway picks the lowest-metric default route from
+// WindowsDefaultGatewayCmd output, ignoring the tunnel adapter: bypass routes
+// pinned to the tunnel would loop the tunnel's own UDP into itself.
+func ParseWindowsGateway(out, tun string) (Gateway, error) {
+	best := -1
+	var gw Gateway
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) < 3 {
+			continue
+		}
+		idx, err := strconv.Atoi(f[0])
+		if err != nil || idx <= 0 {
+			continue
+		}
+		a, err := netip.ParseAddr(f[1])
+		if err != nil || !a.Is4() || a.IsUnspecified() {
+			continue // on-link (0.0.0.0) default routes are VPN adapters, not a gateway
+		}
+		metric, err := strconv.Atoi(f[2])
+		if err != nil {
+			continue
+		}
+		alias := strings.Join(f[3:], " ")
+		if tun != "" && strings.EqualFold(alias, tun) {
+			continue
+		}
+		if best >= 0 && metric >= best {
+			continue
+		}
+		best = metric
+		gw = Gateway{IfIndex: idx, Addr: a, Interface: alias}
 	}
-	idx, err := strconv.Atoi(f[0])
-	if err != nil || idx <= 0 {
-		return Gateway{}, fmt.Errorf("bad interface index %q", f[0])
+	if best < 0 {
+		return Gateway{}, fmt.Errorf("no IPv4 default route outside the tunnel")
 	}
-	a, err := netip.ParseAddr(f[1])
-	if err != nil {
-		return Gateway{}, fmt.Errorf("bad next hop %q", f[1])
-	}
-	return Gateway{IfIndex: idx, Addr: a, Interface: strings.Join(f[2:], " ")}, nil
+	return gw, nil
 }
 
 // DefaultGateway returns the current IPv4 default route outside the tunnel.
@@ -119,7 +141,7 @@ func DefaultGateway(h Host, tun string) (Gateway, error) {
 		if err != nil {
 			return Gateway{}, err
 		}
-		return ParseWindowsGateway(string(out))
+		return ParseWindowsGateway(string(out), tun)
 	}
 	return Gateway{}, fmt.Errorf("default gateway lookup not supported on %s", h.OS)
 }

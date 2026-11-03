@@ -3,6 +3,7 @@ package platforms
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -227,5 +228,170 @@ func TestWaterfallSamplesSpanWholeCapture(t *testing.T) {
 	// Wide FFTs get fewer rows so the block stays within the value budget.
 	if wide := waterfallSamples(samples, 2048); len(wide)*2048 > spectralWaterfallBinBudget {
 		t.Fatalf("wide waterfall %d rows exceeds budget", len(wide))
+	}
+}
+
+func fakeRadioNetdevs(names []string, err error) func(string) ([]string, error) {
+	return func(string) ([]string, error) { return names, err }
+}
+
+// Before any operator request, a passive coordinator must tell hosts without
+// QCA radios (Unsupported) apart from QSDK hosts whose radios are waiting for
+// a Capture() request, and must not touch the driver to do so.
+func TestPassiveSpectralSnapshotBeforeAnyRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		netdevs    []string
+		listErr    error
+		wantStatus string
+		wantOps    string
+	}{
+		{"qsdk radios", []string{"wifi0", "wifi1"}, nil, "Idle", "Capture"},
+		{"no qca radio", []string{}, nil, "Unsupported", ""},
+		{"sysfs unreadable", nil, errors.New("permission denied"), "Idle", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &spectralCoordinator{
+				supported:    true,
+				passive:      true,
+				now:          time.Now,
+				radioNetdevs: fakeRadioNetdevs(tt.netdevs, tt.listErr),
+				discover: func(string) ([]qcaspectral.Radio, error) {
+					t.Fatal("a read must not probe the driver")
+					return nil, nil
+				},
+				capture: func(context.Context, qcaspectral.Radio, qcaspectral.CaptureOptions) (qcaspectral.Result, error) {
+					t.Fatal("a read must not capture")
+					return qcaspectral.Result{}, nil
+				},
+			}
+			snap := c.snapshotAndTrigger("")
+			if snap.Capturing {
+				t.Fatal("passive read started a capture")
+			}
+			msg := &wusp.Message{}
+			if err := appendSpectralSnapshotFields(msg, snap); err != nil {
+				t.Fatal(err)
+			}
+			if err := wusp.ValidateMessageFast(msg); err != nil {
+				t.Fatalf("schema: %v", err)
+			}
+			p := wusp.WUSPSpectralTelemetryPrefix
+			expectString(t, msg, p+"Status", tt.wantStatus)
+			expectString(t, msg, p+"SupportedOperations", tt.wantOps)
+			expectString(t, msg, p+"Implementation", "qca.native")
+			expectString(t, msg, p+"DiscoveryError", "")
+		})
+	}
+}
+
+func TestSpectralRequestCapturesOnDemandOnly(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	release := make(chan struct{}, 4)
+	var captures, discoveries int
+	c := &spectralCoordinator{
+		supported:    true,
+		passive:      true,
+		now:          clock,
+		radioNetdevs: fakeRadioNetdevs([]string{"wifi0"}, nil),
+		discover: func(string) ([]qcaspectral.Radio, error) {
+			mu.Lock()
+			discoveries++
+			mu.Unlock()
+			return []qcaspectral.Radio{{Interface: "wifi0", Caps: qcaspectral.Caps{Spectral: true, ControlPath: qcaspectral.ControlPathVendor, VendorTarget: "wifi0"}}}, nil
+		},
+		capture: func(context.Context, qcaspectral.Radio, qcaspectral.CaptureOptions) (qcaspectral.Result, error) {
+			<-release
+			mu.Lock()
+			captures++
+			mu.Unlock()
+			return qcaspectral.Result{Layout: qcaspectral.LayoutCMN, Samples: []qcaspectral.Sample{{Frequency: 5180, Bins: []byte{1, 2}}}}, nil
+		},
+	}
+	for i := 0; i < 3; i++ {
+		c.snapshotAndTrigger("")
+	}
+	done := make(chan struct{}, 2)
+	started, err := c.request("", func() { done <- struct{}{} })
+	if err != nil || !started {
+		t.Fatalf("request: started=%t err=%v", started, err)
+	}
+	if snap := c.snapshotAndTrigger(""); !snap.Capturing || spectralRootStatus(snap) != "Capturing" {
+		t.Fatalf("snapshot while capturing = %+v", snap)
+	}
+	// A retry while running joins the capture instead of starting another.
+	joined, err := c.request("", func() { done <- struct{}{} })
+	if err != nil || joined {
+		t.Fatalf("join: started=%t err=%v", joined, err)
+	}
+	release <- struct{}{}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("onDone not called")
+		}
+	}
+	snap := c.snapshotAndTrigger("")
+	if snap.Capturing || len(snap.Radios) != 1 || snap.Radios[0].Status != "Ready" || !snap.CaptureAvailable {
+		t.Fatalf("snapshot after capture = %+v", snap)
+	}
+	if _, err := c.request("", nil); err == nil || !strings.Contains(err.Error(), "retry in") {
+		t.Fatalf("request inside cooldown: %v", err)
+	}
+	advance(spectralRequestCooldown)
+	release <- struct{}{}
+	if started, err := c.request("", nil); err != nil || !started {
+		t.Fatalf("request after cooldown: started=%t err=%v", started, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for c.snapshotAndTrigger("").Capturing {
+		if time.Now().After(deadline) {
+			t.Fatal("second capture did not finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for i := 0; i < 5; i++ {
+		advance(time.Hour)
+		c.snapshotAndTrigger("")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if captures != 2 || discoveries != 2 {
+		t.Fatalf("captures=%d discoveries=%d, want 2/2 (only requested captures)", captures, discoveries)
+	}
+}
+
+func TestSpectralRequestRefusedWithoutRadios(t *testing.T) {
+	tests := []struct {
+		name string
+		c    *spectralCoordinator
+	}{
+		{"non-linux build", &spectralCoordinator{supported: false}},
+		{"no wifiN netdev", &spectralCoordinator{supported: true, now: time.Now, radioNetdevs: fakeRadioNetdevs(nil, nil)}},
+		{"sysfs error", &spectralCoordinator{supported: true, now: time.Now, radioNetdevs: fakeRadioNetdevs(nil, errors.New("boom"))}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.c.discover = func(string) ([]qcaspectral.Radio, error) {
+				t.Fatal("refused request must not probe")
+				return nil, nil
+			}
+			started, err := tt.c.request("", nil)
+			if started || !errors.Is(err, errSpectralUnavailable) {
+				t.Fatalf("started=%t err=%v", started, err)
+			}
+		})
+	}
+}
+
+func TestHostBackendSpectralRequestOnlyOnWiFiKinds(t *testing.T) {
+	b := &hostBackend{kind: KindMacOS}
+	if _, err := b.RequestSpectralCapture(nil); !errors.Is(err, errSpectralUnavailable) {
+		t.Fatalf("macOS host: %v", err)
 	}
 }

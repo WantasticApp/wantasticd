@@ -88,9 +88,9 @@ func TestTrayIcons(t *testing.T) {
 		if err != nil || img.Bounds().Dx() != 32 {
 			t.Fatalf("state %d: %v", s, err)
 		}
-		// Centre of the disc is opaque, the corner transparent.
+		// The logo's top is opaque, the corner transparent.
 		if _, _, _, a := img.At(16, 8).RGBA(); a == 0 {
-			t.Fatalf("state %d: disc missing", s)
+			t.Fatalf("state %d: logo missing", s)
 		}
 		if _, _, _, a := img.At(0, 0).RGBA(); a != 0 {
 			t.Fatalf("state %d: corner not transparent", s)

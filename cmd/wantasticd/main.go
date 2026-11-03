@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -16,8 +17,10 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"wantastic-agent/internal/accounts"
 	"wantastic-agent/internal/auth"
 	"wantastic-agent/internal/config"
 	platformdns "wantastic-agent/internal/platform/dns"
@@ -62,6 +65,8 @@ func main() {
 	case "tray":
 		releaseOwnConsole()
 		handleTray()
+	case "account", "accounts":
+		os.Exit(runAccountCommand(os.Args[2:], os.Stdout))
 	case "service":
 		os.Exit(runServiceCommand(os.Args[2:]))
 	case "uninstall":
@@ -87,7 +92,7 @@ func main() {
 	}
 }
 
-var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "tray", "service", "uninstall", "update", "version"}
+var userCommands = []string{"genkey", "login", "connect", "status", "up", "down", "peers", "ping", "exit-node", "jumpto", "comeback", "account", "tray", "service", "uninstall", "update", "version"}
 
 // suggestCommand returns the command within two typos of name, if any.
 func suggestCommand(name string) string {
@@ -309,41 +314,21 @@ func generateWireGuardKeyPair() (string, string, error) {
 }
 
 func buildClaimURL(portalBaseURL, publicKey string) string {
-	base := normalizeClaimServerURL(portalBaseURL)
-	claimURL := base + "/#desktop?claim_public_key=" + url.QueryEscape(strings.TrimSpace(publicKey)) + "&wantastic_server=" + url.QueryEscape(base)
-	if host := claimHostname(osHostname); host != "" {
-		claimURL += "&hostname=" + url.QueryEscape(host)
-	}
-	return claimURL
+	host, _ := osHostname()
+	return auth.BuildClaimURL(portalBaseURL, publicKey, host)
 }
 
 // osHostname is os.Hostname, replaceable in tests.
 var osHostname = os.Hostname
 
-// claimHostname is the device hostname for the claim link, where it only
-// pre-fills the device name in the console's claim form. Network suffixes
-// and stock defaults that say nothing about the device are dropped.
+// claimHostname is the device hostname for the claim link (see
+// auth.ClaimHostname).
 func claimHostname(hostname func() (string, error)) string {
 	host, err := hostname()
 	if err != nil {
 		return ""
 	}
-	host = strings.TrimSpace(host)
-	lower := strings.ToLower(host)
-	for _, suffix := range []string{".local", ".lan", ".home", ".localdomain"} {
-		if strings.HasSuffix(lower, suffix) {
-			host = host[:len(host)-len(suffix)]
-			break
-		}
-	}
-	switch strings.ToLower(host) {
-	case "", "localhost", "openwrt":
-		return ""
-	}
-	if len(host) > 64 {
-		host = strings.ToValidUTF8(host[:64], "")
-	}
-	return host
+	return auth.ClaimHostname(host)
 }
 
 func resolveClaimServerURL(serverURL, server, portalURL string) string {
@@ -356,18 +341,7 @@ func resolveClaimServerURL(serverURL, server, portalURL string) string {
 }
 
 func normalizeClaimServerURL(portalBaseURL string) string {
-	base := strings.TrimRight(strings.TrimSpace(portalBaseURL), "/")
-	if base == "" {
-		return "https://" + auth.DefaultOAuth2Domain
-	}
-	if !strings.HasPrefix(strings.ToLower(base), "http://") &&
-		!strings.HasPrefix(strings.ToLower(base), "https://") {
-		base = "https://" + base
-	}
-	if parsed, err := url.Parse(base); err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		return parsed.Scheme + "://" + parsed.Host
-	}
-	return base
+	return auth.NormalizeServerURL(portalBaseURL)
 }
 
 func writeClaimKeyFile(path string, keyFile *claimKeyFile) error {
@@ -554,7 +528,7 @@ func handleConnect() {
 			}
 		}
 	}
-	if _, err := os.Stat(*configPath); err != nil {
+	if err := configPresent(*configPath); err != nil {
 		if os.IsNotExist(err) && !claimKeyExists(*claimKeyPath) && desktopOS() {
 			// A desktop that is not signed in yet waits for its claim; the
 			// tray's Log in opens the claim link (no login code).
@@ -579,6 +553,22 @@ func handleConnect() {
 		}
 		runAgent(ctx, *configPath, *verbose, autoUpdate, tunName, useTray, localAccess)
 	})
+}
+
+// configPresent is os.Stat for the config, except that an empty file (the
+// installer leaves one when login is skipped) counts as missing: the device
+// is not signed in yet.
+func configPresent(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() && info.Size() < 4096 {
+		if data, rerr := os.ReadFile(path); rerr == nil && len(bytes.TrimSpace(data)) == 0 {
+			return &os.PathError{Op: "read", Path: path, Err: os.ErrNotExist}
+		}
+	}
+	return nil
 }
 
 // desktopOS is true where a person signs in from the tray.
@@ -750,6 +740,30 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 		}
 	}()
 
+	// Account switches restart the agent in place on the other account's
+	// configuration; agtMu guards agt against the final Stop below.
+	var agtMu sync.Mutex
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case id := <-agent.AccountSwitches():
+				agtMu.Lock()
+				agt = switchAccount(ctx, agt, configPath, id, func(next *config.Config) {
+					if verbose || os.Getenv("DEBUG_LEVEL") == "debug" {
+						next.Verbose = true
+					}
+					next.AutoUpdate = autoUpdate
+					localAccess.apply(next)
+					next.Interface.TUNMode = true
+					next.Interface.TUNName = tunName
+				})
+				agtMu.Unlock()
+			}
+		}
+	}()
+
 	if useTray {
 		log.Println("Starting system tray client...")
 		// systray.Run MUST block the main thread on macOS
@@ -758,10 +772,58 @@ func runAgent(parentCtx context.Context, configPath string, verbose bool, autoUp
 		<-ctx.Done()
 	}
 
+	agtMu.Lock()
+	defer agtMu.Unlock()
 	if err := agt.Stop(); err != nil {
 		log.Fatalf("Failed to stop agent: %v", err)
 	}
 	log.Println("Agent stopped successfully")
+}
+
+// switchAccount stops cur, makes account id the active configuration and
+// starts on it. When the other account cannot start, the previous one is
+// made active and started again, so a bad switch never leaves the device
+// offline. It returns the agent now running.
+func switchAccount(ctx context.Context, cur *agent.Agent, configPath, id string, prepare func(*config.Config)) *agent.Agent {
+	store := accounts.Open(configPath)
+	previous := ""
+	if list, err := store.List(); err == nil {
+		for _, a := range list {
+			if a.Active {
+				previous = a.ID
+			}
+		}
+	}
+	log.Printf("Accounts: switching to %s", id)
+	if err := cur.Stop(); err != nil {
+		log.Printf("Accounts: stop before switching: %v", err)
+	}
+	start := func() (*agent.Agent, error) {
+		cfg, err := config.LoadFromFile(configPath)
+		if err != nil {
+			return nil, err
+		}
+		prepare(cfg)
+		return startAgentWithRetry(ctx, cfg)
+	}
+	if _, err := store.Use(id); err != nil {
+		log.Printf("Accounts: switch to %s: %v", id, err)
+	} else if next, err := start(); err == nil {
+		log.Printf("Accounts: now connected with account %s", id)
+		return next
+	} else {
+		log.Printf("Accounts: account %s did not start (%v); going back to %s", id, err, previous)
+		if previous != "" {
+			if _, err := store.Use(previous); err != nil {
+				log.Printf("Accounts: restore %s: %v", previous, err)
+			}
+		}
+	}
+	next, err := start()
+	if err != nil {
+		log.Fatalf("Failed to start agent after an account switch: %v", err)
+	}
+	return next
 }
 
 func printVersion() {
@@ -859,9 +921,13 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  exit-node  Let peers use this device as their exit node: exit-node on|off|status")
 	fmt.Fprintln(os.Stderr, "  jumpto     Send all internet traffic through a peer: jumpto <peer-vpn-ip>")
 	fmt.Fprintln(os.Stderr, "  comeback   Stop using an exit node and restore normal routing")
+	fmt.Fprintln(os.Stderr, "  account    Accounts on this device: list | add | use | rename | remove")
 	fmt.Fprintln(os.Stderr, "  tray       Run the system tray client")
-	if runtime.GOOS == "windows" {
-		fmt.Fprintln(os.Stderr, "  service    Windows service: install | uninstall | start | stop | restart | status")
+	switch runtime.GOOS {
+	case "windows":
+		fmt.Fprintln(os.Stderr, "  service    Windows service: install | uninstall | reinstall | start | stop | restart | status")
+	case "darwin":
+		fmt.Fprintln(os.Stderr, "  service    launchd service: install | uninstall | reinstall | start | stop | restart | status")
 	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		fmt.Fprintln(os.Stderr, "  uninstall  Remove the service, tray and app (--purge also removes the login)")

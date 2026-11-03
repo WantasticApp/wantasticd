@@ -5,7 +5,6 @@ package runner
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,6 +28,10 @@ const trayRefresh = time.Second
 // noticeTTL is how long an action's result stays in the menu.
 const noticeTTL = 20 * time.Second
 
+// livePingEvery is how often peers are pinged while the menu is open (macOS,
+// where the tray sees the menu open); nothing is pinged while it is closed.
+const livePingEvery = 3 * time.Second
+
 // trayClient talks to the daemon's local IPC API. Every call is bounded so a
 // wedged daemon can never freeze the menu; actions that wait on the network
 // (connect, exit node, ping) get their own longer client.
@@ -43,7 +46,10 @@ func ipcURL(path string) string {
 
 // postControl runs a state-changing daemon action and returns the daemon's
 // notice, or its error. Every control endpoint answers {ok, error, notice}.
-func postControl(path string) (string, error) {
+func postControl(path string) (string, error) { return postControlInto(path, nil) }
+
+// postControlInto is postControl that also decodes the whole reply into v.
+func postControlInto(path string, v any) (string, error) {
 	req, err := http.NewRequest(http.MethodPost, ipcURL(path), nil)
 	if err != nil {
 		return "", err
@@ -65,6 +71,9 @@ func postControl(path string) (string, error) {
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
 		return "", fmt.Errorf("daemon: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if v != nil {
+		_ = json.Unmarshal(body, v)
 	}
 	if !r.OK {
 		return "", fmt.Errorf("%s", firstNonEmpty(r.Error, fmt.Sprintf("HTTP %d", resp.StatusCode)))
@@ -176,50 +185,68 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			setTrayIcon(trayDaemonDown)
 			setTrayTooltip("Wantastic")
 
+			// Status: state, address and live traffic.
 			mHeader := systray.AddMenuItem("○ Connecting…", "Connection state")
 			mHeader.Disable()
 			mAddress := systray.AddMenuItem("IP: —", "Click to copy this device's VPN IP")
-			mTraffic := systray.AddMenuItem("Traffic: —", "Total since the daemon started")
-			mTraffic.Disable()
 			mRate := systray.AddMenuItem("Speed: —", "Current throughput")
 			mRate.Disable()
-			mDetails := systray.AddMenuItem("", "")
-			mDetails.Disable()
-			mLogin := systray.AddMenuItem("Log in…", "Open the browser to add this device to your account")
+			mTraffic := systray.AddMenuItem("Traffic: —", "Total since the daemon started")
+			mTraffic.Disable()
+			// Not signed in: a QR code to scan with a phone (macOS draws it
+			// full size) and a link that opens the same page here.
+			mLoginQR := systray.AddMenuItem("Scan to log in", "Scan with your phone, or click to open the login page here")
+			mLoginQR.Hide()
+			mLogin := systray.AddMenuItem("Log in in browser…", "Open the browser to add this device to your account")
 			mLogin.Hide()
 			var (
 				loginMu    sync.Mutex
 				loginURL   string
 				loginShown bool
+				loginQRFor string
 			)
 
+			// Controls: the tunnel and exit-node mode, as switches.
 			systray.AddSeparator()
-			mToggle := systray.AddMenuItem("Disconnect", "Connect or disconnect the tunnel; the service keeps running")
+			mToggle := systray.AddMenuItemCheckbox("Connect", "Connect or disconnect the tunnel; the service keeps running", false)
+			exitMenu := newTrayExitMenu()
+			accountMenu := newTrayAccountMenu()
 
-			mPeers := systray.AddMenuItem("Peers: —", "Devices in this network; click one to copy its IP")
+			// Peers and their latency.
+			systray.AddSeparator()
+			mPeers := systray.AddMenuItem("Peers: —", "Devices in this network; open one for its addresses")
 			peerMenu := newPeerMenuGroup(mPeers, "No peers")
 			mPing := systray.AddMenuItem("Ping all peers", "Measure latency to every peer over the tunnel")
 			mPingResult := systray.AddMenuItem("", "")
 			mPingResult.Disable()
 			mPingResult.Hide()
 
-			exitMenu := newTrayExitMenu()
-
 			mNotice := systray.AddMenuItem("", "")
 			mNotice.Disable()
 			mNotice.Hide()
 			notice := &trayNotice{item: mNotice}
 			exitMenu.report = notice.report
+			accountMenu.report = notice.report
 
+			// More: service details and shortcuts.
 			systray.AddSeparator()
-			mVersion := systray.AddMenuItem("Version "+version.Version, "Installed version")
-			mVersion.Disable()
-			var uninstallClicked chan struct{} // nil: never fires
-			if trayCanUninstall {
-				uninstallClicked = systray.AddMenuItem("Uninstall Wantastic…", "Remove the VPN service, this menu and the program; your login is kept").ClickedCh
+			mMore := systray.AddMenuItem("More", "Service details and shortcuts")
+			mDetails := mMore.AddSubMenuItem("", "")
+			mDetails.Disable()
+			mServer := newCopyMenuItem(mMore)
+			mKey := newCopyMenuItem(mMore)
+			mConsole := mMore.AddSubMenuItem("Open console", "Open "+trayConsoleURL+" in the browser")
+			mLogs := mMore.AddSubMenuItem("Show service log", "Open the service log")
+			logPath := trayLogPath()
+			if logPath == "" {
+				mLogs.Hide()
 			}
-			var uninstalling atomic.Bool
+			mVersion := mMore.AddSubMenuItem("Version "+version.Version, "Installed version")
+			mVersion.Disable()
 			mQuit := systray.AddMenuItem("Quit tray", "Close this menu; the VPN service keeps running")
+
+			keepMenuOpen(mToggle, mPing)
+			menuSwitch(mToggle, exitMenu.offer)
 
 			var (
 				refreshMu sync.Mutex
@@ -227,7 +254,13 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				lastState = trayState(-1)
 				latency   map[string]agent.PingResult
 				address   string
+				// toggling is the VPN row's title while a connect or
+				// disconnect runs ("Connecting…"), "" otherwise.
+				toggling atomic.Value
+				lastPoll time.Time
+				menuOpen atomic.Bool
 			)
+			toggling.Store("")
 			// Clicks refresh from their own goroutines; menu updates are
 			// serialised here.
 			refresh := func() {
@@ -255,7 +288,14 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				address = strings.TrimPrefix(v.Address, "IP: ")
 				setTitle(mTraffic, v.Traffic)
 				setTitle(mRate, v.Rate)
-				setTitle(mDetails, v.Details)
+				setTitle(mDetails, firstNonEmpty(v.Details, "Service details appear once connected"))
+				if st != nil {
+					mServer.set("Server", st.ServerEndpoint)
+					mKey.set("Public key", st.PubKey)
+				} else {
+					mServer.set("Server", "")
+					mKey.set("Public key", "")
+				}
 				loginMu.Lock()
 				loginURL = v.LoginURL
 				if show := v.LoginURL != ""; show != loginShown {
@@ -263,11 +303,19 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						mLogin.Show()
 					} else {
 						mLogin.Hide()
+						mLoginQR.Hide()
 					}
 					loginShown = show
 				}
+				if v.LoginURL != "" && v.LoginURL != loginQRFor {
+					loginQRFor = v.LoginURL
+					if png, err := loginQRPNG(v.LoginURL); err == nil && setMenuImage(mLoginQR, png, loginQRPoints) {
+						mLoginQR.Show()
+					}
+				}
 				loginMu.Unlock()
-				setTitle(mToggle, v.ToggleTitle)
+				setTitle(mToggle, firstNonEmpty(toggling.Load().(string), v.ToggleTitle))
+				setChecked(mToggle, v.State == trayConnected || v.State == trayExitActive)
 				setEnabled(mToggle, v.ToggleEnabled)
 				setTitle(mPeers, v.PeersTitle)
 				setEnabled(mPing, v.State == trayConnected || v.State == trayExitActive)
@@ -277,7 +325,10 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				} else {
 					syncPeerMenuGroup(peerMenu, nil)
 				}
-				exitMenu.apply(deriveExitMenu(st))
+				exitMenu.apply(withExitLatency(deriveExitMenu(st), latency))
+				if st != nil && st.Claim == nil {
+					accountMenu.refresh(menuOpen.Load())
+				}
 				notice.expire()
 
 				ver := "Version " + version.Version
@@ -295,17 +346,34 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			}
 
 			exitMenu.onChange = func() { go refresh() }
+			accountMenu.onChange = func() { go refresh() }
 
-			var pinging sync.Mutex
-			pingAll := func() {
-				if !pinging.TryLock() {
+			// pingAll measures every peer. A click sends three probes each and
+			// says so in the item; the live pings while the menu is open send
+			// one and only update the results.
+			// A click waits for a live ping already running; a live ping
+			// skips while anything runs.
+			var (
+				pinging     sync.Mutex
+				manualQueue atomic.Bool
+			)
+			pingAll := func(manual bool) {
+				query := "/api/ping?count=1&timeout=1000"
+				if manual {
+					if !manualQueue.CompareAndSwap(false, true) {
+						return
+					}
+					mPing.SetTitle("Pinging all peers…")
+					mPing.Disable()
+					pinging.Lock()
+					manualQueue.Store(false)
+					query = "/api/ping?count=3&interval=200&timeout=1000"
+				} else if !pinging.TryLock() {
 					return
 				}
 				defer pinging.Unlock()
-				mPing.SetTitle("Pinging all peers…")
-				mPing.Disable()
 				var pr agent.PingResponse
-				err := fetchJSON(actionClient, "/api/ping?count=3&interval=200&timeout=1000", &pr)
+				err := fetchJSON(actionClient, query, &pr)
 				if err == nil && pr.Error == "" {
 					m := make(map[string]agent.PingResult, len(pr.Results))
 					for _, r := range pr.Results {
@@ -315,27 +383,88 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					latency = m
 					refreshMu.Unlock()
 				}
-				mPing.SetTitle("Ping all peers")
+				if manual {
+					mPing.SetTitle("Ping all peers")
+				}
 				mPingResult.SetTitle(pingSummary(&pr, err) + " · " + time.Now().Format("15:04:05"))
 				mPingResult.Show()
 				refresh()
 			}
 
+			connected := func() bool {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				return lastState == trayConnected || lastState == trayExitActive
+			}
+
+			// While the menu is open it pings on its own and refreshes at
+			// once, so what it shows is live from the moment it opens.
+			liveWake := make(chan struct{}, 1)
+			watchMenu(nil, func() {
+				menuOpen.Store(true)
+				select {
+				case liveWake <- struct{}{}:
+				default:
+				}
+				refresh()
+			}, func() { menuOpen.Store(false) })
+			watchMenu(exitMenu.root, refresh, nil)
+			watchMenu(accountMenu.root, refresh, nil)
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-liveWake:
+					}
+					for menuOpen.Load() {
+						if connected() {
+							pingAll(false)
+						}
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(livePingEvery):
+						}
+					}
+				}
+			}()
+
 			toggle := func() {
 				refreshMu.Lock()
 				disconnect := lastState == trayConnected || lastState == trayExitActive
 				refreshMu.Unlock()
-				mToggle.Disable()
+				if !toggling.CompareAndSwap("", "pending") {
+					return
+				}
 				if disconnect {
-					setTitle(mToggle, "Disconnecting…")
-					n, err := postControl("/api/disconnect")
-					notice.report("Disconnected; the service keeps running", n, err)
+					toggling.Store("Disconnecting…")
 				} else {
-					setTitle(mToggle, "Connecting…")
-					n, err := postControl("/api/connect")
-					notice.report("Connected", n, err)
+					toggling.Store("Connecting…")
 				}
 				refresh()
+				var (
+					n   string
+					err error
+				)
+				if disconnect {
+					n, err = postControl("/api/disconnect")
+					notice.report("Disconnected; the service keeps running", n, err)
+				} else {
+					n, err = postControl("/api/connect")
+					notice.report("Connected", n, err)
+				}
+				toggling.Store("")
+				refresh()
+			}
+
+			openLogin := func() {
+				loginMu.Lock()
+				url := loginURL
+				loginMu.Unlock()
+				if err := OpenURL(url); err != nil {
+					notice.report("", "", fmt.Errorf("open the browser: %w", err))
+				}
 			}
 
 			go func() {
@@ -358,28 +487,23 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						go toggle()
 
 					case <-mLogin.ClickedCh:
-						loginMu.Lock()
-						url := loginURL
-						loginMu.Unlock()
-						if err := OpenURL(url); err != nil {
+						openLogin()
+
+					case <-mLoginQR.ClickedCh:
+						openLogin()
+
+					case <-mConsole.ClickedCh:
+						if err := OpenURL(trayConsoleURL); err != nil {
 							notice.report("", "", fmt.Errorf("open the browser: %w", err))
 						}
 
-					case <-uninstallClicked:
-						if !uninstalling.CompareAndSwap(false, true) {
-							continue
+					case <-mLogs.ClickedCh:
+						if err := openLogFile(logPath); err != nil {
+							notice.report("", "", fmt.Errorf("open the log: %w", err))
 						}
-						go func() {
-							defer uninstalling.Store(false)
-							if err := trayUninstall(); errors.Is(err, errUninstallCanceled) {
-								return
-							} else if err != nil {
-								notice.report("", "", fmt.Errorf("uninstall: %w", err))
-							}
-						}()
 
 					case <-mPing.ClickedCh:
-						go pingAll()
+						go pingAll(true)
 
 					case <-mAddress.ClickedCh:
 						refreshMu.Lock()
@@ -394,6 +518,12 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						}
 
 					case <-ticker.C:
+						// With the menu closed only the icon shows, which a
+						// slower poll keeps current at less cost.
+						if trayKnowsMenuOpen && !menuOpen.Load() && time.Since(lastPoll) < trayIdleRefresh {
+							continue
+						}
+						lastPoll = time.Now()
 						refresh()
 					}
 				}

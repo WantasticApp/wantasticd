@@ -28,6 +28,7 @@ require (
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.10
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
+	rsc.io/qr v0.2.0
 )
 
 require (
@@ -50,5 +51,4 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
-	rsc.io/qr v0.2.0 // indirect
 )

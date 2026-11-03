@@ -42,6 +42,11 @@ func runServiceCommand(args []string) int {
 		err = serviceInstall(args[1:])
 	case "uninstall", "remove":
 		err = serviceUninstall()
+	case "reinstall":
+		// A clean slate for a broken install; the login and config stay.
+		if err = serviceUninstall(); err == nil {
+			err = serviceInstall(args[1:])
+		}
 	case "start":
 		err = withService(func(s *mgr.Service) error { return startAndWait(s) })
 	case "stop":
@@ -71,6 +76,7 @@ func serviceUsage() {
 	fmt.Fprintln(os.Stderr, "  install [--config PATH] [--no-start] [--no-tray]")
 	fmt.Fprintln(os.Stderr, "                                         register (or repair) the service, firewall rules, recovery and tray, then start it")
 	fmt.Fprintln(os.Stderr, "  uninstall                              stop and remove the service and its firewall rules")
+	fmt.Fprintln(os.Stderr, "  reinstall [install flags]              uninstall, then install again (login and config kept)")
 	fmt.Fprintln(os.Stderr, "  start | stop | restart | status")
 }
 

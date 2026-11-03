@@ -45,6 +45,11 @@ func NewAPIServer(a *Agent) *APIServer {
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
 	mux.HandleFunc("/api/ping", s.handlePing)
+	mux.HandleFunc("/api/accounts", s.handleAccounts)
+	mux.HandleFunc("/api/accounts/add", s.handleAccountAdd)
+	mux.HandleFunc("/api/accounts/use", s.handleAccountUse)
+	mux.HandleFunc("/api/accounts/remove", s.handleAccountRemove)
+	mux.HandleFunc("/api/accounts/rename", s.handleAccountRename)
 
 	s.server = &http.Server{
 		Addr:    "127.0.0.1:9034",

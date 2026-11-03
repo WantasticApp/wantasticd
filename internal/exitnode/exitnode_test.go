@@ -170,9 +170,24 @@ func TestGatewayParsers(t *testing.T) {
 	if _, err := ParseLinuxProcRoute("Iface\n", ""); err == nil {
 		t.Fatal("linux: want error without default")
 	}
-	gw, err = ParseWindowsGateway("12 192.168.1.1 Wi-Fi 2\r\n")
+	win := "31 0.0.0.0 5 wantastic\r\n" + // tunnel: ignored
+		"40 10.0.0.1 0 Other VPN\r\n" + // another adapter with a real next hop and the lowest metric
+		"7 192.168.0.1 60 Ethernet\r\n" +
+		"12 192.168.1.1 35 Wi-Fi 2\r\n"
+	gw, err = ParseWindowsGateway(win, "wantastic")
+	if err != nil || gw.IfIndex != 40 {
+		t.Fatalf("windows: %+v %v", gw, err)
+	}
+	gw, err = ParseWindowsGateway("7 192.168.0.1 60 Ethernet\r\n12 192.168.1.1 35 Wi-Fi 2\r\n31 0.0.0.0 1 wantastic\r\n", "wantastic")
 	if err != nil || gw.IfIndex != 12 || gw.Addr != ma("192.168.1.1") || gw.Interface != "Wi-Fi 2" {
 		t.Fatalf("windows: %+v %v", gw, err)
+	}
+	gw, err = ParseWindowsGateway("31 10.255.255.1 1 Wantastic\r\n7 192.168.0.1 60 Ethernet\r\n", "wantastic")
+	if err != nil || gw.IfIndex != 7 {
+		t.Fatalf("windows: tunnel with a next hop must still be ignored: %+v %v", gw, err)
+	}
+	if _, err := ParseWindowsGateway("31 0.0.0.0 1 wantastic\r\n", "wantastic"); err == nil {
+		t.Fatal("windows: want error when only the tunnel has a default route")
 	}
 }
 
@@ -311,8 +326,12 @@ func (f *fakeHost) host(goos string) Host {
 			}
 			return []byte(v), nil
 		},
-		WriteFile: func(p string, b []byte) error { f.files[p] = string(b); f.cmds = append(f.cmds, "write "+p+"="+string(b)); return nil },
-		Exists:    func(p string) bool { return f.bins[p] },
+		WriteFile: func(p string, b []byte) error {
+			f.files[p] = string(b)
+			f.cmds = append(f.cmds, "write "+p+"="+string(b))
+			return nil
+		},
+		Exists: func(p string) bool { return f.bins[p] },
 	}
 }
 

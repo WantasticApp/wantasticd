@@ -67,3 +67,20 @@ func TestDeriveExitMenuUnsupportedAndOffering(t *testing.T) {
 		t.Fatalf("standby: %q", m.Header)
 	}
 }
+
+func TestWithExitLatency(t *testing.T) {
+	s := exitMenuState{Items: []exitMenuItem{{IP: "10.0.0.2", Title: "a"}, {IP: "10.0.0.3", Title: "b"}, {IP: "10.0.0.4", Title: "c"}}}
+	got := withExitLatency(s, map[string]agent.PingResult{
+		"10.0.0.2": {Sent: 1, Received: 1, AvgMs: 12.4},
+		"10.0.0.3": {Sent: 1},
+	})
+	want := []string{"a · 12 ms", "b · no reply", "c"}
+	for i, w := range want {
+		if got.Items[i].Title != w {
+			t.Fatalf("item %d = %q, want %q", i, got.Items[i].Title, w)
+		}
+	}
+	if s.Items[0].Title != "a" {
+		t.Fatal("withExitLatency changed its input")
+	}
+}

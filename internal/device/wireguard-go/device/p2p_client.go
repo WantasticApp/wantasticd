@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,12 +67,16 @@ type P2PClient struct {
 	extraCandidates atomic.Pointer[[]net.UDPAddr]
 	reregister      atomic.Bool
 	lastRegister    atomic.Int64
+	// spraying admits one port spray at a time (see punchSpray).
+	spraying atomic.Bool
 
 	myID          uint32
 	myPublicKey   NoisePublicKey
 	serverPeerKey NoisePublicKey
 	localAddr     net.UDPAddr
 	observedAddr  net.UDPAddr
+	// registered are the candidates last announced to the coordinator.
+	registered []net.UDPAddr
 
 	peers    map[uint32]*DiscoveredPeer
 	mu       sync.RWMutex
@@ -116,6 +121,11 @@ type DiscoveredPeer struct {
 	EstablishedAt time.Time
 	AssignedIP    net.IP
 	PunchAttempts int
+
+	// lastTxBytes/lastTxAt track when this side last sent on a direct
+	// path, for p2pDirectKeepalive.
+	lastTxBytes uint64
+	lastTxAt    time.Time
 }
 
 type P2PState int
@@ -184,6 +194,10 @@ type p2pPunchJob struct {
 	session *P2PSession
 	packet  []byte
 	targets []conn.Endpoint
+	// spray is swept sweeps times, paced, after the plain punch had a head
+	// start (see punchSpray).
+	spray  []conn.Endpoint
+	sweeps int
 }
 
 type p2pPromotionJob struct {
@@ -350,7 +364,20 @@ func (c *P2PClient) attemptWorker() {
 }
 
 func (c *P2PClient) getDefaultLocalIP() net.IP {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	return defaultRouteSource("udp4", "8.8.8.8:80")
+}
+
+// getDefaultLocalIP6 is the IPv6 source address the kernel would use for the
+// internet: the preferred global address of the uplink, never a deprecated,
+// unique-local or IMS-only one.
+func (c *P2PClient) getDefaultLocalIP6() net.IP {
+	return defaultRouteSource("udp6", "[2001:4860:4860::8888]:80")
+}
+
+// defaultRouteSource asks the routing table for the source address towards
+// target. Connecting a UDP socket sends nothing.
+func defaultRouteSource(network, target string) net.IP {
+	conn, err := net.Dial(network, target)
 	if err != nil {
 		return nil
 	}
@@ -374,9 +401,19 @@ type p2pLocalInterface struct {
 // p2pSkippedInterfacePrefixes are tunnels and bridges whose addresses are
 // unreachable for a peer on another network: announcing them only spends
 // punch targets.
-var p2pSkippedInterfacePrefixes = []string{"utun", "ipsec", "ppp", "bridge", "tailscale", "wg"}
+var p2pSkippedInterfacePrefixes = []string{"utun", "ipsec", "bridge", "tailscale", "wg"}
+
+// p2pSkipPPP skips ppp interfaces where they are VPN tunnels (macOS,
+// Windows). On Linux they are the uplink: OpenWrt's pppoe-wan carries the
+// public IPv4 and the global IPv6 of PPPoE broadband (the norm in China), and
+// ppp0 is a 3G/4G modem.
+var p2pSkipPPP = runtime.GOOS != "linux" && runtime.GOOS != "android"
 
 var p2pSharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// p2pIPv4ServiceContinuity is 192.0.0.0/29: the DS-Lite B4 and 464XLAT CLAT
+// addresses (Android's v4-rmnet*), never reachable from another network.
+var p2pIPv4ServiceContinuity = netip.MustParsePrefix("192.0.0.0/29")
 
 func (c *P2PClient) collectLocalCandidates(port int) []net.UDPAddr {
 	ifaces, err := net.Interfaces()
@@ -400,7 +437,7 @@ func (c *P2PClient) collectLocalCandidates(port int) []net.UDPAddr {
 		}
 		local = append(local, entry)
 	}
-	return filterLocalCandidates(c.getDefaultLocalIP(), local, c.tunName(), port)
+	return filterLocalCandidates(c.getDefaultLocalIP(), c.getDefaultLocalIP6(), local, c.tunName(), port)
 }
 
 func (c *P2PClient) tunName() string {
@@ -416,8 +453,11 @@ func (c *P2PClient) tunName() string {
 
 // filterLocalCandidates keeps addresses a peer could plausibly reach: the
 // default-route address first (when it belongs to an eligible interface),
-// then other interface addresses, with at most p2pMaxIPv6Candidates IPv6.
-func filterLocalCandidates(defaultIP net.IP, ifaces []p2pLocalInterface, ownTun string, port int) []net.UDPAddr {
+// then other IPv4 interface addresses, then at most p2pMaxIPv6Candidates
+// IPv6 addresses ranked default-route source, global, unique-local. IPv6 is
+// the direct path that survives carrier-grade NAT, so the slots must not go
+// to addresses no peer can reach.
+func filterLocalCandidates(defaultIP, defaultIP6 net.IP, ifaces []p2pLocalInterface, ownTun string, port int) []net.UDPAddr {
 	eligible := make([]net.IP, 0, 4)
 	for _, iface := range ifaces {
 		if iface.flags&net.FlagUp == 0 || iface.flags&net.FlagLoopback != 0 || isSkippedCandidateInterface(iface.name, ownTun) {
@@ -439,27 +479,36 @@ func filterLocalCandidates(defaultIP net.IP, ifaces []p2pLocalInterface, ownTun 
 			}
 		}
 	}
-	ipv6 := 0
-	for _, candidate := range candidates {
-		if candidate.IP.To4() == nil {
-			ipv6++
+	var v6 [3][]net.IP // default-route source, global, unique-local
+	for _, ip := range eligible {
+		switch {
+		case ip.To4() != nil:
+			appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
+		case defaultIP6 != nil && ip.Equal(defaultIP6):
+			v6[0] = append(v6[0], ip)
+		case isUniqueLocalIPv6(ip):
+			v6[2] = append(v6[2], ip)
+		default:
+			v6[1] = append(v6[1], ip)
 		}
 	}
-	for _, ip := range eligible {
-		if ip.To4() == nil {
+	ipv6 := 0
+	for _, rank := range v6 {
+		for _, ip := range rank {
 			if ipv6 >= p2pMaxIPv6Candidates {
-				continue
+				return candidates
 			}
 			before := len(candidates)
 			appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
-			if len(candidates) > before {
-				ipv6++
-			}
-			continue
+			ipv6 += len(candidates) - before
 		}
-		appendPunchCandidate(&candidates, net.UDPAddr{IP: ip, Port: port}, nil)
 	}
 	return candidates
+}
+
+func isUniqueLocalIPv6(ip net.IP) bool {
+	ip16 := ip.To16()
+	return ip.To4() == nil && ip16 != nil && ip16[0]&0xfe == 0xfc
 }
 
 func isSkippedCandidateInterface(name, ownTun string) bool {
@@ -470,6 +519,9 @@ func isSkippedCandidateInterface(name, ownTun string) bool {
 		return true
 	}
 	lower := strings.ToLower(name)
+	if p2pSkipPPP && strings.HasPrefix(lower, "ppp") {
+		return true
+	}
 	for _, prefix := range p2pSkippedInterfacePrefixes {
 		if strings.HasPrefix(lower, prefix) {
 			return true
@@ -495,7 +547,8 @@ func isUsefulLocalCandidateIP(ip net.IP) bool {
 	}
 	// Carrier-grade NAT and overlay (Tailscale-style) space is never a path
 	// another site can reach directly.
-	if addr, ok := netip.AddrFromSlice(ip); ok && p2pSharedAddressSpace.Contains(addr.Unmap()) {
+	if addr, ok := netip.AddrFromSlice(ip); ok &&
+		(p2pSharedAddressSpace.Contains(addr.Unmap()) || p2pIPv4ServiceContinuity.Contains(addr.Unmap())) {
 		return false
 	}
 	return true
@@ -528,6 +581,7 @@ func (c *P2PClient) register() {
 	}
 	c.mu.Lock()
 	c.localAddr = localAddr
+	c.registered = append([]net.UDPAddr(nil), candidates...)
 	c.mu.Unlock()
 
 	msg := &P2PMessage{
@@ -1084,6 +1138,8 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 	c.sessionByNonce[session.Nonce] = session
 	c.peerKeyIndex[peer.PublicKey] = targetID
 	c.rebuildIndexesLocked()
+	self := c.selfNATLocked()
+	attempts := peer.PunchAttempts
 	c.mu.Unlock()
 
 	if teardown != nil {
@@ -1091,15 +1147,24 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		c.teardownDirect(*teardown)
 	}
 
-	targets := buildPunchTargets(session)
-	c.device.log.Verbosef("[P2P] Punch relay target=%d observed=%v local=%v candidates=%d targets=%d",
-		targetID, session.ObservedAddr, session.LocalAddr, len(session.CandidateAddrs), len(targets))
+	plan := planPunch(session, self, attempts)
+	ipv6 := 0
+	for _, target := range plan.targets {
+		if target.IP.To4() == nil {
+			ipv6++
+		}
+	}
+	c.device.log.Verbosef("[P2P] Punch relay target=%d observed=%v local=%v candidates=%d targets=%d ipv6=%d nat=%s/%s spray=%d attempt=%d",
+		targetID, session.ObservedAddr, session.LocalAddr, len(session.CandidateAddrs), len(plan.targets), ipv6,
+		plan.self, plan.peer, len(plan.spray), attempts)
 
 	job := p2pPunchJob{
 		peerID:  targetID,
 		session: session,
 		packet:  c.makeOuterPunchPacket(session),
-		targets: c.parsePunchTargets(targets),
+		targets: c.parsePunchTargets(plan.targets),
+		spray:   c.parsePunchTargets(plan.spray),
+		sweeps:  plan.sweeps,
 	}
 	if len(job.packet) == 0 || len(job.targets) == 0 || !c.enqueuePunchJob(job) {
 		c.mu.Lock()
@@ -1131,7 +1196,16 @@ func (c *P2PClient) teardownDirect(t p2pDirectTeardown) {
 	c.restoreRelayRoute(t.assignedIP, relayPeer)
 }
 
+// selfNATLocked classifies this device's own NAT from the coordinator's
+// RegisterAck. c.mu must be held.
+func (c *P2PClient) selfNATLocked() natClass {
+	return classifyNAT(c.observedAddr, c.localAddr, c.registered)
+}
+
 func (c *P2PClient) parsePunchTargets(targets []net.UDPAddr) []conn.Endpoint {
+	if len(targets) == 0 {
+		return nil
+	}
 	endpoints := make([]conn.Endpoint, 0, len(targets))
 	for _, target := range targets {
 		endpoint, err := c.device.net.bind.ParseEndpoint(target.String())
@@ -1165,10 +1239,13 @@ func (c *P2PClient) punchWorker() {
 }
 
 func (c *P2PClient) holePunch(job p2pPunchJob) {
-	deadline := time.Now().Add(p2pPunchTimeout)
+	start := time.Now()
+	deadline := start.Add(p2pPunchTimeout)
 	buffers := [][]byte{job.packet}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	spray := newPunchSpray(len(job.spray), job.sweeps, start, &c.spraying)
+	defer spray.release()
 	for round := 0; ; round++ {
 		select {
 		case <-c.ctx.Done():
@@ -1203,6 +1280,18 @@ func (c *P2PClient) holePunch(job p2pPunchJob) {
 		for _, target := range job.targets {
 			_ = c.device.net.bind.Send(buffers, target)
 		}
+		if len(job.spray) > 0 {
+			c.mu.RLock()
+			promoted := job.session.Promoting
+			c.mu.RUnlock()
+			lo, hi := spray.step(time.Now(), promoted)
+			if lo == 0 && hi > 0 {
+				c.device.log.Verbosef("[P2P] Spraying %d ports towards peer %d", len(job.spray), job.peerID)
+			}
+			for _, target := range job.spray[lo:hi] {
+				_ = c.device.net.bind.Send(buffers, target)
+			}
+		}
 		timer.Reset(p2pPunchInterval(round))
 	}
 }
@@ -1229,20 +1318,41 @@ func (c *P2PClient) failPunchSessionIfCurrentLocked(peer *DiscoveredPeer, sessio
 	return true
 }
 
-func buildPunchTargets(session *P2PSession) []net.UDPAddr {
+// buildPunchTargets lists the addresses punched every round: IPv6 first (no
+// NAT, at most a stateful firewall that both sides' simultaneous punches
+// open), then IPv4 in the coordinator's order, which starts with the
+// observed endpoint. With predict, ports next to public IPv4 targets are
+// added for sequential allocators, up to p2pMaxPredictedTargets IPv4 targets.
+func buildPunchTargets(session *P2PSession, predict bool) []net.UDPAddr {
 	if session == nil {
 		return nil
 	}
-	targets := make([]net.UDPAddr, 0, len(session.CandidateAddrs)+8)
+	all := make([]net.UDPAddr, 0, len(session.CandidateAddrs)+2)
 	for _, candidate := range session.CandidateAddrs {
-		appendPunchCandidate(&targets, candidate, session.AssignedIP)
+		appendPunchCandidate(&all, candidate, session.AssignedIP)
 	}
-	appendPunchCandidate(&targets, session.ObservedAddr, session.AssignedIP)
-	appendPunchCandidate(&targets, session.LocalAddr, session.AssignedIP)
+	appendPunchCandidate(&all, session.ObservedAddr, session.AssignedIP)
+	appendPunchCandidate(&all, session.LocalAddr, session.AssignedIP)
 
+	targets := make([]net.UDPAddr, 0, len(all)+p2pMaxPredictedTargets)
+	for _, addr := range all {
+		if addr.IP.To4() == nil {
+			targets = append(targets, addr)
+		}
+	}
+	ipv6 := len(targets)
+	for _, addr := range all {
+		if addr.IP.To4() != nil {
+			targets = append(targets, addr)
+		}
+	}
+	if !predict {
+		return targets
+	}
+	limit := ipv6 + p2pMaxPredictedTargets
 	baseLen := len(targets)
-	for i := 0; i < baseLen && len(targets) < p2pMaxPredictedTargets; i++ {
-		appendPortPredictionCandidates(&targets, targets[i], session.AssignedIP)
+	for i := ipv6; i < baseLen && len(targets) < limit; i++ {
+		appendPortPredictionCandidates(&targets, targets[i], session.AssignedIP, limit)
 	}
 	return targets
 }
@@ -1269,12 +1379,13 @@ func appendPunchCandidate(candidates *[]net.UDPAddr, candidate net.UDPAddr, assi
 	*candidates = append(*candidates, candidate)
 }
 
-func appendPortPredictionCandidates(candidates *[]net.UDPAddr, base net.UDPAddr, assignedIP net.IP) {
-	if !isPublicInternetPunchAddr(base) {
+func appendPortPredictionCandidates(candidates *[]net.UDPAddr, base net.UDPAddr, assignedIP net.IP, limit int) {
+	// IPv6 has no NAT, so there is no port to predict.
+	if !p2pIsPublicIPv4(base) {
 		return
 	}
 	for _, delta := range []int{1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 13, -13} {
-		if len(*candidates) >= p2pMaxPredictedTargets {
+		if len(*candidates) >= limit {
 			return
 		}
 		port := base.Port + delta
@@ -1540,6 +1651,10 @@ func (c *P2PClient) HandlePunch(packet []byte, addr *net.UDPAddr) {
 	job.relayPeer = c.relayPeerForIP(job.assignedIP)
 
 	c.device.log.Verbosef("[P2P] Authenticated punch from %v (ID %d); validating WireGuard handshake", addr, job.peerID)
+	if observed := session.ObservedAddr; addr.IP.Equal(observed.IP) && addr.Port != observed.Port {
+		c.device.log.Verbosef("[P2P] Peer %d maps per destination: the coordinator saw port %d, its punch came from %d",
+			job.peerID, observed.Port, addr.Port)
+	}
 	if err := c.prepareDirectPeer(job.publicKey, job.assignedIP, endpoint.DstToString()); err != nil {
 		c.failDirectPromotion(job, err)
 		return
@@ -1650,6 +1765,7 @@ func (c *P2PClient) validateAndPromote(job p2pPromotionJob) {
 				c.sessions[job.peerID] == job.session
 			c.mu.RUnlock()
 			if !current {
+				c.dropOrphanCandidate(job)
 				return
 			}
 			if err := c.activateDirectPeer(job.publicKey, job.assignedIP); err != nil {
@@ -1757,8 +1873,35 @@ func (c *P2PClient) failDirectPromotion(job p2pPromotionJob, cause error) {
 	if removeCandidate && !job.publicKey.IsZero() {
 		c.device.RemovePeer(job.publicKey)
 		c.restoreRelayRoute(job.assignedIP, job.relayPeer)
+	} else {
+		c.dropOrphanCandidate(job)
 	}
 	c.device.log.Verbosef("[P2P] Direct path validation failed for peer %d; relay remains active: %v", job.peerID, cause)
+}
+
+// dropOrphanCandidate removes the WireGuard candidate a superseded promotion
+// installed, unless a newer attempt or a live direct path now owns that peer.
+// Left behind, it keeps sending handshakes to an endpoint that may be gone
+// (a phone that left the Wi-Fi) for as long as the daemon runs.
+func (c *P2PClient) dropOrphanCandidate(job p2pPromotionJob) {
+	if job.publicKey.IsZero() {
+		return
+	}
+	c.mu.RLock()
+	peer := c.peers[job.peerID]
+	owned := c.sessions[job.peerID] != nil || (peer != nil && peer.State == P2PStateEstablished)
+	if !owned {
+		if id, ok := c.peerKeyIndex[job.publicKey]; ok && id != job.peerID {
+			other := c.peers[id]
+			owned = c.sessions[id] != nil || (other != nil && other.State == P2PStateEstablished)
+		}
+	}
+	c.mu.RUnlock()
+	if owned {
+		return
+	}
+	c.device.RemovePeer(job.publicKey)
+	c.restoreRelayRoute(job.assignedIP, job.relayPeer)
 }
 
 func (c *P2PClient) maintenanceLoop() {
@@ -1785,6 +1928,7 @@ func (c *P2PClient) maintenanceLoop() {
 		c.requestPeerList()
 
 		var removeDirect []p2pDirectTeardown
+		var keepalive []*Peer
 		c.mu.Lock()
 		now := time.Now()
 		indexesChanged := c.forgetUnlistedPeersLocked(now)
@@ -1804,6 +1948,9 @@ func (c *P2PClient) maintenanceLoop() {
 				lastHandshake := int64(0)
 				if wgPeer != nil {
 					lastHandshake = wgPeer.lastHandshakeNano.Load()
+				}
+				if wgPeer != nil && directKeepaliveDue(peer, wgPeer.txBytes.Load(), now) {
+					keepalive = append(keepalive, wgPeer)
 				}
 				if lastHandshake == 0 || now.Sub(time.Unix(0, lastHandshake)) > p2pDirectStaleAfter {
 					peer.State = P2PStateFailed
@@ -1828,6 +1975,9 @@ func (c *P2PClient) maintenanceLoop() {
 		for _, stale := range removeDirect {
 			c.teardownDirect(stale)
 		}
+		for _, wgPeer := range keepalive {
+			wgPeer.SendKeepalive()
+		}
 		if dropped := c.droppedControl.Swap(0); dropped > 0 {
 			c.device.log.Verbosef("[P2P] Dropped %d control datagrams while the bounded queue was full", dropped)
 		}
@@ -1835,6 +1985,22 @@ func (c *P2PClient) maintenanceLoop() {
 			c.device.log.Verbosef("[P2P] Coalesced %d direct-path attempts while the queue was full", dropped)
 		}
 	}
+}
+
+// directKeepaliveDue reports whether this side has sent nothing on peer's
+// direct path for p2pDirectKeepalive, given the WireGuard peer's tx counter.
+// Each side sending on its own keeps its NAT mapping alive even when the
+// other side's keepalives are the only traffic.
+func directKeepaliveDue(peer *DiscoveredPeer, txBytes uint64, now time.Time) bool {
+	if txBytes != peer.lastTxBytes || peer.lastTxAt.IsZero() {
+		peer.lastTxBytes, peer.lastTxAt = txBytes, now
+		return false
+	}
+	if now.Sub(peer.lastTxAt) < p2pDirectKeepalive {
+		return false
+	}
+	peer.lastTxAt = now
+	return true
 }
 
 func (c *P2PClient) discardSessionLocked(peerID uint32) {

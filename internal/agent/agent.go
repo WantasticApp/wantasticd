@@ -106,7 +106,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		log.Printf("Local access enabled for tenant routes: %v", localAccessRoutes)
 	}
 
-	workerCount := 2 // HealthCheck + DNSCheck
+	workerCount := 3 // HealthCheck + DNSCheck + account claims
 	if a.config.AutoUpdate {
 		workerCount++
 	}
@@ -120,6 +120,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	go a.runHealthCheck(workerCtx)
 	go a.runDNSCheck(workerCtx)
+	go a.runAccountClaims(workerCtx)
 
 	if a.usp != nil {
 		go a.runWUSPInit(workerCtx)

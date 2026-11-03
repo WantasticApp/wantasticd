@@ -51,6 +51,15 @@ const (
 	wuspControlFragmentPaceDelay = time.Millisecond
 	wuspControlReplayTTL         = 2 * time.Minute
 	wuspControlReplayMaxEntries  = 256
+	// Read replies are kept briefly so a controller that lost one fragment of
+	// a large Get can ask for just that fragment (wusp.MetadataKeyResendFragments)
+	// instead of waiting out its deadline and asking for everything again.
+	// They are kept compressed and pre-fragmented, and bounded in total so a
+	// small router never holds more than a few hundred KiB for this.
+	wuspReadReplayTTL         = 30 * time.Second
+	wuspReadReplayMaxBytes    = 2 << 20
+	wuspReadReplayMaxReply    = 512 << 10
+	wuspReadReplayMissMessage = "read replay unavailable"
 )
 
 type uspControlReplayKey struct {
@@ -61,9 +70,14 @@ type uspControlReplayKey struct {
 
 type uspControlReplayEntry struct {
 	fingerprint [sha256.Size]byte
-	payload     []byte
-	ready       chan struct{}
-	expiresAt   time.Time
+	// frames is the reply exactly as first sent: replaying the same frames
+	// keeps fragment indices stable, so a controller can combine fragments
+	// from both sends.
+	frames    [][]byte
+	bytes     int
+	read      bool
+	ready     chan struct{}
+	expiresAt time.Time
 }
 
 type uspControlReplayTicket struct {
@@ -372,6 +386,9 @@ func (r *uspRuntime) HandlePeerPacket(peer *wgdevice.Peer, data []byte) {
 }
 
 func replayableWUSPControlMethod(method wusp.USPAgentMethod) bool {
+	if wusp.IsReadReplayMethod(method) {
+		return true
+	}
 	switch method {
 	case wusp.USPAgentMethodSet,
 		wusp.USPAgentMethodAdd,
@@ -388,6 +405,8 @@ func wuspControlRequestFingerprint(req wusp.USPAgentRequest) ([sha256.Size]byte,
 	semantic := req
 	semantic.Metadata = wusp.CloneMetadata(req.Metadata)
 	delete(semantic.Metadata, wusp.MetadataKeyResponseMaxControlPayload)
+	// A resend asks for part of the same reply; it is the same request.
+	delete(semantic.Metadata, wusp.MetadataKeyResendFragments)
 	payload, err := wusp.EncodeUSPAgentRequest(semantic)
 	if err != nil {
 		return [sha256.Size]byte{}, err
@@ -399,7 +418,7 @@ func (r *uspRuntime) beginControlReplay(
 	ctx context.Context,
 	peerPublicKeyHex string,
 	req wusp.USPAgentRequest,
-) (*uspControlReplayTicket, []byte, error) {
+) (*uspControlReplayTicket, [][]byte, error) {
 	if r == nil || !replayableWUSPControlMethod(req.Method) {
 		return nil, nil, nil
 	}
@@ -434,20 +453,31 @@ func (r *uspRuntime) beginControlReplay(
 		}
 		r.controlReplayMu.Lock()
 		entry = r.controlReplay[key]
-		if entry == nil || len(entry.payload) == 0 {
+		if entry == nil || len(entry.frames) == 0 {
 			r.controlReplayMu.Unlock()
+			if wusp.IsReadReplayMethod(req.Method) {
+				return nil, nil, errReadReplayMiss
+			}
 			return nil, nil, fmt.Errorf("original request %d completed without a replayable response", req.ID)
 		}
-		payload := append([]byte(nil), entry.payload...)
+		frames := entry.frames
 		r.controlReplayMu.Unlock()
-		return nil, payload, nil
+		return nil, frames, nil
+	}
+	if _, resend := wusp.ResendFragments(req.Metadata); resend && wusp.IsReadReplayMethod(req.Method) {
+		// The controller holds part of a reply this agent no longer keeps
+		// (expired, evicted, or the agent restarted). A fresh reply could
+		// differ, so never let it be mixed with the old fragments: say so,
+		// and the controller asks again under a new request ID.
+		r.controlReplayMu.Unlock()
+		return nil, nil, errReadReplayMiss
 	}
 	if len(r.controlReplay) >= wuspControlReplayMaxEntries {
 		var oldestKey uspControlReplayKey
 		var oldestExpiry time.Time
 		found := false
 		for replayKey, entry := range r.controlReplay {
-			if len(entry.payload) == 0 {
+			if len(entry.frames) == 0 {
 				continue
 			}
 			if !found || entry.expiresAt.Before(oldestExpiry) {
@@ -464,6 +494,7 @@ func (r *uspRuntime) beginControlReplay(
 	}
 	r.controlReplay[key] = &uspControlReplayEntry{
 		fingerprint: fingerprint,
+		read:        wusp.IsReadReplayMethod(req.Method),
 		ready:       make(chan struct{}),
 		expiresAt:   now.Add(wuspControlReplayTTL),
 	}
@@ -471,19 +502,61 @@ func (r *uspRuntime) beginControlReplay(
 	return &uspControlReplayTicket{key: key, fingerprint: fingerprint}, nil, nil
 }
 
-func (r *uspRuntime) completeControlReplay(ticket *uspControlReplayTicket, payload []byte) {
-	if r == nil || ticket == nil || len(payload) == 0 {
+func (r *uspRuntime) completeControlReplay(ticket *uspControlReplayTicket, frames [][]byte) {
+	if r == nil || ticket == nil || len(frames) == 0 {
 		return
 	}
 	r.controlReplayMu.Lock()
 	defer r.controlReplayMu.Unlock()
 	entry := r.controlReplay[ticket.key]
-	if entry == nil || entry.fingerprint != ticket.fingerprint || len(entry.payload) != 0 {
+	if entry == nil || entry.fingerprint != ticket.fingerprint || len(entry.frames) != 0 {
 		return
 	}
-	entry.payload = append([]byte(nil), payload...)
-	entry.expiresAt = time.Now().Add(wuspControlReplayTTL)
+	size := 0
+	for _, frame := range frames {
+		size += len(frame)
+	}
+	if entry.read && size > wuspReadReplayMaxReply {
+		// Too large to keep on a small device: a resend gets a miss and the
+		// controller asks for a fresh reply.
+		delete(r.controlReplay, ticket.key)
+		close(entry.ready)
+		return
+	}
+	entry.frames = frames
+	entry.bytes = size
+	ttl := wuspControlReplayTTL
+	if entry.read {
+		ttl = wuspReadReplayTTL
+	}
+	entry.expiresAt = time.Now().Add(ttl)
 	close(entry.ready)
+	if entry.read {
+		r.trimReadReplayLocked(ticket.key)
+	}
+}
+
+// trimReadReplayLocked evicts the oldest kept read replies until they fit
+// wuspReadReplayMaxBytes. keep is never evicted. Caller holds controlReplayMu.
+func (r *uspRuntime) trimReadReplayLocked(keep uspControlReplayKey) {
+	for {
+		total := 0
+		var oldestKey uspControlReplayKey
+		var oldest *uspControlReplayEntry
+		for key, entry := range r.controlReplay {
+			if !entry.read || len(entry.frames) == 0 {
+				continue
+			}
+			total += entry.bytes
+			if key != keep && (oldest == nil || entry.expiresAt.Before(oldest.expiresAt)) {
+				oldestKey, oldest = key, entry
+			}
+		}
+		if total <= wuspReadReplayMaxBytes || oldest == nil {
+			return
+		}
+		delete(r.controlReplay, oldestKey)
+	}
 }
 
 func (r *uspRuntime) abortControlReplay(ticket *uspControlReplayTicket) {
@@ -493,7 +566,7 @@ func (r *uspRuntime) abortControlReplay(ticket *uspControlReplayTicket) {
 	r.controlReplayMu.Lock()
 	defer r.controlReplayMu.Unlock()
 	entry := r.controlReplay[ticket.key]
-	if entry == nil || entry.fingerprint != ticket.fingerprint || len(entry.payload) != 0 {
+	if entry == nil || entry.fingerprint != ticket.fingerprint || len(entry.frames) != 0 {
 		return
 	}
 	delete(r.controlReplay, ticket.key)
@@ -598,19 +671,27 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		})
 	}
 
-	replayTicket, replayPayload, replayErr := r.beginControlReplay(ctx, peerPublicKeyHex, req)
+	replayTicket, replayFrames, replayErr := r.beginControlReplay(ctx, peerPublicKeyHex, req)
 	if replayErr != nil {
+		metadata := wusp.ResponseMetadataForRequest(req)
+		if errors.Is(replayErr, errReadReplayMiss) {
+			metadata = wusp.WithReadReplayMiss(metadata)
+		}
 		return r.replyControlResponse(reply, req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
-			Metadata: wusp.ResponseMetadataForRequest(req),
+			Metadata: metadata,
 			Error:    replayErr.Error(),
 		})
 	}
-	if len(replayPayload) != 0 {
+	if len(replayFrames) != 0 {
 		r.stats.controlResponseReplays.Add(1)
-		log.Printf("[USP] replaying cached control response: method=%s id=%d", req.Method, req.ID)
-		return r.replyControlPayload(reply, req, replayPayload)
+		resend, partial := wusp.ResendFragments(req.Metadata)
+		diaglog.Printf("[USP] replaying cached control response: method=%s id=%d fragments=%d partial=%t", req.Method, req.ID, len(replayFrames), partial)
+		if partial {
+			return r.sendControlFrames(reply, req, selectControlFrames(replayFrames, resend))
+		}
+		return r.sendControlFrames(reply, req, replayFrames)
 	}
 	replayCompleted := false
 	defer func() {
@@ -660,6 +741,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 			len(resp.SupportedDataModel.Models), len(resp.SupportedDataModel.Objects), len(resp.SupportedDataModel.Params))
 	}
 	resp = wusp.FinalizeAgentResponse(req, resp)
+	resp.Metadata = wusp.WithReadReplay(resp.Metadata)
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
 		// Encoding can fail if the platform backend returned a value whose
@@ -670,7 +752,7 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 		fallback := wusp.FinalizeAgentResponse(req, wusp.USPAgentResponse{
 			ID:       req.ID,
 			Method:   req.Method,
-			Metadata: wusp.ResponseMetadataForRequest(req),
+			Metadata: wusp.WithReadReplay(wusp.ResponseMetadataForRequest(req)),
 			Error:    err.Error(),
 		})
 		resp = fallback
@@ -679,11 +761,36 @@ func (r *uspRuntime) handleFrameFromPeer(peerPublicKeyHex string, data []byte, r
 			return err
 		}
 	}
-	r.completeControlReplay(replayTicket, frame)
+	frames, err := r.fragmentControlPayload(req, frame)
+	if err != nil {
+		return err
+	}
+	r.completeControlReplay(replayTicket, frames)
 	replayCompleted = true
 	controlResult, _ := wusp.ControlResultFromMetadata(resp.Metadata)
 	diaglog.Printf("[USP] HandleRequest done: method=%d id=%d state=%s code=%s response_bytes=%d", req.Method, req.ID, controlResult.State, controlResult.Code, len(frame))
-	return r.replyControlPayload(reply, req, frame)
+	return r.sendControlFrames(reply, req, frames)
+}
+
+// errReadReplayMiss answers a fragment resend for a read reply this agent no
+// longer keeps.
+var errReadReplayMiss = errors.New(wuspReadReplayMissMessage)
+
+// selectControlFrames returns the frames whose fragment index is in want, in
+// order. A frame that does not decode as a fragment is always kept.
+func selectControlFrames(frames [][]byte, want map[uint32]struct{}) [][]byte {
+	out := make([][]byte, 0, len(want))
+	for _, frame := range frames {
+		fragment, isFragment, err := wusp.DecodeUSPControlFragment(frame)
+		if err != nil || !isFragment {
+			out = append(out, frame)
+			continue
+		}
+		if _, ok := want[fragment.Index]; ok {
+			out = append(out, frame)
+		}
+	}
+	return out
 }
 
 func dataModelMessageCounts(msg *wusp.Message) (objects, values int) {
@@ -706,6 +813,9 @@ func dataModelMessageCounts(msg *wusp.Message) (objects, values int) {
 
 func (r *uspRuntime) replyControlResponse(reply func([]byte) error, req wusp.USPAgentRequest, resp wusp.USPAgentResponse) error {
 	resp = wusp.FinalizeAgentResponse(req, resp)
+	if !wusp.SupportsReadReplay(resp.Metadata) {
+		resp.Metadata = wusp.WithReadReplay(resp.Metadata)
+	}
 	frame, err := wusp.EncodeUSPAgentResponse(resp)
 	if err != nil {
 		return err
@@ -714,20 +824,33 @@ func (r *uspRuntime) replyControlResponse(reply func([]byte) error, req wusp.USP
 }
 
 func (r *uspRuntime) replyControlPayload(reply func([]byte) error, req wusp.USPAgentRequest, payload []byte) error {
+	frames, err := r.fragmentControlPayload(req, payload)
+	if err != nil {
+		return err
+	}
+	return r.sendControlFrames(reply, req, frames)
+}
+
+func (r *uspRuntime) fragmentControlPayload(req wusp.USPAgentRequest, payload []byte) ([][]byte, error) {
+	budget := wusp.RequestedResponseMaxControlPayload(req.Metadata, wusp.WUSPMaxDatagramPayload)
+	return wusp.FragmentUSPControlPayload(payload, req.ID, budget)
+}
+
+func (r *uspRuntime) sendControlFrames(reply func([]byte) error, req wusp.USPAgentRequest, frames [][]byte) error {
 	if reply == nil {
 		return fmt.Errorf("missing reply transport for request %d", req.ID)
 	}
 	budget := wusp.RequestedResponseMaxControlPayload(req.Metadata, wusp.WUSPMaxDatagramPayload)
-	frames, err := wusp.FragmentUSPControlPayload(payload, req.ID, budget)
-	if err != nil {
-		return err
-	}
 	r.stats.outboundResponses.Add(1)
 	r.stats.responseFragmentsSent.Add(uint64(len(frames)))
 	if len(frames) > 1 {
 		r.stats.fragmentedResponses.Add(1)
-		log.Printf("[USP] fragmented control response: request=%d method=%s budget=%d fragments=%d payload_bytes=%d",
-			req.ID, req.Method.String(), budget, len(frames), len(payload))
+		wireBytes := 0
+		for _, frame := range frames {
+			wireBytes += len(frame)
+		}
+		log.Printf("[USP] fragmented control response: request=%d method=%s budget=%d fragments=%d wire_bytes=%d",
+			req.ID, req.Method.String(), budget, len(frames), wireBytes)
 	}
 	for i, frame := range frames {
 		if err := reply(frame); err != nil {
@@ -831,6 +954,8 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 			os.Exit(0)
 		}()
 		return nil, nil
+	case wusp.WUSPSpectralTelemetryPrefix + "Capture()":
+		return r.handleSpectralCapture()
 	case "Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()":
 		if controller, ok := r.rawBackend.(interface {
 			StartApplyEasyMeshTopology(context.Context, string) error
@@ -931,6 +1056,39 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		}
 		return nil, wusp.ErrUSPPathUnsupported
 	}
+}
+
+// handleSpectralCapture runs one operator-requested QCA spectral capture.
+// Captures take several seconds per radio, longer than the control deadline,
+// so the reply only says the capture is running; once it finishes the data
+// model cache is refreshed and the next Get carries the spectrum.
+func (r *uspRuntime) handleSpectralCapture() (*wusp.Message, error) {
+	requester, ok := r.rawBackend.(interface {
+		RequestSpectralCapture(func()) (bool, error)
+	})
+	if !ok {
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+	started, err := requester.RequestSpectralCapture(r.refreshAfterSpectralCapture)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[USP] Spectral capture requested: started=%t", started)
+	output := wusp.NewMessage()
+	output.Set(wusp.WUSPSpectralTelemetryPrefix+"Status", wusp.String("Capturing"))
+	if r.dataModelCache != nil {
+		if err := r.dataModelCache.Patch(output); err != nil {
+			log.Printf("[USP] DataModel cache spectral patch warning: continue_on_error=true err=%v", err)
+		}
+	}
+	return output, nil
+}
+
+func (r *uspRuntime) refreshAfterSpectralCapture() {
+	if r == nil || r.dataModelCache == nil {
+		return
+	}
+	r.dataModelCache.refreshSoon()
 }
 
 func easyMeshOperationStatus(message string) *wusp.Message {

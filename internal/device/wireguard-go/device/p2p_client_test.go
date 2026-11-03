@@ -244,6 +244,52 @@ func TestDirectPeerPromotionKeepsAndRestoresRelayRoute(t *testing.T) {
 	}
 }
 
+// A promotion that lost its session (the peer punched again) must remove the
+// candidate it installed, unless a newer attempt now owns that peer.
+func TestSupersededPromotionDropsOrphanCandidate(t *testing.T) {
+	pair := genTestPair(t, false)
+	client := NewP2PClient(pair[0].dev)
+	defer client.Close()
+
+	destination := pair[1].ip.AsSlice()
+	relayPeer := pair[0].dev.allowedips.Lookup(destination)
+	client.serverPeerKey = relayPeer.handshake.remoteStatic
+	privateKey := testNoisePrivateKey(0x41)
+	directKey := privateKey.publicKey()
+	assignedIP := net.IP(destination)
+	job := p2pPromotionJob{peerID: 7, session: &P2PSession{done: make(chan struct{})}, publicKey: directKey, assignedIP: assignedIP, relayPeer: relayPeer}
+
+	install := func() {
+		if err := client.prepareDirectPeer(directKey, assignedIP, "127.0.0.1:55556"); err != nil {
+			t.Fatalf("prepare direct peer: %v", err)
+		}
+	}
+
+	// A newer attempt is running: its candidate stays.
+	install()
+	client.mu.Lock()
+	client.peers[7] = &DiscoveredPeer{ID: 7, PublicKey: directKey, State: P2PStateTrying}
+	client.sessions[7] = &P2PSession{done: make(chan struct{})}
+	client.mu.Unlock()
+	client.dropOrphanCandidate(job)
+	if pair[0].dev.LookupPeer(directKey) == nil {
+		t.Fatal("candidate of a newer attempt was removed")
+	}
+
+	// Nothing owns it any more: it goes, and the relay keeps the route.
+	client.mu.Lock()
+	delete(client.sessions, 7)
+	client.peers[7].State = P2PStateFailed
+	client.mu.Unlock()
+	client.dropOrphanCandidate(job)
+	if pair[0].dev.LookupPeer(directKey) != nil {
+		t.Fatal("orphaned candidate was left behind")
+	}
+	if got := pair[0].dev.allowedips.Lookup(destination); got != relayPeer {
+		t.Fatal("relay route lost")
+	}
+}
+
 func BenchmarkP2PEndpointLookupMiss512(b *testing.B) {
 	client := &P2PClient{
 		peers:        make(map[uint32]*DiscoveredPeer, 512),
@@ -542,7 +588,10 @@ func TestFilterLocalCandidates(t *testing.T) {
 		{name: "wantastic", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.206.0.1")}},
 		{name: "en3", flags: net.FlagUp, ips: []net.IP{net.ParseIP("100.100.1.1")}},
 	}
-	got := filterLocalCandidates(net.ParseIP("10.1.2.3").To4(), ifaces, "wantastic", 51820)
+	skipPPP := p2pSkipPPP
+	p2pSkipPPP = true
+	t.Cleanup(func() { p2pSkipPPP = skipPPP })
+	got := filterLocalCandidates(net.ParseIP("10.1.2.3").To4(), nil, ifaces, "wantastic", 51820)
 	var names []string
 	for _, candidate := range got {
 		names = append(names, candidate.String())
@@ -558,7 +607,7 @@ func TestFilterLocalCandidates(t *testing.T) {
 	}
 
 	// A default route through another tunnel is not announced.
-	got = filterLocalCandidates(net.ParseIP("10.200.0.1").To4(), ifaces, "wantastic", 51820)
+	got = filterLocalCandidates(net.ParseIP("10.200.0.1").To4(), nil, ifaces, "wantastic", 51820)
 	if len(got) == 0 || got[0].String() != "192.168.1.20:51820" {
 		t.Fatalf("tunnel default-route address announced: %v", got)
 	}

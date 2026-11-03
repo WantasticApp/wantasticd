@@ -46,7 +46,10 @@ func ipcURL(path string) string {
 
 // postControl runs a state-changing daemon action and returns the daemon's
 // notice, or its error. Every control endpoint answers {ok, error, notice}.
-func postControl(path string) (string, error) {
+func postControl(path string) (string, error) { return postControlInto(path, nil) }
+
+// postControlInto is postControl that also decodes the whole reply into v.
+func postControlInto(path string, v any) (string, error) {
 	req, err := http.NewRequest(http.MethodPost, ipcURL(path), nil)
 	if err != nil {
 		return "", err
@@ -68,6 +71,9 @@ func postControl(path string) (string, error) {
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
 		return "", fmt.Errorf("daemon: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if v != nil {
+		_ = json.Unmarshal(body, v)
 	}
 	if !r.OK {
 		return "", fmt.Errorf("%s", firstNonEmpty(r.Error, fmt.Sprintf("HTTP %d", resp.StatusCode)))
@@ -204,6 +210,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			systray.AddSeparator()
 			mToggle := systray.AddMenuItemCheckbox("VPN", "Connect or disconnect the tunnel; the service keeps running", false)
 			exitMenu := newTrayExitMenu()
+			accountMenu := newTrayAccountMenu()
 
 			// Peers and their latency.
 			systray.AddSeparator()
@@ -219,6 +226,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mNotice.Hide()
 			notice := &trayNotice{item: mNotice}
 			exitMenu.report = notice.report
+			accountMenu.report = notice.report
 
 			// More: service details and shortcuts.
 			systray.AddSeparator()
@@ -250,6 +258,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				// disconnect runs ("Connecting…"), "" otherwise.
 				toggling atomic.Value
 				lastPoll time.Time
+				menuOpen atomic.Bool
 			)
 			toggling.Store("")
 			// Clicks refresh from their own goroutines; menu updates are
@@ -317,6 +326,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					syncPeerMenuGroup(peerMenu, nil)
 				}
 				exitMenu.apply(withExitLatency(deriveExitMenu(st), latency))
+				if st != nil && st.Claim == nil {
+					accountMenu.refresh(menuOpen.Load())
+				}
 				notice.expire()
 
 				ver := "Version " + version.Version
@@ -334,6 +346,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			}
 
 			exitMenu.onChange = func() { go refresh() }
+			accountMenu.onChange = func() { go refresh() }
 
 			// pingAll measures every peer. A click sends three probes each and
 			// says so in the item; the live pings while the menu is open send
@@ -386,7 +399,6 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			// While the menu is open it pings on its own and refreshes at
 			// once, so what it shows is live from the moment it opens.
-			var menuOpen atomic.Bool
 			liveWake := make(chan struct{}, 1)
 			watchMenu(nil, func() {
 				menuOpen.Store(true)
@@ -397,6 +409,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				refresh()
 			}, func() { menuOpen.Store(false) })
 			watchMenu(exitMenu.root, refresh, nil)
+			watchMenu(accountMenu.root, refresh, nil)
 			go func() {
 				for {
 					select {

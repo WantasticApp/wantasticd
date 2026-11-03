@@ -72,7 +72,7 @@ static const CGFloat wtSwitchH    = 15;
 - (void)sync {
 	NSMenuItem *item = self.enclosingMenuItem;
 	if (item == nil) return;
-	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d", item.title, item.isEnabled, (long)item.state, self.hover];
+	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%d", item.title, item.isEnabled, (long)item.state, self.hover, item.isHighlighted];
 	if (![key isEqualToString:self.drawn]) {
 		self.drawn = key;
 		self.toolTip = item.toolTip;

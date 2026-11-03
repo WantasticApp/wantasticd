@@ -208,7 +208,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			// Controls: the tunnel and exit-node mode, as switches.
 			systray.AddSeparator()
-			mToggle := systray.AddMenuItemCheckbox("VPN", "Connect or disconnect the tunnel; the service keeps running", false)
+			mToggle := systray.AddMenuItemCheckbox("Connect", "Connect or disconnect the tunnel; the service keeps running", false)
 			exitMenu := newTrayExitMenu()
 			accountMenu := newTrayAccountMenu()
 
@@ -438,9 +438,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					return
 				}
 				if disconnect {
-					toggling.Store("VPN · disconnecting…")
+					toggling.Store("Disconnecting…")
 				} else {
-					toggling.Store("VPN · connecting…")
+					toggling.Store("Connecting…")
 				}
 				refresh()
 				var (

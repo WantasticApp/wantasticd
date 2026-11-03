@@ -18,8 +18,8 @@ extern void wantasticMenuClosed(int menuId);
 static const CGFloat wtRowHeight  = 24;
 static const CGFloat wtSelInset   = 5;
 static const CGFloat wtSelRadius  = 4;
-static const CGFloat wtStateX     = 10;
-static const CGFloat wtTitleX     = 22;
+static const CGFloat wtStateX     = 13;
+static const CGFloat wtTitleX     = 30.5;
 static const CGFloat wtTitleRight = 14;
 static const CGFloat wtSwitchW    = 26;
 static const CGFloat wtSwitchH    = 15;
@@ -28,7 +28,9 @@ static const CGFloat wtSwitchH    = 15;
 // the item's action and the menu stays open: an ordinary NSMenuItem always
 // closes its menu. Title, state, enabled and tooltip come from the item.
 @interface WTKeepOpenView : NSView
-@property (nonatomic) BOOL hover;
+// image, when set, is drawn image-size above the title (a QR code): an
+// NSMenuItem image would push every title in the menu to the right of it.
+@property (nonatomic, strong) NSImage *image;
 // isSwitch draws the item's on/off state as a switch at the right edge
 // instead of a checkmark.
 @property (nonatomic) BOOL isSwitch;
@@ -45,16 +47,9 @@ static const CGFloat wtSwitchH    = 15;
 
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
 
-- (void)updateTrackingAreas {
-	for (NSTrackingArea *a in self.trackingAreas) [self removeTrackingArea:a];
-	[self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
-		options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
-		owner:self userInfo:nil]];
-	[super updateTrackingAreas];
-}
-
-- (void)mouseEntered:(NSEvent *)event { self.hover = YES; [self setNeedsDisplay:YES]; }
-- (void)mouseExited:(NSEvent *)event { self.hover = NO; [self setNeedsDisplay:YES]; }
+// The menu decides which row is highlighted (isHighlighted): own hover
+// tracking misses the exit when the pointer passes quickly and leaves a
+// row stuck blue.
 - (void)mouseDown:(NSEvent *)event {}
 
 - (void)mouseUp:(NSEvent *)event {
@@ -72,13 +67,18 @@ static const CGFloat wtSwitchH    = 15;
 - (void)sync {
 	NSMenuItem *item = self.enclosingMenuItem;
 	if (item == nil) return;
-	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%d", item.title, item.isEnabled, (long)item.state, self.hover, item.isHighlighted];
+	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%p", item.title, item.isEnabled, (long)item.state, item.isHighlighted, self.image];
 	if (![key isEqualToString:self.drawn]) {
 		self.drawn = key;
 		self.toolTip = item.toolTip;
 		CGFloat w = ceil([item.title sizeWithAttributes:@{NSFontAttributeName: [self titleFont]}].width) + wtTitleX + wtTitleRight;
 		if (self.isSwitch) w += wtSwitchW + 12;
-		if (w > NSWidth(self.frame)) [self setFrameSize:NSMakeSize(w, wtRowHeight)];
+		CGFloat h = wtRowHeight;
+		if (self.image != nil) {
+			h += self.image.size.height + 8;
+			w = MAX(w, self.image.size.width + wtTitleX + wtTitleRight);
+		}
+		if (w > NSWidth(self.frame) || h != NSHeight(self.frame)) [self setFrameSize:NSMakeSize(MAX(w, NSWidth(self.frame)), h)];
 		[self setNeedsDisplay:YES];
 	}
 }
@@ -87,7 +87,7 @@ static const CGFloat wtSwitchH    = 15;
 	NSMenuItem *item = self.enclosingMenuItem;
 	if (item == nil) return;
 	BOOL enabled = item.isEnabled;
-	BOOL selected = enabled && (item.isHighlighted || self.hover);
+	BOOL selected = enabled && item.isHighlighted;
 	if (selected) {
 		[[NSColor controlAccentColor] setFill];
 		[[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, wtSelInset, 0) xRadius:wtSelRadius yRadius:wtSelRadius] fill];
@@ -97,11 +97,16 @@ static const CGFloat wtSwitchH    = 15;
 	para.lineBreakMode = NSLineBreakByTruncatingTail;
 	NSDictionary *attrs = @{NSFontAttributeName: [self titleFont], NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: para};
 	CGFloat h = [@"Ag" sizeWithAttributes:attrs].height;
-	CGFloat y = floor((NSHeight(self.bounds) - h) / 2);
+	// The title sits in the bottom row; an image fills the space above it.
+	CGFloat y = floor((wtRowHeight - h) / 2);
+	if (self.image != nil) {
+		NSSize sz = self.image.size;
+		[self.image drawInRect:NSMakeRect(wtTitleX, wtRowHeight, sz.width, sz.height)];
+	}
 	CGFloat right = wtTitleRight;
 	if (self.isSwitch) {
 		BOOL on = item.state == NSControlStateValueOn;
-		NSRect track = NSMakeRect(NSWidth(self.bounds) - wtTitleRight - wtSwitchW, floor((NSHeight(self.bounds) - wtSwitchH) / 2), wtSwitchW, wtSwitchH);
+		NSRect track = NSMakeRect(NSWidth(self.bounds) - wtTitleRight - wtSwitchW, floor((wtRowHeight - wtSwitchH) / 2), wtSwitchW, wtSwitchH);
 		NSColor *fill = on ? (selected ? [NSColor whiteColor] : [NSColor controlAccentColor]) : [[NSColor labelColor] colorWithAlphaComponent:0.18];
 		if (!enabled) fill = [fill colorWithAlphaComponent:0.4];
 		[fill setFill];
@@ -134,7 +139,7 @@ static int wtOpenMenus;
 
 - (void)menuWillOpen:(NSMenu *)menu {
 	if (wtOpenMenus++ == 0) {
-		for (WTKeepOpenView *v in wtViews) { v.hover = NO; [v sync]; }
+		for (WTKeepOpenView *v in wtViews) [v sync];
 		wtTimer = [NSTimer timerWithTimeInterval:0.15 repeats:YES block:^(NSTimer *t) {
 			for (WTKeepOpenView *v in wtViews) [v sync];
 		}];
@@ -225,12 +230,21 @@ void wtKeepOpen(int menuId, int asSwitch) {
 void wtSetImage(int menuId, const void *bytes, int length, int points) {
 	NSData *data = [NSData dataWithBytes:bytes length:length];
 	dispatch_async(dispatch_get_main_queue(), ^{
+		wtInit();
 		NSMenu *root = wtRootMenu();
 		NSMenuItem *item = root ? wtFind(root, menuId) : nil;
 		NSImage *image = [[NSImage alloc] initWithData:data];
-		if (item == nil || image == nil) return;
+		if (item == nil || image == nil || item.hasSubmenu) return;
 		[image setSize:NSMakeSize(points, points)];
-		item.image = image;
+		WTKeepOpenView *v = (WTKeepOpenView *)item.view;
+		if (![v isKindOfClass:[WTKeepOpenView class]]) {
+			v = [[WTKeepOpenView alloc] init];
+			item.view = v;
+			[wtViews addObject:v];
+		}
+		v.image = image;
+		v.drawn = nil;
+		[v sync];
 	});
 }
 */

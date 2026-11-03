@@ -67,7 +67,7 @@ type trayView struct {
 }
 
 func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView {
-	v := trayView{State: stateOf(st), ToggleTitle: "VPN"}
+	v := trayView{State: stateOf(st), ToggleTitle: "Connect"}
 	switch v.State {
 	case trayDaemonDown:
 		v.Header = "○ Daemon not running"
@@ -92,11 +92,11 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 		u := st.ExitNodeState.Using
 		v.Header = "● Connected via exit " + firstNonEmpty(u.Hostname, u.IP)
 		v.Tooltip = "Wantastic: internet via " + firstNonEmpty(u.Hostname, u.IP)
-		v.ToggleEnabled = true
+		v.ToggleTitle, v.ToggleEnabled = "Disconnect", true
 	default:
 		v.Header = "● Connected"
 		v.Tooltip = "Wantastic: connected"
-		v.ToggleEnabled = true
+		v.ToggleTitle, v.ToggleEnabled = "Disconnect", true
 	}
 
 	ip := "—"

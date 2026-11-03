@@ -16,7 +16,7 @@ func TestDeriveTrayViewStates(t *testing.T) {
 		t.Fatalf("daemon down: %+v", v)
 	}
 	down := &agent.StatusResponse{Running: true, DeviceRunning: false}
-	if v := deriveTrayView(down, trafficSample{}, trafficSample{}); v.State != trayDisconnected || v.ToggleTitle != "VPN" || !v.ToggleEnabled {
+	if v := deriveTrayView(down, trafficSample{}, trafficSample{}); v.State != trayDisconnected || v.ToggleTitle != "Connect" || !v.ToggleEnabled {
 		t.Fatalf("disconnected: %+v", v)
 	}
 	up := &agent.StatusResponse{
@@ -30,7 +30,7 @@ func TestDeriveTrayViewStates(t *testing.T) {
 	}
 	t0 := time.Unix(1000, 0)
 	v := deriveTrayView(up, trafficSample{rx: 1 << 20, tx: 1 << 20, at: t0}, trafficSample{rx: 3 << 20, tx: 1 << 20, at: t0.Add(2 * time.Second)})
-	if v.State != trayConnected || v.ToggleTitle != "VPN" || v.Address != "IP: 10.255.255.44" {
+	if v.State != trayConnected || v.ToggleTitle != "Disconnect" || v.Address != "IP: 10.255.255.44" {
 		t.Fatalf("connected: %+v", v)
 	}
 	if v.Rate != "Speed: ↓ 1.0 MiB/s  ↑ 0 B/s" || v.PeersTitle != "Peers: 1 direct, 1 relay" || v.Details != "Up 1h01m · server 172.239.44.171:51820" {

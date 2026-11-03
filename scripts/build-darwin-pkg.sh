@@ -46,12 +46,20 @@ else
     --package-path "$WORK" "dist/wantastic-macos.pkg"
 fi
 
-# Notarize when an App Store Connect API key is provided: Apple scans the
-# package and the ticket is stapled to it, so macOS opens it without the
-# "could not verify ... free of malware" warning, even offline.
-if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ] && [ -n "${NOTARY_KEY_PATH:-}" ]; then
-  xcrun notarytool submit dist/wantastic-macos.pkg --key "$NOTARY_KEY_PATH" \
-    --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait --timeout 30m
+# Notarize when credentials are provided: Apple scans the package and the
+# ticket is stapled to it, so macOS opens it without the "could not verify
+# ... free of malware" warning (or "Move to Trash"), even offline. CI uses an
+# App Store Connect API key (NOTARY_KEY_PATH); a Mac uses a keychain profile
+# saved with `xcrun notarytool store-credentials` (NOTARY_PROFILE).
+NOTARIZE=""
+if [ -n "${NOTARY_KEY_PATH:-}" ]; then
+  NOTARIZE="--key $NOTARY_KEY_PATH --key-id ${NOTARY_KEY_ID:-} --issuer ${NOTARY_ISSUER:-}"
+elif [ -n "${NOTARY_PROFILE:-}" ]; then
+  NOTARIZE="--keychain-profile $NOTARY_PROFILE"
+fi
+if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ] && [ -n "$NOTARIZE" ]; then
+  # shellcheck disable=SC2086 # NOTARIZE is a list of flags
+  xcrun notarytool submit dist/wantastic-macos.pkg $NOTARIZE --wait --timeout 30m
   xcrun stapler staple dist/wantastic-macos.pkg
   xcrun stapler validate dist/wantastic-macos.pkg
   spctl --assess --type install --verbose=2 dist/wantastic-macos.pkg

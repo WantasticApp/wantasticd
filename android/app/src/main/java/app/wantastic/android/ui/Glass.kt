@@ -159,7 +159,7 @@ fun GlassCard(
                 }
             }
             .then(if (onClick != null) Modifier.clickable(interaction, indication = null, role = Role.Button, onClick = onClick) else Modifier)
-            .padding(18.dp),
+            .padding(horizontal = 14.dp, vertical = 12.dp),
         content = content,
     )
 }
@@ -288,7 +288,7 @@ fun GlassButton(text: String, primary: Boolean = false, enabled: Boolean = true,
         else -> Brush.verticalGradient(listOf(Color(0x2EFFFFFF), Color(0x14FFFFFF)))
     }
     Box(
-        Modifier.fillMaxWidth().height(52.dp)
+        Modifier.fillMaxWidth().height(44.dp)
             .graphicsLayer { scaleX = 1f + 0.02f * swell; scaleY = 1f + 0.02f * swell }
             .liquidGlass(Glass.Radius, tint, GlassOptics(refraction = 8.dp, zone = 14.dp, blur = 0.dp, sheen = 0.6f), bulge = { swell })
             .clip(RoundedCornerShape(Glass.Radius))
@@ -296,7 +296,7 @@ fun GlassButton(text: String, primary: Boolean = false, enabled: Boolean = true,
         contentAlignment = Alignment.Center,
     ) {
         if (busy) androidx.compose.material3.CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
-        else Text(text, color = if (enabled) Color.White else Glass.TextDim, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        else Text(text, color = if (enabled) Color.White else Glass.TextDim, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 

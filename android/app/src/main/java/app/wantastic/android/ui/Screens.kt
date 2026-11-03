@@ -85,10 +85,10 @@ fun HomeScreen(
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(NavClearance).padding(horizontal = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Column(Modifier.fillMaxWidth().padding(top = 12.dp)) {
-            Text("Wantastic", color = Glass.Text, fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            Text("Wantastic", color = Glass.Text, fontSize = 28.sp, fontWeight = FontWeight.Bold)
             Dim("$deviceName · this phone", 15)
         }
         // Not approved yet: the button is the way in, straight to the Claim form.
@@ -110,7 +110,7 @@ fun HomeScreen(
                 when (t) {
                     null -> Text("Log in to your account and press Claim to add this phone.", color = Glass.TextDim, fontSize = 13.sp, textAlign = TextAlign.Center)
                     is TunnelState.Connected -> {
-                        Text(t.address, color = Glass.Text, fontSize = 26.sp, fontFamily = FontFamily.Monospace)
+                        Text(t.address, color = Glass.Text, fontSize = 20.sp, fontFamily = FontFamily.Monospace)
                     }
                     TunnelState.EngineUnavailable -> Text("The tunnel engine could not start on this phone.", color = Glass.TextDim, fontSize = 13.sp, textAlign = TextAlign.Center)
                     else -> Dim("Not connected")
@@ -125,7 +125,7 @@ fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Dim("Exit node")
-                    Text(status.usingExit?.let { "Internet via $it" } ?: "Off · internet goes direct", color = Glass.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Text(status.usingExit?.let { "Internet via $it" } ?: "Off · internet goes direct", color = Glass.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                 }
                 Text("›", color = Glass.TextDim, fontSize = 26.sp)
             }
@@ -142,7 +142,7 @@ fun HomeScreen(
 private fun Metric(label: String, value: String, history: List<Long>, color: Color, modifier: Modifier) {
     val peak = (history.maxOrNull() ?: 0L).coerceAtLeast(64_000L).toFloat()
     val scale by androidx.compose.animation.core.animateFloatAsState(peak, androidx.compose.animation.core.tween(600), label = "scale")
-    GlassCard(modifier.height(96.dp)) {
+    GlassCard(modifier.height(84.dp)) {
         Box(Modifier.fillMaxSize()) {
             Canvas(Modifier.matchParentSize().padding(top = 26.dp)) {
                 if (history.size < 2) return@Canvas
@@ -170,7 +170,7 @@ private fun Metric(label: String, value: String, history: List<Long>, color: Col
             }
             Column {
                 Dim(label)
-                Text(value, color = Glass.Text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Text(value, color = Glass.Text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -208,10 +208,9 @@ fun PeersScreen(
                 else -> null
             },
         )
-        if (signedIn) {
-            Column(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 10.dp)) {
-                GlassButton("Add a device", primary = true, onClick = onAddDevice)
-            }
+        // Onboarding keys belong to an account: signed out, this signs in first.
+        Column(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 10.dp)) {
+            GlassButton("Add a device", primary = true, onClick = if (signedIn) onAddDevice else onSignIn)
         }
         if (list.isEmpty()) {
             GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp), onClick = if (signedIn) null else onSignIn) {
@@ -350,7 +349,7 @@ fun ExitNodeScreen(status: EngineStatus, onUse: (String?) -> Unit, onOffer: (Boo
             GlassCard(Modifier.fillMaxWidth()) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text("Share this phone", color = Glass.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Share this phone", color = Glass.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Dim("Your devices may send their internet through this phone. Its own network stays unreachable to them.", 12)
                     }
                     Switch(
@@ -371,7 +370,7 @@ private fun ExitRow(name: String, note: String, selected: Boolean, enabled: Bool
     ) {
         RadioButton(selected = selected, onClick = onClick, enabled = enabled, colors = RadioButtonDefaults.colors(selectedColor = Glass.Cyan, unselectedColor = Glass.TextDim))
         Column {
-            Text(name, color = if (enabled) Glass.Text else Glass.TextDim, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text(name, color = if (enabled) Glass.Text else Glass.TextDim, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             Dim(note, 12)
         }
     }

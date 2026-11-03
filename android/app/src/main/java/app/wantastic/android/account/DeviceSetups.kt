@@ -21,6 +21,25 @@ class DeviceSetups(private val prefs: SharedPreferences) {
 
     data class Setup(val account: String, val privateKey: String, val publicKey: String, val claim: String?) {
         val claimed get() = claim != null
+
+        private val claimJson get() = claim?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+        /** This phone's address in that network, once approved. */
+        val address: String? get() = claimJson?.optString("assigned_ip")?.substringBefore('/')?.ifBlank { null }
+
+        /** The network's address range: the allowed prefix holding [address]. */
+        val network: String? get() {
+            val prefixes = claimJson?.optJSONArray("allowed_ips")?.let { a ->
+                (0 until a.length()).map { a.optString(it) }.filter { it.contains('/') && it != "0.0.0.0/0" && it != "::/0" }
+            } ?: return null
+            val ip = address?.let(::ipv4) ?: return prefixes.firstOrNull()
+            return prefixes.firstOrNull { p ->
+                val base = ipv4(p.substringBefore('/'))
+                val bits = p.substringAfter('/').toIntOrNull()
+                base != null && bits != null && bits in 0..32 &&
+                    (bits == 0 || (ip xor base) ushr (32 - bits) == 0L)
+            } ?: prefixes.firstOrNull()
+        }
     }
 
     private val all = MutableStateFlow(load())
@@ -34,6 +53,24 @@ class DeviceSetups(private val prefs: SharedPreferences) {
     fun forAccount(account: String): Setup? = all.value[account]
 
     fun accounts(): Set<String> = all.value.keys
+
+    /** Every saved setup, by account. */
+    val setups: StateFlow<Map<String, Setup>> = all.asStateFlow()
+
+    /**
+     * Deletes [account]'s setup (key and approval) from this phone. The active
+     * one hands over to another approved setup, if there is one.
+     */
+    fun remove(account: String) {
+        if (account !in all.value) return
+        val rest = all.value - account
+        save(rest)
+        if (activeId.value == account) {
+            val next = rest.values.firstOrNull { it.claimed }?.account ?: rest.keys.firstOrNull() ?: UNBOUND
+            activeId.value = next
+            prefs.edit().putString(ACTIVE, next).apply()
+        }
+    }
 
     /** The setup for [account], made (with a new key) when there is none. */
     fun ensure(account: String): Setup = all.value[account] ?: run {
@@ -97,5 +134,12 @@ class DeviceSetups(private val prefs: SharedPreferences) {
         private const val LEGACY_CLAIM = "claim_config"
 
         private fun enc(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
+
+        /** A dotted IPv4 address as an unsigned 32-bit number, or null. */
+        internal fun ipv4(s: String): Long? {
+            val parts = s.trim().split('.')
+            if (parts.size != 4) return null
+            return parts.fold(0L) { acc, p -> (acc shl 8) or (p.toIntOrNull()?.takeIf { it in 0..255 } ?: return null).toLong() }
+        }
     }
 }

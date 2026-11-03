@@ -18,11 +18,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,6 +44,7 @@ import app.wantastic.android.account.Account
 import app.wantastic.android.engine.Engines
 import app.wantastic.android.account.AccountState
 import app.wantastic.android.account.AccountSync
+import app.wantastic.android.account.DeviceSetups
 import kotlinx.coroutines.launch
 
 /**
@@ -75,6 +78,82 @@ fun AddThisPhoneScreen(sync: AccountSync, email: String, deviceName: String, onO
 }
 
 /**
+ * Home: the network configs saved on this phone, one per account it joined,
+ * signed in or not. Tap one to use it (the tunnel reconnects on it); the bin
+ * deletes it from the phone after asking. Signed out, Log in is here too.
+ */
+@Composable
+fun HomeConfigsCard(setups: DeviceSetups, signedIn: Boolean, onLogIn: () -> Unit, onChanged: () -> Unit) {
+    val all by setups.setups.collectAsState()
+    val activeId by setups.active.collectAsState()
+    var confirm by remember { mutableStateOf<DeviceSetups.Setup?>(null) }
+    // A key made for a claim that never happened is not a config.
+    val list = all.values.filter { it.claimed || it.account == activeId }
+        .sortedWith(compareByDescending<DeviceSetups.Setup> { it.account == activeId }.thenBy { it.network ?: "~" })
+    GlassCard(Modifier.fillMaxWidth()) {
+        Text((if (list.size > 1) "Configs on this phone" else "Config on this phone").uppercase(), color = Glass.TextDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp)
+        if (list.isEmpty()) {
+            Text("None yet. Log in or scan a claim code to add this phone to a network.", color = Glass.TextDim, fontSize = 13.sp)
+        }
+        list.forEachIndexed { i, c ->
+            val active = c.account == activeId
+            if (i > 0) RowDivider()
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(Glass.Radius - 4.dp))
+                    .clickable(enabled = !active && c.claimed) {
+                        setups.activate(c.account)
+                        onChanged()
+                    }
+                    .heightIn(min = 44.dp).padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Avatar(c.network?.substringBefore('/')?.substringAfterLast('.')?.let { "#" } ?: "?")
+                Column(Modifier.weight(1f).padding(start = 10.dp)) {
+                    Text(c.network?.let { "Network $it" } ?: "Config ${i + 1}", color = Glass.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                    Text(
+                        when {
+                            !c.claimed -> "Waiting for approval"
+                            active -> "In use · ${c.address ?: ""}"
+                            else -> "Tap to use · ${c.address ?: ""}"
+                        },
+                        color = Glass.TextDim, fontSize = 11.sp, maxLines = 1,
+                    )
+                }
+                if (active && c.claimed) Box(Modifier.size(10.dp).clip(CircleShape).background(Glass.Green))
+                IconButton(onClick = { confirm = c }, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Filled.Delete, contentDescription = "Delete this config", tint = Glass.TextDim, modifier = Modifier.size(16.dp))
+                }
+            }
+        }
+        if (!signedIn) {
+            Spacer(Modifier.size(4.dp))
+            GlassButton("Log in", primary = true, onClick = onLogIn)
+        }
+    }
+    confirm?.let { c ->
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text("Delete this config?") },
+            text = {
+                Text(
+                    "This phone forgets ${c.network?.let { "network $it" } ?: "this config"} and its key" +
+                        (if (c.account == activeId) " and disconnects from it" else "") +
+                        ". The device stays in that account's console until you remove it there.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = null
+                    setups.remove(c.account)
+                    onChanged()
+                }) { Text("Delete", color = Color(0xFFFF8A80)) }
+            },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+/**
  * Home: which account (and so which network setup) this phone is on. With
  * several accounts, tap one to switch; [onSwitched] reconnects the tunnel on
  * its setup. Signed out: a button straight to sign-in.
@@ -86,8 +165,8 @@ fun HomeAccountCard(sync: AccountSync, state: AccountState, onSignIn: () -> Unit
         when (state) {
             is AccountState.SignedIn -> {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (state.accounts.size > 1) "Accounts" else "Account", color = Glass.TextDim, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                    TextButton(onClick = onAddAccount) { Text("Add account", color = Color(0xFF7DB4FF), fontSize = 13.sp) }
+                    Text((if (state.accounts.size > 1) "Accounts" else "Account").uppercase(), color = Glass.TextDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onAddAccount) { Text("Add account", color = Color(0xFF7DB4FF), fontSize = 12.sp) }
                 }
                 AccountRows(sync, state, activeHint = "This phone's network", otherHint = { "Tap to switch" }, onChanged = onSwitched) { error = it }
             }
@@ -118,7 +197,8 @@ private fun AccountRows(
     var busy by remember { mutableStateOf<String?>(null) } // slot being switched to or removed
     var confirm by remember { mutableStateOf<Account?>(null) }
     val accounts = state.accounts.ifEmpty { listOf(Account("", state.email, "", true, false)) }
-    accounts.forEach { a ->
+    accounts.forEachIndexed { i, a ->
+        if (i > 0) RowDivider()
         Row(
             Modifier.fillMaxWidth().clip(RoundedCornerShape(Glass.Radius - 4.dp))
                 .clickable(enabled = !a.active && a.slot.isNotBlank() && busy == null) {
@@ -131,12 +211,12 @@ private fun AccountRows(
                         busy = null
                     }
                 }
-                .heightIn(min = 52.dp).padding(vertical = 6.dp),
+                .heightIn(min = 44.dp).padding(vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Avatar(a.name.ifBlank { a.email })
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                Text(a.name.ifBlank { a.email }, color = Glass.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                Text(a.name.ifBlank { a.email }, color = Glass.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
                 Text(
                     when {
                         busy == a.slot -> "Working…"
@@ -144,13 +224,13 @@ private fun AccountRows(
                         a.needsReauth -> "Sign in again to use"
                         else -> otherHint(a)
                     },
-                    color = Glass.TextDim, fontSize = 12.sp, maxLines = 1,
+                    color = Glass.TextDim, fontSize = 11.sp, maxLines = 1,
                 )
             }
             if (a.active) Box(Modifier.size(10.dp).clip(CircleShape).background(Glass.Green))
             if (a.slot.isNotBlank()) {
-                IconButton(onClick = { confirm = a }, enabled = busy == null, modifier = Modifier.size(40.dp)) {
-                    Icon(Icons.Filled.Delete, contentDescription = "Remove ${a.name.ifBlank { a.email }}", tint = Glass.TextDim, modifier = Modifier.size(18.dp))
+                IconButton(onClick = { confirm = a }, enabled = busy == null, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Filled.Delete, contentDescription = "Remove ${a.name.ifBlank { a.email }}", tint = Glass.TextDim, modifier = Modifier.size(16.dp))
                 }
             }
         }
@@ -210,12 +290,16 @@ fun AccountCard(sync: AccountSync, state: AccountState, onAddAccount: () -> Unit
     }
 }
 
+/** A hairline between list rows, starting under the text (not the avatar). */
+@Composable
+private fun RowDivider() = HorizontalDivider(Modifier.padding(start = 38.dp), thickness = 0.5.dp, color = Glass.Edge)
+
 @Composable
 private fun Avatar(name: String) {
     Box(
-        Modifier.size(36.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Glass.Blue, Glass.Cyan))),
+        Modifier.size(28.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Glass.Blue, Glass.Cyan))),
         contentAlignment = Alignment.Center,
     ) {
-        Text(name.trim().take(1).uppercase(), color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Text(name.trim().take(1).uppercase(), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }

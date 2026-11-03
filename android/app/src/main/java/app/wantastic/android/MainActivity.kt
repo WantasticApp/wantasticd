@@ -76,6 +76,7 @@ import app.wantastic.android.account.AccountSync
 import app.wantastic.android.account.DeviceSetups
 import app.wantastic.android.ui.AccountCard
 import app.wantastic.android.ui.HomeAccountCard
+import app.wantastic.android.ui.HomeConfigsCard
 import app.wantastic.android.ui.AddThisPhoneScreen
 import app.wantastic.android.ui.AuthScreen
 import app.wantastic.android.ui.ClaimByLinkScreen
@@ -220,7 +221,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
                 onNotNow = if (status.claimed) ({ notNow = signedInState.tenantId }) else null,
             )
             status.claimed || browsing -> Tabs(
-                status, sync, account, deviceName, publicKey, onConnect,
+                status, sync, setups, account, deviceName, publicKey, onConnect,
                 onLogIn = { if (signedInState == null) signingIn = true else notNow = null },
                 onAddAccount = { signingIn = true },
                 onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) },
@@ -269,7 +270,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
 
 @Composable
 private fun BoxScope.Tabs(
-    status: EngineStatus, sync: AccountSync, account: AccountState, deviceName: String, publicKey: String,
+    status: EngineStatus, sync: AccountSync, setups: DeviceSetups, account: AccountState, deviceName: String, publicKey: String,
     onConnect: () -> Unit, onLogIn: () -> Unit, onAddAccount: () -> Unit, onConsole: (String) -> Unit,
     onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit, onAddDevice: () -> Unit,
 ) {
@@ -294,11 +295,21 @@ private fun BoxScope.Tabs(
                     onLogIn = onLogIn,
                     onExitNode = { exitOpen = true },
                 ) {
-                    HomeAccountCard(
-                        sync, account, onSignIn = onLogIn, onAddAccount = onAddAccount,
-                        // A ready setup for the new account: connect on it now.
-                        onSwitched = { if ((sync.account.value as? AccountState.SignedIn)?.needsSetup == false) engine.reconnect() },
-                    )
+                    val signedIn = account is AccountState.SignedIn
+                    HomeConfigsCard(setups, signedIn, onLogIn = onAddAccount) {
+                        // Another config is in use now: connect on it, or stop if none is approved.
+                        (engine as? GoEngine)?.refresh()
+                        if (status.tunnel is TunnelState.Connected || status.tunnel is TunnelState.Connecting) {
+                            if (setups.current().claimed) engine.reconnect() else engine.disconnect()
+                        }
+                    }
+                    if (signedIn) {
+                        HomeAccountCard(
+                            sync, account, onSignIn = onLogIn, onAddAccount = onAddAccount,
+                            // A ready setup for the new account: connect on it now.
+                            onSwitched = { if ((sync.account.value as? AccountState.SignedIn)?.needsSetup == false) engine.reconnect() },
+                        )
+                    }
                 }
                 Tab.Peers -> {
                     val devices by sync.devices.collectAsStateWithLifecycle()

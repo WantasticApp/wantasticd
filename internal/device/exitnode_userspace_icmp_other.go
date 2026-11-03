@@ -1,7 +1,6 @@
-//go:build !windows
+//go:build !windows && !darwin && !linux
 
 package device
 
-// The userspace exit is used only on Windows; elsewhere the kernel NAT
-// carries ICMP.
+// No unprivileged ping here; the userspace exit does not answer pings.
 func newICMPEchoer() icmpEchoer { return nil }

@@ -9,6 +9,7 @@ package runner
 void wtWatchMenu(int menuId);
 void wtKeepOpen(int menuId, int asSwitch);
 void wtSetImage(int menuId, const void *bytes, int length, int points);
+void wtSetTrash(int menuId, int mode);
 */
 import "C"
 
@@ -75,6 +76,29 @@ func setMenuImage(item *systray.MenuItem, png []byte, points int) bool {
 	return true
 }
 
+var trashHooks sync.Map // menu id -> func()
+
+// menuTrash puts a bin at the right edge of item's row (macOS): a click on
+// it runs onClick, the rest of the row keeps its action. Armed draws it red.
+// Off removes it. It reports whether rows can carry a bin here.
+func menuTrash(item *systray.MenuItem, show, armed bool, onClick func()) bool {
+	id := menuItemID(item)
+	mode := 0
+	switch {
+	case show && armed:
+		mode = 2
+	case show:
+		mode = 1
+	}
+	if mode == 0 {
+		trashHooks.Delete(id)
+	} else {
+		trashHooks.Store(id, onClick)
+	}
+	C.wtSetTrash(C.int(id), C.int(mode))
+	return true
+}
+
 // menuItemID is the library's id for item; the native menu tags each
 // NSMenuItem with it.
 func menuItemID(item *systray.MenuItem) int {
@@ -88,9 +112,22 @@ func wantasticMenuOpened(id C.int) {
 	}
 }
 
+//export wantasticMenuTrash
+func wantasticMenuTrash(id C.int) {
+	if fn, ok := trashHooks.Load(int(id)); ok && fn.(func()) != nil {
+		go fn.(func())()
+	}
+}
+
 //export wantasticMenuClosed
 func wantasticMenuClosed(id C.int) {
 	if h, ok := menuHooks.Load(int(id)); ok && h.(*menuHook).closed != nil {
 		go h.(*menuHook).closed()
 	}
 }
+
+// rowsCarryTrash: account rows draw their own bin (menuTrash).
+func rowsCarryTrash() bool { return true }
+
+// trashMenuIcon is unused on macOS: rows draw the system trash symbol.
+func trashMenuIcon() []byte { return nil }

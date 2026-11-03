@@ -340,13 +340,10 @@ func TestEnableDisableNATDarwin(t *testing.T) {
 		"/usr/sbin/sysctl -n net.inet.ip.forwarding": "0\n",
 		"/sbin/pfctl -E": "pf enabled\nToken : 99\n",
 	}}
+	// pf is no longer chosen, but state from older versions still uses it.
 	h := f.host("darwin")
-	b, err := DetectBackend(h)
-	if err != nil || b != BackendPF {
-		t.Fatalf("backend %v %v", b, err)
-	}
 	p := exitPlan
-	p.Backend = b
+	p.Backend = BackendPF
 	st, err := EnableNAT(h, p)
 	if err != nil {
 		t.Fatal(err)
@@ -450,6 +447,9 @@ func TestDetectBackendLinuxPrefersFW4(t *testing.T) {
 	}
 	if b, err := DetectBackend(f.host("windows")); err != nil || b != BackendUserspace {
 		t.Fatalf("windows: %v %v", b, err)
+	}
+	if b, err := DetectBackend(f.host("darwin")); err != nil || b != BackendUserspace {
+		t.Fatalf("darwin: %v %v", b, err)
 	}
 	if _, err := DetectBackend(f.host("plan9")); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("plan9: %v", err)

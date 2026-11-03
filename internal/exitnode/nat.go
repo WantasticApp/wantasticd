@@ -13,12 +13,14 @@ import (
 type NATBackend string
 
 const (
-	BackendPF       NATBackend = "pf"       // macOS
+	// BackendPF: macOS pf. No longer chosen (see DetectBackend); kept so a
+	// pf anchor and token left by an older version are removed on upgrade.
+	BackendPF       NATBackend = "pf"
 	BackendIPTables NATBackend = "iptables" // Linux iptables (legacy or -nft)
 	BackendFW4      NATBackend = "nft-fw4"  // OpenWrt fw4: rules inserted into inet fw4
 	BackendNft      NATBackend = "nft"      // plain nftables: own table
 	// BackendUserspace: no OS rules; the agent forwards exit traffic itself
-	// (Windows). EnableNAT/DisableNAT/EnsureNAT do nothing for it.
+	// (Windows, macOS). EnableNAT/DisableNAT/EnsureNAT do nothing for it.
 	BackendUserspace NATBackend = "userspace"
 )
 
@@ -295,7 +297,11 @@ func (h Host) hasNft() bool {
 func DetectBackend(h Host) (NATBackend, error) {
 	switch h.OS {
 	case "darwin":
-		return BackendPF, nil
+		// macOS forwards packets arriving on a utun unreliably and pf is shared
+		// with every other VPN or firewall app: peers' traffic was forwarded
+		// but its replies never came back. The agent's own sockets follow
+		// whatever routing the host has.
+		return BackendUserspace, nil
 	case "linux":
 		if h.hasNft() {
 			if _, err := h.Run(Cmd{Name: "nft", Args: []string{"list", "table", "inet", "fw4"}}); err == nil {

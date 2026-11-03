@@ -47,6 +47,9 @@ const (
 	exitQueryEvery     = 60 * time.Second
 	exitRequestEvery   = 5 * time.Second
 	exitUserWindow     = 10 * time.Minute
+	// exitPlatformGrace is how long a restarted engine keeps the platform's
+	// default route for a restored exit that is not back yet.
+	exitPlatformGrace = 45 * time.Second
 )
 
 // ExitNodeStatus is the exit-node part of /api/status and /api/exitnode.
@@ -110,7 +113,9 @@ type exitEngine struct {
 	lastTry         time.Time
 	retryAt         time.Time // backoff after a failed activation
 	allowedSet      bool      // 0.0.0.0/0 was given to a peer
-	platformDefault bool      // the platform (ExternalTUN) routes the default into the tunnel
+	platformDefault bool      // the platform (ExternalTUN) may route the default into the tunnel
+	platformOn      bool      // this run asked the platform for the default route
+	platformGrace   time.Time // after a restart, how long a restored exit may take to come back
 	offered         map[wgdevice.NoisePublicKey]bool
 
 	kick chan struct{}
@@ -168,6 +173,13 @@ func (d *Device) startExitEngine() {
 			log.Printf("[EXIT] Could not re-enable exit-node sharing: %v", err)
 		}
 	}
+	if e.st.Use != "" && ExternalDefaultRoute != nil {
+		// The platform restarted the engine, likely to route the default into
+		// the tunnel for this exit. Give the exit time to come back before
+		// handing the internet back to the normal network.
+		e.platformDefault = true
+		e.platformGrace = time.Now().Add(exitPlatformGrace)
+	}
 	if e.st.Use != "" {
 		e.setPhase(exitnode.PhaseStandby, "starting")
 		log.Printf("[EXIT] Restoring exit node %s from saved state", e.st.Use)
@@ -188,6 +200,10 @@ func (d *Device) stopExitEngine() {
 	<-e.done
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// The platform's tunnel goes with the engine. Asking it to drop the
+	// default route here would undo the restart that added it (Android
+	// restarts the engine to change routes) and the two would loop.
+	e.platformDefault, e.platformOn = false, false
 	e.deactivateLocked("daemon stopping")
 	if e.st.NAT != nil {
 		e.disableNATLocked()
@@ -731,7 +747,7 @@ func (e *exitEngine) reconcileClient(now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.st.Use == "" {
-		if len(e.st.Routes) > 0 {
+		if len(e.st.Routes) > 0 || e.platformDefault {
 			e.deactivateLocked("not in use")
 		}
 		return
@@ -775,7 +791,8 @@ func (e *exitEngine) reconcileClient(now time.Time) {
 	health.Granted = e.granted
 	phase, reason := exitnode.NextPhase(health, now)
 	if phase != exitnode.PhaseActive {
-		if len(e.st.Routes) > 0 || e.allowedSet {
+		restoring := e.platformDefault && !e.platformOn && now.Before(e.platformGrace)
+		if !restoring && (len(e.st.Routes) > 0 || e.allowedSet || e.platformDefault) {
 			e.deactivateLocked(reason)
 		}
 		e.setPhaseLocked(phase, reason)
@@ -1017,8 +1034,8 @@ func (e *exitEngine) activatePlatformLocked(dp *wgdevice.DiscoveredPeer, peers m
 		}
 		e.allowedSet = true
 	}
-	if !e.platformDefault {
-		e.platformDefault = true
+	if !e.platformOn {
+		e.platformOn, e.platformDefault = true, true
 		if ExternalDefaultRoute != nil {
 			go ExternalDefaultRoute(true)
 		}
@@ -1074,7 +1091,7 @@ func addAllowedIPCmd(peerHex, prefix string) string {
 // deactivateLocked restores normal routing; the exit choice is kept.
 func (e *exitEngine) deactivateLocked(reason string) {
 	if e.platformDefault {
-		e.platformDefault = false
+		e.platformDefault, e.platformOn = false, false
 		if ExternalDefaultRoute != nil {
 			go ExternalDefaultRoute(false)
 		}

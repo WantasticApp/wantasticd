@@ -373,7 +373,9 @@ quote_sh() {
 INSTALL_PATH_Q=$(quote_sh "$INSTALL_PATH")
 CONFIG_FILE_Q=$(quote_sh "$CONFIG_FILE")
 
-if [ ! -f "$CONFIG_FILE" ]; then
+# A Mac that is not signed in has no config: the service then waits for the
+# claim and the menu-bar app shows the sign-in code.
+if [ ! -f "$CONFIG_FILE" ] && [ "$OS" != "darwin" ]; then
   touch "$CONFIG_FILE" 2>/dev/null && chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 fi
 
@@ -409,6 +411,8 @@ if [ "$DO_LOGIN" = "1" ]; then
       echo "Login failed — $CONFIG_FILE is empty. Edit it and re-run: wantasticd login"
     fi
   fi
+elif [ "$OS" = "darwin" ]; then
+  echo "Not signed in yet: sign in from the Wantastic icon in the menu bar (or run 'wantasticd login')."
 else
   echo "Skipping login. Run 'wantasticd login' to authenticate."
 fi

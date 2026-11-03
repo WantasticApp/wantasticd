@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -527,7 +528,7 @@ func handleConnect() {
 			}
 		}
 	}
-	if _, err := os.Stat(*configPath); err != nil {
+	if err := configPresent(*configPath); err != nil {
 		if os.IsNotExist(err) && !claimKeyExists(*claimKeyPath) && desktopOS() {
 			// A desktop that is not signed in yet waits for its claim; the
 			// tray's Log in opens the claim link (no login code).
@@ -552,6 +553,22 @@ func handleConnect() {
 		}
 		runAgent(ctx, *configPath, *verbose, autoUpdate, tunName, useTray, localAccess)
 	})
+}
+
+// configPresent is os.Stat for the config, except that an empty file (the
+// installer leaves one when login is skipped) counts as missing: the device
+// is not signed in yet.
+func configPresent(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() && info.Size() < 4096 {
+		if data, rerr := os.ReadFile(path); rerr == nil && len(bytes.TrimSpace(data)) == 0 {
+			return &os.PathError{Op: "read", Path: path, Err: os.ErrNotExist}
+		}
+	}
+	return nil
 }
 
 // desktopOS is true where a person signs in from the tray.

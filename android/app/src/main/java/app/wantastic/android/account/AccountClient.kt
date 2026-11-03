@@ -20,8 +20,8 @@ sealed interface SignIn {
     /** A 6-digit code from an authenticator app ("totp") or a text message ("sms"). */
     data class NeedsCode(val method: String, val phoneLast4: String?) : SignIn
     data class NeedsCaptcha(val imageBase64: String, val loginSessionId: String) : SignIn
-    /** The account uses a passkey; the console (which has WebAuthn) finishes the sign-in. */
-    data object NeedsPasskey : SignIn
+    /** The account uses a passkey: [options] is the server's WebAuthn request ({"publicKey": ...}). */
+    data class NeedsPasskey(val options: String, val loginSessionId: String) : SignIn
     data class Failed(val message: String) : SignIn
 }
 
@@ -41,7 +41,7 @@ class AccountClient(val origin: String, private val fingerprint: String) {
      */
     suspend fun signIn(
         email: String, password: String, code: String = "", captchaAnswer: String = "", loginSessionId: String = "",
-        remember: Boolean = true,
+        passkeyAssertion: String = "", remember: Boolean = true,
     ): SignIn {
         val r = try {
             socket.call(
@@ -49,12 +49,12 @@ class AccountClient(val origin: String, private val fingerprint: String) {
                 JSONObject()
                     .put("email", email.trim()).put("password", password).put("totp_code", code.trim())
                     .put("remember_me", remember).put("fingerprint", fingerprint)
-                    .put("session_id", loginSessionId).put("captcha_answer", captchaAnswer.trim()).put("passkey_assertion", ""),
+                    .put("session_id", loginSessionId).put("captcha_answer", captchaAnswer.trim()).put("passkey_assertion", passkeyAssertion),
             )
         } catch (e: ConsoleSocket.RpcException) {
             return SignIn.Failed(friendly(e.message))
         }
-        if (r.optBoolean("requires_passkey")) return SignIn.NeedsPasskey
+        if (r.optBoolean("requires_passkey")) return SignIn.NeedsPasskey(r.optString("passkey_options"), r.optString("session_id").ifBlank { loginSessionId })
         if (r.optBoolean("requires_totp")) return SignIn.NeedsCode(r.optString("two_fa_method", "totp"), r.optString("two_fa_phone_last4").ifBlank { null })
         if (!r.optBoolean("success") && r.optBoolean("captcha_required")) {
             val challenge = r.optJSONObject("captcha_challenge")

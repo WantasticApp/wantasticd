@@ -49,7 +49,10 @@ private fun loadNotices(context: Context): List<Notice> {
             Notice(it.getString("path"), it.optString("version"), "Go engine", it.getString("license"))
         }
     }.getOrDefault(emptyList())
-    return (libs + go).sortedBy { it.name.lowercase() }
+    val font = runCatching {
+        Notice("Inter (typeface)", "4.1", "OFL-1.1", context.resources.openRawResource(app.wantastic.android.R.raw.inter_license).bufferedReader().use { it.readText() })
+    }.getOrNull()
+    return (libs + go + listOfNotNull(font)).sortedBy { it.name.lowercase() }
 }
 
 @Composable

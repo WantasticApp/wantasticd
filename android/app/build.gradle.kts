@@ -90,7 +90,7 @@ aboutLibraries {
 dependencies {
     // The Go engine, built from ../mobile by `gomobile bind` (see android/README.md).
     implementation(files("libs/wantastic-engine.aar"))
-    val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+    val composeBom = platform("androidx.compose:compose-bom:2025.05.01")
     implementation(composeBom)
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
@@ -107,6 +107,9 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.0")
     // The console channel (websocket) and its HTTP endpoints.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Passkeys (Credential Manager; Play services provides them on Android 13 and older).
+    implementation("androidx.credentials:credentials:1.5.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.5.0")
     implementation("com.mikepenz:aboutlibraries-core:12.2.4")
     "playImplementation"("com.google.android.play:app-update-ktx:2.1.0")
     // Play's library brings an old Fragment that breaks registerForActivityResult.

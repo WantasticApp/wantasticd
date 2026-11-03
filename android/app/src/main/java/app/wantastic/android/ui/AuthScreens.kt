@@ -15,7 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
@@ -47,6 +47,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalContext
+import app.wantastic.android.account.Passkeys
+import androidx.compose.ui.autofill.ContentType
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.contentType
+import androidx.compose.ui.semantics.semantics
 import app.wantastic.android.account.AccountClient
 import app.wantastic.android.account.SignIn
 import kotlinx.coroutines.launch
@@ -73,8 +79,8 @@ fun AuthScreen(
 ) {
     var page by rememberSaveable { mutableStateOf(AuthPage.SignIn) }
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().imePadding().verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp, vertical = 28.dp),
+        // Fixed layout: focusing a field or opening the keyboard moves nothing.
+        Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 24.dp, vertical = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
@@ -109,12 +115,14 @@ private fun SignInForm(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    fun submit() {
+    val context = LocalContext.current
+
+    fun submit(assertion: String = "") {
         if (busy) return
         busy = true; error = null
         scope.launch {
             val r = runCatching {
-                client.signIn(email, password, code = code, captchaAnswer = captcha, loginSessionId = loginSession)
+                client.signIn(email, password, code = code, captchaAnswer = captcha, loginSessionId = loginSession, passkeyAssertion = assertion)
             }.getOrElse { SignIn.Failed(AccountClient.friendly(it.message)) }
             busy = false
             when (r) {
@@ -122,7 +130,20 @@ private fun SignInForm(
                 is SignIn.Failed -> error = r.message
                 is SignIn.NeedsCaptcha -> { step = r; loginSession = r.loginSessionId; captcha = "" }
                 is SignIn.NeedsCode -> { step = r; code = "" }
-                SignIn.NeedsPasskey -> step = r
+                is SignIn.NeedsPasskey -> { step = r; loginSession = r.loginSessionId }
+            }
+        }
+    }
+
+    // Android's passkey sheet (Credential Manager), then the same sign-in with the assertion.
+    fun usePasskey(s: SignIn.NeedsPasskey) {
+        if (busy) return
+        scope.launch {
+            error = null
+            when (val a = Passkeys.assert(context, s.options)) {
+                is Passkeys.Result.Ok -> submit(a.json)
+                is Passkeys.Result.Cancelled -> Unit
+                is Passkeys.Result.Failed -> error = a.message
             }
         }
     }
@@ -131,26 +152,30 @@ private fun SignInForm(
     when (val s = step) {
         is SignIn.NeedsCode -> {
             Hint(if (s.method == "sms" && s.phoneLast4 != null) "Enter the code sent to your phone ending in ${s.phoneLast4}." else "Enter the 6-digit code from your authenticator app.")
-            GlassField(code, { code = it.filter(Char::isDigit).take(8) }, "Code", KeyboardType.NumberPassword, ImeAction.Done, onDone = ::submit)
+            GlassField(code, { code = it.filter(Char::isDigit).take(8) }, "Code", KeyboardType.NumberPassword, ImeAction.Done, onDone = { submit() }, kind = FieldKind.Code, paste = true)
             if (s.method == "sms") TextButton(onClick = { scope.launch { runCatching { client.sendCode(email) } } }) { Text("Send a new code", color = Color(0xFF7DB4FF)) }
         }
         is SignIn.NeedsCaptcha -> {
             Hint("Type what you see, to show you are not a robot.")
             CaptchaImage(s.imageBase64)
-            GlassField(captcha, { captcha = it }, "Answer", KeyboardType.Text, ImeAction.Done, onDone = ::submit)
+            GlassField(captcha, { captcha = it }, "Answer", KeyboardType.Text, ImeAction.Done, onDone = { submit() }, paste = true)
         }
-        SignIn.NeedsPasskey -> {
-            Hint("This account signs in with a passkey. Finish in the console; this app signs in with it.")
-            PrimaryButton("Continue in the console", busy = false) { onUseConsole("/login?login_hint=" + android.net.Uri.encode(email)) }
+        is SignIn.NeedsPasskey -> {
+            Hint("Confirm with the passkey for $email.")
+            androidx.compose.runtime.LaunchedEffect(s) { usePasskey(s) }
+            error?.let { ErrorText(it) }
+            PrimaryButton("Use passkey", busy) { usePasskey(s) }
+            TextButton(onClick = { onUseConsole("/login?login_hint=" + android.net.Uri.encode(email)) }) { Text("Use the console instead", color = Glass.TextDim) }
+            TextButton(onClick = { step = null; error = null }) { Text("Back", color = Glass.TextDim) }
             return
         }
         else -> {
-            GlassField(email, { email = it }, "Email", KeyboardType.Email, ImeAction.Next)
-            GlassField(password, { password = it }, "Password", KeyboardType.Password, ImeAction.Done, secret = true, onDone = ::submit)
+            GlassField(email, { email = it }, "Email", KeyboardType.Email, ImeAction.Next, kind = FieldKind.Email)
+            GlassField(password, { password = it }, "Password", KeyboardType.Password, ImeAction.Done, secret = true, onDone = { submit() }, kind = FieldKind.Password)
         }
     }
     error?.let { ErrorText(it) }
-    PrimaryButton(if (step == null) "Sign in" else "Continue", busy, enabled = email.isNotBlank() && password.isNotBlank(), onClick = ::submit)
+    PrimaryButton(if (step == null) "Sign in" else "Continue", busy, enabled = email.isNotBlank() && password.isNotBlank()) { submit() }
     if (step == null) {
         TextButton(onClick = onForgot) { Text("Forgot password?", color = Color(0xFF7DB4FF)) }
         SecondaryButton("Create an account", onRegister)
@@ -207,10 +232,10 @@ private fun RegisterForm(client: AccountClient, onSignedIn: () -> Unit, onBack: 
     AuthTitle("Create your account", "Free. Your phone number keeps the account yours.")
     when (stage) {
         0 -> {
-            GlassField(name, { name = it }, "Full name", KeyboardType.Text, ImeAction.Next)
-            GlassField(email, { email = it }, "Email", KeyboardType.Email, ImeAction.Next)
-            GlassField(password, { password = it }, "Password", KeyboardType.Password, ImeAction.Next, secret = true)
-            GlassField(phone, { v -> phone = "+" + v.filter(Char::isDigit) }, "Phone, with country code", KeyboardType.Phone, ImeAction.Done)
+            GlassField(name, { name = it }, "Full name", KeyboardType.Text, ImeAction.Next, kind = FieldKind.Name)
+            GlassField(email, { email = it }, "Email", KeyboardType.Email, ImeAction.Next, kind = FieldKind.Email)
+            GlassField(password, { password = it }, "Password (8 or more characters)", KeyboardType.Password, ImeAction.Next, secret = true, kind = FieldKind.NewPassword)
+            GlassField(phone, { v -> phone = "+" + v.filter(Char::isDigit) }, "Phone, with country code", KeyboardType.Phone, ImeAction.Done, kind = FieldKind.Phone)
             if (regions.isNotBlank()) Hint(regions)
             error?.let { ErrorText(it) }
             PrimaryButton("Continue", busy, enabled = name.isNotBlank() && email.isNotBlank() && password.length >= 8 && phone.length > 6) {
@@ -227,7 +252,7 @@ private fun RegisterForm(client: AccountClient, onSignedIn: () -> Unit, onBack: 
         1 -> {
             Hint("Type what you see, to show you are not a robot.")
             CaptchaImage(captchaImage)
-            GlassField(answer, { answer = it }, "Answer", KeyboardType.Text, ImeAction.Done)
+            GlassField(answer, { answer = it }, "Answer", KeyboardType.Text, ImeAction.Done, paste = true)
             error?.let { ErrorText(it) }
             PrimaryButton("Continue", busy, enabled = answer.isNotBlank()) {
                 run {
@@ -245,7 +270,7 @@ private fun RegisterForm(client: AccountClient, onSignedIn: () -> Unit, onBack: 
         }
         else -> {
             Hint(if (channel == "email") "Enter the code we emailed to $email." else "Enter the code we texted to $phone.")
-            GlassField(code, { code = it.filter(Char::isDigit).take(6) }, "6-digit code", KeyboardType.NumberPassword, ImeAction.Done)
+            GlassField(code, { code = it.filter(Char::isDigit).take(6) }, "6-digit code", KeyboardType.NumberPassword, ImeAction.Done, kind = FieldKind.Code, paste = true)
             error?.let { ErrorText(it) }
             PrimaryButton("Create account", busy, enabled = code.length == 6) {
                 run {
@@ -286,7 +311,7 @@ private fun ResetForm(client: AccountClient, onDone: () -> Unit) {
     AuthTitle("Reset your password", "We text a code to the phone on your account.")
     when {
         token.isBlank() -> {
-            GlassField(email, { email = it }, "Email", KeyboardType.Email, ImeAction.Done)
+            GlassField(email, { email = it }, "Email", KeyboardType.Email, ImeAction.Done, kind = FieldKind.Email)
             error?.let { ErrorText(it) }
             PrimaryButton("Send code", busy, enabled = email.isNotBlank()) {
                 run {
@@ -299,12 +324,12 @@ private fun ResetForm(client: AccountClient, onDone: () -> Unit) {
         }
         verified.isBlank() -> {
             Hint(if (masked.isNotBlank()) "Enter the code sent to $masked." else "Enter the code we sent you.")
-            GlassField(code, { code = it.filter(Char::isDigit).take(8) }, "Code", KeyboardType.NumberPassword, ImeAction.Done)
+            GlassField(code, { code = it.filter(Char::isDigit).take(8) }, "Code", KeyboardType.NumberPassword, ImeAction.Done, kind = FieldKind.Code, paste = true)
             error?.let { ErrorText(it) }
             PrimaryButton("Continue", busy, enabled = code.isNotBlank()) { run { verified = client.verifyResetCode(token, code).ifBlank { throw IllegalStateException("That code is not right.") } } }
         }
         else -> {
-            GlassField(password, { password = it }, "New password", KeyboardType.Password, ImeAction.Done, secret = true)
+            GlassField(password, { password = it }, "New password (8 or more characters)", KeyboardType.Password, ImeAction.Done, secret = true, kind = FieldKind.NewPassword)
             error?.let { ErrorText(it) }
             PrimaryButton("Save password", busy, enabled = password.length >= 8) { run { client.resetPassword(verified, password); onDone() } }
         }
@@ -341,43 +366,43 @@ private fun CaptchaImage(base64: String) {
     }
 }
 
+/** What a field holds, for autofill (password managers, Google autofill, SMS codes). */
+enum class FieldKind(val type: ContentType?) {
+    Email(ContentType.EmailAddress), Password(ContentType.Password), NewPassword(ContentType.NewPassword),
+    Name(ContentType.PersonFullName), Phone(ContentType.PhoneNumber), Code(ContentType.SmsOtpCode), Plain(null),
+}
+
 @Composable
 fun GlassField(
     value: String, onChange: (String) -> Unit, label: String, keyboard: KeyboardType, ime: ImeAction,
-    secret: Boolean = false, onDone: (() -> Unit)? = null,
+    secret: Boolean = false, onDone: (() -> Unit)? = null, kind: FieldKind = FieldKind.Plain, paste: Boolean = false,
 ) {
+    val clipboard = LocalClipboardManager.current
     TextField(
-        value = value, onValueChange = onChange, label = { Text(label) }, singleLine = true,
+        value = value, onValueChange = onChange, singleLine = true,
+        // A placeholder, not a floating label: nothing moves inside the field on focus.
+        placeholder = { Text(label, color = Glass.TextDim) },
         visualTransformation = if (secret) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
         keyboardOptions = KeyboardOptions(keyboardType = keyboard, imeAction = ime),
         keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { onDone?.invoke() }),
-        shape = RoundedCornerShape(Glass.Radius - 8.dp),
+        trailingIcon = if (paste) ({
+            TextButton(onClick = { clipboard.getText()?.text?.let(onChange) }) { Text("Paste", color = Color(0xFF7DB4FF)) }
+        }) else null,
+        shape = RoundedCornerShape(Glass.Radius - 2.dp),
         colors = TextFieldDefaults.colors(
-            focusedContainerColor = Glass.FillStrong, unfocusedContainerColor = Glass.Fill,
+            focusedContainerColor = Glass.FillStrong, unfocusedContainerColor = Glass.Fill, disabledContainerColor = Glass.Fill,
             focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
-            focusedTextColor = Glass.Text, unfocusedTextColor = Glass.Text,
-            focusedLabelColor = Glass.TextDim, unfocusedLabelColor = Glass.TextDim, cursorColor = Glass.Cyan,
+            focusedTextColor = Glass.Text, unfocusedTextColor = Glass.Text, cursorColor = Glass.Cyan,
         ),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().height(56.dp).then(
+            if (kind.type != null) Modifier.semantics { contentType = kind.type } else Modifier,
+        ),
     )
 }
 
 @Composable
-fun PrimaryButton(text: String, busy: Boolean, enabled: Boolean = true, onClick: () -> Unit) {
-    Button(
-        onClick = onClick, enabled = enabled && !busy,
-        modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(50),
-        colors = ButtonDefaults.buttonColors(containerColor = Glass.Blue, disabledContainerColor = Glass.Fill),
-    ) {
-        if (busy) CircularProgressIndicator(Modifier.height(20.dp), color = Color.White, strokeWidth = 2.dp)
-        else Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-    }
-}
+fun PrimaryButton(text: String, busy: Boolean, enabled: Boolean = true, onClick: () -> Unit) =
+    GlassButton(text, primary = true, enabled = enabled, busy = busy, onClick = onClick)
 
 @Composable
-fun SecondaryButton(text: String, onClick: () -> Unit) {
-    Button(
-        onClick = onClick, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(50),
-        colors = ButtonDefaults.buttonColors(containerColor = Glass.Fill, contentColor = Color.White),
-    ) { Text(text) }
-}
+fun SecondaryButton(text: String, onClick: () -> Unit) = GlassButton(text, onClick = onClick)

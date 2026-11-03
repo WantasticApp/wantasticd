@@ -98,7 +98,10 @@ fun rememberTiltLight(): State<Offset> {
                 // Tilting right swings the light left, like a window behind you.
                 val target = BASE_LIGHT_ANGLE + (event.values[0] / SensorManager.GRAVITY_EARTH) * 1.1f
                 angle += (target - angle) * 0.12f
-                light.value = Offset(cos(angle), sin(angle))
+                // Only real movement (about 2 degrees) moves the light: sensor jitter
+                // would otherwise rebuild every glass surface many times a second.
+                val shown = atan2(light.value.y, light.value.x)
+                if (kotlin.math.abs(angle - shown) > 0.035f) light.value = Offset(cos(angle), sin(angle))
             }
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
         }
@@ -119,6 +122,8 @@ data class GlassOptics(
     val blur: Dp = 10.dp,
     /** Colour split at the edge, 0..0.3. */
     val dispersion: Float = 0.12f,
+    /** Strength of the soft sheen toward the light; 0 for none. */
+    val sheen: Float = 1f,
 )
 
 /**
@@ -139,6 +144,7 @@ fun Modifier.liquidGlass(
     val glass = rememberGraphicsLayer()
     val lens = remember { if (Build.VERSION.SDK_INT >= 33) Lens() else null }
     var origin by remember { mutableStateOf(Offset.Zero) }
+    val cache = remember { EffectKey() }
     return this
         .onGloballyPositioned { origin = it.positionInRoot() }
         .drawBehind {
@@ -154,17 +160,23 @@ fun Modifier.liquidGlass(
                 }
                 val swell = bulge().coerceIn(0f, 1f)
                 val blur = optics.blur.toPx()
-                val effect = if (Build.VERSION.SDK_INT >= 33 && lens != null) {
-                    lens.effect(
-                        width = size.width, height = size.height, radius = radius,
-                        refraction = optics.refraction.toPx() * (1f + 0.6f * swell),
-                        zone = optics.zone.toPx() * (1f + 0.3f * swell),
-                        dispersion = optics.dispersion, light = l, blur = blur,
-                    )
-                } else {
-                    RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP)
+                val key = listOf(size.width, size.height, radius, (swell * 20).toInt(), (l.x * 50).toInt(), (l.y * 50).toInt(), blur, optics)
+                if (key != cache.key) {
+                    cache.key = key
+                    val effect = if (Build.VERSION.SDK_INT >= 33 && lens != null) {
+                        lens.effect(
+                            width = size.width, height = size.height, radius = radius,
+                            refraction = optics.refraction.toPx() * (1f + 0.6f * swell),
+                            zone = optics.zone.toPx() * (1f + 0.3f * swell),
+                            dispersion = optics.dispersion, light = l, blur = blur, sheen = optics.sheen,
+                        )
+                    } else if (blur >= 0.5f) {
+                        RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP)
+                    } else {
+                        null
+                    }
+                    glass.renderEffect = effect?.asComposeRenderEffect()
                 }
-                glass.renderEffect = effect.asComposeRenderEffect()
                 clipPath(shape) { drawLayer(glass) }
             }
             drawPath(shape, tint)
@@ -183,6 +195,11 @@ fun Modifier.liquidGlass(
         }
 }
 
+/** The inputs the current effect was built from; a new effect only when they change. */
+private class EffectKey {
+    var key: List<Any>? = null
+}
+
 /** The AGSL lens: edge refraction, colour split and a specular rim. */
 @RequiresApi(33)
 private class Lens {
@@ -190,7 +207,7 @@ private class Lens {
 
     fun effect(
         width: Float, height: Float, radius: Float, refraction: Float, zone: Float,
-        dispersion: Float, light: Offset, blur: Float,
+        dispersion: Float, light: Offset, blur: Float, sheen: Float,
     ): RenderEffect {
         shader.setFloatUniform("size", width, height)
         shader.setFloatUniform("radius", radius)
@@ -198,6 +215,7 @@ private class Lens {
         shader.setFloatUniform("zone", zone.coerceAtLeast(1f))
         shader.setFloatUniform("dispersion", dispersion)
         shader.setFloatUniform("light", light.x, light.y)
+        shader.setFloatUniform("sheen", sheen)
         val lensed = RenderEffect.createRuntimeShaderEffect(shader, "content")
         if (blur < 0.5f) return lensed
         // The lens reads the blurred backdrop: chain(outer, inner) runs inner first.
@@ -213,6 +231,7 @@ uniform float refraction;
 uniform float zone;
 uniform float dispersion;
 uniform float2 light;
+uniform float sheen;
 
 float box(float2 p, float2 b, float r) {
     float2 q = abs(p) - b + r;
@@ -246,7 +265,7 @@ half4 main(float2 coord) {
     // Specular: a soft sheen on the side facing the light; no outline.
     float edge = smoothstep(-6.0, 0.0, d) * (1.0 - smoothstep(-1.0, 0.0, d) * 0.6);
     float facing = max(dot(n, light), 0.0);
-    float spec = pow(facing, 3.0) * (0.32 * edge + 0.12 * bend);
+    float spec = sheen * pow(facing, 3.0) * (0.32 * edge + 0.12 * bend);
     c.rgb = c.rgb + half3(spec);
     return c * coverage;
 }

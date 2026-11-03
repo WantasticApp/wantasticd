@@ -11,6 +11,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.platform.LocalContext
 import app.wantastic.android.settings.AppSettings
@@ -80,7 +81,7 @@ object Glass {
     val Cyan = Color(0xFF22D3EE)
     val Green = Color(0xFF34D399)
     /** One corner radius for every surface, as in Apple's apps. */
-    val Radius = 24.dp
+    val Radius = 14.dp
     val CardShape = RoundedCornerShape(Radius)
 }
 
@@ -89,9 +90,18 @@ object Glass {
 fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
     val context = LocalContext.current
     val motion by remember { AppSettings.get(context) }.motion.collectAsState()
-    val drift = rememberInfiniteTransition(label = "drift")
-    val moving by drift.animateFloat(0f, 1f, infiniteRepeatable(tween(18_000, easing = LinearEasing), RepeatMode.Reverse), label = "t")
-    val t = if (motion) moving else 0.35f
+    // The light drifts over 18 s; 20 steps a second look smooth at that pace and
+    // keep every glass surface from redrawing at the display's full rate.
+    var t by remember { mutableStateOf(0.35f) }
+    LaunchedEffect(motion) {
+        if (!motion) { t = 0.35f; return@LaunchedEffect }
+        val start = System.nanoTime()
+        while (true) {
+            val phase = ((System.nanoTime() - start) / 1e9f / 18f) % 2f
+            t = if (phase < 1f) phase else 2f - phase
+            delay(50)
+        }
+    }
     val light = rememberBackdrop()
     val tilt = if (motion) rememberTiltLight() else remember { mutableStateOf(Offset(-0.42f, -0.91f)) }
     Box(Modifier.fillMaxSize().background(Glass.Ink)) {
@@ -138,7 +148,7 @@ fun GlassCard(
     Column(
         modifier
             .graphicsLayer { scaleX = 1f + 0.02f * swell; scaleY = 1f + 0.02f * swell }
-            .liquidGlass(corner, Brush.verticalGradient(listOf(Color(0x24FFFFFF), Color(0x0DFFFFFF))), bulge = { swell })
+            .liquidGlass(corner, Brush.verticalGradient(listOf(Color(0x24FFFFFF), Color(0x0DFFFFFF))), GlassOptics(blur = 0.dp), bulge = { swell })
             .clip(shape)
             .drawBehind {
                 if (swell > 0.01f && touch.isSpecified) {
@@ -161,8 +171,12 @@ fun ConnectOrb(on: Boolean, busy: Boolean, enabled: Boolean, label: String, onCl
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val press by animateFloatAsState(if (pressed) 0.92f else 1f, spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessLow), label = "orb")
-    val breathe = rememberInfiniteTransition(label = "breathe")
-    val pulse by breathe.animateFloat(0.9f, 1.08f, infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "pulse")
+    // The halo breathes only while connected or connecting; idle, nothing redraws.
+    var pulse by remember { mutableStateOf(1f) }
+    LaunchedEffect(on || busy) {
+        if (!(on || busy)) { pulse = 1f; return@LaunchedEffect }
+        androidx.compose.animation.core.animate(0.9f, 1.08f, animationSpec = infiniteRepeatable(tween(2200, easing = FastOutSlowInEasing), RepeatMode.Reverse)) { v, _ -> pulse = v }
+    }
     val glow by animateFloatAsState(if (on) 1f else 0f, spring(stiffness = Spring.StiffnessVeryLow), label = "glow")
     Box(Modifier.size(220.dp), contentAlignment = Alignment.Center) {
         // Halo
@@ -179,7 +193,7 @@ fun ConnectOrb(on: Boolean, busy: Boolean, enabled: Boolean, label: String, onCl
                 .liquidGlass(
                     82.dp,
                     Brush.linearGradient(listOf(Glass.Blue.copy(alpha = 0.08f + 0.8f * glow), Glass.Cyan.copy(alpha = 0.06f + 0.75f * glow))),
-                    GlassOptics(refraction = 28.dp, zone = 64.dp, blur = 4.dp, dispersion = 0.22f),
+                    GlassOptics(refraction = 28.dp, zone = 64.dp, blur = 0.dp, dispersion = 0.22f),
                     bulge = { (1f - press) / 0.08f },
                 )
                 .clip(CircleShape)
@@ -225,7 +239,7 @@ fun GlassPillNav(items: List<PillItem>, selected: Int, onSelect: (Int) -> Unit, 
     val stretch = ((right.value - left.value) / itemWidth - 1f).coerceAtLeast(0f)
     Box(
         modifier
-            .liquidGlass(40.dp, Brush.verticalGradient(listOf(Color(0x1FFFFFFF), Color(0x0FFFFFFF))), GlassOptics(refraction = 14.dp, zone = 26.dp, blur = 14.dp), sources = sources)
+            .liquidGlass(26.dp, Brush.verticalGradient(listOf(Color(0x1FFFFFFF), Color(0x0FFFFFFF))), GlassOptics(refraction = 14.dp, zone = 22.dp, blur = 14.dp, sheen = 0.5f), sources = sources)
             .padding(6.dp),
     ) {
         Box(
@@ -233,10 +247,9 @@ fun GlassPillNav(items: List<PillItem>, selected: Int, onSelect: (Int) -> Unit, 
                 .offset(x = left.value.dp)
                 .width((right.value - left.value).dp)
                 .height(56.dp)
-                .graphicsLayer { scaleY = 1f - 0.12f * stretch.coerceAtMost(1f) }
                 .liquidGlass(
-                    30.dp, Brush.verticalGradient(listOf(Color(0x33FFFFFF), Color(0x1AFFFFFF))),
-                    GlassOptics(refraction = 18.dp, zone = 28.dp, blur = 2.dp, dispersion = 0.25f),
+                    20.dp, Brush.verticalGradient(listOf(Color(0x33FFFFFF), Color(0x1AFFFFFF))),
+                    GlassOptics(refraction = 14.dp, zone = 20.dp, blur = 2.dp, dispersion = 0.06f, sheen = 0f),
                     sources = sources, bulge = { stretch },
                 ),
         )
@@ -247,7 +260,7 @@ fun GlassPillNav(items: List<PillItem>, selected: Int, onSelect: (Int) -> Unit, 
                     Modifier
                         .width(itemWidth.dp)
                         .height(56.dp)
-                        .clip(RoundedCornerShape(30.dp))
+                        .clip(RoundedCornerShape(20.dp))
                         .clickable(remember { MutableInteractionSource() }, indication = null, role = Role.Tab) {
                             if (i != selected) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             onSelect(i)
@@ -263,10 +276,57 @@ fun GlassPillNav(items: List<PillItem>, selected: Int, onSelect: (Int) -> Unit, 
     }
 }
 
+/** A liquid glass button: the app's one button. [primary] is tinted blue. */
+@Composable
+fun GlassButton(text: String, primary: Boolean = false, enabled: Boolean = true, busy: Boolean = false, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val swell by animateFloatAsState(if (pressed) 1f else 0f, spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMediumLow), label = "swell")
+    val tint = when {
+        !enabled -> Brush.verticalGradient(listOf(Color(0x14FFFFFF), Color(0x0AFFFFFF)))
+        primary -> Brush.verticalGradient(listOf(Glass.Blue.copy(alpha = 0.92f), Glass.Blue.copy(alpha = 0.78f)))
+        else -> Brush.verticalGradient(listOf(Color(0x2EFFFFFF), Color(0x14FFFFFF)))
+    }
+    Box(
+        Modifier.fillMaxWidth().height(52.dp)
+            .graphicsLayer { scaleX = 1f + 0.02f * swell; scaleY = 1f + 0.02f * swell }
+            .liquidGlass(Glass.Radius, tint, GlassOptics(refraction = 8.dp, zone = 14.dp, blur = 0.dp, sheen = 0.6f), bulge = { swell })
+            .clip(RoundedCornerShape(Glass.Radius))
+            .clickable(interaction, indication = null, enabled = enabled && !busy, role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (busy) androidx.compose.material3.CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+        else Text(text, color = if (enabled) Color.White else Glass.TextDim, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** A glass segmented control; the selection slides between segments. */
+@Composable
+fun GlassSegments(labels: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+    val x by animateFloatAsState(selected.toFloat(), spring(Spring.DampingRatioLowBouncy, Spring.StiffnessMediumLow), label = "segment")
+    androidx.compose.foundation.layout.BoxWithConstraints(
+        Modifier.fillMaxWidth().height(40.dp)
+            .liquidGlass(Glass.Radius - 4.dp, Brush.verticalGradient(listOf(Color(0x1FFFFFFF), Color(0x0FFFFFFF))), GlassOptics(blur = 0.dp, sheen = 0f))
+            .padding(3.dp),
+    ) {
+        val w = maxWidth / labels.size
+        Box(Modifier.offset(x = w * x).width(w).fillMaxSize().clip(RoundedCornerShape(Glass.Radius - 6.dp)).background(Glass.FillStrong))
+        Row(Modifier.fillMaxSize()) {
+            labels.forEachIndexed { i, label ->
+                Box(
+                    Modifier.width(w).fillMaxSize().clip(RoundedCornerShape(Glass.Radius - 6.dp))
+                        .clickable(remember { MutableInteractionSource() }, indication = null, role = Role.Tab) { onSelect(i) },
+                    contentAlignment = Alignment.Center,
+                ) { Text(label, color = if (i == selected) Glass.Text else Glass.TextDim, fontSize = 14.sp, fontWeight = FontWeight.Medium) }
+            }
+        }
+    }
+}
+
 @Composable
 fun GlassTitle(text: String, subtitle: String? = null) {
     Column(Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 12.dp)) {
-        Text(text, color = Glass.Text, fontSize = 34.sp, fontWeight = FontWeight.Bold)
+        Text(text, color = Glass.Text, fontSize = 34.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.9).sp)
         if (subtitle != null) Text(subtitle, color = Glass.TextDim, fontSize = 15.sp)
     }
 }

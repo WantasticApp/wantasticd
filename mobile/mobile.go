@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"wantastic-agent/internal/auth"
+	"wantastic-agent/internal/config"
 )
 
 // Init points the engine's identity and state files at the app's private
@@ -54,6 +55,28 @@ func WaitClaim(server, publicKey string, timeoutSeconds int) (string, error) {
 		return "", nil
 	}
 	out, err := json.Marshal(claim)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// ConfigFromClaim builds the agent config from the console's approval and
+// this phone's key pair, as the desktop agent does after its claim.
+func ConfigFromClaim(server, privateKey, publicKey, claimJSON string) (string, error) {
+	var claim auth.ClaimConfig
+	if err := json.Unmarshal([]byte(claimJSON), &claim); err != nil {
+		return "", err
+	}
+	cfg, err := config.LoadFromClaimConfig(server, privateKey, publicKey, &claim)
+	if err != nil {
+		return "", err
+	}
+	return marshal(cfg)
+}
+
+func marshal(cfg *config.Config) (string, error) {
+	out, err := json.Marshal(cfg)
 	if err != nil {
 		return "", err
 	}

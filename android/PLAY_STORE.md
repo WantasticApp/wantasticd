@@ -51,6 +51,32 @@ a "Delete account" row under Settings → Account pointing at it.
    tablet screenshots, short and full description, privacy policy URL
    `https://console.wantastic.app/privacy`.
 
+## Passkeys on Android
+
+The app signs in with passkeys through Credential Manager. Two things
+outside the app make it work:
+
+1. The hub accepts the app's origin
+   `android:apk-key-hash:o7Y7pQxibSNPp22zdPHtECiDboGWjMatYO6UDFN0984`
+   (ISPApp-TunnelHub `internal/passkey/passkey.go`; ships with the next hub
+   deploy). Add the Play app-signing key's hash there after enrolment.
+2. The landing site (Next.js, wantastic.app) serves
+   `https://wantastic.app/.well-known/assetlinks.json` as
+   `application/json`:
+
+```json
+[{
+  "relation": ["delegate_permission/common.handle_all_urls", "delegate_permission/common.get_login_creds"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "app.wantastic.android",
+    "sha256_cert_fingerprints": ["A3:B6:3B:A5:0C:62:6D:23:4F:A7:6D:B3:74:F1:ED:10:28:83:6E:81:96:8C:C6:AD:60:EE:94:0C:53:74:F7:CE"]
+  }
+}]
+```
+
+   Add the Play app-signing fingerprint to the list after enrolment.
+
 ## Data safety form (from the code)
 
 | Data | Collected | Why | Optional |

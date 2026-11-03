@@ -12,7 +12,47 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /** One account signed in on this phone (the console's account jar). */
-data class Account(val slot: Int, val email: String, val name: String, val active: Boolean, val needsReauth: Boolean)
+/** [slot] is the console's account id (a random string, not a number). */
+data class Account(val slot: String, val email: String, val name: String, val active: Boolean, val needsReauth: Boolean)
+
+/**
+ * An onboarding key (enrollment token): a device installed with it joins the
+ * account by itself. Times are milliseconds; 0 means never / not set.
+ */
+data class OnboardingKey(
+    val id: String, val name: String, val token: String,
+    val maxUses: Int, val usageCount: Int, val expiresAtMs: Long, val createdAtMs: Long,
+) {
+    /** Enrollments left, or null when unlimited. */
+    val remaining: Int? get() = if (maxUses > 0) maxOf(0, maxUses - usageCount) else null
+
+    fun usable(now: Long = System.currentTimeMillis()): Boolean =
+        token.isNotBlank() && (expiresAtMs == 0L || expiresAtMs > now) && remaining != 0
+
+    companion object {
+        fun from(o: JSONObject) = OnboardingKey(
+            id = o.optString("id"), name = o.optString("name"), token = o.optString("token"),
+            maxUses = o.optInt("max_uses", o.optInt("maxUses")),
+            usageCount = o.optInt("usage_count", o.optInt("usageCount")),
+            expiresAtMs = timestampMs(o.opt("expires_at") ?: o.opt("expiresAt")),
+            createdAtMs = timestampMs(o.opt("created_at") ?: o.opt("createdAt")),
+        )
+
+        /**
+         * A protobuf timestamp as JSON: an RFC 3339 string or {seconds, nanos}.
+         * Go's zero time (year 1) means "never".
+         */
+        internal fun timestampMs(v: Any?): Long {
+            val ms = when (v) {
+                is String -> runCatching { java.time.Instant.parse(v).toEpochMilli() }.getOrDefault(0L)
+                is JSONObject -> v.optLong("seconds") * 1000 + v.optLong("nanos") / 1_000_000
+                is Number -> v.toLong().let { if (it < 1_000_000_000_000L) it * 1000 else it }
+                else -> 0L
+            }
+            return if (ms > 0) ms else 0L
+        }
+    }
+}
 
 /** Where a sign-in stands; each step asks for exactly one thing. */
 sealed interface SignIn {
@@ -83,7 +123,7 @@ class AccountClient(val origin: String, private val fingerprint: String) {
         val r = get("/api/accounts")
         val arr = r.optJSONArray("accounts") ?: JSONArray()
         return (0 until arr.length()).map { arr.getJSONObject(it) }.map {
-            Account(it.optInt("slot"), it.optString("email"), it.optString("name"), it.optBoolean("active"), it.optBoolean("needs_reauth"))
+            Account(it.optString("slot"), it.optString("email"), it.optString("name"), it.optBoolean("active"), it.optBoolean("needs_reauth"))
         }.sortedByDescending { it.active }
     }
 
@@ -93,8 +133,14 @@ class AccountClient(val origin: String, private val fingerprint: String) {
         return r.optString("tenant_id").takeIf { r.optBoolean("authenticated") && it.isNotBlank() }
     }
 
-    suspend fun switchTo(slot: Int) {
+    suspend fun switchTo(slot: String) {
         post("/api/accounts/switch", JSONObject().put("slot", slot))
+        socket.reset()
+    }
+
+    /** Removes one account from this phone; the next one becomes active if it was. */
+    suspend fun removeAccount(slot: String) {
+        post("/api/accounts/remove", JSONObject().put("slot", slot))
         socket.reset()
     }
 
@@ -120,6 +166,22 @@ class AccountClient(val origin: String, private val fingerprint: String) {
     /** The active account's devices (the console's Devices list). */
     suspend fun peers(): JSONArray =
         socket.call("TenantPeerService", "ListTenantPeers", JSONObject().put("tenant_id", "")).optJSONArray("peers") ?: JSONArray()
+
+    /** The account's onboarding keys (the console's Onboarding keys), newest first. */
+    suspend fun onboardingKeys(): List<OnboardingKey> {
+        val arr = socket.call("TenantPortalService", "ListEnrollmentTokens", JSONObject().put("tenant_id", ""))
+            .optJSONArray("tokens") ?: JSONArray()
+        return (0 until arr.length()).map { OnboardingKey.from(arr.getJSONObject(it)) }.sortedByDescending { it.createdAtMs }
+    }
+
+    /** Creates an onboarding key; [days] 0 never expires, [maxUses] 0 is unlimited. */
+    suspend fun createOnboardingKey(name: String, days: Int, maxUses: Int): OnboardingKey {
+        val r = socket.call(
+            "TenantPortalService", "CreateEnrollmentToken",
+            JSONObject().put("tenant_id", "").put("name", name).put("expires_in_days", days).put("max_uses", maxUses),
+        )
+        return OnboardingKey.from(r.optJSONObject("token") ?: throw IOException("The key was not created"))
+    }
 
     // Password reset: email -> code by text message -> new password.
     suspend fun requestReset(email: String): JSONObject =

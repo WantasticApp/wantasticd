@@ -111,8 +111,13 @@ class AccountSync(val client: AccountClient, private val setups: DeviceSetups, p
         state.value = s.copy(needsSetup = false)
     }
 
-    suspend fun switchTo(slot: Int) {
+    suspend fun switchTo(slot: String) {
         client.switchTo(slot)
+        sync()
+    }
+
+    suspend fun remove(slot: String) {
+        client.removeAccount(slot)
         sync()
     }
 

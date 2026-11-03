@@ -75,6 +75,7 @@ import app.wantastic.android.account.AccountState
 import app.wantastic.android.account.AccountSync
 import app.wantastic.android.account.DeviceSetups
 import app.wantastic.android.ui.AccountCard
+import app.wantastic.android.ui.HomeAccountCard
 import app.wantastic.android.ui.AddThisPhoneScreen
 import app.wantastic.android.ui.AuthScreen
 import app.wantastic.android.ui.ClaimByLinkScreen
@@ -185,6 +186,9 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
     var browser by remember { mutableStateOf<ConsoleWebHolder?>(null) }
     // An SSH terminal on a peer (address, name).
     var terminal by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // "Add a device": an onboarding key as a QR code and install command.
+    var addDevice by rememberSaveable { mutableStateOf(false) }
+    BackHandler(enabled = addDevice) { addDevice = false }
     fun openConsole(url: String? = null) {
         val holder = console ?: ConsoleWebHolder(context, url ?: ClaimLink.DEFAULT_SERVER).also { console = it }
         if (url != null && holder.url != url) holder.open(url)
@@ -222,6 +226,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
                 onConsole = { path -> openConsole(ClaimLink.DEFAULT_SERVER + path) },
                 onBrowse = { url -> browser = ConsoleWebHolder(context, url) },
                 onTerminal = { ip, name -> terminal = ip to name },
+                onAddDevice = { addDevice = true },
             )
             byLink -> ClaimByLinkScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onBack = { byLink = false })
             account == AccountState.Checking -> Unit
@@ -252,6 +257,13 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
         ) {
             terminal?.let { (ip, name) -> app.wantastic.android.ui.TerminalScreen(ip, name, onClose = { terminal = null }) }
         }
+        AnimatedVisibility(
+            visible = addDevice,
+            enter = slideInVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow)) { it } + fadeIn(),
+            exit = slideOutVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMedium)) { it } + fadeOut(),
+        ) {
+            GlassBackground { app.wantastic.android.ui.AddDeviceScreen(sync.client, deviceName, onClose = { addDevice = false }) }
+        }
     }
 }
 
@@ -259,7 +271,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
 private fun BoxScope.Tabs(
     status: EngineStatus, sync: AccountSync, account: AccountState, deviceName: String, publicKey: String,
     onConnect: () -> Unit, onLogIn: () -> Unit, onAddAccount: () -> Unit, onConsole: (String) -> Unit,
-    onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit,
+    onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit, onAddDevice: () -> Unit,
 ) {
     val engine = Engines.current
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
@@ -281,12 +293,18 @@ private fun BoxScope.Tabs(
                     onToggle = { if (status.tunnel is TunnelState.Connected) engine.disconnect() else onConnect() },
                     onLogIn = onLogIn,
                     onExitNode = { exitOpen = true },
-                )
+                ) {
+                    HomeAccountCard(
+                        sync, account, onSignIn = onLogIn, onAddAccount = onAddAccount,
+                        // A ready setup for the new account: connect on it now.
+                        onSwitched = { if ((sync.account.value as? AccountState.SignedIn)?.needsSetup == false) engine.reconnect() },
+                    )
+                }
                 Tab.Peers -> {
                     val devices by sync.devices.collectAsStateWithLifecycle()
                     PeersScreen(
                         status, devices, account is AccountState.SignedIn, onRefresh = sync::refreshDevices, onSignIn = onAddAccount,
-                        onPing = engine::ping, onBrowse = onBrowse, onTerminal = onTerminal,
+                        onPing = engine::ping, onBrowse = onBrowse, onTerminal = onTerminal, onAddDevice = onAddDevice,
                     )
                 }
                 Tab.Settings -> SettingsScreen(deviceName, publicKey, onConsole = onConsole) {

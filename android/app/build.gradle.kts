@@ -130,4 +130,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
 
     testImplementation("junit:junit:4.13.2")
+    // The real org.json: Android's is a stub in plain JVM unit tests.
+    testImplementation("org.json:json:20240303")
 }

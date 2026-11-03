@@ -77,7 +77,10 @@ val NavClearance = PaddingValues(bottom = 104.dp)
 private fun Dim(text: String, size: Int = 13) = Text(text, color = Glass.TextDim, fontSize = size.sp)
 
 @Composable
-fun HomeScreen(status: EngineStatus, deviceName: String, onToggle: () -> Unit, onLogIn: () -> Unit, onExitNode: () -> Unit) {
+fun HomeScreen(
+    status: EngineStatus, deviceName: String, onToggle: () -> Unit, onLogIn: () -> Unit, onExitNode: () -> Unit,
+    accountCard: @Composable () -> Unit,
+) {
     val tunnel = status.tunnel
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(NavClearance).padding(horizontal = 20.dp),
@@ -127,6 +130,7 @@ fun HomeScreen(status: EngineStatus, deviceName: String, onToggle: () -> Unit, o
                 Text("›", color = Glass.TextDim, fontSize = 26.sp)
             }
         }
+        accountCard()
     }
 }
 
@@ -189,6 +193,7 @@ private fun rate(bits: Long): String = when {
 fun PeersScreen(
     status: EngineStatus, devices: List<Peer>, signedIn: Boolean, onRefresh: suspend () -> Unit, onSignIn: () -> Unit,
     onPing: suspend (String) -> String, onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit,
+    onAddDevice: () -> Unit,
 ) {
     LaunchedEffect(Unit) { onRefresh() }
     // Live peers once the tunnel knows other devices; until then the account's devices (and the hub).
@@ -203,6 +208,11 @@ fun PeersScreen(
                 else -> null
             },
         )
+        if (signedIn) {
+            Column(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 10.dp)) {
+                GlassButton("Add a device", primary = true, onClick = onAddDevice)
+            }
+        }
         if (list.isEmpty()) {
             GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp), onClick = if (signedIn) null else onSignIn) {
                 Text(

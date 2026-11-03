@@ -132,6 +132,18 @@ class GoEngine private constructor(private val context: Context, private val set
         }
     }
 
+    override fun reconnect() {
+        val svc = service ?: return
+        if (state.value.tunnel !is TunnelState.Connected) return
+        routeJob?.cancel()
+        routeJob = scope.launch {
+            Log.i(TAG, "reconnecting on the active setup")
+            poller?.cancel()
+            runCatching { Mobile.stop() }
+            startIn(svc, server)
+        }
+    }
+
     fun stop() {
         routeJob?.cancel()
         poller?.cancel()

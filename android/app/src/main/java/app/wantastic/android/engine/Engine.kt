@@ -63,6 +63,8 @@ interface Engine {
     fun offerExit(on: Boolean)
     /** Pings a peer through the tunnel; a short line for the person ("4/4 · 23 ms"). */
     suspend fun ping(ip: String): String = "Not connected"
+    /** Restarts a running tunnel on the active setup (after an account switch). */
+    fun reconnect() = Unit
 }
 
 /** Stands in until the engine lands: everything reports "not available". */

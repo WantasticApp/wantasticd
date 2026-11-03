@@ -101,12 +101,12 @@ fun ClaimByLinkScreen(claimUrl: String, onLogIn: () -> Unit, onBack: () -> Unit)
     }
 }
 
-private fun copy(context: Context, text: String) {
+internal fun copy(context: Context, text: String, label: String = "Wantastic claim link") {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    clipboard.setPrimaryClip(ClipData.newPlainText("Wantastic claim link", text))
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
 }
 
-private fun qrBitmap(text: String, size: Int): Bitmap {
+internal fun qrBitmap(text: String, size: Int): Bitmap {
     val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
     val pixels = IntArray(size * size) { i ->
         if (matrix.get(i % size, i / size)) 0xFF0B1226.toInt() else 0xFFFFFFFF.toInt()

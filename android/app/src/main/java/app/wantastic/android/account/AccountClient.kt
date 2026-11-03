@@ -44,12 +44,22 @@ data class OnboardingKey(
          */
         internal fun timestampMs(v: Any?): Long {
             val ms = when (v) {
-                is String -> runCatching { java.time.Instant.parse(v).toEpochMilli() }.getOrDefault(0L)
+                is String -> rfc3339Ms(v)
                 is JSONObject -> v.optLong("seconds") * 1000 + v.optLong("nanos") / 1_000_000
                 is Number -> v.toLong().let { if (it < 1_000_000_000_000L) it * 1000 else it }
                 else -> 0L
             }
             return if (ms > 0) ms else 0L
+        }
+
+        /** "2026-11-03T21:00:00.123Z" (or with an offset) to milliseconds; 0 if unreadable. Android 7 has no java.time. */
+        private fun rfc3339Ms(s: String): Long {
+            val m = Regex("""^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$""").find(s.trim()) ?: return 0L
+            val zone = m.groupValues[3].let { if (it == "Z") "+00:00" else it }
+            val f = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", java.util.Locale.US)
+            val base = runCatching { f.parse(m.groupValues[1] + zone)?.time }.getOrNull() ?: return 0L
+            val frac = m.groupValues[2].drop(1).padEnd(3, '0').take(3).toIntOrNull() ?: 0
+            return base + frac
         }
     }
 }

@@ -360,3 +360,42 @@ func pngToICO(pngData []byte, size int) []byte {
 	buf.Write(pngData)
 	return buf.Bytes()
 }
+
+// trashIconPNG draws a small bin (lid, handle, tapered body) for menus that
+// show it as an item image.
+func trashIconPNG(size int) []byte {
+	img := image.NewNRGBA(image.Rect(0, 0, size, size))
+	fill := color.NRGBA{0x6b, 0x72, 0x80, 0xff}
+	body := [][2]float64{{0.22, 0.32}, {0.78, 0.32}, {0.71, 0.92}, {0.29, 0.92}}
+	in := func(x, y float64) bool {
+		switch {
+		case y >= 0.18 && y <= 0.26 && x >= 0.12 && x <= 0.88: // lid
+			return true
+		case y >= 0.08 && y < 0.18 && x >= 0.38 && x <= 0.62: // handle
+			return true
+		case insidePolygon(x, y, body):
+			// two slots, so it reads as a bin at 16 px
+			return !(y > 0.42 && y < 0.82 && ((x > 0.40 && x < 0.45) || (x > 0.55 && x < 0.60)))
+		}
+		return false
+	}
+	const ss = 4
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			n := 0
+			for sy := 0; sy < ss; sy++ {
+				for sx := 0; sx < ss; sx++ {
+					if in((float64(x)+(float64(sx)+0.5)/ss)/float64(size), (float64(y)+(float64(sy)+0.5)/ss)/float64(size)) {
+						n++
+					}
+				}
+			}
+			if n > 0 {
+				img.SetNRGBA(x, y, color.NRGBA{fill.R, fill.G, fill.B, uint8(n * 255 / (ss * ss))})
+			}
+		}
+	}
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
+}

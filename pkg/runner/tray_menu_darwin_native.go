@@ -12,6 +12,7 @@ package runner
 
 extern void wantasticMenuOpened(int menuId);
 extern void wantasticMenuClosed(int menuId);
+extern void wantasticMenuTrash(int menuId);
 
 // Rows with a view do not get AppKit's own drawing, so these follow the
 // system menu: selection inset and corner radius, title column, row height.
@@ -23,6 +24,9 @@ static const CGFloat wtTitleX     = 30.5;
 static const CGFloat wtTitleRight = 14;
 static const CGFloat wtSwitchW    = 26;
 static const CGFloat wtSwitchH    = 15;
+// The bin on removable rows, and the strip at the right edge that hits it.
+static const CGFloat wtTrashSize  = 13;
+static const CGFloat wtTrashHit   = 28;
 
 // WTKeepOpenView stands in for a menu item's own drawing so a click runs
 // the item's action and the menu stays open: an ordinary NSMenuItem always
@@ -34,6 +38,9 @@ static const CGFloat wtSwitchH    = 15;
 // isSwitch draws the item's on/off state as a switch at the right edge
 // instead of a checkmark.
 @property (nonatomic) BOOL isSwitch;
+// trash draws a bin at the right edge whose click calls wantasticMenuTrash
+// instead of the item's action: 1 shows it, 2 shows it armed (red, filled).
+@property (nonatomic) int trash;
 @property (nonatomic, copy) NSString *drawn;
 @end
 
@@ -54,7 +61,15 @@ static const CGFloat wtSwitchH    = 15;
 
 - (void)mouseUp:(NSEvent *)event {
 	NSMenuItem *item = self.enclosingMenuItem;
-	if (item == nil || !item.isEnabled || item.action == nil) return;
+	if (item == nil) return;
+	if (self.trash > 0) {
+		NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+		if (p.x >= NSWidth(self.bounds) - wtTrashHit) {
+			wantasticMenuTrash((int)item.tag);
+			return;
+		}
+	}
+	if (!item.isEnabled || item.action == nil) return;
 	[NSApp sendAction:item.action to:item.target from:item];
 }
 
@@ -67,12 +82,13 @@ static const CGFloat wtSwitchH    = 15;
 - (void)sync {
 	NSMenuItem *item = self.enclosingMenuItem;
 	if (item == nil) return;
-	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%p", item.title, item.isEnabled, (long)item.state, item.isHighlighted, self.image];
+	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%p|%d", item.title, item.isEnabled, (long)item.state, item.isHighlighted, self.image, self.trash];
 	if (![key isEqualToString:self.drawn]) {
 		self.drawn = key;
 		self.toolTip = item.toolTip;
 		CGFloat w = ceil([item.title sizeWithAttributes:@{NSFontAttributeName: [self titleFont]}].width) + wtTitleX + wtTitleRight;
 		if (self.isSwitch) w += wtSwitchW + 12;
+		if (self.trash > 0) w += wtTrashHit;
 		CGFloat h = wtRowHeight;
 		if (self.image != nil) {
 			h += self.image.size.height + 8;
@@ -118,6 +134,20 @@ static const CGFloat wtSwitchH    = 15;
 		right += wtSwitchW + 12;
 	} else if (item.state == NSControlStateValueOn) {
 		[@"✓" drawAtPoint:NSMakePoint(wtStateX, y) withAttributes:attrs];
+	}
+	if (self.trash > 0) {
+		BOOL armed = self.trash == 2;
+		NSImage *bin = [NSImage imageWithSystemSymbolName:(armed ? @"trash.fill" : @"trash") accessibilityDescription:@"Remove"];
+		NSColor *tint = armed ? [NSColor systemRedColor] : selected ? [NSColor selectedMenuItemTextColor] : [NSColor secondaryLabelColor];
+		if (bin != nil) {
+			NSImageSymbolConfiguration *conf = [NSImageSymbolConfiguration configurationWithPointSize:wtTrashSize weight:NSFontWeightRegular];
+			if (@available(macOS 12.0, *)) conf = [conf configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:tint]];
+			bin = [bin imageWithSymbolConfiguration:conf];
+			NSSize sz = bin.size;
+			NSRect r = NSMakeRect(NSWidth(self.bounds) - wtTitleRight - sz.width, floor((wtRowHeight - sz.height) / 2), sz.width, sz.height);
+			[bin drawInRect:r];
+		}
+		right += wtTrashSize + 10; // the title never runs under the bin
 	}
 	[item.title drawInRect:NSMakeRect(wtTitleX, y, NSWidth(self.bounds) - wtTitleX - right, h) withAttributes:attrs];
 }
@@ -220,6 +250,26 @@ void wtKeepOpen(int menuId, int asSwitch) {
 			[wtViews addObject:v];
 		}
 		if (asSwitch) v.isSwitch = YES;
+		v.drawn = nil;
+		[v sync];
+	});
+}
+
+// wtSetTrash shows (1), arms (2) or hides (0) the bin on an item's row.
+void wtSetTrash(int menuId, int mode) {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		wtInit();
+		NSMenu *root = wtRootMenu();
+		NSMenuItem *item = root ? wtFind(root, menuId) : nil;
+		if (item == nil || item.hasSubmenu) return;
+		WTKeepOpenView *v = (WTKeepOpenView *)item.view;
+		if (![v isKindOfClass:[WTKeepOpenView class]]) {
+			if (mode == 0) return;
+			v = [[WTKeepOpenView alloc] init];
+			item.view = v;
+			[wtViews addObject:v];
+		}
+		v.trash = mode;
 		v.drawn = nil;
 		[v sync];
 	});

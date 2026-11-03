@@ -17,6 +17,10 @@ import (
 // menu is closed (it is read on every refresh while open).
 const trayAccountsEvery = 10 * time.Second
 
+// trayRemoveConfirm is how long the first click on an account's bin waits
+// for the second one that removes it.
+const trayRemoveConfirm = 5 * time.Second
+
 // trayAccountMenu is the "Account" submenu: the accounts on this device,
 // the active one checked, a click switches; "Add another account…" shows
 // the new account's claim QR code.
@@ -26,27 +30,39 @@ type trayAccountMenu struct {
 	qr    *systray.MenuItem
 	empty *systray.MenuItem
 
-	mu       sync.Mutex
-	rows     []*systray.MenuItem
-	ids      []string
-	claims   []string // claim link of a pending row
-	pending  map[string]string
-	claimURL string // the QR's link
-	qrFor    string
-	lastRead time.Time
+	mu      sync.Mutex
+	rows    []*systray.MenuItem
+	ids     []string
+	claims  []string // claim link of a pending row
+	pending map[string]string
+	armed   map[string]time.Time // first click on an account's bin
+	last    []accounts.Account
+
+	// Without a bin on each row (Windows, Linux): "Remove an account" lists
+	// the removable accounts.
+	removeRoot *systray.MenuItem
+	removeRows []*systray.MenuItem
+	removeIDs  []string
+	claimURL   string // the QR's link
+	qrFor      string
+	lastRead   time.Time
 
 	report   func(okText, notice string, err error)
 	onChange func()
 }
 
 func newTrayAccountMenu() *trayAccountMenu {
-	m := &trayAccountMenu{pending: map[string]string{}}
+	m := &trayAccountMenu{pending: map[string]string{}, armed: map[string]time.Time{}}
 	m.root = systray.AddMenuItem("Account", "Accounts this device belongs to; click one to switch")
 	m.empty = m.root.AddSubMenuItem("This device is in one account", "")
 	m.empty.Disable()
 	m.add = m.root.AddSubMenuItem("Add another account…", "Add this device to another Wantastic account with a claim link")
 	m.qr = m.root.AddSubMenuItem("Scan to add the account", "Scan with a phone signed in to the other account, or click to open the link here")
 	m.qr.Hide()
+	if !rowsCarryTrash() {
+		m.removeRoot = m.root.AddSubMenuItem("Remove an account", "Remove an account from this device; it stays in its console")
+		m.removeRoot.Hide()
+	}
 	keepMenuOpen(m.add)
 	go m.watchAdd()
 	go func() {
@@ -136,6 +152,7 @@ func (m *trayAccountMenu) refresh(force bool) {
 func (m *trayAccountMenu) apply(list []accounts.Account) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.last = list
 	active := "—"
 	stillPending := false
 	for _, a := range list {
@@ -169,6 +186,7 @@ func (m *trayAccountMenu) apply(list []accounts.Account) {
 	for i, row := range m.rows {
 		if i >= len(list) || len(list) <= 1 {
 			m.ids[i] = ""
+			menuTrash(row, false, false, nil)
 			row.Hide()
 			continue
 		}
@@ -183,6 +201,9 @@ func (m *trayAccountMenu) apply(list []accounts.Account) {
 		case a.Address != "":
 			title += " · " + a.Address
 		}
+		if m.isArmed(a.ID) && rowsCarryTrash() {
+			title = a.Name + " · click the bin again to remove"
+		}
 		setTitle(row, title)
 		setChecked(row, a.Active)
 		if a.Pending {
@@ -190,8 +211,119 @@ func (m *trayAccountMenu) apply(list []accounts.Account) {
 		} else {
 			setTooltip(row, "Switch to "+a.Name+"; the VPN reconnects")
 		}
+		// The account in use cannot be removed: switch away first.
+		id := a.ID
+		menuTrash(row, !a.Active && m.pending[id] == "", m.isArmed(id), func() { m.trash(id) })
 		row.Show()
 	}
+	m.applyRemoveList(list)
+}
+
+// applyRemoveList fills "Remove an account" where rows have no bin. m.mu held.
+func (m *trayAccountMenu) applyRemoveList(list []accounts.Account) {
+	if m.removeRoot == nil {
+		return
+	}
+	var removable []accounts.Account
+	if len(list) > 1 {
+		for _, a := range list {
+			if !a.Active {
+				removable = append(removable, a)
+			}
+		}
+	}
+	if len(removable) == 0 {
+		m.removeRoot.Hide()
+		return
+	}
+	for len(m.removeRows) < len(removable) {
+		idx := len(m.removeRows)
+		row := m.removeRoot.AddSubMenuItem("", "")
+		row.SetIcon(trashMenuIcon())
+		m.removeRows = append(m.removeRows, row)
+		m.removeIDs = append(m.removeIDs, "")
+		go func() {
+			for range row.ClickedCh {
+				m.mu.Lock()
+				id := m.removeIDs[idx]
+				m.mu.Unlock()
+				if id != "" {
+					m.trash(id)
+				}
+			}
+		}()
+	}
+	for i, row := range m.removeRows {
+		if i >= len(removable) {
+			m.removeIDs[i] = ""
+			row.Hide()
+			continue
+		}
+		a := removable[i]
+		m.removeIDs[i] = a.ID
+		switch {
+		case m.pending[a.ID] != "":
+			setTitle(row, a.Name+" · "+m.pending[a.ID])
+		case m.isArmed(a.ID):
+			setTitle(row, "Click again to remove "+a.Name)
+		default:
+			setTitle(row, a.Name)
+		}
+		row.Show()
+	}
+	m.removeRoot.Show()
+}
+
+// isArmed reports whether id's bin was clicked once, recently. m.mu held.
+func (m *trayAccountMenu) isArmed(id string) bool {
+	t, ok := m.armed[id]
+	return ok && time.Since(t) < trayRemoveConfirm
+}
+
+// trash is a click on an account's bin: the first arms it, a second one
+// within trayRemoveConfirm removes the account from this device.
+func (m *trayAccountMenu) trash(id string) {
+	m.mu.Lock()
+	if m.pending[id] != "" {
+		m.mu.Unlock()
+		return
+	}
+	if !m.isArmed(id) {
+		at := time.Now()
+		m.armed[id] = at
+		list := m.last
+		m.mu.Unlock()
+		m.apply(list)
+		time.AfterFunc(trayRemoveConfirm, func() {
+			m.mu.Lock()
+			disarmed := m.armed[id] == at
+			if disarmed {
+				delete(m.armed, id)
+			}
+			list := m.last
+			m.mu.Unlock()
+			if disarmed {
+				m.apply(list)
+			}
+		})
+		return
+	}
+	delete(m.armed, id)
+	m.pending[id] = "removing…"
+	list := m.last
+	m.mu.Unlock()
+	m.apply(list)
+	var resp agent.AccountsResponse
+	err := postAccounts("/api/accounts/remove?"+url.Values{"id": {id}}.Encode(), &resp)
+	m.report("", resp.Notice, err)
+	m.mu.Lock()
+	delete(m.pending, id)
+	m.lastRead = time.Time{}
+	m.mu.Unlock()
+	if err == nil {
+		m.apply(resp.Accounts)
+	}
+	m.changed()
 }
 
 func (m *trayAccountMenu) watchRow(row *systray.MenuItem, idx int) {

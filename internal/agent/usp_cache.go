@@ -486,6 +486,17 @@ func (c *persistentDataModelCache) refreshAsync() {
 	}()
 }
 
+// refreshSoon starts one refresh now, or queues one behind a running sweep
+// so the values it collects are not older than the caller's change.
+func (c *persistentDataModelCache) refreshSoon() {
+	c.mu.Lock()
+	if c.refreshing {
+		c.rerun = true
+	}
+	c.mu.Unlock()
+	c.refreshAsync()
+}
+
 // refreshAfterMutation reconciles the optimistic cache patch without delaying
 // the Set/Add/Delete response: now, and once more after the platform has
 // settled (radios and interfaces apply a change over a few seconds). Refresh

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -337,4 +338,36 @@ func FuzzParseNetlink(f *testing.F) {
 			t.Fatalf("unbounded bins: %d", len(sample.Bins))
 		}
 	})
+}
+
+func TestRadioNetdevsListsOnlyWifiNInNumericOrder(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []string
+		want    []string
+	}{
+		{"qsdk radios and vaps", []string{"wifi10", "ath1", "wifi0", "ath0", "wifi2", "br-lan"}, []string{"wifi0", "wifi2", "wifi10"}},
+		{"mainline mac80211", []string{"wlan0", "wlan1", "phy0-ap0", "eth0"}, []string{}},
+		{"empty", nil, []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range tt.entries {
+				if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := RadioNetdevs(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Fatalf("RadioNetdevs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if _, err := RadioNetdevs(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing sysfs directory must be an error, not an empty list")
+	}
 }

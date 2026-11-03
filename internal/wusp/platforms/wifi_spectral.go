@@ -27,6 +27,12 @@ const (
 	// it stays well under the controller's per-value snapshot limit.
 	spectralWaterfallBinBudget = 32 << 10
 	spectralDiscoveryInterval  = 30 * time.Minute
+	// spectralRequestCooldown spaces operator-requested captures so repeated
+	// clicks or controller retries cannot keep a radio in spectral mode.
+	spectralRequestCooldown = 30 * time.Second
+	// SpectralCaptureOperation is the Operate command name (relative to
+	// Device.WUSP_SpectralTelemetry.) that runs one on-demand capture.
+	SpectralCaptureOperation = "Capture"
 )
 
 type spectralRadioSnapshot struct {
@@ -43,10 +49,13 @@ type spectralSnapshot struct {
 	Discovered bool
 	// NoRadioNetdev is true when discovery found no wifiN netdev at all, the
 	// only case reported as Unsupported at the model root.
-	NoRadioNetdev  bool
-	DiscoveryError string
-	LastCapture    time.Time
-	Radios         []spectralRadioSnapshot
+	NoRadioNetdev bool
+	// CaptureAvailable is true when an operator may request a capture: the
+	// host has at least one wifiN radio netdev.
+	CaptureAvailable bool
+	DiscoveryError   string
+	LastCapture      time.Time
+	Radios           []spectralRadioSnapshot
 }
 
 // spectralCoordinator runs captures in the background so a USP Get only ever
@@ -68,14 +77,25 @@ type spectralCoordinator struct {
 	// releases, so production never starts one on a timer (it disrupted
 	// EasyMesh backhauls); only snapshots of earlier data are reported.
 	passive bool
+	// radioNetdevs lists wifiN netdevs from sysfs without touching the
+	// driver. It answers "could a capture run here" before any capture was
+	// requested; nil skips that probe.
+	radioNetdevs func(string) ([]string, error)
+	lastRequest  time.Time
+	waiters      []func()
 }
 
+// errSpectralUnavailable is returned by request on hosts that cannot run a
+// capture at all.
+var errSpectralUnavailable = errors.New("spectral capture is not available on this device")
+
 var defaultSpectralCoordinator = &spectralCoordinator{
-	supported: qcaspectral.Supported,
-	now:       time.Now,
-	discover:  qcaspectral.DiscoverRadios,
-	capture:   qcaspectral.Capture,
-	passive:   true,
+	supported:    qcaspectral.Supported,
+	now:          time.Now,
+	discover:     qcaspectral.DiscoverRadios,
+	capture:      qcaspectral.Capture,
+	passive:      true,
+	radioNetdevs: qcaspectral.RadioNetdevs,
 }
 
 func (c *spectralCoordinator) snapshotAndTrigger(netClassDir string) spectralSnapshot {
@@ -101,7 +121,74 @@ func (c *spectralCoordinator) snapshotAndTrigger(netClassDir string) spectralSna
 		out.NoRadioNetdev = errors.Is(c.discoveryErr, qcaspectral.ErrNoRadioNetdev)
 	}
 	out.Radios = append(out.Radios, c.radios...)
+	switch {
+	case out.Discovered:
+		out.CaptureAvailable = !out.NoRadioNetdev
+	case c.radioNetdevs != nil:
+		// Nothing captured yet (production never captures on its own): a
+		// read-only sysfs listing tells "no QCA radio" apart from "QCA
+		// radios present, waiting for an operator request".
+		names, err := c.radioNetdevs(netClassDir)
+		out.NoRadioNetdev = err == nil && len(names) == 0
+		out.CaptureAvailable = err == nil && len(names) > 0
+	}
 	return out
+}
+
+// request starts one capture because an operator asked for it (USP Operate
+// Device.WUSP_SpectralTelemetry.Capture()). It always rediscovers radios, runs
+// in the background and calls onDone when the results are in the snapshot. A
+// request while a capture is running joins it; a new one inside
+// spectralRequestCooldown of the previous request is refused.
+func (c *spectralCoordinator) request(netClassDir string, onDone func()) (bool, error) {
+	if c == nil || !c.supported {
+		return false, errSpectralUnavailable
+	}
+	if c.radioNetdevs != nil {
+		names, err := c.radioNetdevs(netClassDir)
+		if err != nil {
+			return false, fmt.Errorf("%w: %v", errSpectralUnavailable, err)
+		}
+		if len(names) == 0 {
+			return false, fmt.Errorf("%w: %v", errSpectralUnavailable, qcaspectral.ErrNoRadioNetdev)
+		}
+	}
+	now := c.now().UTC()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running {
+		if onDone != nil {
+			c.waiters = append(c.waiters, onDone)
+		}
+		return false, nil
+	}
+	if !c.lastRequest.IsZero() {
+		if wait := spectralRequestCooldown - now.Sub(c.lastRequest); wait > 0 {
+			return false, fmt.Errorf("a spectral capture ran %s ago; retry in %s", now.Sub(c.lastRequest).Round(time.Second), wait.Round(time.Second))
+		}
+	}
+	c.running = true
+	c.lastRequest = now
+	if onDone != nil {
+		c.waiters = append(c.waiters, onDone)
+	}
+	go c.run(netClassDir, true, nil)
+	return true, nil
+}
+
+// finishLocked clears the running flag and hands back the callbacks waiting on
+// this capture. The caller holds c.mu.
+func (c *spectralCoordinator) finishLocked() []func() {
+	c.running = false
+	waiters := c.waiters
+	c.waiters = nil
+	return waiters
+}
+
+func runSpectralWaiters(waiters []func()) {
+	for _, waiter := range waiters {
+		waiter()
+	}
 }
 
 func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []qcaspectral.Radio) {
@@ -114,9 +201,10 @@ func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []
 		if recovered := recover(); recovered != nil {
 			diaglog.Printf("[USP] spectral_capture panic=%q", fmt.Sprint(recovered))
 			c.mu.Lock()
-			c.running = false
+			waiters := c.finishLocked()
 			c.discoveryErr = fmt.Errorf("spectral capture panic: %v", recovered)
 			c.mu.Unlock()
+			runSpectralWaiters(waiters)
 		}
 	}()
 
@@ -173,12 +261,13 @@ func (c *spectralCoordinator) run(netClassDir string, rediscover bool, radios []
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.running = false
+	waiters := c.finishLocked()
 	c.radios = results
 	if len(results) > 0 {
 		c.lastCapture = c.now().UTC()
 	}
+	c.mu.Unlock()
+	runSpectralWaiters(waiters)
 }
 
 // appendSpectralFields emits Device.WUSP_SpectralTelemetry. Non-Linux builds
@@ -204,6 +293,11 @@ func appendSpectralSnapshotFields(msg *wusp.Message, snap spectralSnapshot) erro
 		appendField(msg, prefix+"LastCaptureTime", wusp.Time(snap.LastCapture))
 	}
 	appendField(msg, prefix+"Status", wusp.String(spectralRootStatus(snap)))
+	operations := ""
+	if snap.CaptureAvailable {
+		operations = SpectralCaptureOperation
+	}
+	appendField(msg, prefix+"SupportedOperations", wusp.String(operations))
 	appendField(msg, prefix+"RadioNumberOfEntries", wusp.Uint(uint64(len(snap.Radios))))
 
 	radioIndexByName := wifiRadioIndexByName(msg)
@@ -383,4 +477,20 @@ func truncateSpectralError(s string) string {
 		return s[:256]
 	}
 	return s
+}
+
+// RequestSpectralCapture runs one on-demand spectral capture on the QCA
+// radios (USP Operate Device.WUSP_SpectralTelemetry.Capture()). onDone runs
+// once the results are readable from the next collection.
+func (b *OpenWrtBackend) RequestSpectralCapture(onDone func()) (bool, error) {
+	return defaultSpectralCoordinator.request(b.netClassDir, onDone)
+}
+
+// RequestSpectralCapture is the generic-Linux counterpart; hosts without the
+// Linux WiFi collectors (desktop, router images without radios) refuse it.
+func (b *hostBackend) RequestSpectralCapture(onDone func()) (bool, error) {
+	if !hostKindSupportsLinuxWiFi(b.kind) {
+		return false, errSpectralUnavailable
+	}
+	return defaultSpectralCoordinator.request(b.netClassDir, onDone)
 }

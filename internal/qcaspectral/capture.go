@@ -117,10 +117,11 @@ func DiscoverRadios(netClassDir string) ([]Radio, error) {
 	return discoverRadios(newDriver(), netClassDir)
 }
 
-func discoverRadios(d driver, netClassDir string) ([]Radio, error) {
-	if strings.TrimSpace(netClassDir) == "" {
-		netClassDir = "/sys/class/net"
-	}
+// RadioNetdevs lists the QCA radio netdevs (wifiN) under netClassDir in
+// numeric order. It only reads the sysfs directory, never the driver, so it
+// is safe on a collection path.
+func RadioNetdevs(netClassDir string) ([]string, error) {
+	netClassDir = defaultNetClassDir(netClassDir)
 	entries, err := os.ReadDir(netClassDir)
 	if err != nil {
 		return nil, err
@@ -131,15 +132,31 @@ func discoverRadios(d driver, netClassDir string) ([]Radio, error) {
 			names = append(names, entry.Name())
 		}
 	}
-	if len(names) == 0 {
-		return nil, fmt.Errorf("%w under %s", ErrNoRadioNetdev, netClassDir)
-	}
 	sort.Slice(names, func(i, j int) bool {
 		if len(names[i]) != len(names[j]) {
 			return len(names[i]) < len(names[j])
 		}
 		return names[i] < names[j]
 	})
+	return names, nil
+}
+
+func defaultNetClassDir(netClassDir string) string {
+	if strings.TrimSpace(netClassDir) == "" {
+		return "/sys/class/net"
+	}
+	return netClassDir
+}
+
+func discoverRadios(d driver, netClassDir string) ([]Radio, error) {
+	netClassDir = defaultNetClassDir(netClassDir)
+	names, err := RadioNetdevs(netClassDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%w under %s", ErrNoRadioNetdev, netClassDir)
+	}
 	radios := make([]Radio, 0, len(names))
 	for _, name := range names {
 		mac, _ := net.ParseMAC(strings.TrimSpace(readFile(filepath.Join(netClassDir, name, "address"))))

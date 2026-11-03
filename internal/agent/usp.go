@@ -831,6 +831,8 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 			os.Exit(0)
 		}()
 		return nil, nil
+	case wusp.WUSPSpectralTelemetryPrefix + "Capture()":
+		return r.handleSpectralCapture()
 	case "Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()":
 		if controller, ok := r.rawBackend.(interface {
 			StartApplyEasyMeshTopology(context.Context, string) error
@@ -931,6 +933,39 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		}
 		return nil, wusp.ErrUSPPathUnsupported
 	}
+}
+
+// handleSpectralCapture runs one operator-requested QCA spectral capture.
+// Captures take several seconds per radio, longer than the control deadline,
+// so the reply only says the capture is running; once it finishes the data
+// model cache is refreshed and the next Get carries the spectrum.
+func (r *uspRuntime) handleSpectralCapture() (*wusp.Message, error) {
+	requester, ok := r.rawBackend.(interface {
+		RequestSpectralCapture(func()) (bool, error)
+	})
+	if !ok {
+		return nil, wusp.ErrUSPPathUnsupported
+	}
+	started, err := requester.RequestSpectralCapture(r.refreshAfterSpectralCapture)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[USP] Spectral capture requested: started=%t", started)
+	output := wusp.NewMessage()
+	output.Set(wusp.WUSPSpectralTelemetryPrefix+"Status", wusp.String("Capturing"))
+	if r.dataModelCache != nil {
+		if err := r.dataModelCache.Patch(output); err != nil {
+			log.Printf("[USP] DataModel cache spectral patch warning: continue_on_error=true err=%v", err)
+		}
+	}
+	return output, nil
+}
+
+func (r *uspRuntime) refreshAfterSpectralCapture() {
+	if r == nil || r.dataModelCache == nil {
+		return
+	}
+	r.dataModelCache.refreshSoon()
 }
 
 func easyMeshOperationStatus(message string) *wusp.Message {

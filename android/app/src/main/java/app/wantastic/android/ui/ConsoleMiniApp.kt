@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.core.view.WindowCompat
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -64,15 +65,30 @@ class ConsoleWebHolder(context: Context, private val home: String) {
         private set
     var title by mutableStateOf("Console")
         private set
+    /** The page's own theme (the console's .dark), so the app's chrome matches it. */
+    var dark by mutableStateOf(false)
+        private set
+
+    /** Reads the page's theme; cheap, called on navigation and now and then while open. */
+    fun syncTheme() {
+        web.evaluateJavascript("document.documentElement.classList.contains('dark')") { v -> dark = v == "true" }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     val web: WebView = WebView(context).apply {
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
+        // The console recognises the app and leaves room for the capsule.
+        settings.userAgentString = settings.userAgentString + " WantasticApp/" + app.wantastic.android.BuildConfig.VERSION_NAME
         webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) { this@ConsoleWebHolder.progress = 10 }
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                this@ConsoleWebHolder.syncTheme()
+            }
+
             override fun onPageFinished(view: WebView, url: String?) {
                 this@ConsoleWebHolder.progress = 100
+                this@ConsoleWebHolder.syncTheme()
                 view.title?.takeIf { it.isNotBlank() }?.let { this@ConsoleWebHolder.title = it.substringBefore(" · ").substringBefore(" | ") }
             }
         }
@@ -97,20 +113,25 @@ class ConsoleWebHolder(context: Context, private val home: String) {
 fun ConsoleMiniApp(holder: ConsoleWebHolder, onClose: () -> Unit) {
     val context = LocalContext.current
     var menu by remember { mutableStateOf(false) }
-    // Dark status bar icons over the console's white header, light again after.
+    // Status bar icons follow the page: dark over a light console, light over a dark one.
     val view = LocalView.current
-    DisposableEffect(Unit) {
+    val dark = holder.dark
+    DisposableEffect(dark) {
         val window = (view.context as? Activity)?.window
         val bars = window?.let { WindowCompat.getInsetsController(it, view) }
         val before = bars?.isAppearanceLightStatusBars
-        bars?.isAppearanceLightStatusBars = true
+        bars?.isAppearanceLightStatusBars = !dark
         onDispose { if (before != null) bars.isAppearanceLightStatusBars = before }
+    }
+    // The theme can change without a navigation (the console's toggle): look again now and then.
+    LaunchedEffect(holder) {
+        while (true) { holder.syncTheme(); kotlinx.coroutines.delay(2_000) }
     }
     BackHandler {
         if (holder.web.canGoBack()) holder.web.goBack() else onClose()
     }
     // The console takes the whole screen; only the capsule floats over it.
-    Box(Modifier.fillMaxSize().background(Color(0xFFF4F7FB)).imePadding()) {
+    Box(Modifier.fillMaxSize().background(if (dark) Color(0xFF0D0F11) else Color(0xFFF4F7FB)).imePadding()) {
         AndroidView(
             factory = { holder.web.also { (it.parent as? android.view.ViewGroup)?.removeView(it) } },
             modifier = Modifier.fillMaxSize().statusBarsPadding(),

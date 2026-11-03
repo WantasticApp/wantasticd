@@ -83,12 +83,12 @@ fun AddThisPhoneScreen(sync: AccountSync, email: String, deviceName: String, onO
  * deletes it from the phone after asking. Signed out, Log in is here too.
  */
 @Composable
-fun HomeConfigsCard(setups: DeviceSetups, signedIn: Boolean, onLogIn: () -> Unit, onChanged: () -> Unit) {
+fun HomeConfigsCard(setups: DeviceSetups, signedIn: Boolean, onLogIn: () -> Unit, onAddByLink: (String?) -> Unit, onChanged: () -> Unit) {
     val all by setups.setups.collectAsState()
     val activeId by setups.active.collectAsState()
     var confirm by remember { mutableStateOf<DeviceSetups.Setup?>(null) }
     // A key made for a claim that never happened is not a config.
-    val list = all.values.filter { it.claimed || it.account == activeId }
+    val list = all.values.filter { it.claimed || it.account == activeId || it.account.startsWith(DeviceSetups.LINK_PREFIX) }
         .sortedWith(compareByDescending<DeviceSetups.Setup> { it.account == activeId }.thenBy { it.network ?: "~" })
     GlassCard(Modifier.fillMaxWidth()) {
         Text((if (list.size > 1) "Configs on this phone" else "Config on this phone").uppercase(), color = Glass.TextDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp)
@@ -100,9 +100,13 @@ fun HomeConfigsCard(setups: DeviceSetups, signedIn: Boolean, onLogIn: () -> Unit
             if (i > 0) RowDivider()
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(Glass.Radius - 4.dp))
-                    .clickable(enabled = !active && c.claimed) {
-                        setups.activate(c.account)
-                        onChanged()
+                    .clickable(enabled = !active && (c.claimed || c.account.startsWith(DeviceSetups.LINK_PREFIX))) {
+                        if (!c.claimed) {
+                            onAddByLink(c.account) // waiting: show its QR code again
+                        } else {
+                            setups.activate(c.account)
+                            onChanged()
+                        }
                     }
                     .heightIn(min = 44.dp).padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -112,6 +116,7 @@ fun HomeConfigsCard(setups: DeviceSetups, signedIn: Boolean, onLogIn: () -> Unit
                     Text(c.network?.let { "Network $it" } ?: "Config ${i + 1}", color = Glass.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
                     Text(
                         when {
+                            !c.claimed && c.account.startsWith(DeviceSetups.LINK_PREFIX) -> "Waiting for approval · tap for its code"
                             !c.claimed -> "Waiting for approval"
                             active -> "In use · ${c.address ?: ""}"
                             else -> "Tap to use · ${c.address ?: ""}"
@@ -125,9 +130,10 @@ fun HomeConfigsCard(setups: DeviceSetups, signedIn: Boolean, onLogIn: () -> Unit
                 }
             }
         }
-        if (!signedIn) {
-            Spacer(Modifier.size(4.dp))
-            GlassButton("Log in", primary = true, onClick = onLogIn)
+        Spacer(Modifier.size(4.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (!signedIn) Box(Modifier.weight(1f)) { GlassButton("Log in", primary = true, onClick = onLogIn) }
+            Box(Modifier.weight(1f)) { GlassButton("Add by link", primary = signedIn) { onAddByLink(null) } }
         }
     }
     confirm?.let { c ->

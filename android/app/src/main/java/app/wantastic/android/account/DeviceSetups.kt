@@ -58,6 +58,18 @@ class DeviceSetups(private val prefs: SharedPreferences) {
     val setups: StateFlow<Map<String, Setup>> = all.asStateFlow()
 
     /**
+     * A new config to be added by a claim link: its own key (never the one in
+     * use, which would move this phone out of its network), saved until it is
+     * approved or deleted. Its id starts with [LINK_PREFIX].
+     */
+    fun newLinkSetup(): Setup {
+        val private = X25519.generatePrivateKey()
+        val public = enc(X25519.publicFromPrivate(private))
+        val id = LINK_PREFIX + public.filter { it.isLetterOrDigit() }.take(12)
+        return Setup(id, enc(private), public, null).also { put(it) }
+    }
+
+    /**
      * Deletes [account]'s setup (key and approval) from this phone. The active
      * one hands over to another approved setup, if there is one.
      */
@@ -127,6 +139,8 @@ class DeviceSetups(private val prefs: SharedPreferences) {
 
     companion object {
         const val UNBOUND = ""
+        /** Configs added by a claim link; not tied to a signed-in account. */
+        const val LINK_PREFIX = "link:"
         private const val SETUPS = "device_setups"
         private const val ACTIVE = "active_setup"
         private const val LEGACY_PRIVATE = "private_key"

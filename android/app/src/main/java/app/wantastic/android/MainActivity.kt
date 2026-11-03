@@ -190,6 +190,9 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
     // "Add a device": an onboarding key as a QR code and install command.
     var addDevice by rememberSaveable { mutableStateOf(false) }
     BackHandler(enabled = addDevice) { addDevice = false }
+    // "Add by link": the id of the config whose claim QR code is showing.
+    var byLinkSetup by rememberSaveable { mutableStateOf<String?>(null) }
+    BackHandler(enabled = byLinkSetup != null) { byLinkSetup = null }
     fun openConsole(url: String? = null) {
         val holder = console ?: ConsoleWebHolder(context, url ?: ClaimLink.DEFAULT_SERVER).also { console = it }
         if (url != null && holder.url != url) holder.open(url)
@@ -228,6 +231,11 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
                 onBrowse = { url -> browser = ConsoleWebHolder(context, url) },
                 onTerminal = { ip, name -> terminal = ip to name },
                 onAddDevice = { addDevice = true },
+                onAddByLink = { id ->
+                    // One waiting link config at a time: reopen it rather than make another.
+                    byLinkSetup = id ?: setups.setups.value.values.firstOrNull { it.account.startsWith(DeviceSetups.LINK_PREFIX) && !it.claimed }?.account
+                        ?: setups.newLinkSetup().account
+                },
             )
             byLink -> ClaimByLinkScreen(claimUrl, onLogIn = { openConsole(claimUrl) }, onBack = { byLink = false })
             account == AccountState.Checking -> Unit
@@ -265,6 +273,26 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
         ) {
             GlassBackground { app.wantastic.android.ui.AddDeviceScreen(sync.client, deviceName, onClose = { addDevice = false }) }
         }
+        AnimatedVisibility(
+            visible = byLinkSetup != null,
+            enter = slideInVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow)) { it } + fadeIn(),
+            exit = slideOutVertically(spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMedium)) { it } + fadeOut(),
+        ) {
+            byLinkSetup?.let { id ->
+                GlassBackground {
+                    app.wantastic.android.ui.AddByLinkScreen(
+                        setups, id, deviceName,
+                        onUse = {
+                            setups.activate(id)
+                            (engine as? GoEngine)?.refresh()
+                            if (status.tunnel is TunnelState.Connected) engine.reconnect() else onConnect()
+                            byLinkSetup = null
+                        },
+                        onClose = { byLinkSetup = null },
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -272,7 +300,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
 private fun BoxScope.Tabs(
     status: EngineStatus, sync: AccountSync, setups: DeviceSetups, account: AccountState, deviceName: String, publicKey: String,
     onConnect: () -> Unit, onLogIn: () -> Unit, onAddAccount: () -> Unit, onConsole: (String) -> Unit,
-    onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit, onAddDevice: () -> Unit,
+    onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit, onAddDevice: () -> Unit, onAddByLink: (String?) -> Unit,
 ) {
     val engine = Engines.current
     var tab by rememberSaveable { mutableStateOf(Tab.Network) }
@@ -296,7 +324,7 @@ private fun BoxScope.Tabs(
                     onExitNode = { exitOpen = true },
                 ) {
                     val signedIn = account is AccountState.SignedIn
-                    HomeConfigsCard(setups, signedIn, onLogIn = onAddAccount) {
+                    HomeConfigsCard(setups, signedIn, onLogIn = onAddAccount, onAddByLink = onAddByLink) {
                         // Another config is in use now: connect on it, or stop if none is approved.
                         (engine as? GoEngine)?.refresh()
                         if (status.tunnel is TunnelState.Connected || status.tunnel is TunnelState.Connecting) {

@@ -15,6 +15,8 @@ import androidx.compose.runtime.setValue
 import app.wantastic.android.settings.AppSettings
 import app.wantastic.android.update.UpdateStatus
 import app.wantastic.android.update.Updates
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
@@ -208,9 +210,25 @@ fun PeersScreen(
                 else -> null
             },
         )
-        // Onboarding keys belong to an account: signed out, this signs in first.
-        Column(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 10.dp)) {
-            GlassButton("Add a device", primary = true, onClick = if (signedIn) onAddDevice else onSignIn)
+        val connected = status.tunnel is TunnelState.Connected
+        val scope = rememberCoroutineScope()
+        // Ping all: every reachable peer at once; each card shows its result.
+        var pinged by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+        var pingingAll by remember { mutableStateOf(false) }
+        Row(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            // Onboarding keys belong to an account: signed out, this signs in first.
+            Box(Modifier.weight(1f)) { GlassButton("Add a device", primary = true, onClick = if (signedIn) onAddDevice else onSignIn) }
+            Box(Modifier.weight(1f)) {
+                GlassButton(if (pingingAll) "Pinging…" else "Ping all", enabled = connected && !pingingAll) {
+                    val targets = list.filter { it.vpnIp.isNotBlank() && !it.self }.map { it.vpnIp }.distinct()
+                    pingingAll = true
+                    pinged = targets.associateWith { "pinging…" }
+                    scope.launch {
+                        targets.map { ip -> async { ip to onPing(ip) } }.awaitAll().forEach { (ip, r) -> pinged = pinged + (ip to r) }
+                        pingingAll = false
+                    }
+                }
+            }
         }
         if (list.isEmpty()) {
             GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp), onClick = if (signedIn) null else onSignIn) {
@@ -226,7 +244,7 @@ fun PeersScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             itemsIndexed(list, key = { i, p -> "$i:${p.vpnIp}" }) { _, p ->
-                PeerCard(p, live, connected = status.tunnel is TunnelState.Connected, onPing = onPing, onBrowse = onBrowse, onTerminal = onTerminal)
+                PeerCard(p, live, connected = status.tunnel is TunnelState.Connected, pinged = pinged[p.vpnIp], onPing = onPing, onBrowse = onBrowse, onTerminal = onTerminal)
             }
         }
     }
@@ -234,7 +252,7 @@ fun PeersScreen(
 
 /** A peer: tap to see its details and tools (ping, ports, browser). */
 @Composable
-private fun PeerCard(p: Peer, live: Boolean, connected: Boolean, onPing: suspend (String) -> String, onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit) {
+private fun PeerCard(p: Peer, live: Boolean, connected: Boolean, pinged: String?, onPing: suspend (String) -> String, onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit) {
     val hub = p.vpnIp.isBlank()
     var open by rememberSaveable(p.vpnIp + p.name) { mutableStateOf(false) }
     var ping by remember { mutableStateOf<String?>(null) }
@@ -248,8 +266,10 @@ private fun PeerCard(p: Peer, live: Boolean, connected: Boolean, onPing: suspend
             Box(Modifier.size(10.dp).clip(CircleShape).background(if (on) Glass.Green else Glass.TextDim.copy(alpha = 0.4f)))
             Spacer(Modifier.size(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(p.name + if (p.self) " · this phone" else "", color = Glass.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                Text(if (hub) "Relays traffic when a direct path isn't possible" else p.vpnIp, color = Glass.TextDim, fontSize = 12.sp, fontFamily = if (hub) null else FontFamily.Monospace)
+                Text(p.name + if (p.self) " · this phone" else "", color = Glass.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                Text(if (hub) "Relays traffic when a direct path isn't possible" else p.vpnIp, color = Glass.TextDim, fontSize = 11.sp, fontFamily = if (hub) null else FontFamily.Monospace)
+                // The last "Ping all" result.
+                if (pinged != null) Text("Ping: $pinged", color = Glass.Cyan, fontSize = 11.sp)
             }
             Dim(
                 if (hub) "connected"

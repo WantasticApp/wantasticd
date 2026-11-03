@@ -1765,6 +1765,7 @@ func (c *P2PClient) validateAndPromote(job p2pPromotionJob) {
 				c.sessions[job.peerID] == job.session
 			c.mu.RUnlock()
 			if !current {
+				c.dropOrphanCandidate(job)
 				return
 			}
 			if err := c.activateDirectPeer(job.publicKey, job.assignedIP); err != nil {
@@ -1872,8 +1873,35 @@ func (c *P2PClient) failDirectPromotion(job p2pPromotionJob, cause error) {
 	if removeCandidate && !job.publicKey.IsZero() {
 		c.device.RemovePeer(job.publicKey)
 		c.restoreRelayRoute(job.assignedIP, job.relayPeer)
+	} else {
+		c.dropOrphanCandidate(job)
 	}
 	c.device.log.Verbosef("[P2P] Direct path validation failed for peer %d; relay remains active: %v", job.peerID, cause)
+}
+
+// dropOrphanCandidate removes the WireGuard candidate a superseded promotion
+// installed, unless a newer attempt or a live direct path now owns that peer.
+// Left behind, it keeps sending handshakes to an endpoint that may be gone
+// (a phone that left the Wi-Fi) for as long as the daemon runs.
+func (c *P2PClient) dropOrphanCandidate(job p2pPromotionJob) {
+	if job.publicKey.IsZero() {
+		return
+	}
+	c.mu.RLock()
+	peer := c.peers[job.peerID]
+	owned := c.sessions[job.peerID] != nil || (peer != nil && peer.State == P2PStateEstablished)
+	if !owned {
+		if id, ok := c.peerKeyIndex[job.publicKey]; ok && id != job.peerID {
+			other := c.peers[id]
+			owned = c.sessions[id] != nil || (other != nil && other.State == P2PStateEstablished)
+		}
+	}
+	c.mu.RUnlock()
+	if owned {
+		return
+	}
+	c.device.RemovePeer(job.publicKey)
+	c.restoreRelayRoute(job.assignedIP, job.relayPeer)
 }
 
 func (c *P2PClient) maintenanceLoop() {

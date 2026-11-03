@@ -213,12 +213,29 @@ class GoEngine private constructor(private val context: Context, private val set
 
     private val protected = mutableSetOf<Int>()
 
-    /** WireGuard's own UDP sockets must never be routed into the tunnel they carry. */
+    private var boundTo: android.net.Network? = null
+
+    /**
+     * WireGuard's own UDP sockets must never be routed into the tunnel they
+     * carry, and must leave on the phone's real network: protect() alone leaves
+     * them unbound, and on some carriers (Inwi 4G) nothing then gets through.
+     */
     private fun protectSockets() {
         val svc = service ?: return
         val fds = runCatching { Mobile.socketFDs() }.getOrDefault("").split(',').mapNotNull { it.trim().toIntOrNull() }
+        val net = context.getSystemService(android.net.ConnectivityManager::class.java)?.activeNetwork
+        if (net != boundTo) {
+            protected.clear() // the network changed: bind everything again
+            boundTo = net
+        }
         for (fd in fds) {
-            if (fd !in protected && svc.protect(fd)) protected += fd
+            if (fd in protected || !svc.protect(fd)) continue
+            if (net != null) {
+                // A duplicate of the descriptor binds the same socket.
+                runCatching { android.os.ParcelFileDescriptor.fromFd(fd).use { net.bindSocket(it.fileDescriptor) } }
+                    .onFailure { Log.w(TAG, "bindSocket: ${it.message}") }
+            }
+            protected += fd
         }
         protected.retainAll(fds.toSet())
     }
@@ -356,6 +373,8 @@ class GoEngine private constructor(private val context: Context, private val set
             // The app itself is in the tunnel (peer tools, browser); only WireGuard's
             // own sockets are protected out of it (see protectSockets).
             if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
+            // The tunnel rides the phone's current network.
+            service.getSystemService(android.net.ConnectivityManager::class.java)?.activeNetwork?.let { b.setUnderlyingNetworks(arrayOf(it)) }
             val fd = b.establish() ?: throw IllegalStateException("Android did not allow the VPN")
             return fd.detachFd().toLong()
         }

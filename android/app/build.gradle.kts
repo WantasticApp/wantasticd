@@ -55,7 +55,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     buildFeatures {
         compose = true
         buildConfig = true
@@ -82,6 +81,10 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+}
+
 aboutLibraries {
     // Only what ships: no network lookups at build time.
     offlineMode = true
@@ -90,7 +93,7 @@ aboutLibraries {
 dependencies {
     // The Go engine, built from ../mobile by `gomobile bind` (see android/README.md).
     implementation(files("libs/wantastic-engine.aar"))
-    val composeBom = platform("androidx.compose:compose-bom:2025.05.01")
+    val composeBom = platform("androidx.compose:compose-bom:2026.05.01")
     implementation(composeBom)
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
@@ -107,6 +110,9 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.0")
     // The console channel (websocket) and its HTTP endpoints.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Peer terminal: SSH (JSch, BSD) and ConnectBot's terminal (Apache-2.0, libvterm).
+    implementation("com.github.mwiede:jsch:2.28.8")
+    implementation("org.connectbot:termlib:0.0.40")
     // Passkeys (Credential Manager; Play services provides them on Android 13 and older).
     implementation("androidx.credentials:credentials:1.5.0")
     implementation("androidx.credentials:credentials-play-services-auth:1.5.0")

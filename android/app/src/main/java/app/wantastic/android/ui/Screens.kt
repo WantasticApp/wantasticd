@@ -188,7 +188,7 @@ private fun rate(bits: Long): String = when {
 @Composable
 fun PeersScreen(
     status: EngineStatus, devices: List<Peer>, signedIn: Boolean, onRefresh: suspend () -> Unit, onSignIn: () -> Unit,
-    onPing: suspend (String) -> String, onBrowse: (String) -> Unit,
+    onPing: suspend (String) -> String, onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit,
 ) {
     LaunchedEffect(Unit) { onRefresh() }
     // Live peers once the tunnel knows other devices; until then the account's devices (and the hub).
@@ -217,7 +217,7 @@ fun PeersScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             itemsIndexed(list, key = { i, p -> "$i:${p.vpnIp}" }) { _, p ->
-                PeerCard(p, live, connected = status.tunnel is TunnelState.Connected, onPing = onPing, onBrowse = onBrowse)
+                PeerCard(p, live, connected = status.tunnel is TunnelState.Connected, onPing = onPing, onBrowse = onBrowse, onTerminal = onTerminal)
             }
         }
     }
@@ -225,7 +225,7 @@ fun PeersScreen(
 
 /** A peer: tap to see its details and tools (ping, ports, browser). */
 @Composable
-private fun PeerCard(p: Peer, live: Boolean, connected: Boolean, onPing: suspend (String) -> String, onBrowse: (String) -> Unit) {
+private fun PeerCard(p: Peer, live: Boolean, connected: Boolean, onPing: suspend (String) -> String, onBrowse: (String) -> Unit, onTerminal: (String, String) -> Unit) {
     val hub = p.vpnIp.isBlank()
     var open by rememberSaveable(p.vpnIp + p.name) { mutableStateOf(false) }
     var ping by remember { mutableStateOf<String?>(null) }
@@ -274,12 +274,15 @@ private fun PeerCard(p: Peer, live: Boolean, connected: Boolean, onPing: suspend
                 }
                 Spacer(Modifier.size(8.dp))
                 val web = ports?.firstOrNull { it.web }
-                ToolButton("Open in browser", Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ToolButton("Terminal", Modifier.weight(1f)) { onTerminal(p.vpnIp, p.name) }
+                    ToolButton("Open in browser", Modifier.weight(1f)) {
                     onBrowse(when {
                         web == null -> "http://${p.vpnIp}/"
                         web.https -> "https://${p.vpnIp}:${web.port}/"
                         else -> "http://${p.vpnIp}:${web.port}/"
                     })
+                    }
                 }
             }
         }

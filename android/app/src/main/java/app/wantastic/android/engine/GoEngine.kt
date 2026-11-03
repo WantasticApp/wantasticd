@@ -134,7 +134,8 @@ class GoEngine private constructor(private val context: Context, private val set
 
     override fun reconnect() {
         val svc = service ?: return
-        if (state.value.tunnel !is TunnelState.Connected) return
+        val t = state.value.tunnel
+        if (t !is TunnelState.Connected && t !is TunnelState.Connecting) return
         routeJob?.cancel()
         routeJob = scope.launch {
             Log.i(TAG, "reconnecting on the active setup")
@@ -182,7 +183,9 @@ class GoEngine private constructor(private val context: Context, private val set
                     name = p.optString("hostname").ifBlank { p.optString("assigned_ip") }.ifBlank { "Wantastic hub" },
                     vpnIp = p.optString("assigned_ip"),
                     publicIp = p.optString("endpoint").substringBeforeLast(':').ifBlank { null },
-                    direct = p.optBoolean("is_p2p"),
+                    // is_p2p only says the peer can go direct; an established
+                    // P2P state with a handshake says it does (as `wantasticd peers`).
+                    direct = p.optString("p2p_state") == "established" && handshake > 0,
                     latencyMs = null,
                     handshakeAgoSec = if (handshake > 0) now / 1000 - handshake else null,
                     rxBytes = p.optLong("rx_bytes"),
@@ -203,10 +206,16 @@ class GoEngine private constructor(private val context: Context, private val set
                 )
             }
         }.orEmpty()
+        // Connected means the hub answers: a recent handshake with it (WireGuard
+        // rekeys every 2 minutes), not only that the interface is up.
+        val hubAgo = peers.firstOrNull { it.vpnIp.isBlank() }?.handshakeAgoSec
+        val running = json.optBoolean("device_running")
+        val hubAnswers = hubAgo != null && hubAgo < HUB_HANDSHAKE_FRESH_SEC
         state.update {
             it.copy(
-                tunnel = if (json.optBoolean("device_running")) TunnelState.Connected(address, since, json.optString("server_endpoint").substringBefore(':').ifBlank { "Wantastic" })
+                tunnel = if (running && hubAnswers) TunnelState.Connected(address, since, json.optString("server_endpoint").substringBefore(':').ifBlank { "Wantastic" })
                 else TunnelState.Connecting,
+                serverSilent = running && !hubAnswers && now - since > SERVER_SILENT_AFTER_MS,
                 peers = peers,
                 exitCandidates = candidates,
                 usingExit = using?.optString("ip")?.ifBlank { null },
@@ -295,6 +304,8 @@ class GoEngine private constructor(private val context: Context, private val set
 
     companion object {
         private const val TAG = "WantasticEngine"
+        private const val HUB_HANDSHAKE_FRESH_SEC = 180L
+        private const val SERVER_SILENT_AFTER_MS = 15_000L
         /** Two minutes of throughput at one sample every 2 s. */
         private const val HISTORY = 60
 

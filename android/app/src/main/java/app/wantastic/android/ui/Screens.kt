@@ -115,6 +115,12 @@ fun HomeScreen(
                         Text(t.address, color = Glass.Text, fontSize = 20.sp, fontFamily = FontFamily.Monospace)
                     }
                     TunnelState.EngineUnavailable -> Text("The tunnel engine could not start on this phone.", color = Glass.TextDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+                    TunnelState.Connecting -> if (status.serverSilent) {
+                        Text(
+                            "No reply from the Wantastic server. This network may block VPNs; try Wi-Fi.",
+                            color = Color(0xFFFFB74D), fontSize = 13.sp, textAlign = TextAlign.Center,
+                        )
+                    } else Dim("Connecting…")
                     else -> Dim("Not connected")
                 }
             }

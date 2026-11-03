@@ -47,6 +47,8 @@ data class EngineStatus(
     val exitNotice: String? = null,
     /** Whether this phone can share its internet as an exit node. */
     val canShareExit: Boolean = false,
+    /** The tunnel is up on the phone but the Wantastic server has not answered for a while. */
+    val serverSilent: Boolean = false,
 )
 
 /**

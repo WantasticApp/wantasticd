@@ -542,7 +542,10 @@ func TestFilterLocalCandidates(t *testing.T) {
 		{name: "wantastic", flags: net.FlagUp, ips: []net.IP{net.ParseIP("10.206.0.1")}},
 		{name: "en3", flags: net.FlagUp, ips: []net.IP{net.ParseIP("100.100.1.1")}},
 	}
-	got := filterLocalCandidates(net.ParseIP("10.1.2.3").To4(), ifaces, "wantastic", 51820)
+	skipPPP := p2pSkipPPP
+	p2pSkipPPP = true
+	t.Cleanup(func() { p2pSkipPPP = skipPPP })
+	got := filterLocalCandidates(net.ParseIP("10.1.2.3").To4(), nil, ifaces, "wantastic", 51820)
 	var names []string
 	for _, candidate := range got {
 		names = append(names, candidate.String())
@@ -558,7 +561,7 @@ func TestFilterLocalCandidates(t *testing.T) {
 	}
 
 	// A default route through another tunnel is not announced.
-	got = filterLocalCandidates(net.ParseIP("10.200.0.1").To4(), ifaces, "wantastic", 51820)
+	got = filterLocalCandidates(net.ParseIP("10.200.0.1").To4(), nil, ifaces, "wantastic", 51820)
 	if len(got) == 0 || got[0].String() != "192.168.1.20:51820" {
 		t.Fatalf("tunnel default-route address announced: %v", got)
 	}

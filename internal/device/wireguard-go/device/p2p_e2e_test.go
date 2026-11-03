@@ -163,6 +163,34 @@ func TestP2PE2EOneWay(t *testing.T) {
 	waitDirect(t, a, b, 15*time.Second)
 }
 
+// B is behind a port-rewriting NAT: the coordinator saw it at a port next to
+// its real one, and B only has a wrong address for A. A has a stable public
+// endpoint, so it sprays B's port neighbourhood; the spray reaching B's real
+// port is the only way a direct path forms.
+func TestP2PE2ESprayReachesPortRewritingPeer(t *testing.T) {
+	isPublic := p2pIsPublicIPv4
+	p2pIsPublicIPv4 = func(addr net.UDPAddr) bool { return addr.IP.Equal(net.IPv4(127, 0, 0, 1)) }
+	t.Cleanup(func() { p2pIsPublicIPv4 = isPublic })
+
+	a, b := newE2EPair(t, nil)
+	a.client.mu.Lock()
+	a.client.observedAddr = a.addr()
+	a.client.localAddr = a.addr()
+	a.client.mu.Unlock()
+
+	nonce := randomNonce(t)
+	relay := relayFor(b, e2eIDB, nonce)
+	observed := b.addr()
+	observed.Port -= 5
+	local := net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: observed.Port + 5} // unroutable; carries the listen port
+	relay.SetObservedAddr(&observed)
+	relay.SetLocalAddr(&local)
+	relay.Payload = AppendP2PCandidatePayload(b.ip, []net.UDPAddr{observed})
+	a.client.HandleMessage(relay)
+	b.client.HandleMessage(unreachableRelayFor(a, e2eIDA, nonce))
+	waitDirect(t, a, b, 15*time.Second)
+}
+
 // As OneWay, and B's first answers to A are lost. B must keep answering
 // later punches instead of answering only once.
 func TestP2PE2EOneWayLostReply(t *testing.T) {

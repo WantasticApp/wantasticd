@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -122,11 +124,18 @@ func TestSlowListSMSAnswersInTimeAndPatchesCacheLater(t *testing.T) {
 		t.Fatalf("modem listed %d times", n)
 	}
 
+	saved, _ := os.ReadFile(r.dataModelCache.path)
 	close(release)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
+		// The patch reaches memory just before it is saved; wait for the
+		// save too, or Windows cannot remove the test's temp folder.
 		if strings.Contains(r.cachedString("Device.WUSP_CellularControl.Interface.1.SMSInboxJSON"), "new") {
-			return
+			if now, err := os.ReadFile(r.dataModelCache.path); err == nil && !bytes.Equal(now, saved) {
+				replaceFileMu.Lock()
+				replaceFileMu.Unlock()
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

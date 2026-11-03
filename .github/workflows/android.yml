@@ -75,7 +75,8 @@ jobs:
           fi
           # Monotonic across builds, as Android requires for upgrades.
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          echo "code=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_OUTPUT"
+          # +200 keeps releases above the local test builds (up to 135) already installed.
+          echo "code=$((GITHUB_RUN_NUMBER + 200))" >> "$GITHUB_OUTPUT"
 
       # The release key never lives in the repository. Tagged releases need
       # it: an APK signed with another key could never be upgraded.

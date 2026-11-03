@@ -211,10 +211,10 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 				// Check for Punch Packet (Short form: subtype + 8 nonce + 32 mac = 41 bytes)
 				if len(p2pData) == 41 && p2pData[0] == P2PSubtypePunchPacket {
-					endpointStr := endpoints[i].DstToString()
-					srcAddr, err := net.ResolveUDPAddr("udp", endpointStr)
-					if client := device.GetP2PClient(); err == nil && client != nil {
-						client.EnqueuePunch(p2pData, srcAddr)
+					if client := device.GetP2PClient(); client != nil {
+						if srcAddr := endpointUDPAddr(endpoints[i]); srcAddr != nil {
+							client.EnqueuePunch(p2pData, srcAddr)
+						}
 					}
 
 					bufsArrs[i] = device.GetMessageBuffer()
@@ -586,7 +586,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 					continue
 				}
 				field := elem.packet[IPv6offsetPayloadLength : IPv6offsetPayloadLength+2]
-				length := binary.BigEndian.Uint16(field)
+				length := uint32(binary.BigEndian.Uint16(field))
 				length += ipv6.HeaderLen
 				if int(length) > len(elem.packet) {
 					continue
@@ -629,4 +629,21 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		bufs = bufs[:0]
 		device.PutInboundElementsContainer(elemsContainer)
 	}
+}
+
+// endpointUDPAddr converts a receive endpoint to a UDP address without the
+// string format/parse round trip (punch packets arrive unauthenticated, so
+// their per-packet cost should stay small).
+func endpointUDPAddr(ep conn.Endpoint) *net.UDPAddr {
+	if std, ok := ep.(*conn.StdNetEndpoint); ok {
+		if !std.AddrPort.IsValid() {
+			return nil
+		}
+		return net.UDPAddrFromAddrPort(std.AddrPort)
+	}
+	addr, err := net.ResolveUDPAddr("udp", ep.DstToString())
+	if err != nil {
+		return nil
+	}
+	return addr
 }

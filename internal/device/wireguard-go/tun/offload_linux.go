@@ -609,6 +609,10 @@ func tcpGRO(bufs [][]byte, offset int, pktI int, table *tcpGROTable, isV6 bool) 
 			case coalesceItemInvalidCSum:
 				// delete the item with an invalid csum
 				table.deleteAt(item.key, i)
+				// The deleted item will not be re-visited in applyTCPCoalesceAccounting,
+				// so we must zero the virtioNetHdr. clear() is the equivalent of
+				// encoding a zero value virtioNetHdr.
+				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			case coalescePktInvalidCSum:
 				// no point in inserting an item that we can't coalesce
 				return groResultNoop

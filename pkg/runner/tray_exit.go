@@ -21,18 +21,29 @@ type trayExitMenu struct {
 	items    []*systray.MenuItem
 	itemIPs  []string
 	offering bool
+	// pending is what a running action shows after its item's title
+	// ("switching…"), so progress is visible while the menu stays open.
+	pending  map[*systray.MenuItem]string
 	onChange func()
 	// report shows an action's outcome in the menu.
 	report func(okText, notice string, err error)
 }
 
 func newTrayExitMenu() *trayExitMenu {
-	m := &trayExitMenu{}
-	m.root = systray.AddMenuItem("Exit node: off", "Route internet traffic through another device")
-	m.offer = m.root.AddSubMenuItemCheckbox("Allow this device as exit node", "", false)
-	m.use = m.root.AddSubMenuItem("Use exit node", "Send all internet traffic through a peer")
-	m.none = m.use.AddSubMenuItemCheckbox("Don't use an exit node", "Normal routing", true)
-	go m.watch(m.offer, func() (string, string, error) {
+	m := &trayExitMenu{pending: map[*systray.MenuItem]string{}}
+	// The sharing switch sits in the main menu; the submenu picks the
+	// exit node this device uses.
+	m.offer = systray.AddMenuItemCheckbox("Allow this device as exit node", "", false)
+	m.root = systray.AddMenuItem("Exit node: off", "Send all internet traffic through a peer")
+	m.use = m.root
+	m.none = m.use.AddSubMenuItemCheckbox(exitNoneTitle, "Normal routing", true)
+	keepMenuOpen(m.none)
+	go m.watch(m.offer, func() string {
+		if m.offering {
+			return "turning off…"
+		}
+		return "turning on…"
+	}, func() (string, string, error) {
 		m.mu.Lock()
 		on := !m.offering
 		m.mu.Unlock()
@@ -43,25 +54,52 @@ func newTrayExitMenu() *trayExitMenu {
 		n, err := postControl("/api/exitnode/offer?enabled=off")
 		return "Exit-node sharing off", n, err
 	})
-	go m.watch(m.none, func() (string, string, error) {
+	go m.watch(m.none, func() string { return "restoring…" }, func() (string, string, error) {
 		n, err := postControl("/api/exitnode/comeback")
 		return "Normal routing restored", n, err
 	})
 	return m
 }
 
-func (m *trayExitMenu) watch(item *systray.MenuItem, action func() (okText, notice string, err error)) {
+// watch runs action for each click, one at a time per item; pending says
+// what the item shows meanwhile.
+func (m *trayExitMenu) watch(item *systray.MenuItem, pending func() string, action func() (okText, notice string, err error)) {
 	for range item.ClickedCh {
+		m.mu.Lock()
+		_, busy := m.pending[item]
+		if !busy {
+			m.pending[item] = pending()
+		}
+		m.mu.Unlock()
+		if busy {
+			continue
+		}
+		m.changed()
 		go func() {
 			okText, notice, err := action()
+			m.mu.Lock()
+			delete(m.pending, item)
+			m.mu.Unlock()
 			if m.report != nil && okText != "" {
 				m.report(okText, notice, err)
 			}
-			if m.onChange != nil {
-				m.onChange()
-			}
+			m.changed()
 		}()
 	}
+}
+
+func (m *trayExitMenu) changed() {
+	if m.onChange != nil {
+		m.onChange()
+	}
+}
+
+// title is base plus the running action's progress, if any. Callers hold mu.
+func (m *trayExitMenu) title(item *systray.MenuItem, base string) string {
+	if p := m.pending[item]; p != "" {
+		return base + " · " + p
+	}
+	return base
 }
 
 func (m *trayExitMenu) apply(s exitMenuState) {
@@ -69,12 +107,13 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 	defer m.mu.Unlock()
 	m.offering = s.OfferChecked
 	setTitle(m.root, s.Header)
-	setTitle(m.offer, s.OfferTitle)
+	setTitle(m.offer, m.title(m.offer, s.OfferTitle))
 	setTooltip(m.offer, s.OfferTooltip)
 	setChecked(m.offer, s.OfferChecked)
 	setEnabled(m.offer, s.OfferEnabled)
 	setTooltip(m.use, s.UseTooltip)
 	setEnabled(m.use, s.UseEnabled)
+	setTitle(m.none, m.title(m.none, exitNoneTitle))
 	setChecked(m.none, s.NoneChecked)
 	setEnabled(m.none, s.NoneEnabled)
 
@@ -83,7 +122,8 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 		it := m.use.AddSubMenuItemCheckbox("", "", false)
 		m.items = append(m.items, it)
 		m.itemIPs = append(m.itemIPs, "")
-		go m.watch(it, func() (string, string, error) {
+		keepMenuOpen(it)
+		go m.watch(it, func() string { return "switching…" }, func() (string, string, error) {
 			m.mu.Lock()
 			ip := m.itemIPs[idx]
 			m.mu.Unlock()
@@ -104,13 +144,15 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 		}
 		e := s.Items[i]
 		m.itemIPs[i] = e.IP
-		setTitle(it, e.Title)
+		setTitle(it, m.title(it, e.Title))
 		setTooltip(it, e.Tooltip)
 		setChecked(it, e.Checked)
 		setEnabled(it, e.Enabled)
 		it.Show()
 	}
 }
+
+const exitNoneTitle = "Don't use an exit node"
 
 func setChecked(it *systray.MenuItem, on bool) {
 	if on {

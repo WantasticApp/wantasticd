@@ -860,8 +860,11 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  jumpto     Send all internet traffic through a peer: jumpto <peer-vpn-ip>")
 	fmt.Fprintln(os.Stderr, "  comeback   Stop using an exit node and restore normal routing")
 	fmt.Fprintln(os.Stderr, "  tray       Run the system tray client")
-	if runtime.GOOS == "windows" {
-		fmt.Fprintln(os.Stderr, "  service    Windows service: install | uninstall | start | stop | restart | status")
+	switch runtime.GOOS {
+	case "windows":
+		fmt.Fprintln(os.Stderr, "  service    Windows service: install | uninstall | reinstall | start | stop | restart | status")
+	case "darwin":
+		fmt.Fprintln(os.Stderr, "  service    launchd service: install | uninstall | reinstall | start | stop | restart | status")
 	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		fmt.Fprintln(os.Stderr, "  uninstall  Remove the service, tray and app (--purge also removes the login)")

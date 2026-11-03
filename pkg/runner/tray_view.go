@@ -7,7 +7,6 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"math"
 	"net/netip"
 	"runtime"
 	"sort"
@@ -68,7 +67,7 @@ type trayView struct {
 }
 
 func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView {
-	v := trayView{State: stateOf(st), ToggleTitle: "Connect"}
+	v := trayView{State: stateOf(st), ToggleTitle: "VPN"}
 	switch v.State {
 	case trayDaemonDown:
 		v.Header = "○ Daemon not running"
@@ -93,11 +92,11 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 		u := st.ExitNodeState.Using
 		v.Header = "● Connected via exit " + firstNonEmpty(u.Hostname, u.IP)
 		v.Tooltip = "Wantastic: internet via " + firstNonEmpty(u.Hostname, u.IP)
-		v.ToggleTitle, v.ToggleEnabled = "Disconnect", true
+		v.ToggleEnabled = true
 	default:
 		v.Header = "● Connected"
 		v.Tooltip = "Wantastic: connected"
-		v.ToggleTitle, v.ToggleEnabled = "Disconnect", true
+		v.ToggleEnabled = true
 	}
 
 	ip := "—"
@@ -300,38 +299,33 @@ var trayStateColors = map[trayState]color.NRGBA{
 	trayNotSignedIn:  {0xF5, 0x9E, 0x0B, 0xFF}, // amber
 }
 
-// trayIconPNG draws the menu-bar icon: a disc in the state colour with a
-// white "W". Drawn in code so every platform and state shares one source.
+// trayLogo is the Wantastic logo (console img/icon/logo.svg) in a 0..1 box.
+var trayLogo = [][2]float64{
+	{0.20, 0.20}, {0.50, 0.10}, {0.80, 0.20}, {0.65, 0.45},
+	{0.80, 0.70}, {0.50, 0.90}, {0.20, 0.70}, {0.35, 0.45},
+}
+
+// trayIconPNG draws the menu-bar icon: the Wantastic logo in the state
+// colour. Drawn in code so every platform and state shares one source.
 func trayIconPNG(s trayState, size int) []byte {
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
 	fill := trayStateColors[s]
-	w := [][2]float64{{0.22, 0.31}, {0.36, 0.70}, {0.50, 0.40}, {0.64, 0.70}, {0.78, 0.31}}
 	const ss = 4 // supersampling per axis, for smooth edges
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
-			var discN, letterN int
+			var in int
 			for sy := 0; sy < ss; sy++ {
 				for sx := 0; sx < ss; sx++ {
 					px := (float64(x) + (float64(sx)+0.5)/ss) / float64(size)
 					py := (float64(y) + (float64(sy)+0.5)/ss) / float64(size)
-					if math.Hypot(px-0.5, py-0.5) > 0.47 {
-						continue
-					}
-					discN++
-					for i := 0; i+1 < len(w); i++ {
-						if segmentDist(px, py, w[i], w[i+1]) < 0.055 {
-							letterN++
-							break
-						}
+					if insidePolygon(px, py, trayLogo) {
+						in++
 					}
 				}
 			}
-			if discN == 0 {
-				continue
+			if in > 0 {
+				img.SetNRGBA(x, y, color.NRGBA{fill.R, fill.G, fill.B, uint8(in * 255 / (ss * ss))})
 			}
-			t := float64(letterN) / float64(discN)
-			blend := func(c uint8) uint8 { return uint8(float64(c)*(1-t) + 255*t + 0.5) }
-			img.SetNRGBA(x, y, color.NRGBA{blend(fill.R), blend(fill.G), blend(fill.B), uint8(discN * 255 / (ss * ss))})
 		}
 	}
 	var buf bytes.Buffer
@@ -339,11 +333,16 @@ func trayIconPNG(s trayState, size int) []byte {
 	return buf.Bytes()
 }
 
-func segmentDist(px, py float64, a, b [2]float64) float64 {
-	dx, dy := b[0]-a[0], b[1]-a[1]
-	t := ((px-a[0])*dx + (py-a[1])*dy) / (dx*dx + dy*dy)
-	t = math.Max(0, math.Min(1, t))
-	return math.Hypot(px-(a[0]+t*dx), py-(a[1]+t*dy))
+// insidePolygon is the even-odd rule test of (px, py) against poly.
+func insidePolygon(px, py float64, poly [][2]float64) bool {
+	in := false
+	for i, j := 0, len(poly)-1; i < len(poly); j, i = i, i+1 {
+		a, b := poly[i], poly[j]
+		if (a[1] > py) != (b[1] > py) && px < (b[0]-a[0])*(py-a[1])/(b[1]-a[1])+a[0] {
+			in = !in
+		}
+	}
+	return in
 }
 
 // pngToICO wraps a PNG in a single-image .ico, the format the Windows

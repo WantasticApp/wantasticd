@@ -146,3 +146,24 @@ func exitCandidateItem(c device.ExitCandidate, using string) exitMenuItem {
 	}
 	return it
 }
+
+// withExitLatency adds each candidate's last ping to its title, so picking
+// an exit node shows how far each one is.
+func withExitLatency(s exitMenuState, latency map[string]agent.PingResult) exitMenuState {
+	if len(latency) == 0 {
+		return s
+	}
+	items := make([]exitMenuItem, len(s.Items))
+	for i, it := range s.Items {
+		if r, ok := latency[it.IP]; ok && r.Sent > 0 {
+			if r.Received > 0 {
+				it.Title += fmt.Sprintf(" · %.0f ms", r.AvgMs)
+			} else {
+				it.Title += " · no reply"
+			}
+		}
+		items[i] = it
+	}
+	s.Items = items
+	return s
+}

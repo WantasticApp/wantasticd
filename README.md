@@ -75,9 +75,12 @@ curl -fsSL https://get.wantastic.app/install.sh | sudo sh -s -- --uninstall [--p
 ### macOS code signing
 
 Until it is set up, macOS warns that it "could not verify `wantastic-macos.pkg`
-is free of malware" when the package comes from a browser (right-click → Open,
-or System Settings → Privacy & Security → Open Anyway). The `curl | sudo sh`
-install is not affected. To remove the warning, with an Apple Developer Program
+is free of malware" when the package comes from a browser and offers only
+**Done** or **Move to Trash**. Click **Done**, then open **System Settings →
+Privacy & Security**, scroll to Security and click **Open Anyway** next to
+`wantastic-macos.pkg`; confirm **Open Anyway** again with your password and
+the installer starts. (macOS 15 removed the right-click → Open shortcut.) The
+`curl | sudo sh` install is not affected. To remove the warning, with an Apple Developer Program
 membership (Wantastic LLC):
 
 1. Create a **Developer ID Application** and a **Developer ID Installer**
@@ -97,8 +100,9 @@ https://get.wantastic.app/latest/ (one package for Intel and Apple silicon, macO
 and open it; then click **Log in** in the menu bar. It installs exactly what the
 script above installs, and upgrades in place.
 
-On macOS the same is built in: `sudo wantasticd uninstall [--purge]`, or
-**Uninstall Wantastic…** in the menu-bar app (asks for an administrator password).
+On macOS the same is built in: `sudo wantasticd uninstall [--purge]`. The
+service alone is managed with `sudo wantasticd service install | uninstall |
+reinstall | start | stop | restart | status`.
 
 The installer automatically:
 - Detects your OS and architecture (`linux/amd64`, `arm64`, `arm`, `mips`, `riscv64`, `ppc64le`, ...)

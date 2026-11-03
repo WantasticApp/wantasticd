@@ -919,7 +919,13 @@ func (c *P2PClient) TryP2P(peerID uint32) bool {
 // lock-free immutable-map lookup and an atomic cooldown check. The first
 // packet keeps using the relay while a bounded worker negotiates a direct
 // path; it is never delayed by hole punching.
-func (c *P2PClient) ObserveDestination(dst []byte) {
+//
+// nowNano caches the clock for one TUN read batch: 0 means "not read yet",
+// and the first destination that needs the time fills it. Reading the clock
+// is a real syscall on targets without a Go vDSO (linux/mips, mipsle), so a
+// batch of packets toward a relayed P2P candidate costs one read, not one
+// per packet. A nil nowNano reads the clock directly.
+func (c *P2PClient) ObserveDestination(dst []byte, nowNano *int64) {
 	index := c.destinations.Load()
 	if index == nil {
 		return
@@ -938,13 +944,21 @@ func (c *P2PClient) ObserveDestination(dst []byte) {
 		return
 	}
 
-	now := time.Now()
+	var now int64
+	if nowNano == nil {
+		now = time.Now().UnixNano()
+	} else {
+		if *nowNano == 0 {
+			*nowNano = time.Now().UnixNano()
+		}
+		now = *nowNano
+	}
 	next := destination.gate.Load()
-	if next > now.UnixNano() || !destination.gate.CompareAndSwap(next, now.Add(p2pAttemptGateInterval).UnixNano()) {
+	if next > now || !destination.gate.CompareAndSwap(next, now+int64(p2pAttemptGateInterval)) {
 		return
 	}
 	if !c.queueP2PAttempt(destination.peerID) {
-		destination.gate.Store(now.UnixNano())
+		destination.gate.Store(now)
 	}
 }
 

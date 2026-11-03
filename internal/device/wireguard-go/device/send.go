@@ -389,6 +389,8 @@ func (device *Device) RoutineReadFromTUN() {
 	for {
 		// read packets
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+		p2pClient := device.GetP2PClient()
+		var batchNow int64 // clock read at most once per batch, lazily
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
@@ -405,8 +407,8 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
-				if client := device.GetP2PClient(); client != nil {
-					client.ObserveDestination(dst)
+				if p2pClient != nil {
+					p2pClient.ObserveDestination(dst, &batchNow)
 				}
 				peer = device.allowedips.Lookup(dst)
 
@@ -415,8 +417,8 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
-				if client := device.GetP2PClient(); client != nil {
-					client.ObserveDestination(dst)
+				if p2pClient != nil {
+					p2pClient.ObserveDestination(dst, &batchNow)
 				}
 				peer = device.allowedips.Lookup(dst)
 

@@ -163,7 +163,7 @@ func TestObserveDestinationCoalescesAttempts(t *testing.T) {
 	}})
 
 	for range 100 {
-		client.ObserveDestination(net.IPv4(10, 0, 0, 7).To4())
+		client.ObserveDestination(net.IPv4(10, 0, 0, 7).To4(), nil)
 	}
 	if got := len(client.attemptQueue); got != 1 {
 		t.Fatalf("queued attempts = %d, want 1", got)
@@ -683,4 +683,63 @@ func TestHandlePeerNamesStoresCoordinatorNames(t *testing.T) {
 	if got := client.PeerName(b); got != "" {
 		t.Fatalf("truncated payload stored %q", got)
 	}
+}
+
+func TestObserveDestinationBatchClockStillGates(t *testing.T) {
+	client := NewP2PClient(&Device{})
+	defer client.Close()
+	gate := newAtomicInt64()
+	client.destinations.Store(&p2pDestinationIndex{byIP: map[netip.Addr]p2pDestination{
+		netip.MustParseAddr("10.0.0.7"): {peerID: 7, gate: gate},
+	}})
+	dst := net.IPv4(10, 0, 0, 7).To4()
+	var batchNow int64
+	for range 64 {
+		client.ObserveDestination(dst, &batchNow)
+	}
+	if batchNow == 0 {
+		t.Fatalf("batch clock was not filled by a gated destination")
+	}
+	if got := len(client.attemptQueue); got != 1 {
+		t.Fatalf("queued attempts = %d, want 1", got)
+	}
+	// A destination that is not a P2P candidate must not read the clock.
+	var untouched int64
+	client.ObserveDestination(net.IPv4(10, 0, 0, 8).To4(), &untouched)
+	if untouched != 0 {
+		t.Fatalf("non-candidate destination read the clock")
+	}
+}
+
+// BenchmarkObserveDestinationGated measures the per-packet TUN hot-path cost
+// for a relayed P2P candidate inside its attempt cooldown (the steady state
+// when a direct path cannot be made). "perPacketClock" is the previous
+// behaviour (one clock read per packet); "batchClock" reads it once per
+// 64-packet TUN batch.
+func BenchmarkObserveDestinationGated(b *testing.B) {
+	client := NewP2PClient(&Device{})
+	defer client.Close()
+	gate := newAtomicInt64()
+	gate.Store(time.Now().Add(time.Hour).UnixNano())
+	client.destinations.Store(&p2pDestinationIndex{byIP: map[netip.Addr]p2pDestination{
+		netip.MustParseAddr("10.0.0.7"): {peerID: 7, gate: gate},
+	}})
+	dst := net.IPv4(10, 0, 0, 7).To4()
+	const batch = 64
+	b.Run("perPacketClock", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			client.ObserveDestination(dst, nil)
+		}
+	})
+	b.Run("batchClock", func(b *testing.B) {
+		b.ReportAllocs()
+		var batchNow int64
+		for i := 0; i < b.N; i++ {
+			if i%batch == 0 {
+				batchNow = 0
+			}
+			client.ObserveDestination(dst, &batchNow)
+		}
+	})
 }

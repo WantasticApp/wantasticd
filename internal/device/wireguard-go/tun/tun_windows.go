@@ -141,9 +141,14 @@ func (tun *NativeTun) ForceMTU(mtu int) {
 	}
 }
 
+// windowsReadBatchSize bounds how many packets one Read takes from the wintun
+// ring. Packets already in the ring are collected without waiting, so the
+// device stages and encrypts them as one batch instead of paying a goroutine
+// hand-off per packet; a lone packet is returned as soon as it arrives.
+const windowsReadBatchSize = 32
+
 func (tun *NativeTun) BatchSize() int {
-	// TODO: implement batching with wintun
-	return 1
+	return windowsReadBatchSize
 }
 
 // Note: Read() and Write() assume the caller comes only from a single thread; there's no locking.
@@ -168,7 +173,22 @@ retry:
 			sizes[0] = n
 			tun.session.ReleaseReceivePacket(packet)
 			tun.rate.update(uint64(n))
-			return 1, nil
+			count := 1
+			// Drain packets already in the ring; never wait for more. Any
+			// error (normally ERROR_NO_MORE_ITEMS) ends the batch and a real
+			// failure surfaces on the next Read.
+			for count < len(bufs) {
+				packet, err = tun.session.ReceivePacket()
+				if err != nil {
+					break
+				}
+				n = copy(bufs[count][offset:], packet)
+				sizes[count] = n
+				tun.session.ReleaseReceivePacket(packet)
+				tun.rate.update(uint64(n))
+				count++
+			}
+			return count, nil
 		case windows.ERROR_NO_MORE_ITEMS:
 			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
 				windows.WaitForSingleObject(tun.readWait, windows.INFINITE)

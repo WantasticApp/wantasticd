@@ -35,9 +35,19 @@ func isOptionalUTUNOptErr(err error) bool {
 		err == unix.EINVAL
 }
 
+// darwinReadBatchSize bounds how many already-queued packets one Read drains
+// from the utun socket. utun hands out one packet per read(2), but under load
+// several are already waiting; collecting them in one Read lets the device
+// stage, encrypt and hand off a whole batch instead of paying a goroutine
+// handoff and queue round trip per packet. The drain never waits, so a lone
+// packet is delivered exactly as fast as before.
+const darwinReadBatchSize = 32
+
 type NativeTun struct {
 	name        string
 	tunFile     *os.File
+	rawConn     syscall.RawConn // non-blocking drain of queued packets; nil disables batching
+	drain       utunDrain
 	events      chan Event
 	errors      chan error
 	routeSocket int
@@ -168,6 +178,7 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		events:  make(chan Event, 10),
 		errors:  make(chan error, 5),
 	}
+	tun.rawConn = drainConn(file)
 
 	name, err := tun.Name()
 	if err != nil {
@@ -245,8 +256,71 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 			return 0, err
 		}
 		sizes[0] = n - 4
-		return 1, err
+		if err != nil || len(bufs) == 1 || tun.rawConn == nil {
+			return 1, err
+		}
+		return 1 + tun.drain.run(tun.rawConn, bufs[1:], sizes[1:], offset), nil
 	}
+}
+
+// drainConn returns the raw socket used to drain queued packets, or nil when
+// the descriptor is not non-blocking (then Read keeps the classic
+// one-packet-per-call behaviour). CreateTUN always sets O_NONBLOCK. Nothing
+// may call File().Fd() on a batching NativeTun: Fd() switches the descriptor
+// to blocking mode, which would let a drain read wait for a second packet.
+func drainConn(file *os.File) syscall.RawConn {
+	rc, err := file.SyscallConn()
+	if err != nil {
+		return nil
+	}
+	nonblocking := false
+	if err := rc.Control(func(fd uintptr) {
+		flags, err := unix.FcntlInt(fd, unix.F_GETFL, 0)
+		nonblocking = err == nil && flags&unix.O_NONBLOCK != 0
+	}); err != nil || !nonblocking {
+		return nil
+	}
+	return rc
+}
+
+// utunDrain reads packets that are already queued on the utun socket. Its
+// callback is bound once so a drain does not allocate a closure per Read.
+// Only the single TUN reader goroutine uses it.
+type utunDrain struct {
+	bufs   [][]byte
+	sizes  []int
+	offset int
+	count  int
+	fn     func(fd uintptr) bool
+}
+
+// run fills bufs with queued packets without ever waiting: it stops at the
+// first EAGAIN (nothing queued), at any other error (the next blocking Read
+// reports it) or when bufs is full, and returns how many it read.
+func (d *utunDrain) run(rc syscall.RawConn, bufs [][]byte, sizes []int, offset int) int {
+	if d.fn == nil {
+		d.fn = d.read
+	}
+	d.bufs, d.sizes, d.offset, d.count = bufs, sizes, offset, 0
+	_ = rc.Read(d.fn)
+	count := d.count
+	d.bufs, d.sizes = nil, nil
+	return count
+}
+
+func (d *utunDrain) read(fd uintptr) bool {
+	for d.count < len(d.bufs) {
+		n, err := unix.Read(int(fd), d.bufs[d.count][d.offset-4:])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil || n < 4 {
+			break
+		}
+		d.sizes[d.count] = n - 4
+		d.count++
+	}
+	return true // done: never park waiting for more
 }
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
@@ -334,7 +408,10 @@ func (tun *NativeTun) MTU() (int, error) {
 }
 
 func (tun *NativeTun) BatchSize() int {
-	return 1
+	if tun.rawConn == nil {
+		return 1
+	}
+	return darwinReadBatchSize
 }
 
 func socketCloexec(family, sotype, proto int) (fd int, err error) {

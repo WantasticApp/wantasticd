@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -52,7 +52,9 @@ private fun loadNotices(context: Context): List<Notice> {
     val font = runCatching {
         Notice("Inter (typeface)", "4.1", "OFL-1.1", context.resources.openRawResource(app.wantastic.android.R.raw.inter_license).bufferedReader().use { it.readText() })
     }.getOrNull()
-    return (libs + go + listOfNotNull(font)).sortedBy { it.name.lowercase() }
+    // A library can ship as several artifacts with one name (e.g. -core and
+    // -core-android): list it once.
+    return (libs + go + listOfNotNull(font)).distinctBy { it.name to it.version }.sortedBy { it.name.lowercase() }
 }
 
 @Composable
@@ -65,7 +67,7 @@ fun LicensesScreen() {
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 110.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            items(notices.orEmpty(), key = { it.name + it.version }) { n -> NoticeCard(n) }
+            itemsIndexed(notices.orEmpty(), key = { i, n -> "$i:${n.name}" }) { _, n -> NoticeCard(n) }
         }
     }
 }

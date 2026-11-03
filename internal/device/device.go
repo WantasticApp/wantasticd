@@ -188,7 +188,8 @@ func (d *Device) Start() error {
 	// it during Stop; failures remain non-fatal so firewall policy never prevents
 	// the tunnel from starting or changes unrelated host firewall rules.
 	tenantRules := tenantFirewallRules(d.tunName, d.config.Interface.Addresses, d.config.Server.AllowedIPs)
-	if len(tenantRules) > 0 {
+	// A platform-provided tunnel (Android) has no host firewall to open.
+	if len(tenantRules) > 0 && ExternalTUN == nil {
 		err := ctl.TenantFirewallSet(tenantRules)
 		d.mu.Lock()
 		d.tenantFirewallRules = tenantRules

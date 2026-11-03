@@ -255,6 +255,10 @@ func (a *Agent) runHealthCheck(ctx context.Context) {
 
 func (a *Agent) runDNSCheck(ctx context.Context) {
 	defer a.wg.Done()
+	// A platform-provided tunnel (Android) carries its DNS servers itself.
+	if device.ExternalTUN != nil {
+		return
+	}
 
 	// Initial assertion + periodic re-assertion. Frequent enough to recover
 	// quickly from external rewrites (DHCP, netifd, container restarts).

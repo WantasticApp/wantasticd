@@ -174,8 +174,9 @@ private fun Metric(label: String, value: String, history: List<Long>, color: Col
 
 private const val HISTORY_POINTS = 60
 
+// Always a number: the value changes in place, never drops back to a dash.
 private fun rate(bits: Long): String = when {
-    bits <= 0 -> "—"
+    bits <= 0 -> "0 kbit/s"
     bits >= 1_000_000 -> "%.1f Mbit/s".format(bits / 1_000_000.0)
     else -> "%.0f kbit/s".format(bits / 1_000.0)
 }

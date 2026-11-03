@@ -221,6 +221,7 @@ class GoEngine private constructor(private val context: Context, private val set
 
     /** Shares (or stops sharing) this phone's internet with the network's devices. */
     override fun offerExit(on: Boolean) {
+        Log.i(TAG, "share this phone: $on")
         state.update { it.copy(exitNotice = null, offeringExit = on) }
         scope.launch {
             control("/api/exitnode/offer?enabled=" + if (on) "on" else "off")

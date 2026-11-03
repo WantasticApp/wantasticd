@@ -126,6 +126,10 @@ func (d *Device) exitEngine() *exitEngine {
 
 func exitStatePath(cfgPath string) string {
 	if cfgPath == "" {
+		// The Android app keeps state in its private folder (the engine sets this).
+		if dir := os.Getenv("WANTASTIC_STATE_DIR"); dir != "" {
+			return filepath.Join(dir, "exitnode.json")
+		}
 		return filepath.Join(os.TempDir(), "wantasticd-exitnode.json")
 	}
 	return filepath.Join(filepath.Dir(cfgPath), "exitnode.json")

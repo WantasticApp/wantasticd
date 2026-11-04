@@ -16,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 /**
@@ -48,7 +49,11 @@ class WantasticVpnService : VpnService() {
         if (!watching) {
             watching = true
             scope.launch {
-                engine.status.collect { status ->
+                // Only when what the notification and tile show changes: the byte
+                // counters tick every 2 s and would redraw them for nothing.
+                engine.status.distinctUntilChanged { a, b ->
+                    a.tunnel == b.tunnel && a.usingExit == b.usingExit && a.exitState == b.exitState && a.peers.size == b.peers.size
+                }.collect { status ->
                     getSystemService(NotificationManager::class.java)
                         .notify(ConnectionNotification.ID, ConnectionNotification.build(this@WantasticVpnService, status))
                     TileService.requestListeningState(this@WantasticVpnService, ComponentName(this@WantasticVpnService, ConnectTile::class.java))

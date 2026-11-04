@@ -308,7 +308,8 @@ class WireGuardDevice(
         direct.remove(vpnIp)?.let { if (it.path !== main) it.path.close() }
     }
 
-    internal fun directPeer(vpnIp: String): Boolean = direct[vpnIp]?.lastHandshakeMs?.let { it > 0 } == true
+    /** A direct path carries traffic only while packets keep coming back from it. */
+    internal fun directPeer(vpnIp: String): Boolean = direct[vpnIp]?.alive(System.currentTimeMillis()) == true
 
     private fun tunLoop() {
         val buf = ByteArray(65535)
@@ -326,7 +327,7 @@ class WireGuardDevice(
             val dst = InetAddress.getByAddress(dstRaw).hostAddress
             // A direct peer with a live session carries its address; the internet
             // goes to the exit node when one is active; the hub the rest.
-            val p = direct[dst]?.takeIf { it.lastHandshakeMs > 0 }
+            val p = direct[dst]?.takeIf { it.alive(System.currentTimeMillis()) }
             when {
                 p != null -> p.sendPacket(packet)
                 !isOverlay(dstRaw) && exitActive() -> direct[exitIp]?.sendPacket(packet)
@@ -353,7 +354,9 @@ class WireGuardDevice(
             direct.values.forEach { it.tick(now) }
             // A direct session that went quiet: back to the hub.
             direct.entries.removeIf { (_, p) ->
-                val stale = p.lastHandshakeMs > 0 && now - p.lastHandshakeMs > DIRECT_STALE_MS ||
+                // Both sides keep it alive (the Go agent every 12 s, this side every
+                // 25 s): silence means the other side dropped it. Back to the hub.
+                val stale = p.lastHandshakeMs > 0 && now - p.lastReceivedMs > DIRECT_SILENT_MS ||
                     p.lastHandshakeMs == 0L && now - p.created > DIRECT_SETUP_TIMEOUT_MS
                 if (stale) {
                     log("direct path to ${p.vpnIp} ${if (p.lastHandshakeMs == 0L) "never came up" else "went quiet"}; using the hub")
@@ -404,9 +407,12 @@ class WireGuardDevice(
         private var lastInitiation = 0L
         private var lastSent = 0L
         private var lastReceived = 0L
+        val lastReceivedMs: Long get() = lastReceived
         private var lastDataSent = 0L
         private var lastDataReceived = 0L
         private var resolveAgainAt = 0L
+
+        fun alive(now: Long): Boolean = lastHandshakeMs > 0 && now - lastReceived < DIRECT_SILENT_MS
 
         fun allowsSource(packet: ByteArray): Boolean {
             val src = when (packet[0].toInt() ushr 4) {
@@ -607,7 +613,7 @@ class WireGuardDevice(
         private const val P2P_KEEPALIVE_SEC = 25
         /** Like the Go agent's p2pResponderFallback. */
         private const val RESPONDER_FALLBACK_MS = 3_000L
-        private const val DIRECT_STALE_MS = 4 * 60_000L
+        private const val DIRECT_SILENT_MS = 40_000L
         private const val DIRECT_SETUP_TIMEOUT_MS = 20_000L
 
         private const val EXIT_TICK_MS = 2_000L

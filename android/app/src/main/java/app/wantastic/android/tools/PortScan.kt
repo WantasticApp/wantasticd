@@ -32,7 +32,7 @@ object PortScan {
             services.map { s ->
                 async {
                     gate.withPermit {
-                        runCatching { Socket().use { it.connect(InetSocketAddress(ip, s.port), 900) }; s }.getOrNull()
+                        runCatching { Socket().use { it.connect(InetSocketAddress(ip, s.port), 2500) }; s }.getOrNull()
                     }
                 }
             }.awaitAll().filterNotNull()

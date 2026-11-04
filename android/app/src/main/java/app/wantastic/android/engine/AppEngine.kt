@@ -148,17 +148,16 @@ class AppEngine private constructor(private val context: Context, private val se
             it.copy(
                 tunnel = if (hubAnswers) TunnelState.Connected(address, since, k.config.server.endpointHost) else TunnelState.Connecting,
                 serverSilent = !hubAnswers && now - since > SERVER_SILENT_AFTER_MS,
-                peers = listOf(
+                // The network's devices, direct or through the relay (the hub's own
+                // state shows on Home, as the connection itself).
+                peers = (s.p2p?.peers.orEmpty() + s.direct.map { it.vpnIp }).distinct().map { ip ->
+                    val d = direct[ip]
+                    val live = d != null && d.lastHandshakeMs > 0 && now - d.lastHandshakeMs < HUB_HANDSHAKE_FRESH_SEC * 1000
                     Peer(
-                        name = "Wantastic hub", vpnIp = "", publicIp = s.endpoint?.substringBeforeLast(':'),
-                        direct = false, latencyMs = null, handshakeAgoSec = hubAgo, rxBytes = s.rxBytes, txBytes = s.txBytes,
-                    ),
-                ) + s.direct.map { d ->
-                    Peer(
-                        name = d.vpnIp, vpnIp = d.vpnIp, publicIp = d.endpoint.substringBeforeLast(':'),
-                        direct = d.lastHandshakeMs > 0, latencyMs = null,
-                        handshakeAgoSec = if (d.lastHandshakeMs > 0) (now - d.lastHandshakeMs) / 1000 else null,
-                        rxBytes = d.rxBytes, txBytes = d.txBytes,
+                        name = ip, vpnIp = ip, publicIp = d?.endpoint?.substringBeforeLast(':')?.ifBlank { null },
+                        direct = live, latencyMs = null,
+                        handshakeAgoSec = d?.lastHandshakeMs?.takeIf { it > 0 }?.let { (now - it) / 1000 },
+                        rxBytes = d?.rxBytes ?: 0, txBytes = d?.txBytes ?: 0,
                     )
                 },
                 exitCandidates = (s.p2p?.peers.orEmpty()).map { ip ->

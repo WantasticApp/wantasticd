@@ -106,6 +106,11 @@ class KotlinTunnel private constructor(
                     (net?.getAllByName(host) ?: InetAddress.getAllByName(host)).toList()
                 },
                 log = { Log.i(TAG, it) },
+                // P2P candidates: this phone's addresses on its real network.
+                localAddresses = {
+                    val net = cm?.activeNetwork
+                    net?.let { cm.getLinkProperties(it) }?.linkAddresses?.map { it.address }.orEmpty()
+                },
             )
             device.start()
             Log.i(TAG, "Kotlin engine up: ${config.addresses.joinToString()} via ${config.server.endpointHost}:${config.server.endpointPort}")

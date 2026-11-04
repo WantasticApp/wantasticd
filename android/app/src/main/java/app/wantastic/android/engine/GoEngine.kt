@@ -160,6 +160,7 @@ class GoEngine private constructor(private val context: Context, private val set
     private fun pollKotlin() {
         val k = kotlin ?: return
         val s = k.stats
+        s.p2p?.let { p -> if (p.attempts.isNotEmpty() || p.id != 0) Log.i(TAG, "P2P id=${p.id} seen=${p.observed} nat=${p.nat} peers=${p.discovered} ${p.attempts}") }
         val now = System.currentTimeMillis()
         val prev = last
         last = Triple(now, s.rxBytes, s.txBytes)
@@ -178,7 +179,14 @@ class GoEngine private constructor(private val context: Context, private val set
                         name = "Wantastic hub · Kotlin engine", vpnIp = "", publicIp = s.endpoint?.substringBeforeLast(':'),
                         direct = false, latencyMs = null, handshakeAgoSec = hubAgo, rxBytes = s.rxBytes, txBytes = s.txBytes,
                     ),
-                ),
+                ) + s.direct.map { d ->
+                    Peer(
+                        name = d.vpnIp, vpnIp = d.vpnIp, publicIp = d.endpoint.substringBeforeLast(':'),
+                        direct = d.lastHandshakeMs > 0, latencyMs = null,
+                        handshakeAgoSec = if (d.lastHandshakeMs > 0) (now - d.lastHandshakeMs) / 1000 else null,
+                        rxBytes = d.rxBytes, txBytes = d.txBytes,
+                    )
+                },
                 downBitsPerSec = down,
                 upBitsPerSec = up,
                 downHistory = (it.downHistory + down).takeLast(HISTORY),

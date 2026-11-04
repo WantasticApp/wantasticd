@@ -13,6 +13,7 @@ object MessageType {
     const val PUNCH = 6
     const val TUN_CONTROL = 7
     const val WUSP = 8
+    const val P2P_CONTROL = 9
 
     const val INITIATION_SIZE = 148
     const val RESPONSE_SIZE = 92

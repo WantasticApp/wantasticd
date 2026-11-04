@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -199,11 +201,26 @@ class AppEngine private constructor(private val context: Context, private val se
             val path = if (state.value.peers.any { it.vpnIp == ip && it.direct }) "direct" else "relay"
             when {
                 got == null -> "No answer"
-                got.groupValues[2] == "0" -> "No reply · $path"
+                got.groupValues[2] == "0" -> tcpReach(ip)?.let { "No reply to ping (it blocks pings) · reachable on TCP $it · $path" }
+                    ?: "No reply · $path"
                 rtt != null -> "${got.groupValues[2]}/${got.groupValues[1]} · ${rtt.groupValues[1].toDouble().toInt()} ms avg · ${rtt.groupValues[2].toDouble().toInt()} ms jitter · $path"
                 else -> "${got.groupValues[2]}/${got.groupValues[1]} · $path"
             }
         }.getOrElse { it.message ?: "Ping failed" }
+    }
+
+    /**
+     * Many devices drop pings (macOS stealth mode, Windows' firewall): the first
+     * common TCP port that accepts a connection, or null.
+     */
+    private suspend fun tcpReach(ip: String): Int? = kotlinx.coroutines.coroutineScope {
+        val ports = listOf(22, 80, 443, 445, 3389, 5000, 7000, 8080, 8291, 5900)
+        val tries = ports.map { port ->
+            async(Dispatchers.IO) {
+                runCatching { java.net.Socket().use { it.connect(java.net.InetSocketAddress(ip, port), 2500) }; port }.getOrNull()
+            }
+        }
+        tries.awaitAll().firstOrNull { it != null }
     }
 
     companion object {

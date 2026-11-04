@@ -308,6 +308,9 @@ class WireGuardDevice(
         direct.remove(vpnIp)?.let { if (it.path !== main) it.path.close() }
     }
 
+    /** A direct path to [vpnIp] exists, set up or being set up. */
+    internal fun hasDirect(vpnIp: String): Boolean = direct.containsKey(vpnIp)
+
     /** A direct path carries traffic only while packets keep coming back from it. */
     internal fun directPeer(vpnIp: String): Boolean = direct[vpnIp]?.alive(System.currentTimeMillis()) == true
 

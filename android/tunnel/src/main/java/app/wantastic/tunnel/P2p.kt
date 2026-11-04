@@ -148,7 +148,9 @@ internal class P2pClient(
 
     /** Traffic for [vpnIp] went through the hub: try a direct path (rate-limited). */
     fun observeDestination(vpnIp: String) {
-        if (myId == 0 || dev.directPeer(vpnIp) || sessions.containsKey(vpnIp)) return
+        // Never while a direct path exists or is coming up: the other side treats
+        // a new punch as "the path was lost" and tears it down (it flapped).
+        if (myId == 0 || dev.hasDirect(vpnIp) || sessions.containsKey(vpnIp)) return
         val now = System.currentTimeMillis()
         if (now < (nextTry[vpnIp] ?: 0L)) return
         val peer = peers.values.firstOrNull { it.vpnIp == vpnIp && it.capable } ?: return

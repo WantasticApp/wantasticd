@@ -42,25 +42,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: mobile/go.mod
-          cache-dependency-path: mobile/go.sum
 
-      # The Go engine (../mobile, the agent's own code) as an Android library,
-      # 16 KB page aligned as Google Play requires for native code.
-      - name: Engine (gomobile)
-        working-directory: mobile
-        run: |
-          set -euo pipefail
-          MOBILE=$(go list -m -f '{{.Version}}' golang.org/x/mobile)
-          go install "golang.org/x/mobile/cmd/gomobile@$MOBILE" "golang.org/x/mobile/cmd/gobind@$MOBILE"
-          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          mkdir -p ../android/app/libs
-          gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 24 \
-            -javapkg app.wantastic -trimpath -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" -o ../android/app/libs/wantastic-engine.aar .
-          # Open-source notices for every Go module in the engine.
-          go run ./cmd/golicenses -o ../android/app/libs/assets/go-licenses.json
 
       - name: Version
         id: version

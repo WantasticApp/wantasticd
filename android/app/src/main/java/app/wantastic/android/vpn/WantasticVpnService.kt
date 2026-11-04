@@ -10,7 +10,7 @@ import android.content.ComponentName
 import app.wantastic.android.claim.ClaimKey
 import app.wantastic.android.claim.ClaimLink
 import app.wantastic.android.engine.Engines
-import app.wantastic.android.engine.GoEngine
+import app.wantastic.android.engine.AppEngine
 import app.wantastic.android.engine.TunnelState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +20,7 @@ import kotlinx.coroutines.launch
 
 /**
  * The system VPN entry point, also started by Always-on VPN at boot. It
- * owns the interface: the Go engine runs the tunnel inside it while it
+ * owns the interface: the engine runs the tunnel inside it while it
  * stays in the foreground with the connection notification and tile.
  */
 class WantasticVpnService : VpnService() {
@@ -30,7 +30,7 @@ class WantasticVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Always-on VPN may start us before the app ever opened in this process.
-        val engine = GoEngine.install(this, ClaimKey.open(this).setups()) as? GoEngine
+        val engine = AppEngine.install(this, ClaimKey.open(this).setups()) as? AppEngine
         if (intent?.action == ACTION_DISCONNECT || engine == null) {
             engine?.stop()
             stopForegroundCompat()
@@ -72,14 +72,14 @@ class WantasticVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        (Engines.current as? GoEngine)?.stop()
+        (Engines.current as? AppEngine)?.stop()
         scope.cancel()
         super.onDestroy()
     }
 
     override fun onRevoke() {
         // Another VPN took over, or the user revoked it in system settings.
-        (Engines.current as? GoEngine)?.stop()
+        (Engines.current as? AppEngine)?.stop()
         stopForegroundCompat()
         stopSelf()
         super.onRevoke()

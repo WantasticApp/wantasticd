@@ -43,18 +43,12 @@ private fun loadNotices(context: Context): List<Notice> {
             text = lib.licenses.mapNotNull { it.licenseContent ?: it.url }.joinToString("\n\n"),
         )
     }
-    val go = runCatching {
-        val arr = JSONArray(context.assets.open("go-licenses.json").bufferedReader().use { it.readText() })
-        (0 until arr.length()).map { arr.getJSONObject(it) }.map {
-            Notice(it.getString("path"), it.optString("version"), "Go engine", it.getString("license"))
-        }
-    }.getOrDefault(emptyList())
     val font = runCatching {
         Notice("Inter (typeface)", "4.1", "OFL-1.1", context.resources.openRawResource(app.wantastic.android.R.raw.inter_license).bufferedReader().use { it.readText() })
     }.getOrNull()
     // A library can ship as several artifacts with one name (e.g. -core and
     // -core-android): list it once.
-    return (libs + go + listOfNotNull(font)).distinctBy { it.name to it.version }.sortedBy { it.name.lowercase() }
+    return (libs + listOfNotNull(font)).distinctBy { it.name to it.version }.sortedBy { it.name.lowercase() }
 }
 
 @Composable

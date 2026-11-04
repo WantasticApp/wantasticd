@@ -30,7 +30,8 @@ android {
         versionCode = appVersionCode
         versionName = appVersionName
         // The CPUs the Go engine is built for; other native libraries follow.
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        // Phones only: 64- and 32-bit ARM (x86_64 served emulators).
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     signingConfigs {
@@ -62,7 +63,6 @@ android {
         buildConfig = true
     }
     // go-licenses.json from mobile/cmd/golicenses, generated with the engine.
-    sourceSets["main"].assets.srcDir("libs/assets")
 
     // One universal APK for every CPU (arm64, armv7, x86_64, x86).
     splits { abi { isEnable = false } }
@@ -94,7 +94,6 @@ aboutLibraries {
 
 dependencies {
     // The Go engine, built from ../mobile by `gomobile bind` (see android/README.md).
-    implementation(files("libs/wantastic-engine.aar"))
     implementation(project(":tunnel"))
     val composeBom = platform("androidx.compose:compose-bom:2026.05.01")
     implementation(composeBom)

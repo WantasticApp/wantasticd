@@ -411,7 +411,6 @@ fun SettingsScreen(deviceName: String, publicKey: String, onConsole: (path: Stri
     val autoUpdate by settings.autoUpdate.collectAsState()
     val wifiOnly by settings.wifiOnly.collectAsState()
     val motion by settings.motion.collectAsState()
-    val kotlinEngine by settings.kotlinEngine.collectAsState()
     val scope = rememberCoroutineScope()
     var licenses by rememberSaveable { mutableStateOf(false) }
     BackHandler(enabled = licenses) { licenses = false }
@@ -464,14 +463,6 @@ fun SettingsScreen(deviceName: String, publicKey: String, onConsole: (path: Stri
             Section("Appearance")
             GlassCard(Modifier.fillMaxWidth()) {
                 ToggleRow("Motion", "Drifting light and glass that follows the phone's tilt", motion) { settings.setMotion(it) }
-                ToggleRow(
-                    "Kotlin engine (beta)",
-                    "The new tunnel engine. For now: the connection to the server only, no direct paths or exit node. Reconnects to switch.",
-                    kotlinEngine,
-                ) {
-                    settings.setKotlinEngine(it)
-                    app.wantastic.android.engine.Engines.current.reconnect()
-                }
             }
 
             Section("This device")

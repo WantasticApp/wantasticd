@@ -37,7 +37,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.wantastic.android.account.DeviceSetups
 import app.wantastic.android.claim.ClaimLink
-import app.wantastic.mobile.Mobile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -62,9 +61,7 @@ fun AddByLinkScreen(setups: DeviceSetups, setupId: String, deviceName: String, o
     LaunchedEffect(setup?.publicKey, approved) {
         val key = setup?.publicKey ?: return@LaunchedEffect
         while (!approved) {
-            val claim = withContext(Dispatchers.IO) {
-                runCatching { Mobile.waitClaim(ClaimLink.DEFAULT_SERVER, key, 30) }.getOrNull()
-            }
+            val claim = (app.wantastic.android.engine.Engines.current as? app.wantastic.android.engine.AppEngine)?.waitClaim(ClaimLink.DEFAULT_SERVER, key)
             if (!claim.isNullOrEmpty()) {
                 setups.saveClaim(setupId, claim)
                 return@LaunchedEffect

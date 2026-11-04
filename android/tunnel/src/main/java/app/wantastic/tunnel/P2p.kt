@@ -12,7 +12,11 @@ import java.nio.channels.Selector
 import java.util.concurrent.ConcurrentHashMap
 
 /** P2P state for the screens and logs. */
-data class P2pStatus(val id: Int, val observed: String?, val nat: String, val discovered: Int, val attempts: Map<String, String>)
+data class P2pStatus(
+    val id: Int, val observed: String?, val nat: String, val discovered: Int, val attempts: Map<String, String>,
+    /** VPN IPs of the network's P2P-capable devices. */
+    val peers: List<String> = emptyList(),
+)
 
 /**
  * Wantastic's P2P coordination, byte-compatible with the Go agent
@@ -57,7 +61,10 @@ internal class P2pClient(
     private val state = ConcurrentHashMap<String, String>()
     @Volatile private var stopped = false
 
-    fun status() = P2pStatus(myId, observed?.let { "${it.address.hostAddress}:${it.port}" }, selfNat().name.lowercase(), peers.size, HashMap(state))
+    fun status() = P2pStatus(
+        myId, observed?.let { "${it.address.hostAddress}:${it.port}" }, selfNat().name.lowercase(), peers.size, HashMap(state),
+        peers.values.filter { it.capable }.map { it.vpnIp }.sorted(),
+    )
 
     fun stop() {
         stopped = true

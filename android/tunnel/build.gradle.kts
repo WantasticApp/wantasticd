@@ -11,7 +11,14 @@ android {
     defaultConfig {
         minSdk = 24
         consumerProguardFiles("consumer-rules.pro")
+        // The agents' shared signing key, read from the Go agent's source at
+        // build time so the repository keeps a single copy of it.
+        val authGo = rootProject.file("../internal/auth/auth.go").readText()
+        val secret = Regex("""SharedSecret\s*=\s*"([^"]+)"""").find(authGo)?.groupValues?.get(1)
+            ?: error("SharedSecret not found in internal/auth/auth.go")
+        buildConfigField("String", "AGENT_SHARED_SECRET", "\"$secret\"")
     }
+    buildFeatures { buildConfig = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

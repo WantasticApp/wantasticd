@@ -45,7 +45,11 @@ data class TunnelStats(
     val endpoint: String?,
     val direct: List<DirectPeerStats> = emptyList(),
     val p2p: P2pStatus? = null,
+    val exit: ExitStatus? = null,
 )
+
+/** Using another device as exit node: its VPN IP, standby | pending | active, and why. */
+data class ExitStatus(val vpnIp: String, val phase: String, val reason: String, val offers: Map<String, Boolean>)
 
 /**
  * WireGuard with the hub plus directly reached peers. Each peer sends on its
@@ -77,7 +81,91 @@ class WireGuardDevice(
             rx.get(), tx.get(), server.lastHandshakeMs, server.endpoint?.let { "${it.address.hostAddress}:${it.port}" },
             direct.map { (ip, p) -> DirectPeerStats(ip, p.endpoint?.let { "${it.address.hostAddress}:${it.port}" } ?: "", p.lastHandshakeMs, p.rx.get(), p.tx.get()) },
             p2p.status(),
+            exitIp?.let { ExitStatus(it, exitPhase, exitReason, HashMap(exitOffers)) },
         )
+
+    // ── exit node (client side) ──────────────────────────────────────────
+    @Volatile private var exitIp: String? = null
+    @Volatile private var exitGranted = false
+    @Volatile private var exitPhase = "standby"
+    @Volatile private var exitReason = ""
+    private var exitRequestedAt = 0L
+    private val exitOffers = ConcurrentHashMap<String, Boolean>()
+    /** Called when internet traffic starts or stops going through the exit (the VPN needs its default route). */
+    @Volatile var onExitActive: (Boolean) -> Unit = {}
+
+    /** The exit carries the internet only with a granted request over a live direct session. */
+    private fun exitActive(): Boolean {
+        val ip = exitIp ?: return false
+        return exitGranted && directPeer(ip)
+    }
+
+    /** Uses the device at [vpnIp] as exit node; null goes back to direct internet. */
+    fun useExit(vpnIp: String?) {
+        val old = exitIp
+        if (old == vpnIp) return
+        val wasActive = exitActive()
+        if (old != null) direct[old]?.sendEncrypted(MessageType.TUN_CONTROL, frameTun(byteArrayOf(TUN_EXIT_REQUEST, EXIT_OP_RELEASE)))
+        exitIp = vpnIp
+        exitGranted = false
+        exitRequestedAt = 0
+        setExitPhase("standby", if (vpnIp == null) "" else "starting")
+        if (wasActive) onExitActive(false)
+        if (vpnIp != null) p2p.observeDestination(vpnIp)
+    }
+
+    private fun setExitPhase(phase: String, reason: String) {
+        if (phase != exitPhase || reason != exitReason) log("exit node ${exitIp ?: "-"}: $phase${if (reason.isNotEmpty()) " ($reason)" else ""}")
+        exitPhase = phase
+        exitReason = reason
+    }
+
+    /** Every 2 s: get a direct path, ask the exit to carry us, notice when it stops. */
+    private fun exitTick(now: Long) {
+        val ip = exitIp ?: return
+        val wasActive = exitPhase == "active"
+        val peer = direct[ip]
+        when {
+            peer == null || peer.lastHandshakeMs == 0L -> {
+                exitGranted = false
+                p2p.observeDestination(ip) // ask the hub to punch (rate-limited)
+                setExitPhase("standby", "no direct path to the exit node yet")
+            }
+            !exitGranted -> {
+                if (now - exitRequestedAt >= EXIT_REQUEST_EVERY_MS) {
+                    exitRequestedAt = now
+                    peer.sendEncrypted(MessageType.TUN_CONTROL, frameTun(byteArrayOf(TUN_EXIT_REQUEST, EXIT_OP_USE)))
+                }
+                setExitPhase("pending", if (exitOffers[ip] == false) "that device does not share its internet" else "waiting for the exit node to confirm")
+            }
+            else -> setExitPhase("active", "")
+        }
+        val active = exitPhase == "active"
+        if (active != wasActive) onExitActive(active)
+    }
+
+    private fun onTunControl(p: Peer, plain: ByteArray) {
+        if (p.isServer) return // negotiation is between devices only
+        val m = unframeTun(plain) ?: return
+        if (m.size < 2) return
+        when (m[0]) {
+            TUN_EXIT_STATUS -> {
+                val offered = m[1].toInt() and EXIT_FLAG_OFFERED != 0
+                val granted = m[1].toInt() and EXIT_FLAG_GRANTED != 0
+                exitOffers[p.vpnIp] = offered
+                if (p.vpnIp == exitIp) {
+                    if (granted) exitGranted = true else if (!offered) exitGranted = false
+                }
+            }
+            TUN_EXIT_REQUEST -> {
+                // Sharing this phone comes in a later phase: say it does not offer.
+                p.sendEncrypted(MessageType.TUN_CONTROL, frameTun(byteArrayOf(TUN_EXIT_STATUS, 0)))
+            }
+        }
+    }
+
+    /** Destinations outside the networks the hub carries: the internet. */
+    private fun isOverlay(dst: ByteArray): Boolean = config.server.allowedIps.any { it.bits > 0 && it.contains(dst) }
 
     /** The local UDP port of the main socket (for tests and P2P). */
     val localPort: Int get() = main.channel.socket().localPort
@@ -169,7 +257,8 @@ class WireGuardDevice(
                         if (p.allowsSource(ip)) tun.write(ip, ip.size)
                     }
                     MessageType.P2P_CONTROL -> if (p.isServer) unframeControl(plain)?.let { p2p.onControl(it) }
-                    else -> Unit // 7, 8: exit-node control and WUSP (later phases)
+                    MessageType.TUN_CONTROL -> onTunControl(p, plain)
+                    else -> Unit // 8: WUSP (later phase)
                 }
             }
             MessageType.RESPONSE -> {
@@ -228,12 +317,23 @@ class WireGuardDevice(
             if (n < 0) { if (running) Thread.sleep(50); continue }
             if (n < 20) continue
             val packet = buf.copyOf(n)
-            // A direct peer with a live session carries its address; the hub the rest.
-            val dst = if (packet[0].toInt() ushr 4 == 4) InetAddress.getByAddress(packet.copyOfRange(16, 20)).hostAddress else null
-            val p = dst?.let { direct[it] }?.takeIf { it.lastHandshakeMs > 0 }
-            if (p != null) p.sendPacket(packet) else {
-                server.sendPacket(packet)
-                if (dst != null) p2p.observeDestination(dst)
+            if (packet[0].toInt() ushr 4 != 4) {
+                // IPv6 goes to the hub's networks only; with an exit it is dropped (no leak around it).
+                if (!exitActive()) server.sendPacket(packet)
+                continue
+            }
+            val dstRaw = packet.copyOfRange(16, 20)
+            val dst = InetAddress.getByAddress(dstRaw).hostAddress
+            // A direct peer with a live session carries its address; the internet
+            // goes to the exit node when one is active; the hub the rest.
+            val p = direct[dst]?.takeIf { it.lastHandshakeMs > 0 }
+            when {
+                p != null -> p.sendPacket(packet)
+                !isOverlay(dstRaw) && exitActive() -> direct[exitIp]?.sendPacket(packet)
+                else -> {
+                    server.sendPacket(packet)
+                    p2p.observeDestination(dst)
+                }
             }
         }
     }
@@ -241,6 +341,7 @@ class WireGuardDevice(
     private fun timerLoop() {
         resolveEndpoint()
         var lastP2p = 0L
+        var lastExit = 0L
         while (running) {
             try {
                 Thread.sleep(TICK_MS)
@@ -262,6 +363,10 @@ class WireGuardDevice(
                 stale
             }
             p2p.fastTick(now)
+            if (now - lastExit >= EXIT_TICK_MS) {
+                lastExit = now
+                exitTick(now)
+            }
             if (now - lastP2p >= P2P_TICK_MS && server.lastHandshakeMs > 0) {
                 lastP2p = now
                 p2p.tick(now)
@@ -309,7 +414,9 @@ class WireGuardDevice(
                 6 -> if (packet.size >= 40) packet.copyOfRange(8, 24) else return false
                 else -> return false
             }
-            return cfg.allowedIps.any { it.contains(src) }
+            if (cfg.allowedIps.any { it.contains(src) }) return true
+            // The exit node brings the internet's replies.
+            return !isServer && vpnIp == exitIp && exitActive()
         }
 
         fun roam(from: InetSocketAddress, via: UdpPath) {
@@ -502,6 +609,34 @@ class WireGuardDevice(
         private const val RESPONDER_FALLBACK_MS = 3_000L
         private const val DIRECT_STALE_MS = 4 * 60_000L
         private const val DIRECT_SETUP_TIMEOUT_MS = 20_000L
+
+        private const val EXIT_TICK_MS = 2_000L
+        private const val EXIT_REQUEST_EVERY_MS = 5_000L
+        // TUN control (type 7), as the Go agent's tun_control.go / exitnode.go.
+        private const val TUN_EXIT_REQUEST: Byte = 10
+        private const val TUN_EXIT_STATUS: Byte = 11
+        private const val EXIT_OP_RELEASE: Byte = 0
+        private const val EXIT_OP_USE: Byte = 1
+        private const val EXIT_FLAG_OFFERED = 1
+        private const val EXIT_FLAG_GRANTED = 2
+        private val TUN_MAGIC = byteArrayOf('W'.code.toByte(), 'T'.code.toByte(), 'C'.code.toByte(), 1)
+
+        /** "WTC\x01" | u16 LE length | payload: the TUN control frame. */
+        internal fun frameTun(payload: ByteArray): ByteArray {
+            val out = ByteArray(6 + payload.size)
+            TUN_MAGIC.copyInto(out)
+            out[4] = payload.size.toByte()
+            out[5] = (payload.size ushr 8).toByte()
+            payload.copyInto(out, 6)
+            return out
+        }
+
+        internal fun unframeTun(plain: ByteArray): ByteArray? {
+            if (plain.size < 6 || !plain.copyOfRange(0, 4).contentEquals(TUN_MAGIC)) return null
+            val len = (plain[4].toInt() and 0xff) or ((plain[5].toInt() and 0xff) shl 8)
+            if (len > 1200 || len > plain.size - 6) return null
+            return plain.copyOfRange(6, 6 + len)
+        }
 
         /** "WPC\x01" | u16 LE length | message: the Go agent's P2P control frame. */
         private val CONTROL_MAGIC = byteArrayOf('W'.code.toByte(), 'P'.code.toByte(), 'C'.code.toByte(), 1)

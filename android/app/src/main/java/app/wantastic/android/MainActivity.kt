@@ -41,7 +41,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import app.wantastic.android.engine.GoEngine
+import app.wantastic.android.engine.AppEngine
 import app.wantastic.android.update.Updates
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
@@ -117,17 +117,17 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         val setups = ClaimKey.open(this).setups()
-        val engine = GoEngine.install(this, setups)
+        val engine = AppEngine.install(this, setups)
         val deviceName = ClaimKey.deviceName(this)
         // A stable, non-identifying id for the server's sign-in checks.
         val fingerprint = "android:" + setups.current().publicKey.hashCode().toUInt().toString(16)
-        val sync = AccountSync(AccountClient(ClaimLink.DEFAULT_SERVER, fingerprint), setups) { (engine as? GoEngine)?.refresh() }
+        val sync = AccountSync(AccountClient(ClaimLink.DEFAULT_SERVER, fingerprint), setups) { (engine as? AppEngine)?.refresh() }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 // Each time the app comes back: who is signed in (here or in the console), and that account's setup.
                 launch { sync.sync() }
                 // Wait for the active setup's approval while open.
-                if (engine is GoEngine) engine.awaitClaims(ClaimLink.DEFAULT_SERVER)
+                if (engine is AppEngine) engine.awaitClaims(ClaimLink.DEFAULT_SERVER)
             }
         }
         if (savedInstanceState == null) VpnService.prepare(this)?.let(vpnAccess::launch)
@@ -284,7 +284,7 @@ private fun App(sync: AccountSync, setups: DeviceSetups, deviceName: String, onC
                         setups, id, deviceName,
                         onUse = {
                             setups.activate(id)
-                            (engine as? GoEngine)?.refresh()
+                            (engine as? AppEngine)?.refresh()
                             if (status.tunnel is TunnelState.Connected) engine.reconnect() else onConnect()
                             byLinkSetup = null
                         },
@@ -326,7 +326,7 @@ private fun BoxScope.Tabs(
                     val signedIn = account is AccountState.SignedIn
                     HomeConfigsCard(setups, signedIn, onLogIn = onAddAccount, onAddByLink = onAddByLink) {
                         // Another config is in use now: connect on it, or stop if none is approved.
-                        (engine as? GoEngine)?.refresh()
+                        (engine as? AppEngine)?.refresh()
                         if (status.tunnel is TunnelState.Connected || status.tunnel is TunnelState.Connecting) {
                             if (setups.current().claimed) engine.reconnect() else engine.disconnect()
                         }

@@ -352,11 +352,8 @@ func writeClaimKeyFile(path string, keyFile *claimKeyFile) error {
 	if err := auth.EnsureParentDir(path, 0o700); err != nil {
 		return fmt.Errorf("create key directory: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := auth.WriteFileAtomic(path, data, 0600); err != nil {
 		return fmt.Errorf("write key file: %w", err)
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("secure key file permissions: %w", err)
 	}
 	return nil
 }

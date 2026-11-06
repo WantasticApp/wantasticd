@@ -92,3 +92,18 @@ func TestEnsureParentDirRejectsFileParent(t *testing.T) {
 		t.Fatalf("EnsureParentDir()=%v want not-directory error", err)
 	}
 }
+
+func TestWriteFileAtomicReplacesReadOnlyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "device-public-key")
+	if err := os.WriteFile(path, []byte("old\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFileAtomic(path, []byte("new\n"), 0o600); err != nil {
+		t.Fatalf("WriteFileAtomic over a read-only file: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	info, _ := os.Stat(path)
+	if string(data) != "new\n" || info.Mode().Perm() != 0o600 {
+		t.Fatalf("got %q mode %v", data, info.Mode().Perm())
+	}
+}

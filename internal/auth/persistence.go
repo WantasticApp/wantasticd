@@ -183,7 +183,33 @@ func writePersistentFile(path, value string, perm os.FileMode) error {
 	if err := EnsureParentDir(path, 0o700); err != nil {
 		return fmt.Errorf("create persistent directory: %w", err)
 	}
-	return os.WriteFile(path, []byte(value), perm)
+	return WriteFileAtomic(path, []byte(value), perm)
+}
+
+// WriteFileAtomic writes data through a temp file renamed over path. Unlike
+// os.WriteFile it also replaces a file this user cannot open, such as one a
+// past sudo run left root-owned in the user's own Application Support folder.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	_, err = tmp.Write(data)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(name, perm)
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	if err != nil {
+		os.Remove(name)
+	}
+	return err
 }
 
 func readTextFile(path string) string {

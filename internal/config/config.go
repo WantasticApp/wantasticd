@@ -25,6 +25,34 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// resolveEndpointBackoff is the per-attempt wait schedule for
+// resolveEndpointWithRetry (capped), ~60s total before giving up — long enough
+// to outlast a slow boot-time DNS/network bring-up, short enough to still fail
+// if the endpoint is genuinely wrong.
+var resolveEndpointBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second}
+
+// resolveOnce performs a single resolution attempt; indirected so tests can
+// drive resolveEndpointWithRetry without real DNS.
+var resolveOnce = resolveEndpoint
+
+// resolveEndpointWithRetry resolves hostname, retrying on failure with backoff.
+// It returns as soon as resolution succeeds (no delay on the common path) and
+// returns the last error only after the whole schedule is exhausted.
+func resolveEndpointWithRetry(hostname string) (string, error) {
+	ip, err := resolveOnce(hostname)
+	if err == nil {
+		return ip, nil
+	}
+	for i, wait := range resolveEndpointBackoff {
+		log.Printf("Endpoint %s not resolvable yet (%v); retrying in %s (attempt %d/%d)", hostname, err, wait, i+1, len(resolveEndpointBackoff))
+		time.Sleep(wait)
+		if ip, err = resolveOnce(hostname); err == nil {
+			return ip, nil
+		}
+	}
+	return "", err
+}
+
 // resolveEndpoint resolves a hostname to an IP address using the system's default DNS resolver.
 // This respects /etc/hosts, mDNS (.local), and all system DNS configuration.
 func resolveEndpoint(hostname string) (string, error) {
@@ -417,9 +445,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("server endpoint required")
 	}
 
-	// Resolve hostname to IP address if it's not already an IP
+	// Resolve hostname to IP address if it's not already an IP. At boot (or just
+	// after a network change) the system resolver is often not ready yet, which
+	// used to fail config load outright and make the service exit — the SCM then
+	// restart-looped it every ~10s until DNS came up. Retry with backoff so a
+	// transient boot-time DNS miss waits instead of crash-looping; this is
+	// instant when DNS is already available.
 	if net.ParseIP(c.Server.Endpoint) == nil {
-		resolvedIP, err := resolveEndpoint(c.Server.Endpoint)
+		resolvedIP, err := resolveEndpointWithRetry(c.Server.Endpoint)
 		if err != nil {
 			return fmt.Errorf("failed to resolve endpoint %s: %w", c.Server.Endpoint, err)
 		}

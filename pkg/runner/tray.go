@@ -243,7 +243,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			}
 			mVersion := mMore.AddSubMenuItem("Version "+version.Version, "Installed version")
 			mVersion.Disable()
-			mQuit := systray.AddMenuItem("Quit tray", "Close this menu; the VPN service keeps running")
+			mQuit := systray.AddMenuItem("Quit", "Disconnect the tunnel and close the tray")
 
 			keepMenuOpen(mToggle, mPing)
 			menuSwitch(mToggle, exitMenu.offer)
@@ -479,6 +479,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						return
 
 					case <-mQuit.ClickedCh:
+						// Quit now disconnects the tunnel first; users expect "Quit"
+						// to stop the VPN, not leave it running after the tray closes.
+						_, _ = postControl("/api/disconnect")
 						cancel()
 						systray.Quit()
 						return

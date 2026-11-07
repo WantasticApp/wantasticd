@@ -45,8 +45,17 @@ const (
 	exitReconcileEvery = 2 * time.Second
 	exitEnsureEvery    = 30 * time.Second
 	exitQueryEvery     = 60 * time.Second
-	exitRequestEvery   = 5 * time.Second
-	exitUserWindow     = 10 * time.Minute
+
+	// exitTickPanicGiveup is how many consecutive panics the reconcile loop will
+	// absorb before disabling the exit node. The OS route/NAT apply (notably the
+	// Windows default-route branch) runs in that loop; a panic there used to kill
+	// the whole daemon, and because the exit is restored from saved state on the
+	// next start it would crash-loop every run. Absorbing the panic keeps the
+	// daemon up, and giving up after a few in a row restores normal routing
+	// instead of wedging on an exit that can never apply.
+	exitTickPanicGiveup = 5
+	exitRequestEvery    = 5 * time.Second
+	exitUserWindow      = 10 * time.Minute
 )
 
 // ExitNodeStatus is the exit-node part of /api/status and /api/exitnode.
@@ -101,16 +110,18 @@ type exitEngine struct {
 	offerErr string
 
 	// client runtime
-	useKey      wgdevice.NoisePublicKey
-	phase       exitnode.ClientPhase
-	reason      string
-	since       time.Time
-	granted     bool
-	lastRequest time.Time
-	lastTry     time.Time
-	retryAt     time.Time // backoff after a failed activation
-	allowedSet  bool      // 0.0.0.0/0 was given to a peer
-	offered     map[wgdevice.NoisePublicKey]bool
+	useKey         wgdevice.NoisePublicKey
+	phase          exitnode.ClientPhase
+	reason         string
+	since          time.Time
+	granted        bool
+	lastRequest    time.Time
+	lastTry        time.Time
+	retryAt        time.Time // backoff after a failed activation
+	tickPanics     int       // consecutive reconcile-loop panics recovered (see runTick)
+	disabledReason string    // set when the breaker disables the exit; surfaced via useStatus
+	allowedSet     bool      // 0.0.0.0/0 was given to a peer
+	offered        map[wgdevice.NoisePublicKey]bool
 
 	kick chan struct{}
 	stop chan struct{}
@@ -246,17 +257,85 @@ func (e *exitEngine) loop() {
 		case <-t.C:
 		case <-e.kick:
 		}
-		now := time.Now()
-		e.reconcileClient(now)
-		if now.Sub(lastEnsure) >= exitEnsureEvery {
-			lastEnsure = now
-			e.ensureNAT()
-		}
-		if now.Sub(lastQuery) >= exitQueryEvery {
-			lastQuery = now
-			e.queryDirectPeers()
-		}
+		e.runTick(time.Now(), &lastEnsure, &lastQuery)
 	}
+}
+
+// runTick runs one reconcile pass under a panic guard. The OS route/NAT apply
+// (especially the Windows default-route branch) happens here; without this
+// guard a panic on that path takes down the whole daemon — the "Daemon not
+// running" the tray shows mid-switch. reconcileClient releases e.mu via defer
+// even while panicking, so no lock is held when we recover. A tick that panics
+// does not reach resetTickPanics, so a persistently failing exit keeps the
+// counter climbing until onTickPanic trips the breaker.
+func (e *exitEngine) runTick(now time.Time, lastEnsure, lastQuery *time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			var buf [8192]byte
+			n := runtime.Stack(buf[:], false)
+			e.onTickPanic(r, buf[:n])
+		}
+	}()
+	e.reconcileClient(now)
+	if now.Sub(*lastEnsure) >= exitEnsureEvery {
+		*lastEnsure = now
+		e.ensureNAT()
+	}
+	if now.Sub(*lastQuery) >= exitQueryEvery {
+		*lastQuery = now
+		e.queryDirectPeers()
+	}
+	e.resetTickPanics()
+}
+
+func (e *exitEngine) resetTickPanics() {
+	e.mu.Lock()
+	e.tickPanics = 0
+	e.mu.Unlock()
+}
+
+// onTickPanic logs a recovered reconcile panic and, after too many in a row,
+// disables the exit node so the daemon stays stable instead of crash-looping on
+// a restored-but-unapplyable exit.
+func (e *exitEngine) onTickPanic(r any, stack []byte) {
+	n, use, gaveUp := e.recordTickPanic()
+	if n <= 1 {
+		log.Printf("[EXIT] recovered from panic in reconcile loop (#%d); daemon stays up: %v\n%s", n, r, stack)
+	} else {
+		// Bound log volume while we're in a tight failing loop; the first stack is enough.
+		log.Printf("[EXIT] recovered from panic in reconcile loop (#%d); daemon stays up: %v", n, r)
+	}
+	if gaveUp {
+		log.Printf("[EXIT] exit node %s disabled after %d consecutive apply failures; normal routing restored", use, exitTickPanicGiveup)
+	}
+}
+
+// recordTickPanic increments the consecutive-panic counter and, once it reaches
+// the breaker threshold, clears and persists the saved Use so the next start
+// does not restore a broken exit and crash again. It deliberately does NOT run
+// the OS teardown here: if the recurring panic is on the teardown path, doing it
+// under the inner recover could be swallowed and never reach the clears, leaving
+// the crash loop in place. Instead the next reconcile tick sees Use=="" and
+// tears routes down under runTick's outer recover, where a teardown panic is
+// just counted, not fatal.
+func (e *exitEngine) recordTickPanic() (n int, use string, gaveUp bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	defer func() { _ = recover() }()
+	e.tickPanics++
+	n = e.tickPanics
+	use = e.st.Use
+	if n >= exitTickPanicGiveup && use != "" {
+		e.st.Use = ""
+		e.useKey = wgdevice.NoisePublicKey{}
+		e.granted = false
+		e.disabledReason = "exit node disabled after repeated failures"
+		e.setPhaseLocked(exitnode.PhaseOff, "disabled after repeated failures")
+		e.saveLocked()
+		e.tickPanics = 0
+		gaveUp = true
+	}
+	return
 }
 
 // ── exit side ───────────────────────────────────────────────────────────────
@@ -416,11 +495,18 @@ func (e *exitEngine) ensureNAT() {
 			e.saveLocked()
 		}
 	} else if e.st.Offer {
+		// Drop the lock around enableOffer, but re-acquire it even if enableOffer
+		// panics: otherwise the deferred e.mu.Unlock() above would unlock an
+		// already-unlocked mutex (a fatal throw recover() cannot catch) and the
+		// daemon would die here every 30s on exit-sharing devices. With the
+		// deferred re-lock the panic instead propagates to runTick's recover.
 		e.mu.Unlock()
-		if err := e.enableOffer(); err == nil {
-			e.save()
-		}
-		e.mu.Lock()
+		func() {
+			defer e.mu.Lock()
+			if err := e.enableOffer(); err == nil {
+				e.save()
+			}
+		}()
 	}
 	if e.st.ClientNAT != nil {
 		if repaired, err := exitnode.EnsureNAT(e.host, e.st.ClientNAT); err == nil && repaired {
@@ -587,6 +673,8 @@ func (d *Device) UseExitNode(target string, wait time.Duration) (*ExitUse, error
 		e.st.Use = ip.String()
 		e.useKey = dp.PublicKey
 		e.granted = false
+		e.disabledReason = "" // the user is choosing an exit again; clear any prior auto-disable
+		e.tickPanics = 0
 		delete(e.offered, dp.PublicKey) // wait for a fresh answer
 		e.retryAt = time.Time{}
 		e.lastRequest = time.Time{}
@@ -638,6 +726,8 @@ func (d *Device) ClearExitNode() error {
 	e.st.Use = ""
 	e.useKey = wgdevice.NoisePublicKey{}
 	e.granted = false
+	e.disabledReason = "" // explicit user action; drop any prior auto-disable notice
+	e.tickPanics = 0
 	e.phase = exitnode.PhaseOff
 	e.reason = ""
 	e.saveLocked()
@@ -1106,6 +1196,12 @@ func (e *exitEngine) useStatus() *ExitUse {
 
 func (e *exitEngine) useStatusLocked() *ExitUse {
 	if e.st.Use == "" {
+		if e.disabledReason != "" {
+			// The breaker auto-disabled a failing exit. Surface it instead of
+			// reporting "no exit node", so the tray/API don't silently hide that
+			// traffic has fallen back to direct routing.
+			return &ExitUse{State: "disabled", Reason: e.disabledReason, Since: e.since.Unix(), Path: "offline"}
+		}
 		return nil
 	}
 	u := &ExitUse{IP: e.st.Use, State: string(e.phase), Reason: e.reason, Since: e.since.Unix(), Path: "offline"}

@@ -535,7 +535,16 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 					// The receive buffer returns to the pool after this batch. Give
 					// asynchronous handlers an owned copy of authenticated plaintext.
 					payloadCopy := append([]byte(nil), payload...)
-					go device.tunControlHandler(peer, payloadCopy)
+					go func() {
+						// A TUN-control message drives exit-node switching; a panic
+						// in that path must not take down the whole daemon.
+						defer func() {
+							if r := recover(); r != nil {
+								device.log.Errorf("recovered from panic in TUN control handler: %v", r)
+							}
+						}()
+						device.tunControlHandler(peer, payloadCopy)
+					}()
 				}
 				continue
 			case MessageWUSPType:
@@ -553,7 +562,14 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 					// collecting the full TR-181 tree) does not block the receive pipeline
 					// and starve IP traffic delivery.
 					payloadCopy := append([]byte(nil), payload...)
-					go device.wuspHandler(peer, payloadCopy)
+					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+								device.log.Errorf("recovered from panic in WUSP handler: %v", r)
+							}
+						}()
+						device.wuspHandler(peer, payloadCopy)
+					}()
 				}
 				continue
 			}

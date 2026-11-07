@@ -687,22 +687,61 @@ func (d *Device) UseExitNode(target string, wait time.Duration) (*ExitUse, error
 	e.poke()
 
 	deadline := time.Now().Add(wait)
+	u, status := awaitExitUse(deadline, 250*time.Millisecond, time.Now, time.Sleep, e.poke,
+		func() (*ExitUse, bool) {
+			s := e.useStatus()
+			e.mu.Lock()
+			refused := e.offered[e.useKey] == false && hasKey(e.offered, e.useKey)
+			e.mu.Unlock()
+			return s, refused
+		})
+	switch status {
+	case exitWaitCleared:
+		return nil, errors.New("exit node was cleared")
+	case exitWaitRefused:
+		_ = d.ClearExitNode()
+		return nil, fmt.Errorf("%s has not enabled exit-node; run `sudo wantasticd exit-node on` on that device", ip)
+	default:
+		return u, nil
+	}
+}
+
+// exitWaitStatus is why awaitExitUse stopped.
+type exitWaitStatus int
+
+const (
+	exitWaitDone    exitWaitStatus = iota // the use reached Active, or the deadline passed
+	exitWaitCleared                       // the exit was cleared out from under the wait
+	exitWaitRefused                       // the peer refused (exit-node is off there)
+)
+
+// awaitExitUse drives an interactive jumpto to convergence. It polls every step
+// and pokes the reconciler before each wait. The lever: a same-LAN direct path
+// comes up in well under a second, but the exit-use request is only sent from
+// reconcileClient, which otherwise runs on the exitReconcileEvery (2s) tick —
+// so without this poke the switch stalls up to a tick (often two: one while the
+// punch and handshake complete, one before the request goes out) after the path
+// is already live. Poking is cheap and self-limiting: poke() is non-blocking
+// (kick is buffered, extra pokes coalesce) and reconcileClient's own 10s lastTry
+// guard means the faster cadence re-issues TryP2P at most once, so there is no
+// extra punch traffic. The clock, sleep and poll are injected so the loop runs
+// under test without a device or real time.
+func awaitExitUse(deadline time.Time, step time.Duration, now func() time.Time,
+	sleep func(time.Duration), poke func(),
+	poll func() (u *ExitUse, refused bool)) (*ExitUse, exitWaitStatus) {
 	for {
-		u := e.useStatus()
+		u, refused := poll()
 		if u == nil {
-			return nil, errors.New("exit node was cleared")
+			return nil, exitWaitCleared
 		}
-		e.mu.Lock()
-		refused := e.offered[e.useKey] == false && hasKey(e.offered, e.useKey)
-		e.mu.Unlock()
 		if refused {
-			_ = d.ClearExitNode()
-			return nil, fmt.Errorf("%s has not enabled exit-node; run `sudo wantasticd exit-node on` on that device", ip)
+			return u, exitWaitRefused
 		}
-		if u.State == string(exitnode.PhaseActive) || time.Now().After(deadline) {
-			return u, nil
+		if u.State == string(exitnode.PhaseActive) || now().After(deadline) {
+			return u, exitWaitDone
 		}
-		time.Sleep(250 * time.Millisecond)
+		poke()
+		sleep(step)
 	}
 }
 

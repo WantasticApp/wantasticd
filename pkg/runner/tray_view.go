@@ -67,52 +67,52 @@ type trayView struct {
 }
 
 func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView {
-	v := trayView{State: stateOf(st), ToggleTitle: "Connect"}
+	v := trayView{State: stateOf(st), ToggleTitle: T("toggle.connect")}
 	switch v.State {
 	case trayDaemonDown:
-		v.Header = "○ Daemon not running"
-		v.Tooltip = "Wantastic: daemon not running"
-		v.Details = "Start it: " + daemonStartCommand()
-		v.Address, v.Traffic, v.Rate = "IP: —", "Traffic: —", "Speed: —"
-		v.PeersTitle = "Peers: —"
+		v.Header = T("header.daemon.down")
+		v.Tooltip = T("tooltip.daemon.down")
+		v.Details = T("details.start", daemonStartCommand())
+		v.Address, v.Traffic, v.Rate = T("addr.empty"), T("traffic.empty"), T("speed.empty")
+		v.PeersTitle = T("peers.empty")
 		return v
 	case trayNotSignedIn:
-		v.Header = "○ Not signed in"
-		v.Tooltip = "Wantastic: not signed in"
-		v.Details = "Log in to add this device to your account"
-		v.Address, v.Traffic, v.Rate = "IP: —", "Traffic: —", "Speed: —"
-		v.PeersTitle = "Peers: —"
+		v.Header = T("header.notsignedin")
+		v.Tooltip = T("tooltip.notsignedin")
+		v.Details = T("details.login")
+		v.Address, v.Traffic, v.Rate = T("addr.empty"), T("traffic.empty"), T("speed.empty")
+		v.PeersTitle = T("peers.empty")
 		v.LoginURL = st.Claim.URL
 		return v
 	case trayDisconnected:
-		v.Header = "○ Disconnected"
-		v.Tooltip = "Wantastic: disconnected"
+		v.Header = T("header.disconnected")
+		v.Tooltip = T("tooltip.disconnected")
 		v.ToggleEnabled = st.Running
 	case trayExitActive:
 		u := st.ExitNodeState.Using
-		v.Header = "● Connected via exit " + firstNonEmpty(u.Hostname, u.IP)
-		v.Tooltip = "Wantastic: internet via " + firstNonEmpty(u.Hostname, u.IP)
-		v.ToggleTitle, v.ToggleEnabled = "Disconnect", true
+		v.Header = T("header.exit", firstNonEmpty(u.Hostname, u.IP))
+		v.Tooltip = T("tooltip.exit", firstNonEmpty(u.Hostname, u.IP))
+		v.ToggleTitle, v.ToggleEnabled = T("toggle.disconnect"), true
 	default:
-		v.Header = "● Connected"
-		v.Tooltip = "Wantastic: connected"
-		v.ToggleTitle, v.ToggleEnabled = "Disconnect", true
+		v.Header = T("header.connected")
+		v.Tooltip = T("tooltip.connected")
+		v.ToggleTitle, v.ToggleEnabled = T("toggle.disconnect"), true
 	}
 
 	ip := "—"
 	if len(st.IPs) > 0 {
 		ip = strings.TrimSuffix(st.IPs[0], "/32")
 	}
-	v.Address = "IP: " + ip
-	v.Traffic = fmt.Sprintf("Traffic: ↓ %s  ↑ %s", trayBytes(st.RxBytes), trayBytes(st.TxBytes))
-	v.Rate = "Speed: " + trafficRate(prev, cur)
+	v.Address = T("addr", ip)
+	v.Traffic = T("traffic", trayBytes(st.RxBytes), trayBytes(st.TxBytes))
+	v.Rate = T("speed", trafficRate(prev, cur))
 
 	var details []string
 	if st.UptimeSec > 0 {
-		details = append(details, "Up "+trayDuration(time.Duration(st.UptimeSec)*time.Second))
+		details = append(details, T("details.up", trayDuration(time.Duration(st.UptimeSec)*time.Second)))
 	}
 	if st.ServerEndpoint != "" {
-		details = append(details, "server "+st.ServerEndpoint)
+		details = append(details, T("details.server", st.ServerEndpoint))
 	}
 	v.Details = strings.Join(details, " · ")
 
@@ -126,7 +126,7 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 			relay++
 		}
 	}
-	v.PeersTitle = fmt.Sprintf("Peers: %d direct, %d relay", direct, relay)
+	v.PeersTitle = T("peers", direct, relay)
 	return v
 }
 
@@ -193,11 +193,11 @@ func firstNonEmpty(s ...string) string {
 func pingSummary(pr *agent.PingResponse, err error) string {
 	switch {
 	case err != nil:
-		return "Ping failed: " + err.Error()
+		return T("ping.failed", err.Error())
 	case pr.Error != "":
-		return "Ping failed: " + pr.Error
+		return T("ping.failed", pr.Error)
 	case len(pr.Results) == 0:
-		return "Ping: no peers to ping"
+		return T("ping.nopeers")
 	}
 	var up int
 	var sum float64
@@ -208,9 +208,9 @@ func pingSummary(pr *agent.PingResponse, err error) string {
 		}
 	}
 	if up == 0 {
-		return fmt.Sprintf("Ping: 0/%d peers answered", len(pr.Results))
+		return T("ping.none", len(pr.Results))
 	}
-	return fmt.Sprintf("Ping: %d/%d peers answered · avg %.0f ms", up, len(pr.Results), sum/float64(up))
+	return T("ping.summary", up, len(pr.Results), sum/float64(up))
 }
 
 // peerMenuEntry is one row under Peers; its submenu shows Detail and copies
@@ -223,9 +223,6 @@ type peerMenuEntry struct {
 	VPNIP    string
 	PublicIP string
 }
-
-// peerRowTooltip is the fixed hint on every peer row.
-const peerRowTooltip = "Open for live link details; click an address to copy it"
 
 // buildPeerMenuEntries lists every peer except the server, direct ones first,
 // with the latency of the last "Ping all peers" when there is one.
@@ -249,18 +246,18 @@ func buildPeerMenuEntries(peers []device.PeerInfo, latency map[string]agent.Ping
 		title := fmt.Sprintf("%s %s · %s", mark, peerLabel(p), path)
 		if r, ok := latency[p.AssignedIP]; ok {
 			if r.Received > 0 {
-				title += fmt.Sprintf(" · %.0f ms", r.AvgMs)
+				title += " · " + T("latency.ms", r.AvgMs)
 			} else {
-				title += " · no reply"
+				title += " · " + T("latency.noreply")
 			}
 		}
-		handshake := "Handshake never"
+		handshake := T("handshake.never")
 		if p.LastHandshake > 0 {
-			handshake = "Handshake " + trayDuration(now.Sub(time.Unix(p.LastHandshake, 0))) + " ago"
+			handshake = T("handshake.ago", trayDuration(now.Sub(time.Unix(p.LastHandshake, 0))))
 		}
 		out = append(out, peerMenuEntry{
 			Title:    "( " + title + " )",
-			Tooltip:  peerRowTooltip,
+			Tooltip:  T("peer.tooltip"),
 			Detail:   fmt.Sprintf("%s · ↓ %s ↑ %s", handshake, trayBytes(p.RxBytes), trayBytes(p.TxBytes)),
 			VPNIP:    strings.TrimSpace(p.AssignedIP),
 			PublicIP: endpointHost(p.Endpoint),

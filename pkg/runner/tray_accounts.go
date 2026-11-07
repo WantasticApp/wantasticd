@@ -53,14 +53,14 @@ type trayAccountMenu struct {
 
 func newTrayAccountMenu() *trayAccountMenu {
 	m := &trayAccountMenu{pending: map[string]string{}, armed: map[string]time.Time{}}
-	m.root = systray.AddMenuItem("Account", "Accounts this device belongs to; click one to switch")
-	m.empty = m.root.AddSubMenuItem("This device is in one account", "")
+	m.root = systray.AddMenuItem(T("account.title"), T("account.tooltip"))
+	m.empty = m.root.AddSubMenuItem(T("account.single"), "")
 	m.empty.Disable()
-	m.add = m.root.AddSubMenuItem("Add another account…", "Add this device to another Wantastic account with a claim link")
-	m.qr = m.root.AddSubMenuItem("Scan to add the account", "Scan with a phone signed in to the other account, or click to open the link here")
+	m.add = m.root.AddSubMenuItem(T("account.add"), T("account.add.tooltip"))
+	m.qr = m.root.AddSubMenuItem(T("account.qr"), T("account.qr.tooltip"))
 	m.qr.Hide()
 	if !rowsCarryTrash() {
-		m.removeRoot = m.root.AddSubMenuItem("Remove an account", "Remove an account from this device; it stays in its console")
+		m.removeRoot = m.root.AddSubMenuItem(T("account.remove"), T("account.remove.tooltip"))
 		m.removeRoot.Hide()
 	}
 	keepMenuOpen(m.add)
@@ -87,17 +87,17 @@ func (m *trayAccountMenu) open(link string) {
 
 func (m *trayAccountMenu) watchAdd() {
 	for range m.add.ClickedCh {
-		setTitle(m.add, "Adding an account…")
+		setTitle(m.add, T("account.adding"))
 		var resp agent.AccountsResponse
 		err := postAccounts("/api/accounts/add", &resp)
-		setTitle(m.add, "Add another account…")
+		setTitle(m.add, T("account.add"))
 		if err != nil {
 			m.report("", "", err)
 			continue
 		}
 		if resp.Added != nil {
 			m.showClaim(resp.Added.ClaimURL)
-			m.report("", "Scan the code or click it, signed in to the other account", nil)
+			m.report("", T("account.scan.notice"), nil)
 		}
 		m.apply(resp.Accounts)
 		m.changed()
@@ -163,7 +163,7 @@ func (m *trayAccountMenu) apply(list []accounts.Account) {
 			stillPending = true
 		}
 	}
-	setTitle(m.root, "Account: "+active)
+	setTitle(m.root, T("account.header", active))
 	// The QR goes once its account is claimed.
 	if m.claimURL != "" && !stillPending {
 		m.claimURL = ""
@@ -197,19 +197,19 @@ func (m *trayAccountMenu) apply(list []accounts.Account) {
 		case m.pending[a.ID] != "":
 			title += " · " + m.pending[a.ID]
 		case a.Pending:
-			title += " · waiting for claim"
+			title += " · " + T("account.waiting")
 		case a.Address != "":
 			title += " · " + a.Address
 		}
 		if m.isArmed(a.ID) && rowsCarryTrash() {
-			title = a.Name + " · click the bin again to remove"
+			title = T("account.confirm.bin", a.Name)
 		}
 		setTitle(row, title)
 		setChecked(row, a.Active)
 		if a.Pending {
-			setTooltip(row, "Click to show its claim code again")
+			setTooltip(row, T("account.row.pending.tooltip"))
 		} else {
-			setTooltip(row, "Switch to "+a.Name+"; the VPN reconnects")
+			setTooltip(row, T("account.row.switch.tooltip", a.Name))
 		}
 		// The account in use cannot be removed: switch away first.
 		id := a.ID
@@ -265,7 +265,7 @@ func (m *trayAccountMenu) applyRemoveList(list []accounts.Account) {
 		case m.pending[a.ID] != "":
 			setTitle(row, a.Name+" · "+m.pending[a.ID])
 		case m.isArmed(a.ID):
-			setTitle(row, "Click again to remove "+a.Name)
+			setTitle(row, T("account.confirm.remove", a.Name))
 		default:
 			setTitle(row, a.Name)
 		}
@@ -309,7 +309,7 @@ func (m *trayAccountMenu) trash(id string) {
 		return
 	}
 	delete(m.armed, id)
-	m.pending[id] = "removing…"
+	m.pending[id] = T("account.removing")
 	list := m.last
 	m.mu.Unlock()
 	m.apply(list)
@@ -332,7 +332,7 @@ func (m *trayAccountMenu) watchRow(row *systray.MenuItem, idx int) {
 		id, claim := m.ids[idx], m.claims[idx]
 		busy := m.pending[id] != ""
 		if id != "" && claim == "" && !busy {
-			m.pending[id] = "switching…"
+			m.pending[id] = T("account.switching")
 		}
 		m.mu.Unlock()
 		switch {

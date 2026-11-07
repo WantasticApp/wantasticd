@@ -36,24 +36,24 @@ type exitMenuState struct {
 
 func deriveExitMenu(st *agent.StatusResponse) exitMenuState {
 	m := exitMenuState{
-		Header:       "Exit node: unavailable",
-		OfferTitle:   "Allow this device as exit node",
-		OfferTooltip: "Let other devices in this network send their internet traffic through this one",
+		Header:       T("exit.unavailable"),
+		OfferTitle:   T("exit.offer.title"),
+		OfferTooltip: T("exit.offer.tooltip"),
 		NoneChecked:  true,
 	}
 	if st != nil && st.Claim != nil {
-		m.OfferTooltip = "Log in first"
-		m.UseTooltip = "Log in first"
+		m.OfferTooltip = T("exit.login.first")
+		m.UseTooltip = T("exit.login.first")
 		return m
 	}
 	if st == nil || !st.Running {
-		m.OfferTooltip = "Daemon not running"
-		m.UseTooltip = "Daemon not running"
+		m.OfferTooltip = T("exit.daemon.down")
+		m.UseTooltip = T("exit.daemon.down")
 		return m
 	}
 	es := st.ExitNodeState
 	if es == nil {
-		m.OfferTooltip = "The running daemon is older and has no exit-node support; restart it"
+		m.OfferTooltip = T("exit.daemon.old")
 		m.UseTooltip = m.OfferTooltip
 		return m
 	}
@@ -61,21 +61,21 @@ func deriveExitMenu(st *agent.StatusResponse) exitMenuState {
 	m.OfferChecked = es.Offering
 	switch {
 	case !es.Supported:
-		m.OfferTooltip = "Unsupported here: " + es.UnsupportedReason
+		m.OfferTooltip = T("exit.unsupported", es.UnsupportedReason)
 	case es.OfferError != "":
 		m.OfferEnabled = true
-		m.OfferTooltip = "Last attempt failed: " + es.OfferError
+		m.OfferTooltip = T("exit.offer.error", es.OfferError)
 	default:
 		m.OfferEnabled = true
 		if es.Offering && len(es.Users) > 0 {
-			m.OfferTooltip = fmt.Sprintf("In use by %d peer(s)", len(es.Users))
+			m.OfferTooltip = T("exit.inuse", len(es.Users))
 		}
 	}
 
 	m.UseEnabled = es.ClientSupported
 	m.NoneEnabled = es.ClientSupported
 	if !es.ClientSupported {
-		m.UseTooltip = "Using an exit node is not supported on this platform"
+		m.UseTooltip = T("exit.use.unsupported")
 	}
 	using := ""
 	if u := es.Using; u != nil {
@@ -86,14 +86,14 @@ func deriveExitMenu(st *agent.StatusResponse) exitMenuState {
 			name = u.Hostname
 		}
 		if u.State == "active" {
-			m.Header = fmt.Sprintf("Exit node: via %s (%s)", name, u.Path)
+			m.Header = T("exit.via", name, u.Path)
 		} else {
-			m.Header = fmt.Sprintf("Exit node: %s (%s)", name, u.State)
+			m.Header = T("exit.state", name, u.State)
 		}
 	} else if es.Offering {
-		m.Header = "Exit node: sharing this device"
+		m.Header = T("exit.sharing")
 	} else {
-		m.Header = "Exit node: off"
+		m.Header = T("exit.off")
 	}
 
 	for _, c := range es.Candidates {
@@ -103,7 +103,7 @@ func deriveExitMenu(st *agent.StatusResponse) exitMenuState {
 		m.Items = append(m.Items, exitCandidateItem(c, using))
 	}
 	if len(m.Items) == 0 && m.UseTooltip == "" {
-		m.UseTooltip = "No other devices online in this network"
+		m.UseTooltip = T("exit.nodevices")
 	}
 	return m
 }
@@ -115,15 +115,15 @@ func exitCandidateItem(c device.ExitCandidate, using string) exitMenuItem {
 	}
 	var tags []string
 	if !c.Online {
-		tags = append(tags, "offline")
+		tags = append(tags, T("tag.offline"))
 	} else {
 		tags = append(tags, c.Path)
 	}
 	switch c.Offers {
 	case "yes":
-		tags = append(tags, "offers exit")
+		tags = append(tags, T("tag.offers"))
 	case "no":
-		tags = append(tags, "not an exit")
+		tags = append(tags, T("tag.notexit"))
 	}
 	it := exitMenuItem{
 		IP:      c.IP,
@@ -133,13 +133,13 @@ func exitCandidateItem(c device.ExitCandidate, using string) exitMenuItem {
 	}
 	switch {
 	case !c.Online:
-		it.Tooltip = "Device is offline"
+		it.Tooltip = T("exit.cand.offline")
 	case c.Offers == "no":
-		it.Tooltip = "That device has not enabled exit-node (Allow this device as exit node)"
+		it.Tooltip = T("exit.cand.notenabled", T("exit.offer.title"))
 	case c.Path != "direct":
-		it.Tooltip = "Relayed right now: exit traffic starts once a direct path is up"
+		it.Tooltip = T("exit.cand.relayed")
 	default:
-		it.Tooltip = "Send all internet traffic through " + label
+		it.Tooltip = T("exit.cand.use", label)
 	}
 	if it.Checked {
 		it.Enabled = true // always allow re-selecting the active one
@@ -157,9 +157,9 @@ func withExitLatency(s exitMenuState, latency map[string]agent.PingResult) exitM
 	for i, it := range s.Items {
 		if r, ok := latency[it.IP]; ok && r.Sent > 0 {
 			if r.Received > 0 {
-				it.Title += fmt.Sprintf(" · %.0f ms", r.AvgMs)
+				it.Title += " · " + T("latency.ms", r.AvgMs)
 			} else {
-				it.Title += " · no reply"
+				it.Title += " · " + T("latency.noreply")
 			}
 		}
 		items[i] = it

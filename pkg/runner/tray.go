@@ -57,12 +57,12 @@ func postControlInto(path string, v any) (string, error) {
 	req.Header.Set(agent.ControlHeader, "1")
 	resp, err := actionClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("daemon not reachable")
+		return "", fmt.Errorf("%s", T("error.daemon.unreachable"))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("the running daemon is older than this tray; restart the service")
+		return "", fmt.Errorf("%s", T("error.daemon.old"))
 	}
 	var r struct {
 		OK     bool   `json:"ok"`
@@ -70,7 +70,7 @@ func postControlInto(path string, v any) (string, error) {
 		Notice string `json:"notice"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return "", fmt.Errorf("daemon: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("%s", T("error.daemon.http", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	if v != nil {
 		_ = json.Unmarshal(body, v)
@@ -186,18 +186,18 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			setTrayTooltip("Wantastic")
 
 			// Status: state, address and live traffic.
-			mHeader := systray.AddMenuItem("○ Connecting…", "Connection state")
+			mHeader := systray.AddMenuItem(T("header.connecting"), T("header.tooltip"))
 			mHeader.Disable()
-			mAddress := systray.AddMenuItem("IP: —", "Click to copy this device's VPN IP")
-			mRate := systray.AddMenuItem("Speed: —", "Current throughput")
+			mAddress := systray.AddMenuItem(T("addr.empty"), T("address.tooltip"))
+			mRate := systray.AddMenuItem(T("speed.empty"), T("speed.tooltip"))
 			mRate.Disable()
-			mTraffic := systray.AddMenuItem("Traffic: —", "Total since the daemon started")
+			mTraffic := systray.AddMenuItem(T("traffic.empty"), T("traffic.tooltip"))
 			mTraffic.Disable()
 			// Not signed in: a QR code to scan with a phone (macOS draws it
 			// full size) and a link that opens the same page here.
-			mLoginQR := systray.AddMenuItem("Scan to log in", "Scan with your phone, or click to open the login page here")
+			mLoginQR := systray.AddMenuItem(T("login.qr"), T("login.qr.tooltip"))
 			mLoginQR.Hide()
-			mLogin := systray.AddMenuItem("Log in in browser…", "Open the browser to add this device to your account")
+			mLogin := systray.AddMenuItem(T("login.browser"), T("login.browser.tooltip"))
 			mLogin.Hide()
 			var (
 				loginMu    sync.Mutex
@@ -208,15 +208,15 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			// Controls: the tunnel and exit-node mode, as switches.
 			systray.AddSeparator()
-			mToggle := systray.AddMenuItemCheckbox("Connect", "Connect or disconnect the tunnel; the service keeps running", false)
+			mToggle := systray.AddMenuItemCheckbox(T("toggle.connect"), T("toggle.tooltip"), false)
 			exitMenu := newTrayExitMenu()
 			accountMenu := newTrayAccountMenu()
 
 			// Peers and their latency.
 			systray.AddSeparator()
-			mPeers := systray.AddMenuItem("Peers: —", "Devices in this network; open one for its addresses")
-			peerMenu := newPeerMenuGroup(mPeers, "No peers")
-			mPing := systray.AddMenuItem("Ping all peers", "Measure latency to every peer over the tunnel")
+			mPeers := systray.AddMenuItem(T("peers.empty"), T("peers.tooltip"))
+			peerMenu := newPeerMenuGroup(mPeers, T("peers.none"))
+			mPing := systray.AddMenuItem(T("ping.title"), T("ping.tooltip"))
 			mPingResult := systray.AddMenuItem("", "")
 			mPingResult.Disable()
 			mPingResult.Hide()
@@ -230,20 +230,20 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			// More: service details and shortcuts.
 			systray.AddSeparator()
-			mMore := systray.AddMenuItem("More", "Service details and shortcuts")
+			mMore := systray.AddMenuItem(T("more"), T("more.tooltip"))
 			mDetails := mMore.AddSubMenuItem("", "")
 			mDetails.Disable()
 			mServer := newCopyMenuItem(mMore)
 			mKey := newCopyMenuItem(mMore)
-			mConsole := mMore.AddSubMenuItem("Open console", "Open "+trayConsoleURL+" in the browser")
-			mLogs := mMore.AddSubMenuItem("Show service log", "Open the service log")
+			mConsole := mMore.AddSubMenuItem(T("console"), T("console.tooltip", trayConsoleURL))
+			mLogs := mMore.AddSubMenuItem(T("log"), T("log.tooltip"))
 			logPath := trayLogPath()
 			if logPath == "" {
 				mLogs.Hide()
 			}
-			mVersion := mMore.AddSubMenuItem("Version "+version.Version, "Installed version")
+			mVersion := mMore.AddSubMenuItem(T("version", version.Version), T("version.tooltip"))
 			mVersion.Disable()
-			mQuit := systray.AddMenuItem("Quit", "Disconnect the tunnel and close the tray")
+			mQuit := systray.AddMenuItem(T("menu.quit"), T("menu.quit.tooltip"))
 
 			keepMenuOpen(mToggle, mPing)
 			menuSwitch(mToggle, exitMenu.offer)
@@ -288,13 +288,13 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				address = strings.TrimPrefix(v.Address, "IP: ")
 				setTitle(mTraffic, v.Traffic)
 				setTitle(mRate, v.Rate)
-				setTitle(mDetails, firstNonEmpty(v.Details, "Service details appear once connected"))
+				setTitle(mDetails, firstNonEmpty(v.Details, T("details.placeholder")))
 				if st != nil {
-					mServer.set("Server", st.ServerEndpoint)
-					mKey.set("Public key", st.PubKey)
+					mServer.set(T("copy.server"), st.ServerEndpoint)
+					mKey.set(T("copy.pubkey"), st.PubKey)
 				} else {
-					mServer.set("Server", "")
-					mKey.set("Public key", "")
+					mServer.set(T("copy.server"), "")
+					mKey.set(T("copy.pubkey"), "")
 				}
 				loginMu.Lock()
 				loginURL = v.LoginURL
@@ -331,9 +331,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				}
 				notice.expire()
 
-				ver := "Version " + version.Version
+				ver := T("version", version.Version)
 				if st != nil && st.Version != "" && st.Version != version.Version {
-					ver += " (service " + st.Version + ")"
+					ver += T("version.service", st.Version)
 				}
 				setTitle(mVersion, ver)
 
@@ -363,7 +363,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					if !manualQueue.CompareAndSwap(false, true) {
 						return
 					}
-					mPing.SetTitle("Pinging all peers…")
+					mPing.SetTitle(T("ping.running"))
 					mPing.Disable()
 					pinging.Lock()
 					manualQueue.Store(false)
@@ -384,7 +384,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					refreshMu.Unlock()
 				}
 				if manual {
-					mPing.SetTitle("Ping all peers")
+					mPing.SetTitle(T("ping.title"))
 				}
 				mPingResult.SetTitle(pingSummary(&pr, err) + " · " + time.Now().Format("15:04:05"))
 				mPingResult.Show()
@@ -438,9 +438,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					return
 				}
 				if disconnect {
-					toggling.Store("Disconnecting…")
+					toggling.Store(T("toggle.disconnecting"))
 				} else {
-					toggling.Store("Connecting…")
+					toggling.Store(T("toggle.connecting"))
 				}
 				refresh()
 				var (
@@ -449,10 +449,10 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				)
 				if disconnect {
 					n, err = postControl("/api/disconnect")
-					notice.report("Disconnected; the service keeps running", n, err)
+					notice.report(T("notice.disconnected"), n, err)
 				} else {
 					n, err = postControl("/api/connect")
-					notice.report("Connected", n, err)
+					notice.report(T("notice.connected"), n, err)
 				}
 				toggling.Store("")
 				refresh()
@@ -463,7 +463,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				url := loginURL
 				loginMu.Unlock()
 				if err := OpenURL(url); err != nil {
-					notice.report("", "", fmt.Errorf("open the browser: %w", err))
+					notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
 				}
 			}
 
@@ -497,12 +497,12 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 					case <-mConsole.ClickedCh:
 						if err := OpenURL(trayConsoleURL); err != nil {
-							notice.report("", "", fmt.Errorf("open the browser: %w", err))
+							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
 						}
 
 					case <-mLogs.ClickedCh:
 						if err := openLogFile(logPath); err != nil {
-							notice.report("", "", fmt.Errorf("open the log: %w", err))
+							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.log"), err))
 						}
 
 					case <-mPing.ClickedCh:
@@ -514,9 +514,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						refreshMu.Unlock()
 						if ip != "" && ip != "—" {
 							if err := copyToClipboard(ip); err != nil {
-								notice.set("⚠ Copy failed: " + err.Error())
+								notice.set("⚠ " + T("copy.failed", err.Error()))
 							} else {
-								notice.set("✓ Copied " + ip)
+								notice.set("✓ " + T("copy.done", ip))
 							}
 						}
 
@@ -575,8 +575,8 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 	if len(entries) == 0 {
 		group.emptyItem.Show()
 		for _, item := range group.peerItems {
-			item.vpnIP.set("VPN IP", "")
-			item.publicIP.set("Public IP", "")
+			item.vpnIP.set(T("copy.vpnip"), "")
+			item.publicIP.set(T("copy.publicip"), "")
 			item.item.Hide()
 		}
 		return
@@ -600,13 +600,13 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 		setTitle(row.item, entry.Title)
 		setTooltip(row.item, entry.Tooltip)
 		setTitle(row.detail, entry.Detail)
-		row.vpnIP.set("VPN IP", entry.VPNIP)
-		row.publicIP.set("Public IP", entry.PublicIP)
+		row.vpnIP.set(T("copy.vpnip"), entry.VPNIP)
+		row.publicIP.set(T("copy.publicip"), entry.PublicIP)
 		row.item.Show()
 	}
 	for i := len(entries); i < len(group.peerItems); i++ {
-		group.peerItems[i].vpnIP.set("VPN IP", "")
-		group.peerItems[i].publicIP.set("Public IP", "")
+		group.peerItems[i].vpnIP.set(T("copy.vpnip"), "")
+		group.peerItems[i].publicIP.set(T("copy.publicip"), "")
 		group.peerItems[i].item.Hide()
 	}
 }
@@ -630,7 +630,7 @@ func (c *copyMenuItem) set(label, value string) {
 		return
 	}
 	setTitle(c.item, label+"  "+value)
-	setTooltip(c.item, "Click to copy "+value)
+	setTooltip(c.item, T("copy.tooltip", value))
 	c.item.Enable()
 }
 

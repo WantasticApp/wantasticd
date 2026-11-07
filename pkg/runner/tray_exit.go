@@ -33,30 +33,30 @@ func newTrayExitMenu() *trayExitMenu {
 	m := &trayExitMenu{pending: map[*systray.MenuItem]string{}}
 	// The sharing switch sits in the main menu; the submenu picks the
 	// exit node this device uses.
-	m.offer = systray.AddMenuItemCheckbox("Allow this device as exit node", "", false)
-	m.root = systray.AddMenuItem("Exit node: off", "Send all internet traffic through a peer")
+	m.offer = systray.AddMenuItemCheckbox(T("exit.offer.title"), "", false)
+	m.root = systray.AddMenuItem(T("exit.off"), T("exit.root.tooltip"))
 	m.use = m.root
-	m.none = m.use.AddSubMenuItemCheckbox(exitNoneTitle, "Normal routing", true)
+	m.none = m.use.AddSubMenuItemCheckbox(T("exit.none"), T("exit.none.tooltip"), true)
 	keepMenuOpen(m.none)
 	go m.watch(m.offer, func() string {
 		if m.offering {
-			return "turning off…"
+			return T("exit.offer.pending.off")
 		}
-		return "turning on…"
+		return T("exit.offer.pending.on")
 	}, func() (string, string, error) {
 		m.mu.Lock()
 		on := !m.offering
 		m.mu.Unlock()
 		if on {
 			n, err := postControl("/api/exitnode/offer?enabled=on")
-			return "This device is now an exit node", n, err
+			return T("exit.offer.on.ok"), n, err
 		}
 		n, err := postControl("/api/exitnode/offer?enabled=off")
-		return "Exit-node sharing off", n, err
+		return T("exit.offer.off.ok"), n, err
 	})
-	go m.watch(m.none, func() string { return "restoring…" }, func() (string, string, error) {
+	go m.watch(m.none, func() string { return T("exit.none.pending") }, func() (string, string, error) {
 		n, err := postControl("/api/exitnode/comeback")
-		return "Normal routing restored", n, err
+		return T("exit.none.ok"), n, err
 	})
 	return m
 }
@@ -113,7 +113,7 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 	setEnabled(m.offer, s.OfferEnabled)
 	setTooltip(m.use, s.UseTooltip)
 	setEnabled(m.use, s.UseEnabled)
-	setTitle(m.none, m.title(m.none, exitNoneTitle))
+	setTitle(m.none, m.title(m.none, T("exit.none")))
 	setChecked(m.none, s.NoneChecked)
 	setEnabled(m.none, s.NoneEnabled)
 
@@ -123,7 +123,7 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 		m.items = append(m.items, it)
 		m.itemIPs = append(m.itemIPs, "")
 		keepMenuOpen(it)
-		go m.watch(it, func() string { return "switching…" }, func() (string, string, error) {
+		go m.watch(it, func() string { return T("exit.use.pending") }, func() (string, string, error) {
 			m.mu.Lock()
 			ip := m.itemIPs[idx]
 			m.mu.Unlock()
@@ -133,7 +133,7 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 			// A few seconds' wait lets the menu report "active" instead of
 			// "pending" when a direct path is already up.
 			n, err := postControl("/api/exitnode/jumpto?" + url.Values{"ip": {ip}, "wait": {"5000"}}.Encode())
-			return "Internet now goes through " + ip, n, err
+			return T("exit.use.ok", ip), n, err
 		})
 	}
 	for i, it := range m.items {
@@ -151,8 +151,6 @@ func (m *trayExitMenu) apply(s exitMenuState) {
 		it.Show()
 	}
 }
-
-const exitNoneTitle = "Don't use an exit node"
 
 func setChecked(it *systray.MenuItem, on bool) {
 	if on {

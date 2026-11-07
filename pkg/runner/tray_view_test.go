@@ -63,7 +63,7 @@ func TestPeerEntriesDirectFirstWithLatency(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("server must not be listed: %+v", got)
 	}
-	if got[0].Title != "( ● 10.0.0.3 · direct · 171 ms )" || got[0].VPNIP != "10.0.0.3" || got[0].PublicIP != "1.2.3.4" || !strings.Contains(got[0].Detail, "Handshake 21s ago") || got[0].Tooltip != peerRowTooltip {
+	if got[0].Title != "( ● 10.0.0.3 · direct · 171 ms )" || got[0].VPNIP != "10.0.0.3" || got[0].PublicIP != "1.2.3.4" || !strings.Contains(got[0].Detail, "Handshake 21s ago") || got[0].Tooltip != T("peer.tooltip") {
 		t.Fatalf("direct: %+v", got[0])
 	}
 	if got[1].Title != "( ◌ relay-box · relay · no reply )" || got[1].VPNIP != "10.0.0.2" || got[1].PublicIP != "" {

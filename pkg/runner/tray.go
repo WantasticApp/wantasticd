@@ -479,9 +479,16 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 						return
 
 					case <-mQuit.ClickedCh:
-						// Quit now disconnects the tunnel first; users expect "Quit"
-						// to stop the VPN, not leave it running after the tray closes.
-						_, _ = postControl("/api/disconnect")
+						// Quit disconnects the tunnel first; users expect "Quit" to
+						// stop the VPN, not leave it running after the tray closes.
+						// Bound the wait so a wedged (but still listening) daemon can
+						// never freeze the quit — give the disconnect ~3s, then close.
+						done := make(chan struct{})
+						go func() { _, _ = postControl("/api/disconnect"); close(done) }()
+						select {
+						case <-done:
+						case <-time.After(3 * time.Second):
+						}
 						cancel()
 						systray.Quit()
 						return

@@ -187,3 +187,68 @@ func TestApplyRelayOnlyPinsAndTearsDown(t *testing.T) {
 		t.Error("peer should be promotable after pins cleared")
 	}
 }
+
+// TestInboundPunchRelayRefusesPinnedAndDenied proves N1: the INBOUND punch-relay
+// promotion path refuses a relay-pinned or denied target (no session created),
+// mirroring tryP2PByID's outbound refusal, while a normal target still promotes.
+func TestInboundPunchRelayRefusesPinnedAndDenied(t *testing.T) {
+	makeRelay := func(target uint32, remote NoisePublicKey, ip net.IP) *P2PMessage {
+		m := &P2PMessage{Subtype: P2PSubtypePunchRelay, TargetID: target, Nonce: [8]byte{1}}
+		copy(m.PublicKey[:], remote[:])
+		m.SetObservedAddr(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 41641})
+		m.Payload = AppendP2PCandidatePayload(ip.To4(), nil)
+		return m
+	}
+	pinnedIP := net.IPv4(10, 0, 0, 21).To4()
+	deniedIP := net.IPv4(10, 0, 0, 22).To4()
+	okIP := net.IPv4(10, 0, 0, 23).To4()
+
+	// Relay-pinned target: no punch session is created, peer refused (Failed).
+	t.Run("pinned", func(t *testing.T) {
+		pair := genTestPair(t, false)
+		client := NewP2PClient(pair[0].dev)
+		defer client.Close()
+		client.mu.Lock()
+		client.relayPinned = map[string]struct{}{string(pinnedIP): {}}
+		client.mu.Unlock()
+		client.handlePunchRelay(makeRelay(21, testNoisePublicKey(0x81), pinnedIP))
+		client.mu.RLock()
+		s, p := client.sessions[21], client.peers[21]
+		client.mu.RUnlock()
+		if s != nil {
+			t.Error("relay-pinned target created a punch session")
+		}
+		if p == nil || p.State != P2PStateFailed {
+			t.Errorf("relay-pinned target not refused (state): %v", p)
+		}
+	})
+
+	// Denied target: no punch session is created.
+	t.Run("denied", func(t *testing.T) {
+		pair := genTestPair(t, false)
+		client := NewP2PClient(pair[0].dev)
+		defer client.Close()
+		pair[0].dev.SetReceiverACLDenySet([][]byte{deniedIP}, NoisePublicKey{})
+		client.handlePunchRelay(makeRelay(22, testNoisePublicKey(0x82), deniedIP))
+		client.mu.RLock()
+		s := client.sessions[22]
+		client.mu.RUnlock()
+		if s != nil {
+			t.Error("denied target created a punch session")
+		}
+	})
+
+	// Normal (unpinned, allowed) target: a punch session is created.
+	t.Run("allowed", func(t *testing.T) {
+		pair := genTestPair(t, false)
+		client := NewP2PClient(pair[0].dev)
+		defer client.Close()
+		client.handlePunchRelay(makeRelay(23, testNoisePublicKey(0x83), okIP))
+		client.mu.RLock()
+		s := client.sessions[23]
+		client.mu.RUnlock()
+		if s == nil {
+			t.Error("normal target did not create a punch session")
+		}
+	})
+}

@@ -156,6 +156,23 @@ func (device *Device) receiverACLDrop(peer *Peer, src []byte) bool {
 	return denied
 }
 
+// receiverDenyContains reports whether key (raw big-endian address bytes) is in
+// the installed receiver deny set. Lockless (one atomic load). Used by the P2P
+// promotion paths to refuse a direct tunnel to a denied target — independent of
+// the per-packet drop (no server-peer carve-out: this tests a target IP, not a
+// received packet's arrival peer).
+func (device *Device) receiverDenyContains(key string) bool {
+	if key == "" {
+		return false
+	}
+	ds := device.aclReceiverDeny.Load()
+	if ds == nil {
+		return false
+	}
+	_, ok := ds.m[key]
+	return ok
+}
+
 func (device *Device) SetWUSPHandler(handler func(*Peer, []byte)) {
 	device.wuspHandler = handler
 }

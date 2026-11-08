@@ -975,14 +975,12 @@ func (c *P2PClient) tryP2PByID(peerID uint32) bool {
 		c.mu.Unlock()
 		return false
 	}
-	// Phase-3 residual #1: a relay-pinned peer (scoped allow) must never be
-	// promoted to a direct tunnel — it stays on the hub relay where port/protocol
-	// is enforced. Inert when no pins are installed (non-strict / no scoped pairs).
-	if c.relayPinned != nil {
-		if _, pinned := c.relayPinned[denyKeyForIP(peer.AssignedIP)]; pinned {
-			c.mu.Unlock()
-			return false
-		}
+	// Phase-3 residual #1: a relay-pinned (scoped allow) or denied peer must never
+	// be promoted to a direct tunnel — it stays on the hub relay where port/
+	// protocol is enforced. Inert when neither set is installed.
+	if c.isRelayPinnedOrDeniedLocked(peer.AssignedIP) {
+		c.mu.Unlock()
+		return false
 	}
 	now := time.Now()
 	switch peer.State {
@@ -1127,6 +1125,22 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		if !assignedIP.Equal(net.IPv4zero) {
 			peer.AssignedIP = assignedIP
 		}
+	}
+
+	// Phase-3 residual #1 (inbound suspenders): the hub punch gate (facilitateDirect)
+	// already refuses to relay a punch for a relay-pinned/denied pair, but enforce
+	// it again here so the inbound promotion path can never build an all-ports
+	// direct tunnel for a scoped/denied target even if the hub gate ever failed
+	// open. Mirrors tryP2PByID's refusal; inert when neither set is installed.
+	if c.isRelayPinnedOrDeniedLocked(peer.AssignedIP) {
+		peer.State = P2PStateFailed
+		peer.LastUsed = now
+		peer.PunchAttempts++
+		c.setRetryGateLocked(peer)
+		c.rebuildIndexesLocked()
+		c.mu.Unlock()
+		c.device.log.Verbosef("[P2P] Refusing inbound punch relay for relay-pinned/denied target %d", targetID)
+		return
 	}
 
 	peer.LocalAddr = normalizeUDPAddr(msg.LocalAddr())
@@ -1987,6 +2001,24 @@ func (c *P2PClient) TearDownDeniedDirectPeers(denied map[string]struct{}) []net.
 		torn = append(torn, v.ip)
 	}
 	return torn
+}
+
+// isRelayPinnedOrDeniedLocked reports whether ip must never be given a direct
+// tunnel: it is in the relay-pin set (scoped allow) or the receiver deny set
+// (fully denied). c.mu must be held. Inert (false) when both sets are empty and
+// for an empty/unknown ip. Shared by the outbound (tryP2PByID) and inbound
+// (handlePunchRelay) promotion paths so they refuse symmetrically.
+func (c *P2PClient) isRelayPinnedOrDeniedLocked(ip net.IP) bool {
+	key := denyKeyForIP(ip)
+	if key == "" {
+		return false
+	}
+	if c.relayPinned != nil {
+		if _, pinned := c.relayPinned[key]; pinned {
+			return true
+		}
+	}
+	return c.device.receiverDenyContains(key)
 }
 
 // ApplyRelayOnly installs the relay-pin set (replacing any previous one) and

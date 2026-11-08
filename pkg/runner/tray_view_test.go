@@ -33,12 +33,61 @@ func TestDeriveTrayViewStates(t *testing.T) {
 	if v.State != trayConnected || v.ToggleTitle != "Disconnect" || v.Address != "IP: 10.255.255.44" {
 		t.Fatalf("connected: %+v", v)
 	}
-	if v.Rate != "Speed: ↓ 1.0 MiB/s  ↑ 0 B/s" || v.PeersTitle != "Peers: 1 direct, 1 relay" || v.Details != "Up 1h01m · server 172.239.44.171:51820" {
-		t.Fatalf("details: %+v", v)
+	// Rate is 1 MiB/s down (2 MiB over 2s), 0 up. Built from trayBytes so the
+	// assertion tracks the formatter's fixed-width padding.
+	wantRate := "Speed: ↓ " + trayBytes(1<<20) + "/s  ↑ " + trayBytes(0) + "/s"
+	if v.Rate != wantRate || v.PeersTitle != "Peers: 1 direct, 1 relay" || v.Details != "Up 1h01m · server 172.239.44.171:51820" {
+		t.Fatalf("details: %+v (want rate %q)", v, wantRate)
 	}
 	up.ExitNodeState = &device.ExitNodeStatus{Using: &device.ExitUse{IP: "10.255.255.36", Hostname: "mini", State: "active"}}
 	if v := deriveTrayView(up, trafficSample{}, trafficSample{}); v.State != trayExitActive || !strings.Contains(v.Header, "mini") || v.Rate != "Speed: —" {
 		t.Fatalf("exit active: %+v", v)
+	}
+}
+
+func TestTrayBytesFormat(t *testing.T) {
+	fs := string(figureSpace)
+	cases := map[uint64]string{
+		0:             fs + fs + fs + fs + "0 B", // mantissa right-aligned in a 5-wide field
+		512:           fs + fs + "512 B",         // exact bytes, no decimal
+		1023:          fs + "1023 B",             // last byte value before KiB (binary boundary)
+		1024:          fs + fs + "1.0 KiB",       // 1024-based: exactly 1.0 KiB, not "1.0 KB"
+		1536:          fs + fs + "1.5 KiB",       // 1.5 * 1024
+		1 << 20:       fs + fs + "1.0 MiB",       // 1 MiB
+		1 << 30:       fs + fs + "1.0 GiB",       // 1 GiB
+		3<<30 + 1<<29: fs + fs + "3.5 GiB",       // large, multi-GiB
+	}
+	for n, want := range cases {
+		if got := trayBytes(n); got != want {
+			t.Errorf("trayBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+	// Every result ends in a binary unit with the "iB" suffix (never a decimal
+	// "KB"/"MB"), and a rate simply appends "/s" — bytes per second, not bps.
+	for _, n := range []uint64{0, 1024, 1 << 40} {
+		if s := trayBytes(n); !strings.HasSuffix(s, " B") && !strings.Contains(s, "iB") {
+			t.Errorf("trayBytes(%d) = %q: not a binary unit", n, s)
+		}
+	}
+}
+
+func TestAdvanceRateSample(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	// First sample (no baseline yet): advance.
+	if !advanceRateSample(trafficSample{}, trafficSample{rx: 10, at: t0}) {
+		t.Error("first sample should advance the baseline")
+	}
+	// Within the window, counters rising: hold (avoid a near-zero-interval spike).
+	if advanceRateSample(trafficSample{rx: 100, tx: 100, at: t0}, trafficSample{rx: 200, tx: 150, at: t0.Add(100 * time.Millisecond)}) {
+		t.Error("sub-window refresh should hold the baseline")
+	}
+	// Full window elapsed: advance.
+	if !advanceRateSample(trafficSample{rx: 100, at: t0}, trafficSample{rx: 200, at: t0.Add(minRateWindow)}) {
+		t.Error("a full window should advance the baseline")
+	}
+	// Counter went backwards (tunnel restart): advance to reset the baseline.
+	if !advanceRateSample(trafficSample{rx: 500, at: t0}, trafficSample{rx: 10, at: t0.Add(100 * time.Millisecond)}) {
+		t.Error("a counter reset should advance (reset) the baseline")
 	}
 }
 

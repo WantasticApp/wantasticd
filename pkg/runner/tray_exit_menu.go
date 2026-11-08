@@ -85,6 +85,9 @@ func deriveExitMenu(st *agent.StatusResponse) exitMenuState {
 		if u.Hostname != "" {
 			name = u.Hostname
 		}
+		// This is a top-level row ("Exit node: via <name> …"); clip the name so
+		// a long hostname can't stretch the menu width on the exit toggle.
+		name = clip(name, maxHeaderName)
 		if u.State == "active" {
 			m.Header = T("exit.via", name, u.Path)
 		} else {

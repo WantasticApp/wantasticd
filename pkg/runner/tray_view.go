@@ -49,6 +49,27 @@ type trafficSample struct {
 	at     time.Time
 }
 
+// minRateWindow is the shortest interval the live rate is measured over. The
+// menu refreshes from several callers (the 1s ticker, menu-open, a ping, a
+// toggle, exit/account changes), often a few milliseconds apart. Dividing a
+// tiny byte delta by a near-zero interval would show a garbage spike, so the
+// displayed sample pair (ratePrev/rateCur in RunSystray) only advances once
+// this much wall time has passed; a burst of refreshes in between reuses the
+// frozen pair. Kept just under trayRefresh so the 1s ticker always advances
+// it (giving a ~1s window); the rate shown is thus stale by up to a window but
+// never noisy.
+const minRateWindow = 900 * time.Millisecond
+
+// advanceRateSample reports whether the displayed rate pair should advance to
+// cur: on the first sample, after a counter reset (tunnel restarted, cur <
+// prev), or once a full rate window has elapsed. Holding it otherwise is what
+// keeps a burst of refreshes from producing a garbage rate (see minRateWindow).
+func advanceRateSample(prev, cur trafficSample) bool {
+	return prev.at.IsZero() ||
+		cur.rx < prev.rx || cur.tx < prev.tx ||
+		cur.at.Sub(prev.at) >= minRateWindow
+}
+
 // trayView is everything the top of the menu shows, derived from one status
 // poll by a pure function so it is unit tested.
 type trayView struct {
@@ -90,8 +111,9 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 		v.ToggleEnabled = st.Running
 	case trayExitActive:
 		u := st.ExitNodeState.Using
-		v.Header = T("header.exit", firstNonEmpty(u.Hostname, u.IP))
-		v.Tooltip = T("tooltip.exit", firstNonEmpty(u.Hostname, u.IP))
+		name := clip(firstNonEmpty(u.Hostname, u.IP), maxHeaderName)
+		v.Header = T("header.exit", name)
+		v.Tooltip = T("tooltip.exit", name)
 		v.ToggleTitle, v.ToggleEnabled = T("toggle.disconnect"), true
 	default:
 		v.Header = T("header.connected")
@@ -142,17 +164,60 @@ func trafficRate(prev, cur trafficSample) string {
 	return fmt.Sprintf("↓ %s/s  ↑ %s/s", trayBytes(rx), trayBytes(tx))
 }
 
+const (
+	// figureSpace is a space the width of a digit in the system menu fonts
+	// (SF Pro, Segoe UI, Cantarell). Padding a number with it keeps columns
+	// aligned as the digits change, which an ordinary space (about half a
+	// digit) cannot. A font without the glyph falls back to a normal space:
+	// a slightly looser pad, never a broken layout.
+	figureSpace = '\u2007'
+	// mantissaWidth right-aligns the number so the decimal point and the unit
+	// after it hold their place as the value ticks (e.g. "1.0"→"12.3"→"999.9"
+	// don't shift the second rate ↑). 5 covers "999.9"; the rare "1023.9" just
+	// before a unit rolls over is one wider and simply isn't padded.
+	mantissaWidth = 5
+	// maxHeaderName bounds the exit-node name in the header so a long hostname
+	// can't stretch the menu width.
+	maxHeaderName = 24
+)
+
+// trayBytes renders n in binary units (B, KiB, MiB, GiB, …; 1024-based, with
+// the "iB" suffix) for the menu. The mantissa is right-aligned in a fixed
+// figure-space field so the string's width barely changes as the value ticks:
+// within a unit magnitude the trailing part (and any "/s" or second rate)
+// stays put. A change of unit magnitude (B↔KiB↔MiB) still shifts it — that is
+// inherent and infrequent.
 func trayBytes(n uint64) string {
 	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
+	num, u := fmt.Sprintf("%d", n), "B"
+	if n >= unit {
+		div, exp := uint64(unit), 0
+		for m := n / unit; m >= unit; m /= unit {
+			div *= unit
+			exp++
+		}
+		num = fmt.Sprintf("%.1f", float64(n)/float64(div))
+		u = string("KMGTPE"[exp]) + "iB"
 	}
-	div, exp := uint64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
+	return padLeft(num, mantissaWidth) + " " + u
+}
+
+// padLeft right-aligns s in a field of w figure spaces; shorter is returned
+// unchanged.
+func padLeft(s string, w int) string {
+	if n := w - len([]rune(s)); n > 0 {
+		return strings.Repeat(string(figureSpace), n) + s
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+	return s
+}
+
+// clip shortens s to at most max runes, ending in an ellipsis when cut.
+func clip(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
 }
 
 func trayDuration(d time.Duration) string {

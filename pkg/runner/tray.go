@@ -115,15 +115,19 @@ func (n *trayNotice) set(text string) {
 	n.at = time.Now()
 	n.item.SetTitle(text)
 	n.item.SetTooltip(text)
-	n.item.Show()
 }
 
+// expire returns the row to its idle placeholder once a notice has aged out.
+// The row is never hidden: showing and hiding it was the menu's main layout
+// wiggle (a row appeared on every connect/disconnect/toggle and vanished
+// noticeTTL later). It stays in place and only its text changes.
 func (n *trayNotice) expire() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if !n.at.IsZero() && time.Since(n.at) > noticeTTL {
 		n.at = time.Time{}
-		n.item.Hide()
+		n.item.SetTitle(T("notice.idle"))
+		n.item.SetTooltip("")
 	}
 }
 
@@ -217,13 +221,14 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mPeers := systray.AddMenuItem(T("peers.empty"), T("peers.tooltip"))
 			peerMenu := newPeerMenuGroup(mPeers, T("peers.none"))
 			mPing := systray.AddMenuItem(T("ping.title"), T("ping.tooltip"))
-			mPingResult := systray.AddMenuItem("", "")
+			// The ping-result and notice rows are permanent, with an idle
+			// placeholder, so the menu keeps the same item count (and height)
+			// across every state and action. Only their titles change.
+			mPingResult := systray.AddMenuItem(T("ping.idle"), "")
 			mPingResult.Disable()
-			mPingResult.Hide()
 
-			mNotice := systray.AddMenuItem("", "")
+			mNotice := systray.AddMenuItem(T("notice.idle"), "")
 			mNotice.Disable()
-			mNotice.Hide()
 			notice := &trayNotice{item: mNotice}
 			exitMenu.report = notice.report
 			accountMenu.report = notice.report
@@ -250,10 +255,16 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			var (
 				refreshMu sync.Mutex
-				prev      trafficSample
-				lastState = trayState(-1)
-				latency   map[string]agent.PingResult
-				address   string
+				// ratePrev/rateCur are the two samples the live traffic rate is
+				// measured between. The pair only advances on a cadence (see
+				// advanceRateSample), so the rate shown is always averaged over
+				// a real ≥minRateWindow interval; a burst of refreshes a few ms
+				// apart reuses the frozen pair instead of dividing a tiny byte
+				// delta by a near-zero gap (which showed a garbage spike).
+				ratePrev, rateCur trafficSample
+				lastState         = trayState(-1)
+				latency           map[string]agent.PingResult
+				address           string
 				// toggling is the VPN row's title while a connect or
 				// disconnect runs ("Connecting…"), "" otherwise.
 				toggling atomic.Value
@@ -275,8 +286,15 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				if st != nil {
 					cur = trafficSample{rx: st.RxBytes, tx: st.TxBytes, at: now}
 				}
-				v := deriveTrayView(st, prev, cur)
-				prev = cur
+				// Advance the displayed pair only on a cadence (or a counter
+				// reset); between advances the frozen pair is reused, so the
+				// rate is never divided by a near-zero interval.
+				if st == nil {
+					ratePrev, rateCur = trafficSample{}, trafficSample{}
+				} else if advanceRateSample(rateCur, cur) {
+					ratePrev, rateCur = rateCur, cur
+				}
+				v := deriveTrayView(st, ratePrev, rateCur)
 
 				if v.State != lastState {
 					setTrayIcon(v.State)
@@ -387,7 +405,6 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					mPing.SetTitle(T("ping.title"))
 				}
 				mPingResult.SetTitle(pingSummary(&pr, err) + " · " + time.Now().Format("15:04:05"))
-				mPingResult.Show()
 				refresh()
 			}
 

@@ -1904,6 +1904,78 @@ func (c *P2PClient) dropOrphanCandidate(job p2pPromotionJob) {
 	c.restoreRelayRoute(job.assignedIP, job.relayPeer)
 }
 
+// denyKeyForIP returns the raw big-endian address bytes of ip as a map key
+// matching the receiver deny set's encoding (4 bytes for v4, 16 for v6), or ""
+// if ip is empty.
+func denyKeyForIP(ip net.IP) string {
+	if ip4 := ip.To4(); ip4 != nil {
+		return string(ip4)
+	}
+	if len(ip) == net.IPv6len {
+		return string(ip)
+	}
+	return ""
+}
+
+// TearDownDeniedDirectPeers removes any live or in-flight direct peer whose
+// overlay IP is in denied (keyed by raw address bytes, as the receiver deny set
+// encodes them), restoring its relay route so a now-denied pair cannot keep
+// using an already-established direct tunnel. In-flight promotions are aborted
+// and the retry gate is set so the client does not immediately re-punch a pair
+// the hub will refuse. Returns the overlay IPs torn down (for logging / exit
+// cleanup by the caller). Reuses the existing RemovePeer + restoreRelayRoute
+// primitive.
+func (c *P2PClient) TearDownDeniedDirectPeers(denied map[string]struct{}) []net.IP {
+	if len(denied) == 0 {
+		return nil
+	}
+	type victim struct {
+		pubKey NoisePublicKey
+		ip     net.IP
+		relay  *Peer
+	}
+	var victims []victim
+	c.mu.Lock()
+	serverKey := c.serverPeerKey
+	for id, peer := range c.peers {
+		if peer == nil || len(peer.AssignedIP) == 0 {
+			continue
+		}
+		if peer.State != P2PStateEstablished && peer.State != P2PStateTrying {
+			continue
+		}
+		if _, ok := denied[denyKeyForIP(peer.AssignedIP)]; !ok {
+			continue
+		}
+		relay := peer.RelayPeer
+		victims = append(victims, victim{
+			pubKey: peer.PublicKey,
+			ip:     append(net.IP(nil), peer.AssignedIP...),
+			relay:  relay,
+		})
+		peer.State = P2PStateFailed
+		peer.LastUsed = time.Now()
+		c.setRetryGateLocked(peer)
+		if session := c.sessions[id]; session != nil {
+			c.forgetSessionLocked(id, session)
+		}
+	}
+	c.rebuildIndexesLocked()
+	c.mu.Unlock()
+
+	var torn []net.IP
+	for _, v := range victims {
+		relay := v.relay
+		if relay == nil && !serverKey.IsZero() {
+			relay = c.device.LookupPeer(serverKey)
+		}
+		c.device.RemovePeer(v.pubKey)
+		c.restoreRelayRoute(v.ip, relay)
+		torn = append(torn, v.ip)
+	}
+	return torn
+}
+
 func (c *P2PClient) maintenanceLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()

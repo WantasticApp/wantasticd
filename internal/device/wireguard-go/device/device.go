@@ -103,6 +103,57 @@ type Device struct {
 	p2pClient           atomic.Pointer[P2PClient]
 	tunControlHandler   func(*Peer, []byte) // Handler for P2P TUN mode coordination (message type 7)
 	addPeerRouteHandler func(net.IP)        // Handler for dynamically adding P2P peer routes to TUN
+
+	// aclReceiverDeny is the phase-3 receiver-side ACL backstop: the hub-computed
+	// set of source overlay /32s this client must drop inbound from, even over a
+	// direct P2P tunnel. nil ⇒ no filtering and no per-packet cost (the empty /
+	// non-strict case). The source IP checked against it is crypto-authenticated
+	// by allowedips.Lookup in the receive path, so it cannot be spoofed.
+	aclReceiverDeny atomic.Pointer[receiverDenySet]
+}
+
+// receiverDenySet is an immutable, atomically-swapped snapshot of the deny set.
+// m is keyed by the raw big-endian address bytes (4 for v4, 16 for v6) so the
+// hot path can test membership with an allocation-free m[string(src)] lookup.
+// serverKey carves out the hub/relay peer: traffic arriving via the coordinator
+// peer is already authoritatively filtered hub-side and is never dropped here.
+type receiverDenySet struct {
+	m         map[string]struct{}
+	serverKey NoisePublicKey
+}
+
+// SetReceiverACLDenySet installs (or clears, with an empty set) the receiver deny
+// set. Called from the outer device on an ApplyReceiverACL control message. An
+// empty set stores nil so the hot path stays a single nil check.
+func (device *Device) SetReceiverACLDenySet(addrs [][]byte, serverKey NoisePublicKey) {
+	if len(addrs) == 0 {
+		device.aclReceiverDeny.Store(nil)
+		return
+	}
+	m := make(map[string]struct{}, len(addrs))
+	for _, a := range addrs {
+		m[string(a)] = struct{}{}
+	}
+	device.aclReceiverDeny.Store(&receiverDenySet{m: m, serverKey: serverKey})
+}
+
+// receiverACLDrop reports whether a decrypted inbound packet must be dropped by
+// the phase-3 receiver ACL. src is the crypto-authenticated source overlay
+// address (4 or 16 bytes). Hot path: one atomic load + nil check when no deny
+// set is installed. Carve-out: traffic arriving via the hub/relay (coordinator)
+// peer is never dropped — the hub already filtered it authoritatively, and the
+// deny set only names other peers' overlay /32s so control/return traffic from
+// the server peer can never match anyway.
+func (device *Device) receiverACLDrop(peer *Peer, src []byte) bool {
+	ds := device.aclReceiverDeny.Load()
+	if ds == nil {
+		return false
+	}
+	if !ds.serverKey.IsZero() && peer != nil && ds.serverKey.Equals(peer.handshake.remoteStatic) {
+		return false
+	}
+	_, denied := ds.m[string(src)]
+	return denied
 }
 
 func (device *Device) SetWUSPHandler(handler func(*Peer, []byte)) {

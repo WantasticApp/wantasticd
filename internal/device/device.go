@@ -80,13 +80,16 @@ type Device struct {
 	localAccessRoutes    []string
 	localAccessSyncMu    sync.Mutex
 
-	// Receiver-ACL (phase 3) chunk reassembly. A deny-set push may span several
-	// TUNControl frames; the client accumulates entries from FIRST through LAST,
-	// discarding a partial batch if a newer generation starts. Guarded by aclMu.
+	// Receiver-ACL (phase 3) chunk reassembly. A push carries two lists — the
+	// deny set (drop inbound) and the relay-only set (keep on the relay, no direct
+	// tunnel) — and may span several TUNControl frames; the client accumulates
+	// both from FIRST through LAST, discarding a partial batch if a newer
+	// generation starts. Guarded by aclMu.
 	aclMu            sync.Mutex
 	aclPendingGen    uint8
 	aclPendingHasGen bool
-	aclPendingKeys   [][]byte
+	aclPendingDeny   [][]byte
+	aclPendingRelay  [][]byte
 
 	// Device netstack for P2P connection handling
 	netstack *virtstack.Net

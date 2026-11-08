@@ -87,6 +87,10 @@ type P2PClient struct {
 	attemptGates   map[uint32]*atomic.Int64
 	sessionByNonce map[[8]byte]*P2PSession
 	destinations   atomic.Pointer[p2pDestinationIndex]
+	// relayPinned (phase-3 residual #1) holds overlay IPs (raw address bytes) the
+	// hub says must stay on the relay — permitted but scoped pairs that may not use
+	// a direct tunnel. tryP2PByID refuses to promote a pinned peer. Guarded by mu.
+	relayPinned map[string]struct{}
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -970,6 +974,15 @@ func (c *P2PClient) tryP2PByID(peerID uint32) bool {
 		len(peer.AssignedIP.To4()) != net.IPv4len || peer.PublicKey.Equals(c.serverPeerKey) {
 		c.mu.Unlock()
 		return false
+	}
+	// Phase-3 residual #1: a relay-pinned peer (scoped allow) must never be
+	// promoted to a direct tunnel — it stays on the hub relay where port/protocol
+	// is enforced. Inert when no pins are installed (non-strict / no scoped pairs).
+	if c.relayPinned != nil {
+		if _, pinned := c.relayPinned[denyKeyForIP(peer.AssignedIP)]; pinned {
+			c.mu.Unlock()
+			return false
+		}
 	}
 	now := time.Now()
 	switch peer.State {
@@ -1974,6 +1987,25 @@ func (c *P2PClient) TearDownDeniedDirectPeers(denied map[string]struct{}) []net.
 		torn = append(torn, v.ip)
 	}
 	return torn
+}
+
+// ApplyRelayOnly installs the relay-pin set (replacing any previous one) and
+// tears down any live direct tunnel to a pinned peer so its traffic falls back to
+// the hub relay. The pin prevents re-promotion (see tryP2PByID). An empty set
+// clears the pins — a pair that became direct-ok can be promoted again. Returns
+// the overlay IPs whose direct tunnels were torn down.
+func (c *P2PClient) ApplyRelayOnly(pins map[string]struct{}) []net.IP {
+	c.mu.Lock()
+	if len(pins) == 0 {
+		c.relayPinned = nil
+	} else {
+		c.relayPinned = pins
+	}
+	c.mu.Unlock()
+	if len(pins) == 0 {
+		return nil
+	}
+	return c.TearDownDeniedDirectPeers(pins)
 }
 
 func (c *P2PClient) maintenanceLoop() {

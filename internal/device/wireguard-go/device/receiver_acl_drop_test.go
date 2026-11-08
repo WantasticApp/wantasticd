@@ -2,6 +2,7 @@ package device
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 )
 
@@ -119,5 +120,70 @@ func TestTearDownDeniedDirectPeers(t *testing.T) {
 	}
 	if got := pair[0].dev.allowedips.Lookup(destination); got != relayPeer {
 		t.Error("relay route was not restored after teardown")
+	}
+}
+
+// TestApplyRelayOnlyPinsAndTearsDown proves a relay-only peer's live direct
+// tunnel is torn down, the relay route restored, and the peer pinned so
+// tryP2PByID refuses to re-promote it; clearing the pins lets it promote again.
+func TestApplyRelayOnlyPinsAndTearsDown(t *testing.T) {
+	pair := genTestPair(t, false)
+	client := NewP2PClient(pair[0].dev)
+	defer client.Close()
+
+	destination := pair[1].ip.AsSlice()
+	relayPeer := pair[0].dev.allowedips.Lookup(destination)
+	client.serverPeerKey = relayPeer.handshake.remoteStatic
+
+	directPriv := testNoisePrivateKey(0x71)
+	directKey := directPriv.publicKey()
+	assignedIP := net.IP(destination)
+	if err := client.prepareDirectPeer(directKey, assignedIP, "127.0.0.1:55558"); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if err := client.activateDirectPeer(directKey, assignedIP); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	client.mu.Lock()
+	client.peers[11] = &DiscoveredPeer{
+		ID:         11,
+		PublicKey:  directKey,
+		P2PCapable: true,
+		State:      P2PStateEstablished,
+		AssignedIP: append(net.IP(nil), assignedIP...),
+		RelayPeer:  relayPeer,
+	}
+	client.attemptGates[11] = &atomic.Int64{}
+	client.rebuildIndexesLocked()
+	client.mu.Unlock()
+
+	pins := map[string]struct{}{denyKeyForIP(assignedIP): {}}
+	torn := client.ApplyRelayOnly(pins)
+	if len(torn) != 1 {
+		t.Fatalf("relay-only teardown = %d, want 1", len(torn))
+	}
+	if pair[0].dev.LookupPeer(directKey) != nil {
+		t.Error("relay-only direct peer not removed")
+	}
+	if got := pair[0].dev.allowedips.Lookup(destination); got != relayPeer {
+		t.Error("relay route not restored for relay-only peer")
+	}
+	// Relay-only must NOT drop the peer's traffic — it flows via the relay. The
+	// deny set is independent of the relay-pin set.
+	pair[0].dev.SetReceiverACLDenySet(nil, client.serverPeerKey)
+	if pair[0].dev.receiverACLDrop(relayPeer, assignedIP.To4()) {
+		t.Error("relay-only peer's traffic must NOT be dropped")
+	}
+	// Pinned: a promotion attempt is refused.
+	client.mu.Lock()
+	client.peers[11].State = P2PStateDiscovered
+	client.mu.Unlock()
+	if client.tryP2PByID(11) {
+		t.Error("relay-pinned peer was promoted to direct")
+	}
+	// Clearing the pins lets it promote again.
+	client.ApplyRelayOnly(nil)
+	if !client.tryP2PByID(11) {
+		t.Error("peer should be promotable after pins cleared")
 	}
 }

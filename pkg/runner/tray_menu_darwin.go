@@ -5,17 +5,21 @@ package runner
 /*
 #cgo CFLAGS: -x objective-c -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa
+#include <stdlib.h>
 
 void wtWatchMenu(int menuId);
 void wtKeepOpen(int menuId, int asSwitch);
 void wtSetImage(int menuId, const void *bytes, int length, int points);
 void wtSetTrash(int menuId, int mode);
+void wtBindText(int menuId, const char *templates, const char *initial, int tabular, int reserve);
+void wtSetText(int menuId, const char *text, const char *tip);
 */
 import "C"
 
 import (
 	"os/exec"
 	"reflect"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -65,6 +69,64 @@ func menuSwitch(items ...*systray.MenuItem) {
 	for _, item := range items {
 		C.wtKeepOpen(C.int(menuItemID(item)), 1)
 	}
+}
+
+// bindRow makes item a natively drawn row whose text changes with setRowText.
+// Only that row redraws: the item's title is never touched, so AppKit never
+// re-lays out the open menu (which is what made live values flicker).
+// templates are the texts the row may show; the widest sizes it up front so
+// a changing value never widens the menu. tabular draws digits at a fixed
+// width. reserve keeps the menu's checkmark column, so native rows line up
+// with drawn ones whether or not a switch is on.
+func bindRow(item *systray.MenuItem, initial string, tabular, reserve bool, templates ...string) {
+	tpl := C.CString(strings.Join(append(templates, initial), "\n"))
+	first := C.CString(initial)
+	defer C.free(unsafe.Pointer(tpl))
+	defer C.free(unsafe.Pointer(first))
+	C.wtBindText(C.int(menuItemID(item)), tpl, first, cBool(tabular), cBool(reserve))
+	boundRows.Store(item, true)
+	menuText.Store(menuTextKey{item: item, bound: true}, initial)
+}
+
+var boundRows sync.Map // *systray.MenuItem -> true
+
+// setRowText shows text on a row; a bound row redraws only itself.
+func setRowText(item *systray.MenuItem, text string) {
+	if _, ok := boundRows.Load(item); !ok {
+		setTitle(item, text)
+		return
+	}
+	setMenuText(menuTextKey{item: item, bound: true}, text, func(t string) {
+		ct := C.CString(t)
+		defer C.free(unsafe.Pointer(ct))
+		C.wtSetText(C.int(menuItemID(item)), ct, nil)
+	})
+}
+
+// setRowTip sets a row's tooltip; on a bound row without touching the item.
+func setRowTip(item *systray.MenuItem, tip string) {
+	if _, ok := boundRows.Load(item); !ok {
+		setTooltip(item, tip)
+		return
+	}
+	setMenuText(menuTextKey{item: item, bound: true, tooltip: true}, tip, func(t string) {
+		key := menuTextKey{item: item, bound: true}
+		cur := ""
+		if v, ok := menuText.Load(key); ok {
+			cur = v.(string)
+		}
+		ct, ctip := C.CString(cur), C.CString(t)
+		defer C.free(unsafe.Pointer(ct))
+		defer C.free(unsafe.Pointer(ctip))
+		C.wtSetText(C.int(menuItemID(item)), ct, ctip)
+	})
+}
+
+func cBool(b bool) C.int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // setMenuImage shows png at points x points beside the item's title.

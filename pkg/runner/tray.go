@@ -21,6 +21,13 @@ import (
 	"github.com/getlantern/systray"
 )
 
+// The client's license and public source, shown under More › About.
+const (
+	projectLicense    = "MIT"
+	projectSourceURL  = "https://github.com/ispapp/wantasticd"
+	projectLicenseURL = projectSourceURL + "/blob/main/LICENSE"
+)
+
 // trayRefresh is how often the menu re-reads the daemon: often enough that
 // speeds and peer paths look live while the menu is open.
 const trayRefresh = time.Second
@@ -113,9 +120,14 @@ func (n *trayNotice) set(text string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.at = time.Now()
-	n.item.SetTitle(text)
-	n.item.SetTooltip(text)
+	// A long error is clipped in the row (the full text is its tooltip) so it
+	// cannot stretch the menu.
+	setRowText(n.item, clip(text, maxNoticeRunes))
+	setRowTip(n.item, text)
 }
+
+// maxNoticeRunes bounds the notice row's width.
+const maxNoticeRunes = 56
 
 // expire returns the row to its idle placeholder once a notice has aged out.
 // The row is never hidden: showing and hiding it was the menu's main layout
@@ -126,8 +138,8 @@ func (n *trayNotice) expire() {
 	defer n.mu.Unlock()
 	if !n.at.IsZero() && time.Since(n.at) > noticeTTL {
 		n.at = time.Time{}
-		n.item.SetTitle(T("notice.idle"))
-		n.item.SetTooltip("")
+		setRowText(n.item, T("notice.idle"))
+		setRowTip(n.item, "")
 	}
 }
 
@@ -150,6 +162,7 @@ var menuText sync.Map // menuTextKey -> string
 type menuTextKey struct {
 	item    *systray.MenuItem
 	tooltip bool
+	bound   bool // a natively bound row (bindRow), cached apart from its title
 }
 
 func setMenuText(key menuTextKey, text string, apply func(string)) {
@@ -193,8 +206,8 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mHeader := systray.AddMenuItem(T("header.connecting"), T("header.tooltip"))
 			mHeader.Disable()
 			mAddress := systray.AddMenuItem(T("addr.empty"), T("address.tooltip"))
-			mRate := systray.AddMenuItem(T("speed.empty"), T("speed.tooltip"))
-			mRate.Disable()
+			mLatency := systray.AddMenuItem(T("latency.empty"), T("latency.tooltip"))
+			mLatency.Disable()
 			mTraffic := systray.AddMenuItem(T("traffic.empty"), T("traffic.tooltip"))
 			mTraffic.Disable()
 			// Not signed in: a QR code to scan with a phone (macOS draws it
@@ -248,23 +261,46 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			}
 			mVersion := mMore.AddSubMenuItem(T("version", version.Version), T("version.tooltip"))
 			mVersion.Disable()
+			// About: the client's license and where its source lives.
+			mAbout := mMore.AddSubMenuItem(T("about"), T("about.tooltip"))
+			mLicense := mAbout.AddSubMenuItem(T("about.license", projectLicense), T("about.license.tooltip"))
+			mSource := mAbout.AddSubMenuItem(T("about.source"), T("about.source.tooltip", projectSourceURL))
 			mQuit := systray.AddMenuItem(T("menu.quit"), T("menu.quit.tooltip"))
 
 			keepMenuOpen(mToggle, mPing)
 			menuSwitch(mToggle, exitMenu.offer)
 
+			// Value rows are bound natively (macOS): a refresh redraws only the
+			// row whose value changed and never re-lays out the open menu. Each
+			// is sized up front for the widest value it will show. The header
+			// and the details row also keep their menus' checkmark column, so
+			// native rows line up with drawn ones in every state.
+			bindRow(mHeader, T("header.connecting"), false, true,
+				T("header.daemon.down"), T("header.notsignedin"), T("header.disconnected"),
+				T("header.connected"), T("header.exit", strings.Repeat("o", maxHeaderName)) /* average-width letters: a typical name */)
+			bindRow(mAddress, T("addr.empty"), true, false, T("addr", "255.255.255.255"))
+			bindRow(mLatency, T("latency.empty"), true, false,
+				T("latency.row", T("latency.ms", 9999.0)), T("latency.row", T("latency.noreply")))
+			wideBytes := trayBytes(1023 << 30)
+			bindRow(mTraffic, T("traffic.empty"), true, false, T("traffic", wideBytes, wideBytes))
+			bindRow(mToggle, T("toggle.connect"), false, false,
+				T("toggle.disconnect"), T("toggle.connecting"), T("toggle.disconnecting"))
+			bindRow(mPing, T("ping.title"), false, false, T("ping.running"))
+			bindRow(mPingResult, T("ping.idle"), true, false,
+				T("ping.summary", 99, 99, 999.0)+" · 00:00:00", T("ping.none", 99)+" · 00:00:00")
+			bindRow(mNotice, T("notice.idle"), false, false)
+			bindRow(mDetails, T("details.placeholder"), true, true,
+				T("details.up", "99d23h")+" · "+T("details.server", "255.255.255.255:65535"))
+
 			var (
 				refreshMu sync.Mutex
-				// ratePrev/rateCur are the two samples the live traffic rate is
-				// measured between. The pair only advances on a cadence (see
-				// advanceRateSample), so the rate shown is always averaged over
-				// a real ≥minRateWindow interval; a burst of refreshes a few ms
-				// apart reuses the frozen pair instead of dividing a tiny byte
-				// delta by a near-zero gap (which showed a garbage spike).
-				ratePrev, rateCur trafficSample
-				lastState         = trayState(-1)
-				latency           map[string]agent.PingResult
-				address           string
+				lastState = trayState(-1)
+				// gateway is the network's router address (from the daemon);
+				// gwLatency is the last round trip to it.
+				gateway   string
+				gwLatency gatewayLatency
+				latency   map[string]agent.PingResult
+				address   string
 				// toggling is the VPN row's title while a connect or
 				// disconnect runs ("Connecting…"), "" otherwise.
 				toggling atomic.Value
@@ -282,31 +318,27 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					st = nil
 				}
 				now := time.Now()
-				var cur trafficSample
 				if st != nil {
-					cur = trafficSample{rx: st.RxBytes, tx: st.TxBytes, at: now}
+					gateway = st.Gateway
+				} else {
+					gateway = ""
 				}
-				// Advance the displayed pair only on a cadence (or a counter
-				// reset); between advances the frozen pair is reused, so the
-				// rate is never divided by a near-zero interval.
-				if st == nil {
-					ratePrev, rateCur = trafficSample{}, trafficSample{}
-				} else if advanceRateSample(rateCur, cur) {
-					ratePrev, rateCur = rateCur, cur
+				v := deriveTrayView(st, gwLatency)
+				if v.State != trayConnected && v.State != trayExitActive {
+					gwLatency = gatewayLatency{} // a fresh tunnel starts unmeasured
 				}
-				v := deriveTrayView(st, ratePrev, rateCur)
 
 				if v.State != lastState {
 					setTrayIcon(v.State)
 					lastState = v.State
 				}
 				setTrayTooltip(v.Tooltip)
-				setTitle(mHeader, v.Header)
-				setTitle(mAddress, v.Address)
+				setRowText(mHeader, v.Header)
+				setRowText(mAddress, v.Address)
 				address = strings.TrimPrefix(v.Address, "IP: ")
-				setTitle(mTraffic, v.Traffic)
-				setTitle(mRate, v.Rate)
-				setTitle(mDetails, firstNonEmpty(v.Details, T("details.placeholder")))
+				setRowText(mTraffic, v.Traffic)
+				setRowText(mLatency, v.Latency)
+				setRowText(mDetails, firstNonEmpty(v.Details, T("details.placeholder")))
 				if st != nil {
 					mServer.set(T("copy.server"), st.ServerEndpoint)
 					mKey.set(T("copy.pubkey"), st.PubKey)
@@ -332,7 +364,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					}
 				}
 				loginMu.Unlock()
-				setTitle(mToggle, firstNonEmpty(toggling.Load().(string), v.ToggleTitle))
+				setRowText(mToggle, firstNonEmpty(toggling.Load().(string), v.ToggleTitle))
 				setChecked(mToggle, v.State == trayConnected || v.State == trayExitActive)
 				setEnabled(mToggle, v.ToggleEnabled)
 				setTitle(mPeers, v.PeersTitle)
@@ -381,7 +413,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					if !manualQueue.CompareAndSwap(false, true) {
 						return
 					}
-					mPing.SetTitle(T("ping.running"))
+					setRowText(mPing, T("ping.running"))
 					mPing.Disable()
 					pinging.Lock()
 					manualQueue.Store(false)
@@ -390,6 +422,23 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					return
 				}
 				defer pinging.Unlock()
+
+				// Latency: one round trip to the network's gateway first, so the
+				// row fills in at once even when peers are slow to answer.
+				refreshMu.Lock()
+				gw := gateway
+				refreshMu.Unlock()
+				if gw != "" {
+					var gr agent.PingResponse
+					l := gatewayLatency{Measured: true}
+					if err := fetchJSON(actionClient, "/api/ping?count=1&timeout=1000&target="+gw, &gr); err == nil && gr.Error == "" && len(gr.Results) > 0 && gr.Results[0].Received > 0 {
+						l.Replied, l.Ms = true, gr.Results[0].AvgMs
+					}
+					refreshMu.Lock()
+					gwLatency = l
+					refreshMu.Unlock()
+				}
+
 				var pr agent.PingResponse
 				err := fetchJSON(actionClient, query, &pr)
 				if err == nil && pr.Error == "" {
@@ -402,9 +451,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					refreshMu.Unlock()
 				}
 				if manual {
-					mPing.SetTitle(T("ping.title"))
+					setRowText(mPing, T("ping.title"))
 				}
-				mPingResult.SetTitle(pingSummary(&pr, err) + " · " + time.Now().Format("15:04:05"))
+				setRowText(mPingResult, pingSummary(&pr, err)+" · "+time.Now().Format("15:04:05"))
 				refresh()
 			}
 
@@ -524,6 +573,16 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
 						}
 
+					case <-mLicense.ClickedCh:
+						if err := OpenURL(projectLicenseURL); err != nil {
+							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
+						}
+
+					case <-mSource.ClickedCh:
+						if err := OpenURL(projectSourceURL); err != nil {
+							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
+						}
+
 					case <-mLogs.ClickedCh:
 						if err := openLogFile(logPath); err != nil {
 							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.log"), err))
@@ -611,6 +670,11 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 		item := group.parent.AddSubMenuItem("", "")
 		detail := item.AddSubMenuItem("", "")
 		detail.Disable()
+		// The detail line ticks every refresh (handshake age, traffic): bind it
+		// so the open submenu redraws only that line. It also keeps the
+		// submenu's checkmark column, aligning the copy rows under it.
+		wide := trayBytes(1023 << 30)
+		bindRow(detail, "", true, true, T("handshake.ago", "99d23h")+" · ↓ "+wide+" ↑ "+wide)
 		state := &peerMenuItemState{
 			item:     item,
 			detail:   detail,
@@ -623,7 +687,7 @@ func syncPeerMenuGroup(group *peerMenuGroup, entries []peerMenuEntry) {
 		row := group.peerItems[i]
 		setTitle(row.item, entry.Title)
 		setTooltip(row.item, entry.Tooltip)
-		setTitle(row.detail, entry.Detail)
+		setRowText(row.detail, entry.Detail)
 		row.vpnIP.set(T("copy.vpnip"), entry.VPNIP)
 		row.publicIP.set(T("copy.publicip"), entry.PublicIP)
 		row.item.Show()

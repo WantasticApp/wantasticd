@@ -26,6 +26,19 @@ func setupTUNInterface(tunName string, addrs []netip.Prefix) error {
 	return nil
 }
 
+// setTUNMTUOS applies the tunnel MTU to the Windows IP interface. Wintun
+// advertises a 65535-byte link MTU and wireguard-go's MTU is only reported
+// internally, so without this Windows sends full 1500-byte segments (TCP
+// MSS 65495) into a tunnel that carries ~1420: large transfers stall behind
+// fragmentation or a PMTUD black hole, worst through an exit node.
+func setTUNMTUOS(tunName string, mtu int) error {
+	if mtu <= 0 {
+		return nil
+	}
+	log.Printf("[TUN] Setting MTU %d on interface %s", mtu, tunName)
+	return ctl.LinkSetMTU(tunName, mtu)
+}
+
 func addRouteOS(tunName string, network string) error {
 	prefix, err := netip.ParsePrefix(network)
 	if err != nil {

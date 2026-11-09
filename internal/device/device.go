@@ -685,6 +685,11 @@ func (d *Device) startTUNMode(addrs []netip.Addr) (tun.Device, error) {
 	if err := setupTUNInterface(actualName, d.config.Interface.Addresses); err != nil {
 		log.Printf("Warning: failed to setup TUN interface networking: %v", err)
 	}
+	if mtu, err := nativeTun.MTU(); err == nil {
+		if err := setTUNMTUOS(actualName, mtu); err != nil {
+			log.Printf("Warning: failed to set MTU %d on %s: %v", mtu, actualName, err)
+		}
+	}
 
 	// Create a parallel Userspace Netstack bound to the native TUN IP
 	// This ensures P2P hole-punching and internal WireGuard routing is accelerated in Go userspace

@@ -87,6 +87,27 @@ func TestDiffRoutesIdempotentAndComeback(t *testing.T) {
 	}
 }
 
+func TestCanBlockIPv6(t *testing.T) {
+	onLink := func(a netip.Addr) bool { return mp("2001:db8:1::/64").Contains(a) }
+	cases := []struct {
+		name     string
+		critical []netip.Addr
+		want     bool
+	}{
+		{"none", nil, true},
+		{"ipv4 hub and exit", []netip.Addr{ma("172.239.44.171"), ma("187.188.144.125")}, true},
+		{"v4-mapped", []netip.Addr{ma("::ffff:203.0.113.9")}, true},
+		{"link-local v6 exit", []netip.Addr{ma("fe80::1")}, true},
+		{"on-link v6 exit", []netip.Addr{ma("2001:db8:1::70")}, true},
+		{"global v6 hub", []netip.Addr{ma("172.239.44.171"), ma("2606:4700::1")}, false},
+	}
+	for _, c := range cases {
+		if got := CanBlockIPv6(c.critical, onLink); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestDiffRoutesEndpointRebind(t *testing.T) {
 	old := PlanClientRoutes(ClientPlan{Bypass: []netip.Addr{ma("203.0.113.9"), ma("198.51.100.7")}})
 	cur := PlanClientRoutes(ClientPlan{Bypass: []netip.Addr{ma("203.0.113.9"), ma("198.51.100.99")}})
@@ -123,6 +144,10 @@ func TestRouteCommands(t *testing.T) {
 		{"windows", tunnel, false, "netsh interface ipv4 delete route prefix=0.0.0.0/1 interface=utun5"},
 		{"windows", bypass, true, "netsh interface ipv4 add route prefix=203.0.113.9/32 interface=7 nexthop=192.168.1.1 store=active"},
 		{"windows", bypass, false, "netsh interface ipv4 delete route prefix=203.0.113.9/32 interface=7 nexthop=192.168.1.1"},
+		// No reject routes on Windows: IPv6 goes into the tunnel adapter,
+		// where no peer owns ::/0, so it is dropped instead of leaking.
+		{"windows", reject, true, "netsh interface ipv6 add route prefix=8000::/1 interface=utun5 metric=5 store=active"},
+		{"windows", reject, false, "netsh interface ipv6 delete route prefix=8000::/1 interface=utun5"},
 	}
 	for _, c := range cases {
 		var cmd Cmd
@@ -135,9 +160,6 @@ func TestRouteCommands(t *testing.T) {
 		if err != nil || cmd.String() != c.want {
 			t.Errorf("%s %v add=%v: got %q err=%v, want %q", c.goos, c.r, c.add, cmd.String(), err, c.want)
 		}
-	}
-	if _, err := RouteAddCmd("windows", reject, "utun5", gw); err == nil {
-		t.Error("windows reject route should be unsupported")
 	}
 	// PPP-style gateway without an address goes via the interface.
 	cmd, _ := RouteAddCmd("darwin", bypass, "utun5", Gateway{Interface: "ppp0"})

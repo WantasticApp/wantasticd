@@ -21,6 +21,13 @@ import (
 	"github.com/getlantern/systray"
 )
 
+// The client's license and public source, shown under More › About.
+const (
+	projectLicense    = "MIT"
+	projectSourceURL  = "https://github.com/ispapp/wantasticd"
+	projectLicenseURL = projectSourceURL + "/blob/main/LICENSE"
+)
+
 // trayRefresh is how often the menu re-reads the daemon: often enough that
 // speeds and peer paths look live while the menu is open.
 const trayRefresh = time.Second
@@ -254,6 +261,10 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			}
 			mVersion := mMore.AddSubMenuItem(T("version", version.Version), T("version.tooltip"))
 			mVersion.Disable()
+			// About: the client's license and where its source lives.
+			mAbout := mMore.AddSubMenuItem(T("about"), T("about.tooltip"))
+			mLicense := mAbout.AddSubMenuItem(T("about.license", projectLicense), T("about.license.tooltip"))
+			mSource := mAbout.AddSubMenuItem(T("about.source"), T("about.source.tooltip", projectSourceURL))
 			mQuit := systray.AddMenuItem(T("menu.quit"), T("menu.quit.tooltip"))
 
 			keepMenuOpen(mToggle, mPing)
@@ -559,6 +570,16 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 					case <-mConsole.ClickedCh:
 						if err := OpenURL(trayConsoleURL); err != nil {
+							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
+						}
+
+					case <-mLicense.ClickedCh:
+						if err := OpenURL(projectLicenseURL); err != nil {
+							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
+						}
+
+					case <-mSource.ClickedCh:
+						if err := OpenURL(projectSourceURL); err != nil {
 							notice.report("", "", fmt.Errorf("%s: %w", T("error.open.browser"), err))
 						}
 

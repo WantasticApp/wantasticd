@@ -7,8 +7,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"wantastic-agent/internal/device"
@@ -131,6 +133,10 @@ type StatusResponse struct {
 	Version        string `json:"version,omitempty"`
 	Commit         string `json:"commit,omitempty"`
 	ServerEndpoint string `json:"server_endpoint,omitempty"`
+	// Gateway is the network's Wantastic router address inside the tunnel. It
+	// is always reachable (access rules never block it), so the tray measures
+	// latency to it.
+	Gateway string `json:"gateway,omitempty"`
 	StartedAt      int64  `json:"started_at,omitempty"`
 	UptimeSec      int64  `json:"uptime_sec,omitempty"`
 	AutoUpdate     bool   `json:"auto_update"`
@@ -203,6 +209,7 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		UptimeSec:  int64(time.Since(processStart).Seconds()),
 		AutoUpdate: s.agent.config.AutoUpdate,
 	}
+	status.Gateway = tunnelGateway(s.agent.config.Interface.DNS)
 	exitState := s.agent.device.ExitStatus()
 	status.ExitNode = exitState.Offering
 	status.ExitNodeState = &exitState
@@ -263,4 +270,23 @@ func (s *APIServer) handleToggleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.connectionReply(w, s.agent.Connect())
+}
+
+// cgnatRange is the RFC 6598 shared address space, also used for overlays.
+var cgnatRange = netip.MustParsePrefix("100.64.0.0/10")
+
+// tunnelGateway picks the network's router from the tunnel config's DNS list:
+// the hub issues it first (e.g. "10.6.81.33, 1.1.1.1"). Public resolvers are
+// skipped, so a list without the router yields "".
+func tunnelGateway(dns []string) string {
+	for _, raw := range dns {
+		a, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil || !a.Is4() {
+			continue
+		}
+		if a.IsPrivate() || cgnatRange.Contains(a) {
+			return a.String()
+		}
+	}
+	return ""
 }

@@ -12,11 +12,12 @@ import (
 )
 
 func TestDeriveTrayViewStates(t *testing.T) {
-	if v := deriveTrayView(nil, trafficSample{}, trafficSample{}); v.State != trayDaemonDown || v.ToggleEnabled {
+	if v := deriveTrayView(nil, gatewayLatency{}); v.State != trayDaemonDown || v.ToggleEnabled || v.Latency != "Latency: —" {
 		t.Fatalf("daemon down: %+v", v)
 	}
 	down := &agent.StatusResponse{Running: true, DeviceRunning: false}
-	if v := deriveTrayView(down, trafficSample{}, trafficSample{}); v.State != trayDisconnected || v.ToggleTitle != "Connect" || !v.ToggleEnabled {
+	// A stale measurement never shows while the tunnel is down.
+	if v := deriveTrayView(down, gatewayLatency{Measured: true, Replied: true, Ms: 12}); v.State != trayDisconnected || v.ToggleTitle != "Connect" || !v.ToggleEnabled || v.Latency != "Latency: —" {
 		t.Fatalf("disconnected: %+v", v)
 	}
 	up := &agent.StatusResponse{
@@ -28,19 +29,22 @@ func TestDeriveTrayViewStates(t *testing.T) {
 			{IsP2P: true, P2PState: "failed", AssignedIP: "10.255.255.38"},
 		},
 	}
-	t0 := time.Unix(1000, 0)
-	v := deriveTrayView(up, trafficSample{rx: 1 << 20, tx: 1 << 20, at: t0}, trafficSample{rx: 3 << 20, tx: 1 << 20, at: t0.Add(2 * time.Second)})
+	v := deriveTrayView(up, gatewayLatency{Measured: true, Replied: true, Ms: 23.4})
 	if v.State != trayConnected || v.ToggleTitle != "Disconnect" || v.Address != "IP: 10.255.255.44" {
 		t.Fatalf("connected: %+v", v)
 	}
-	// Rate is 1 MiB/s down (2 MiB over 2s), 0 up. Built from trayBytes so the
-	// assertion tracks the formatter's fixed-width padding.
-	wantRate := "Speed: ↓ " + trayBytes(1<<20) + "/s  ↑ " + trayBytes(0) + "/s"
-	if v.Rate != wantRate || v.PeersTitle != "Peers: 1 direct, 1 relay" || v.Details != "Up 1h01m · server 172.239.44.171:51820" {
-		t.Fatalf("details: %+v (want rate %q)", v, wantRate)
+	wantTraffic := "Traffic: ↓ " + trayBytes(3<<20) + "  ↑ " + trayBytes(1<<20)
+	if v.Latency != "Latency: 23 ms" || v.Traffic != wantTraffic || v.PeersTitle != "Peers: 1 direct, 1 relay" || v.Details != "Up 1h01m · server 172.239.44.171:51820" {
+		t.Fatalf("details: %+v", v)
+	}
+	if v := deriveTrayView(up, gatewayLatency{}); v.Latency != "Latency: —" {
+		t.Fatalf("not measured yet: %q", v.Latency)
+	}
+	if v := deriveTrayView(up, gatewayLatency{Measured: true}); v.Latency != "Latency: no reply" {
+		t.Fatalf("no reply: %q", v.Latency)
 	}
 	up.ExitNodeState = &device.ExitNodeStatus{Using: &device.ExitUse{IP: "10.255.255.36", Hostname: "mini", State: "active"}}
-	if v := deriveTrayView(up, trafficSample{}, trafficSample{}); v.State != trayExitActive || !strings.Contains(v.Header, "mini") || v.Rate != "Speed: —" {
+	if v := deriveTrayView(up, gatewayLatency{Measured: true, Replied: true, Ms: 40}); v.State != trayExitActive || !strings.Contains(v.Header, "mini") || v.Latency != "Latency: 40 ms" {
 		t.Fatalf("exit active: %+v", v)
 	}
 }
@@ -68,33 +72,6 @@ func TestTrayBytesFormat(t *testing.T) {
 		if s := trayBytes(n); !strings.HasSuffix(s, " B") && !strings.Contains(s, "iB") {
 			t.Errorf("trayBytes(%d) = %q: not a binary unit", n, s)
 		}
-	}
-}
-
-func TestAdvanceRateSample(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	// First sample (no baseline yet): advance.
-	if !advanceRateSample(trafficSample{}, trafficSample{rx: 10, at: t0}) {
-		t.Error("first sample should advance the baseline")
-	}
-	// Within the window, counters rising: hold (avoid a near-zero-interval spike).
-	if advanceRateSample(trafficSample{rx: 100, tx: 100, at: t0}, trafficSample{rx: 200, tx: 150, at: t0.Add(100 * time.Millisecond)}) {
-		t.Error("sub-window refresh should hold the baseline")
-	}
-	// Full window elapsed: advance.
-	if !advanceRateSample(trafficSample{rx: 100, at: t0}, trafficSample{rx: 200, at: t0.Add(minRateWindow)}) {
-		t.Error("a full window should advance the baseline")
-	}
-	// Counter went backwards (tunnel restart): advance to reset the baseline.
-	if !advanceRateSample(trafficSample{rx: 500, at: t0}, trafficSample{rx: 10, at: t0.Add(100 * time.Millisecond)}) {
-		t.Error("a counter reset should advance (reset) the baseline")
-	}
-}
-
-func TestTrafficRateCounterReset(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	if got := trafficRate(trafficSample{rx: 500, at: t0}, trafficSample{rx: 10, at: t0.Add(time.Second)}); got != "—" {
-		t.Fatalf("reset counters: %q", got)
 	}
 }
 
@@ -153,14 +130,14 @@ func TestTrayIcons(t *testing.T) {
 
 func TestTrayViewNotSignedIn(t *testing.T) {
 	st := &agent.StatusResponse{Claim: &agent.ClaimStatus{URL: "https://wantastic.app/claim?key=abc", PublicKey: "abc"}}
-	v := deriveTrayView(st, trafficSample{}, trafficSample{})
+	v := deriveTrayView(st, gatewayLatency{})
 	if v.State != trayNotSignedIn || v.LoginURL != st.Claim.URL || v.ToggleEnabled {
 		t.Fatalf("not signed in: %+v", v)
 	}
 	if m := deriveExitMenu(st); m.OfferTooltip != "Log in first" {
 		t.Errorf("exit menu while not signed in: %+v", m)
 	}
-	if v := deriveTrayView(&agent.StatusResponse{Running: true, DeviceRunning: true}, trafficSample{}, trafficSample{}); v.LoginURL != "" {
+	if v := deriveTrayView(&agent.StatusResponse{Running: true, DeviceRunning: true}, gatewayLatency{}); v.LoginURL != "" {
 		t.Errorf("signed-in device offers Log in: %+v", v)
 	}
 }

@@ -42,6 +42,21 @@ static const CGFloat wtTrashHit   = 28;
 // instead of the item's action: 1 shows it, 2 shows it armed (red, filled).
 @property (nonatomic) int trash;
 @property (nonatomic, copy) NSString *drawn;
+// Bound rows (wtBindText): the row shows .text, set from Go by wtSetText, and
+// never the item's title. Changing a title makes AppKit re-lay out the whole
+// open menu (the flicker); changing .text only redraws this view.
+@property (nonatomic) BOOL bound;
+@property (nonatomic, copy) NSString *text;
+@property (nonatomic, copy) NSString *tip;
+// tabular draws digits at a fixed width so live values do not jiggle.
+@property (nonatomic) BOOL tabular;
+// reserveState keeps the item's state on — never drawn — so the menu always
+// reserves its checkmark column and native rows line up with drawn ones
+// whatever the switches show.
+@property (nonatomic) BOOL reserveState;
+// minWidth sizes the row for the widest text it will show (its templates),
+// so live values never widen the menu.
+@property (nonatomic) CGFloat minWidth;
 @end
 
 @implementation WTKeepOpenView
@@ -75,18 +90,27 @@ static const CGFloat wtTrashHit   = 28;
 
 - (NSFont *)titleFont {
 	NSFont *f = self.enclosingMenuItem.menu.font;
-	return f ?: [NSFont menuFontOfSize:0];
+	f = f ?: [NSFont menuFontOfSize:0];
+	if (self.tabular) return [NSFont monospacedDigitSystemFontOfSize:f.pointSize weight:NSFontWeightRegular];
+	return f;
+}
+
+- (NSString *)shownText {
+	if (self.bound) return self.text ?: @"";
+	return self.enclosingMenuItem.title ?: @"";
 }
 
 // sync redraws when the item changed since the last draw.
 - (void)sync {
 	NSMenuItem *item = self.enclosingMenuItem;
 	if (item == nil) return;
-	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%p|%d", item.title, item.isEnabled, (long)item.state, item.isHighlighted, self.image, self.trash];
+	NSString *key = [NSString stringWithFormat:@"%@|%d|%ld|%d|%p|%d", [self shownText], item.isEnabled, (long)item.state, item.isHighlighted, self.image, self.trash];
 	if (![key isEqualToString:self.drawn]) {
 		self.drawn = key;
-		self.toolTip = item.toolTip;
-		CGFloat w = ceil([item.title sizeWithAttributes:@{NSFontAttributeName: [self titleFont]}].width) + wtTitleX + wtTitleRight;
+		self.toolTip = self.tip ?: item.toolTip;
+		if (self.bound) [self setAccessibilityLabel:[self shownText]];
+		CGFloat w = ceil([[self shownText] sizeWithAttributes:@{NSFontAttributeName: [self titleFont]}].width) + wtTitleX + wtTitleRight;
+		w = MAX(w, self.minWidth);
 		if (self.isSwitch) w += wtSwitchW + 12;
 		if (self.trash > 0) w += wtTrashHit;
 		CGFloat h = wtRowHeight;
@@ -132,7 +156,7 @@ static const CGFloat wtTrashHit   = 28;
 		[(on && selected ? [NSColor controlAccentColor] : [NSColor whiteColor]) setFill];
 		[[NSBezierPath bezierPathWithOvalInRect:k] fill];
 		right += wtSwitchW + 12;
-	} else if (item.state == NSControlStateValueOn) {
+	} else if (item.state == NSControlStateValueOn && !self.reserveState) {
 		[@"✓" drawAtPoint:NSMakePoint(wtStateX, y) withAttributes:attrs];
 	}
 	if (self.trash > 0) {
@@ -149,7 +173,7 @@ static const CGFloat wtTrashHit   = 28;
 		}
 		right += wtTrashSize + 10; // the title never runs under the bin
 	}
-	[item.title drawInRect:NSMakeRect(wtTitleX, y, NSWidth(self.bounds) - wtTitleX - right, h) withAttributes:attrs];
+	[[self shownText] drawInRect:NSMakeRect(wtTitleX, y, NSWidth(self.bounds) - wtTitleX - right, h) withAttributes:attrs];
 }
 
 @end
@@ -168,6 +192,13 @@ static int wtOpenMenus;
 @implementation WTMenuWatcher
 
 - (void)menuWillOpen:(NSMenu *)menu {
+	// Re-assert the reserved state column before AppKit lays the menu out.
+	for (NSMenuItem *it in menu.itemArray) {
+		WTKeepOpenView *v = (WTKeepOpenView *)it.view;
+		if ([v isKindOfClass:[WTKeepOpenView class]] && v.reserveState && it.state != NSControlStateValueOn) {
+			it.state = NSControlStateValueOn;
+		}
+	}
 	if (wtOpenMenus++ == 0) {
 		for (WTKeepOpenView *v in wtViews) [v sync];
 		wtTimer = [NSTimer timerWithTimeInterval:0.15 repeats:YES block:^(NSTimer *t) {
@@ -251,6 +282,59 @@ void wtKeepOpen(int menuId, int asSwitch) {
 		}
 		if (asSwitch) v.isSwitch = YES;
 		v.drawn = nil;
+		[v sync];
+	});
+}
+
+static WTKeepOpenView *wtViewFor(NSInteger menuId) {
+	NSMenu *root = wtRootMenu();
+	NSMenuItem *item = root ? wtFind(root, menuId) : nil;
+	if (item == nil || item.hasSubmenu) return nil;
+	WTKeepOpenView *v = (WTKeepOpenView *)item.view;
+	if (![v isKindOfClass:[WTKeepOpenView class]]) {
+		v = [[WTKeepOpenView alloc] init];
+		item.view = v;
+		[wtViews addObject:v];
+	}
+	return v;
+}
+
+// wtBindText makes an item a bound row (see WTKeepOpenView.bound). templates
+// are newline-separated texts the row may show; the widest sizes it.
+void wtBindText(int menuId, const char *templates, const char *initial, int tabular, int reserve) {
+	NSString *tpl = [NSString stringWithUTF8String:templates ?: ""];
+	NSString *first = [NSString stringWithUTF8String:initial ?: ""];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		wtInit();
+		WTKeepOpenView *v = wtViewFor(menuId);
+		if (v == nil) return;
+		v.bound = YES;
+		v.tabular = tabular != 0;
+		v.reserveState = reserve != 0;
+		if (v.text == nil) v.text = first;
+		NSFont *font = [v titleFont];
+		CGFloat w = 0;
+		for (NSString *t in [tpl componentsSeparatedByString:@"\n"]) {
+			w = MAX(w, ceil([t sizeWithAttributes:@{NSFontAttributeName: font}].width));
+		}
+		CGFloat extra = wtTitleX + wtTitleRight + (v.isSwitch ? wtSwitchW + 12 : 0);
+		v.minWidth = w > 0 ? w + extra : 0;
+		if (v.reserveState) v.enclosingMenuItem.state = NSControlStateValueOn;
+		v.drawn = nil;
+		[v sync];
+	});
+}
+
+// wtSetText changes a bound row's text; only that row redraws.
+void wtSetText(int menuId, const char *text, const char *tip) {
+	NSString *t = [NSString stringWithUTF8String:text ?: ""];
+	NSString *tt = tip ? [NSString stringWithUTF8String:tip] : nil;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		wtInit();
+		WTKeepOpenView *v = wtViewFor(menuId);
+		if (v == nil || !v.bound) return;
+		v.text = t;
+		if (tt != nil) v.tip = tt.length ? tt : nil;
 		[v sync];
 	});
 }

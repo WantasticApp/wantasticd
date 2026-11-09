@@ -43,31 +43,24 @@ func stateOf(st *agent.StatusResponse) trayState {
 	}
 }
 
-// trafficSample is one status poll's byte counters, for live rates.
-type trafficSample struct {
-	rx, tx uint64
-	at     time.Time
+// gatewayLatency is the last round trip to the network's Wantastic gateway,
+// measured while the menu is open.
+type gatewayLatency struct {
+	Measured bool    // a ping has completed
+	Replied  bool    // and the gateway answered
+	Ms       float64 // average round trip when it did
 }
 
-// minRateWindow is the shortest interval the live rate is measured over. The
-// menu refreshes from several callers (the 1s ticker, menu-open, a ping, a
-// toggle, exit/account changes), often a few milliseconds apart. Dividing a
-// tiny byte delta by a near-zero interval would show a garbage spike, so the
-// displayed sample pair (ratePrev/rateCur in RunSystray) only advances once
-// this much wall time has passed; a burst of refreshes in between reuses the
-// frozen pair. Kept just under trayRefresh so the 1s ticker always advances
-// it (giving a ~1s window); the rate shown is thus stale by up to a window but
-// never noisy.
-const minRateWindow = 900 * time.Millisecond
-
-// advanceRateSample reports whether the displayed rate pair should advance to
-// cur: on the first sample, after a counter reset (tunnel restarted, cur <
-// prev), or once a full rate window has elapsed. Holding it otherwise is what
-// keeps a burst of refreshes from producing a garbage rate (see minRateWindow).
-func advanceRateSample(prev, cur trafficSample) bool {
-	return prev.at.IsZero() ||
-		cur.rx < prev.rx || cur.tx < prev.tx ||
-		cur.at.Sub(prev.at) >= minRateWindow
+// latencyText is the Latency row for a connected tunnel.
+func latencyText(l gatewayLatency) string {
+	switch {
+	case !l.Measured:
+		return T("latency.empty")
+	case !l.Replied:
+		return T("latency.row", T("latency.noreply"))
+	default:
+		return T("latency.row", T("latency.ms", l.Ms))
+	}
 }
 
 // trayView is everything the top of the menu shows, derived from one status
@@ -78,7 +71,7 @@ type trayView struct {
 	Header        string
 	Address       string
 	Traffic       string
-	Rate          string
+	Latency       string
 	Details       string
 	ToggleTitle   string
 	ToggleEnabled bool
@@ -87,21 +80,21 @@ type trayView struct {
 	LoginURL string
 }
 
-func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView {
+func deriveTrayView(st *agent.StatusResponse, lat gatewayLatency) trayView {
 	v := trayView{State: stateOf(st), ToggleTitle: T("toggle.connect")}
 	switch v.State {
 	case trayDaemonDown:
 		v.Header = T("header.daemon.down")
 		v.Tooltip = T("tooltip.daemon.down")
 		v.Details = T("details.start", daemonStartCommand())
-		v.Address, v.Traffic, v.Rate = T("addr.empty"), T("traffic.empty"), T("speed.empty")
+		v.Address, v.Traffic, v.Latency = T("addr.empty"), T("traffic.empty"), T("latency.empty")
 		v.PeersTitle = T("peers.empty")
 		return v
 	case trayNotSignedIn:
 		v.Header = T("header.notsignedin")
 		v.Tooltip = T("tooltip.notsignedin")
 		v.Details = T("details.login")
-		v.Address, v.Traffic, v.Rate = T("addr.empty"), T("traffic.empty"), T("speed.empty")
+		v.Address, v.Traffic, v.Latency = T("addr.empty"), T("traffic.empty"), T("latency.empty")
 		v.PeersTitle = T("peers.empty")
 		v.LoginURL = st.Claim.URL
 		return v
@@ -127,7 +120,10 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 	}
 	v.Address = T("addr", ip)
 	v.Traffic = T("traffic", trayBytes(st.RxBytes), trayBytes(st.TxBytes))
-	v.Rate = T("speed", trafficRate(prev, cur))
+	v.Latency = T("latency.empty")
+	if v.State == trayConnected || v.State == trayExitActive {
+		v.Latency = latencyText(lat)
+	}
 
 	var details []string
 	if st.UptimeSec > 0 {
@@ -150,18 +146,6 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 	}
 	v.PeersTitle = T("peers", direct, relay)
 	return v
-}
-
-// trafficRate is the throughput between two polls; a counter that went
-// backwards (tunnel restarted) has no meaningful rate yet.
-func trafficRate(prev, cur trafficSample) string {
-	dt := cur.at.Sub(prev.at).Seconds()
-	if prev.at.IsZero() || dt <= 0 || cur.rx < prev.rx || cur.tx < prev.tx {
-		return "—"
-	}
-	rx := uint64(float64(cur.rx-prev.rx) / dt)
-	tx := uint64(float64(cur.tx-prev.tx) / dt)
-	return fmt.Sprintf("↓ %s/s  ↑ %s/s", trayBytes(rx), trayBytes(tx))
 }
 
 const (

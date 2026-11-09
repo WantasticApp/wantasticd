@@ -19,6 +19,14 @@ func keepMenuOpen(...*systray.MenuItem) {}
 
 func menuSwitch(...*systray.MenuItem) {}
 
+// Rows are plain menu items here: the menu is not redrawn live while open, so
+// a title change cannot make it flicker.
+func bindRow(*systray.MenuItem, string, bool, bool, ...string) {}
+
+func setRowText(item *systray.MenuItem, text string) { setTitle(item, text) }
+
+func setRowTip(item *systray.MenuItem, tip string) { setTooltip(item, tip) }
+
 // setMenuImage reports false: the menu library draws item images at 16 px,
 // too small for a QR code.
 func setMenuImage(*systray.MenuItem, []byte, int) bool { return false }

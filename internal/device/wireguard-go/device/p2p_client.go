@@ -87,6 +87,10 @@ type P2PClient struct {
 	attemptGates   map[uint32]*atomic.Int64
 	sessionByNonce map[[8]byte]*P2PSession
 	destinations   atomic.Pointer[p2pDestinationIndex]
+	// relayPinned (phase-3 residual #1) holds overlay IPs (raw address bytes) the
+	// hub says must stay on the relay — permitted but scoped pairs that may not use
+	// a direct tunnel. tryP2PByID refuses to promote a pinned peer. Guarded by mu.
+	relayPinned map[string]struct{}
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -971,6 +975,13 @@ func (c *P2PClient) tryP2PByID(peerID uint32) bool {
 		c.mu.Unlock()
 		return false
 	}
+	// Phase-3 residual #1: a relay-pinned (scoped allow) or denied peer must never
+	// be promoted to a direct tunnel — it stays on the hub relay where port/
+	// protocol is enforced. Inert when neither set is installed.
+	if c.isRelayPinnedOrDeniedLocked(peer.AssignedIP) {
+		c.mu.Unlock()
+		return false
+	}
 	now := time.Now()
 	switch peer.State {
 	case P2PStateEstablished, P2PStateTrying:
@@ -1114,6 +1125,22 @@ func (c *P2PClient) handlePunchRelay(msg *P2PMessage) {
 		if !assignedIP.Equal(net.IPv4zero) {
 			peer.AssignedIP = assignedIP
 		}
+	}
+
+	// Phase-3 residual #1 (inbound suspenders): the hub punch gate (facilitateDirect)
+	// already refuses to relay a punch for a relay-pinned/denied pair, but enforce
+	// it again here so the inbound promotion path can never build an all-ports
+	// direct tunnel for a scoped/denied target even if the hub gate ever failed
+	// open. Mirrors tryP2PByID's refusal; inert when neither set is installed.
+	if c.isRelayPinnedOrDeniedLocked(peer.AssignedIP) {
+		peer.State = P2PStateFailed
+		peer.LastUsed = now
+		peer.PunchAttempts++
+		c.setRetryGateLocked(peer)
+		c.rebuildIndexesLocked()
+		c.mu.Unlock()
+		c.device.log.Verbosef("[P2P] Refusing inbound punch relay for relay-pinned/denied target %d", targetID)
+		return
 	}
 
 	peer.LocalAddr = normalizeUDPAddr(msg.LocalAddr())
@@ -1902,6 +1929,115 @@ func (c *P2PClient) dropOrphanCandidate(job p2pPromotionJob) {
 	}
 	c.device.RemovePeer(job.publicKey)
 	c.restoreRelayRoute(job.assignedIP, job.relayPeer)
+}
+
+// denyKeyForIP returns the raw big-endian address bytes of ip as a map key
+// matching the receiver deny set's encoding (4 bytes for v4, 16 for v6), or ""
+// if ip is empty.
+func denyKeyForIP(ip net.IP) string {
+	if ip4 := ip.To4(); ip4 != nil {
+		return string(ip4)
+	}
+	if len(ip) == net.IPv6len {
+		return string(ip)
+	}
+	return ""
+}
+
+// TearDownDeniedDirectPeers removes any live or in-flight direct peer whose
+// overlay IP is in denied (keyed by raw address bytes, as the receiver deny set
+// encodes them), restoring its relay route so a now-denied pair cannot keep
+// using an already-established direct tunnel. In-flight promotions are aborted
+// and the retry gate is set so the client does not immediately re-punch a pair
+// the hub will refuse. Returns the overlay IPs torn down (for logging / exit
+// cleanup by the caller). Reuses the existing RemovePeer + restoreRelayRoute
+// primitive.
+func (c *P2PClient) TearDownDeniedDirectPeers(denied map[string]struct{}) []net.IP {
+	if len(denied) == 0 {
+		return nil
+	}
+	type victim struct {
+		pubKey NoisePublicKey
+		ip     net.IP
+		relay  *Peer
+	}
+	var victims []victim
+	c.mu.Lock()
+	serverKey := c.serverPeerKey
+	for id, peer := range c.peers {
+		if peer == nil || len(peer.AssignedIP) == 0 {
+			continue
+		}
+		if peer.State != P2PStateEstablished && peer.State != P2PStateTrying {
+			continue
+		}
+		if _, ok := denied[denyKeyForIP(peer.AssignedIP)]; !ok {
+			continue
+		}
+		relay := peer.RelayPeer
+		victims = append(victims, victim{
+			pubKey: peer.PublicKey,
+			ip:     append(net.IP(nil), peer.AssignedIP...),
+			relay:  relay,
+		})
+		peer.State = P2PStateFailed
+		peer.LastUsed = time.Now()
+		c.setRetryGateLocked(peer)
+		if session := c.sessions[id]; session != nil {
+			c.forgetSessionLocked(id, session)
+		}
+	}
+	c.rebuildIndexesLocked()
+	c.mu.Unlock()
+
+	var torn []net.IP
+	for _, v := range victims {
+		relay := v.relay
+		if relay == nil && !serverKey.IsZero() {
+			relay = c.device.LookupPeer(serverKey)
+		}
+		c.device.RemovePeer(v.pubKey)
+		c.restoreRelayRoute(v.ip, relay)
+		torn = append(torn, v.ip)
+	}
+	return torn
+}
+
+// isRelayPinnedOrDeniedLocked reports whether ip must never be given a direct
+// tunnel: it is in the relay-pin set (scoped allow) or the receiver deny set
+// (fully denied). c.mu must be held. Inert (false) when both sets are empty and
+// for an empty/unknown ip. Shared by the outbound (tryP2PByID) and inbound
+// (handlePunchRelay) promotion paths so they refuse symmetrically.
+func (c *P2PClient) isRelayPinnedOrDeniedLocked(ip net.IP) bool {
+	key := denyKeyForIP(ip)
+	if key == "" {
+		return false
+	}
+	if c.relayPinned != nil {
+		if _, pinned := c.relayPinned[key]; pinned {
+			return true
+		}
+	}
+	return c.device.receiverDenyContains(key)
+}
+
+// ApplyRelayOnly installs the relay-pin set (replacing any previous one) and
+// tears down any live direct tunnel to a pinned peer so its traffic falls back to
+// the hub relay. The pin prevents re-promotion (see tryP2PByID). An empty set
+// clears the pins — a pair that became direct-ok can be promoted again. Returns
+// the overlay IPs whose direct tunnels were torn down.
+func (c *P2PClient) ApplyRelayOnly(pins map[string]struct{}) []net.IP {
+	c.mu.Lock()
+	if len(pins) == 0 {
+		c.relayPinned = nil
+	} else {
+		c.relayPinned = pins
+	}
+	c.mu.Unlock()
+	if len(pins) == 0 {
+		return nil
+	}
+	return c.TearDownDeniedDirectPeers(pins)
 }
 
 func (c *P2PClient) maintenanceLoop() {

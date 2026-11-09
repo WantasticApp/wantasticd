@@ -27,6 +27,13 @@ const (
 	// session between two devices of the same tenant (never via the hub).
 	TUNControlActionExitRequest TUNControlAction = 10 // [10, op]
 	TUNControlActionExitStatus  TUNControlAction = 11 // [11, flags]
+
+	// TUNControlActionApplyReceiverACL carries the hub-computed receiver deny set
+	// (phase 3): the overlay /32 source IPs this client must drop inbound from,
+	// even over a direct P2P tunnel. Server→client only. An old client ignores it
+	// as an unknown action (default case below), so a strict tenant on an old
+	// client is enforced by the hub gates alone until the client updates.
+	TUNControlActionApplyReceiverACL TUNControlAction = 12 // [12, ver, flags, gen, count, entries...]
 )
 
 const tunControlPeerPayloadSize = 1 + 32
@@ -57,6 +64,8 @@ func (a TUNControlAction) String() string {
 		return "exit-request"
 	case TUNControlActionExitStatus:
 		return "exit-status"
+	case TUNControlActionApplyReceiverACL:
+		return "apply-receiver-acl"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(a))
 	}
@@ -127,7 +136,8 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 		TUNControlActionDisableExitNodeSharing,
 		TUNControlActionApplyLocalAccessRoutes,
 		TUNControlActionRemoveLocalAccessRoutes,
-		TUNControlActionSyncLocalAccessRoutes:
+		TUNControlActionSyncLocalAccessRoutes,
+		TUNControlActionApplyReceiverACL:
 		if !d.isServerTUNControlPeer(peer.PublicKeyHex()) {
 			log.Printf("[TUN] Ignoring unauthorized %s message from %s", action, peer)
 			return
@@ -188,6 +198,11 @@ func (d *Device) handleTUNControl(peer *wgdevice.Peer, data []byte) {
 		}
 		if err := d.applyLocalAccessSnapshot(routesByOwner); err != nil {
 			log.Printf("[TUN] Failed to sync local-access routes: %v", err)
+		}
+	case TUNControlActionApplyReceiverACL:
+		if err := d.applyReceiverACL(data); err != nil {
+			// On a malformed payload keep the previous set rather than clearing it.
+			log.Printf("[TUN] Invalid receiver-ACL update (keeping previous set): %v", err)
 		}
 	default:
 		log.Printf("[TUN] Ignoring unsupported TUN control action %d (%s) from %s", uint8(action), action, peer)

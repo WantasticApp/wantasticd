@@ -43,10 +43,24 @@ func stateOf(st *agent.StatusResponse) trayState {
 	}
 }
 
-// trafficSample is one status poll's byte counters, for live rates.
-type trafficSample struct {
-	rx, tx uint64
-	at     time.Time
+// gatewayLatency is the last round trip to the network's Wantastic gateway,
+// measured while the menu is open.
+type gatewayLatency struct {
+	Measured bool    // a ping has completed
+	Replied  bool    // and the gateway answered
+	Ms       float64 // average round trip when it did
+}
+
+// latencyText is the Latency row for a connected tunnel.
+func latencyText(l gatewayLatency) string {
+	switch {
+	case !l.Measured:
+		return T("latency.empty")
+	case !l.Replied:
+		return T("latency.row", T("latency.noreply"))
+	default:
+		return T("latency.row", T("latency.ms", l.Ms))
+	}
 }
 
 // trayView is everything the top of the menu shows, derived from one status
@@ -57,7 +71,7 @@ type trayView struct {
 	Header        string
 	Address       string
 	Traffic       string
-	Rate          string
+	Latency       string
 	Details       string
 	ToggleTitle   string
 	ToggleEnabled bool
@@ -66,21 +80,21 @@ type trayView struct {
 	LoginURL string
 }
 
-func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView {
+func deriveTrayView(st *agent.StatusResponse, lat gatewayLatency) trayView {
 	v := trayView{State: stateOf(st), ToggleTitle: T("toggle.connect")}
 	switch v.State {
 	case trayDaemonDown:
 		v.Header = T("header.daemon.down")
 		v.Tooltip = T("tooltip.daemon.down")
 		v.Details = T("details.start", daemonStartCommand())
-		v.Address, v.Traffic, v.Rate = T("addr.empty"), T("traffic.empty"), T("speed.empty")
+		v.Address, v.Traffic, v.Latency = T("addr.empty"), T("traffic.empty"), T("latency.empty")
 		v.PeersTitle = T("peers.empty")
 		return v
 	case trayNotSignedIn:
 		v.Header = T("header.notsignedin")
 		v.Tooltip = T("tooltip.notsignedin")
 		v.Details = T("details.login")
-		v.Address, v.Traffic, v.Rate = T("addr.empty"), T("traffic.empty"), T("speed.empty")
+		v.Address, v.Traffic, v.Latency = T("addr.empty"), T("traffic.empty"), T("latency.empty")
 		v.PeersTitle = T("peers.empty")
 		v.LoginURL = st.Claim.URL
 		return v
@@ -90,8 +104,9 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 		v.ToggleEnabled = st.Running
 	case trayExitActive:
 		u := st.ExitNodeState.Using
-		v.Header = T("header.exit", firstNonEmpty(u.Hostname, u.IP))
-		v.Tooltip = T("tooltip.exit", firstNonEmpty(u.Hostname, u.IP))
+		name := clip(firstNonEmpty(u.Hostname, u.IP), maxHeaderName)
+		v.Header = T("header.exit", name)
+		v.Tooltip = T("tooltip.exit", name)
 		v.ToggleTitle, v.ToggleEnabled = T("toggle.disconnect"), true
 	default:
 		v.Header = T("header.connected")
@@ -105,7 +120,10 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 	}
 	v.Address = T("addr", ip)
 	v.Traffic = T("traffic", trayBytes(st.RxBytes), trayBytes(st.TxBytes))
-	v.Rate = T("speed", trafficRate(prev, cur))
+	v.Latency = T("latency.empty")
+	if v.State == trayConnected || v.State == trayExitActive {
+		v.Latency = latencyText(lat)
+	}
 
 	var details []string
 	if st.UptimeSec > 0 {
@@ -130,29 +148,60 @@ func deriveTrayView(st *agent.StatusResponse, prev, cur trafficSample) trayView 
 	return v
 }
 
-// trafficRate is the throughput between two polls; a counter that went
-// backwards (tunnel restarted) has no meaningful rate yet.
-func trafficRate(prev, cur trafficSample) string {
-	dt := cur.at.Sub(prev.at).Seconds()
-	if prev.at.IsZero() || dt <= 0 || cur.rx < prev.rx || cur.tx < prev.tx {
-		return "—"
-	}
-	rx := uint64(float64(cur.rx-prev.rx) / dt)
-	tx := uint64(float64(cur.tx-prev.tx) / dt)
-	return fmt.Sprintf("↓ %s/s  ↑ %s/s", trayBytes(rx), trayBytes(tx))
-}
+const (
+	// figureSpace is a space the width of a digit in the system menu fonts
+	// (SF Pro, Segoe UI, Cantarell). Padding a number with it keeps columns
+	// aligned as the digits change, which an ordinary space (about half a
+	// digit) cannot. A font without the glyph falls back to a normal space:
+	// a slightly looser pad, never a broken layout.
+	figureSpace = '\u2007'
+	// mantissaWidth right-aligns the number so the decimal point and the unit
+	// after it hold their place as the value ticks (e.g. "1.0"→"12.3"→"999.9"
+	// don't shift the second rate ↑). 5 covers "999.9"; the rare "1023.9" just
+	// before a unit rolls over is one wider and simply isn't padded.
+	mantissaWidth = 5
+	// maxHeaderName bounds the exit-node name in the header so a long hostname
+	// can't stretch the menu width.
+	maxHeaderName = 24
+)
 
+// trayBytes renders n in binary units (B, KiB, MiB, GiB, …; 1024-based, with
+// the "iB" suffix) for the menu. The mantissa is right-aligned in a fixed
+// figure-space field so the string's width barely changes as the value ticks:
+// within a unit magnitude the trailing part (and any "/s" or second rate)
+// stays put. A change of unit magnitude (B↔KiB↔MiB) still shifts it — that is
+// inherent and infrequent.
 func trayBytes(n uint64) string {
 	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
+	num, u := fmt.Sprintf("%d", n), "B"
+	if n >= unit {
+		div, exp := uint64(unit), 0
+		for m := n / unit; m >= unit; m /= unit {
+			div *= unit
+			exp++
+		}
+		num = fmt.Sprintf("%.1f", float64(n)/float64(div))
+		u = string("KMGTPE"[exp]) + "iB"
 	}
-	div, exp := uint64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
+	return padLeft(num, mantissaWidth) + " " + u
+}
+
+// padLeft right-aligns s in a field of w figure spaces; shorter is returned
+// unchanged.
+func padLeft(s string, w int) string {
+	if n := w - len([]rune(s)); n > 0 {
+		return strings.Repeat(string(figureSpace), n) + s
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+	return s
+}
+
+// clip shortens s to at most max runes, ending in an ellipsis when cut.
+func clip(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
 }
 
 func trayDuration(d time.Duration) string {

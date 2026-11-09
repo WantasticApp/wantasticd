@@ -596,6 +596,14 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 					device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
 					continue
 				}
+				// Phase-3 receiver ACL backstop: src is now crypto-authenticated,
+				// so drop it if the hub-pushed deny set names it. Carved out: the
+				// hub/relay (coordinator) peer, so relayed/control/return traffic the
+				// hub already filtered is never touched. Keepalives (len==0) never
+				// reach here. nil set ⇒ no cost.
+				if device.receiverACLDrop(peer, src) {
+					continue
+				}
 
 			case 6:
 				if len(elem.packet) < ipv6.HeaderLen {
@@ -611,6 +619,10 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				src := elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
 				if device.allowedips.Lookup(src) != peer {
 					device.log.Verbosef("IPv6 packet with disallowed source address from %v", peer)
+					continue
+				}
+				// Phase-3 receiver ACL backstop (see the IPv4 case).
+				if device.receiverACLDrop(peer, src) {
 					continue
 				}
 

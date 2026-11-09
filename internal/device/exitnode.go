@@ -1316,6 +1316,15 @@ func (e *exitEngine) useStatus() *ExitUse {
 	return e.useStatusLocked()
 }
 
+// currentUseIP returns the overlay IP of the exit node this device is currently
+// using, or "" when none is selected. Used by the receiver-ACL path to clear a
+// now-denied exit before its direct tunnel is torn down.
+func (e *exitEngine) currentUseIP() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.st.Use
+}
+
 func (e *exitEngine) useStatusLocked() *ExitUse {
 	if e.st.Use == "" {
 		if e.disabledReason != "" {

@@ -1053,6 +1053,12 @@ func decodeIWInfoAssociationsKnown(data []byte) ([]iwinfo.AssocEntry, error) {
 		entry.TxRate, entry.TxRateKnown = configNestedUint32Known(result, "tx", "rate", "tx_rate")
 		entry.TxRetries, entry.TxRetriesKnown = configNestedUint32Known(result, "tx", "retries", "tx_retries")
 		entry.TxFailed, entry.TxFailedKnown = configNestedUint32Known(result, "tx", "failed", "tx_failed")
+		if rx, ok := result["rx"].(map[string]any); ok {
+			entry.RxRateInfo = iwinfoUbusRateInfo(rx)
+		}
+		if tx, ok := result["tx"].(map[string]any); ok {
+			entry.TxRateInfo = iwinfoUbusRateInfo(tx)
+		}
 		if value, present := result["authorized"]; present {
 			entry.AuthenticationKnown = true
 			entry.Authenticated = configAnyBool(value)
@@ -1260,6 +1266,7 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 			if station.AssociationID == 0 {
 				station.AssociationID = existing.AssociationID
 			}
+			mergeWiFiModulation(&station, existing)
 			if existing.Source != "" && station.Source != "" && existing.Source != station.Source {
 				station.Source = existing.Source + "+" + station.Source
 			} else if station.Source == "" {

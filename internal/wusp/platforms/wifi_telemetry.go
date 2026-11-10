@@ -100,6 +100,18 @@ type wifiTelemetryRadio struct {
 	CollectedAt     time.Time
 }
 
+// wifiTelemetryUplink is the access point a station-mode interface is
+// associated with. Entry.MAC is the BSSID.
+type wifiTelemetryUplink struct {
+	Interface   string
+	Radio       string
+	Entry       iwinfo.AssocEntry
+	SSID        string
+	Frequency   int
+	Bandwidth   int
+	CollectedAt time.Time
+}
+
 type wifiTelemetrySnapshot struct {
 	Supported     bool
 	Sampled       bool
@@ -109,6 +121,7 @@ type wifiTelemetrySnapshot struct {
 	LatencyMethod string
 	Radios        []wifiTelemetryRadio
 	Stations      []wifiTelemetryStation
+	Uplinks       []wifiTelemetryUplink
 	RadioHistory  map[string][]wusp.WiFiHistorySample
 	StationHist   map[string][]wusp.WiFiHistorySample
 }
@@ -136,7 +149,11 @@ type wifiTelemetryDeps struct {
 	frequency      func(ifname string) (int, bool)
 	txPower        func(ifname string) (int, bool)
 	neighbors      func() map[string]netip.Addr
-	probe          func(context.Context, []netip.Addr, wifiprobe.Options) (map[netip.Addr]wifiprobe.Result, error)
+	// bssid and stationLookup only serve station-mode interfaces whose
+	// station dump does not list the access point (qca-wifi STA VAPs).
+	bssid         func(ifname string) (net.HardwareAddr, bool)
+	stationLookup func(ifname string, mac net.HardwareAddr) (iwinfo.AssocEntry, error)
+	probe         func(context.Context, []netip.Addr, wifiprobe.Options) (map[netip.Addr]wifiprobe.Result, error)
 }
 
 func defaultWiFiTelemetryDeps() wifiTelemetryDeps {
@@ -151,6 +168,8 @@ func defaultWiFiTelemetryDeps() wifiTelemetryDeps {
 		frequency:      iwinfo.WextFrequency,
 		txPower:        iwinfo.WextTxPower,
 		neighbors:      readIPv4Neighbors,
+		bssid:          iwinfo.WextBSSID,
+		stationLookup:  iwinfo.NL80211Station,
 		probe:          wifiprobe.Probe,
 	}
 }
@@ -202,6 +221,7 @@ func (c *wifiTelemetryCoordinator) snapshotAndStart(netClassDir string) wifiTele
 	out := c.current
 	out.Radios = append([]wifiTelemetryRadio(nil), c.current.Radios...)
 	out.Stations = append([]wifiTelemetryStation(nil), c.current.Stations...)
+	out.Uplinks = append([]wifiTelemetryUplink(nil), c.current.Uplinks...)
 	out.RadioHistory = make(map[string][]wusp.WiFiHistorySample, len(c.radioHist))
 	for k, v := range c.radioHist {
 		out.RadioHistory[k] = append([]wusp.WiFiHistorySample(nil), v...)
@@ -248,6 +268,8 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 
 	radiosByName := make(map[string]*wifiTelemetryRadio)
 	var stations []wifiTelemetryStation
+	var endpoints []wifiTelemetryVAP
+	endpointEntries := make(map[string][]iwinfo.AssocEntry)
 	seenMAC := make(map[string]bool)
 	for _, vap := range vaps {
 		radio := radiosByName[vap.Radio]
@@ -273,7 +295,14 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 			radio.Counters.RxDropped += counters.RxDropped
 			radio.Counters.TxDropped += counters.TxDropped
 		}
-		for _, entry := range deps.stations(deps.netClassDir, vap) {
+		entries := deps.stations(deps.netClassDir, vap)
+		if wifiInterfaceModeIsEndpoint(vap.Mode) {
+			// The station dump of a client interface lists its AP. The AP
+			// keeps its Station row as before and also becomes the Uplink.
+			endpoints = append(endpoints, vap)
+			endpointEntries[vap.Name] = entries
+		}
+		for _, entry := range entries {
 			key := strings.ToLower(entry.MAC.String())
 			if seenMAC[key] {
 				continue
@@ -334,6 +363,13 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 			if radio.Frequency == 0 && seen.Frequency > 0 {
 				radio.Frequency = seen.Frequency
 			}
+		}
+	}
+
+	uplinks := make([]wifiTelemetryUplink, 0, len(endpoints))
+	for _, vap := range endpoints {
+		if uplink, ok := c.buildUplink(vap, endpointEntries[vap.Name], radiosByName[vap.Radio], now); ok {
+			uplinks = append(uplinks, uplink)
 		}
 	}
 
@@ -458,8 +494,140 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 		LatencyMethod: latencyMethod,
 		Radios:        radios,
 		Stations:      stations,
+		Uplinks:       uplinks,
 	}
-	diaglog.Printf("[USP] wifi_telemetry radios=%d stations=%d probed=%d latency=%s error=%q", len(radios), len(stations), len(targets), latencyMethod, lastError)
+	diaglog.Printf("[USP] wifi_telemetry radios=%d stations=%d uplinks=%d probed=%d latency=%s error=%q", len(radios), len(stations), len(uplinks), len(targets), latencyMethod, lastError)
+}
+
+// buildUplink describes the AP behind a station-mode interface from its
+// station dump. When the dump is empty (qca-wifi STA VAPs) the BSSID comes
+// from SIOCGIWAP and the per-MAC nl80211 GET_STATION fills what it can.
+func (c *wifiTelemetryCoordinator) buildUplink(vap wifiTelemetryVAP, entries []iwinfo.AssocEntry, radio *wifiTelemetryRadio, now time.Time) (wifiTelemetryUplink, bool) {
+	deps := c.deps
+	var ap iwinfo.AssocEntry
+	found := false
+	for _, entry := range entries {
+		if len(entry.MAC) != 6 {
+			continue
+		}
+		if !found || (entry.SignalKnown && (!ap.SignalKnown || entry.Signal > ap.Signal)) {
+			ap, found = entry, true
+		}
+	}
+	if !found && deps.bssid != nil {
+		if bssid, ok := deps.bssid(vap.Name); ok {
+			ap, found = iwinfo.AssocEntry{MAC: bssid, Source: "wext"}, true
+			if deps.stationLookup != nil {
+				if detail, err := deps.stationLookup(vap.Name, bssid); err == nil {
+					detail.MAC = bssid
+					if detail.Source == "" {
+						detail.Source = "nl80211-get"
+					}
+					if merged := mergeWiFiAssociations([]iwinfo.AssocEntry{ap}, []iwinfo.AssocEntry{detail}); len(merged) == 1 {
+						ap = merged[0]
+					}
+				}
+			}
+		}
+	}
+	if !found {
+		return wifiTelemetryUplink{}, false
+	}
+	uplink := wifiTelemetryUplink{Interface: vap.Name, Radio: vap.Radio, Entry: ap, Frequency: vap.Frequency, CollectedAt: now}
+	if deps.radioLink != nil {
+		if link, err := deps.radioLink(vap.Name); err == nil {
+			uplink.SSID = link.SSID
+			if link.Frequency > 0 {
+				uplink.Frequency = link.Frequency
+			}
+			uplink.Bandwidth = link.ChannelWidth
+		}
+	}
+	if radio != nil {
+		if uplink.Frequency == 0 {
+			uplink.Frequency = radio.Frequency
+		}
+		if uplink.Bandwidth == 0 {
+			uplink.Bandwidth = radio.ChannelWidth
+		}
+		if !uplink.Entry.NoiseKnown && radio.Noise < 0 {
+			uplink.Entry.Noise, uplink.Entry.NoiseKnown = int8(radio.Noise), true
+		}
+	}
+	return uplink, true
+}
+
+func appendWiFiUplinkFields(msg *wusp.Message, path string, uplink wifiTelemetryUplink, radioRow int, ssidByInterface map[string]string) {
+	e := uplink.Entry
+	appendField(msg, path+"Alias", wusp.String("uplink-"+uplink.Interface))
+	appendField(msg, path+"Interface", wusp.String(uplink.Interface))
+	if radioRow > 0 {
+		appendField(msg, path+"Radio", wusp.String(fmt.Sprintf("%sRadio.%d.", wusp.WUSPWiFiTelemetryPrefix, radioRow)))
+	}
+	appendField(msg, path+"BSSID", wusp.MAC(e.MAC))
+	ssid := uplink.SSID
+	if ssid == "" {
+		ssid = ssidByInterface[uplink.Interface]
+	}
+	if ssid != "" {
+		appendField(msg, path+"SSID", wusp.String(ssid))
+	}
+	if uplink.Frequency > 0 {
+		appendField(msg, path+"FrequencyMHz", wusp.Uint(uint64(uplink.Frequency)))
+	}
+	if uplink.Bandwidth > 0 {
+		appendField(msg, path+"BandwidthMHz", wusp.Uint(uint64(uplink.Bandwidth)))
+	}
+	if e.SignalKnown && e.Signal < 0 {
+		appendField(msg, path+"SignalStrength", wusp.Int(int64(e.Signal)))
+	}
+	if e.NoiseKnown && e.Noise < 0 {
+		appendField(msg, path+"Noise", wusp.Int(int64(e.Noise)))
+	}
+	if e.TxRateKnown {
+		appendField(msg, path+"TxRateKbps", wusp.Uint(uint64(e.TxRate)))
+	}
+	if e.RxRateKnown {
+		appendField(msg, path+"RxRateKbps", wusp.Uint(uint64(e.RxRate)))
+	}
+	if e.ConnectedTimeKnown {
+		appendField(msg, path+"ConnectedTime", wusp.Uint(uint64(e.ConnectedTime)))
+	}
+	if source := strings.TrimSpace(e.Source); source != "" {
+		if len(source) > 64 {
+			source = source[:64]
+		}
+		appendField(msg, path+"Source", wusp.String(source))
+	}
+	appendWiFiModulationFields(msg, path, e)
+	appendField(msg, path+"CollectedAt", wusp.Time(uplink.CollectedAt))
+}
+
+// wifiSSIDByInterface maps Device.WiFi.SSID.{i}.Name to its SSID from the
+// fields the WiFi collector already emitted in this message.
+func wifiSSIDByInterface(msg *wusp.Message) map[string]string {
+	names := make(map[int]string)
+	ssids := make(map[int]string)
+	for _, field := range msg.Fields {
+		var index int
+		switch {
+		case strings.HasSuffix(field.Path, ".Name"):
+			if _, err := fmt.Sscanf(field.Path, "Device.WiFi.SSID.%d.Name", &index); err == nil {
+				names[index] = strings.TrimSpace(wusp.ValueToString(field.Val))
+			}
+		case strings.HasSuffix(field.Path, ".SSID"):
+			if _, err := fmt.Sscanf(field.Path, "Device.WiFi.SSID.%d.SSID", &index); err == nil {
+				ssids[index] = wusp.ValueToString(field.Val)
+			}
+		}
+	}
+	out := make(map[string]string, len(names))
+	for index, name := range names {
+		if ssid := ssids[index]; name != "" && ssid != "" {
+			out[name] = ssid
+		}
+	}
+	return out
 }
 
 func (c *wifiTelemetryCoordinator) applySurvey(radio *wifiTelemetryRadio, survey []iwinfo.SurveyEntry) {
@@ -727,6 +895,7 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 	}
 	appendField(msg, prefix+"RadioNumberOfEntries", wusp.Uint(uint64(len(snap.Radios))))
 	appendField(msg, prefix+"StationNumberOfEntries", wusp.Uint(uint64(len(snap.Stations))))
+	appendField(msg, prefix+"UplinkNumberOfEntries", wusp.Uint(uint64(len(snap.Uplinks))))
 
 	wifiRadioRefs := wifiRadioReferencesByInterface(msg)
 	radioRow := make(map[string]int, len(snap.Radios))
@@ -845,10 +1014,15 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 			appendField(msg, path+"DistanceMethod", wusp.String("none"))
 		}
 		appendLatencyFields(msg, path, station.Latency)
+		appendWiFiModulationFields(msg, path, e)
 		appendField(msg, path+"CollectedAt", wusp.Time(station.CollectedAt))
 		if err := appendHistoryField(msg, path, snap.StationHist[key]); err != nil {
 			return fmt.Errorf("station %s history: %w", key, err)
 		}
+	}
+	ssidByInterface := wifiSSIDByInterface(msg)
+	for i, uplink := range snap.Uplinks {
+		appendWiFiUplinkFields(msg, fmt.Sprintf("%sUplink.%d.", prefix, i+1), uplink, radioRow[uplink.Radio], ssidByInterface)
 	}
 	return nil
 }

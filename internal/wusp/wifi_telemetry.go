@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -53,6 +54,7 @@ var WUSPWiFiTelemetryObjects = []Object{
 	{Path: WUSPWiFiTelemetryPrefix, SinceVersion: "1.0", Description: "Agent-owned WiFi radio and station telemetry with a rolling history, collected natively (nl80211, QCA/MadWifi driver ioctls, hostapd) plus ICMP latency probes to associated stations."},
 	{Path: WUSPWiFiTelemetryPrefix + "Radio.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Counters, channel load, configured link distance, aggregate throughput and latency for one radio."},
 	{Path: WUSPWiFiTelemetryPrefix + "Station.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Signal, rates, measured throughput, estimated distance and latency for one associated station."},
+	{Path: WUSPWiFiTelemetryPrefix + "Uplink.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "The access point a station-mode (client/CPE) interface is associated with, seen from this device: signal, PHY rates, modulation and airtime."},
 }
 
 func wifiTelemetryParam(path string, typ ParamType, description string, limits Limits) Param {
@@ -70,6 +72,29 @@ var wifiTelemetryLatencyParams = func(object string) []Param {
 	}
 }
 
+// wifiTelemetryModulationParams describe the last-frame modulation in each
+// direction (nl80211 TX/RX_BITRATE), per-chain signal and airtime counters.
+// Every field is omitted when the driver does not report it. Tx is from this
+// device towards the peer, Rx from the peer.
+var wifiTelemetryModulationParams = func(object string) []Param {
+	var out []Param
+	for _, dir := range []struct{ prefix, what string }{{"Tx", "towards the peer"}, {"Rx", "from the peer"}} {
+		out = append(out,
+			wifiTelemetryParam(object+dir.prefix+"PHY", TypeString, "PHY of the last frame "+dir.what+": legacy (OFDM/CCK), ht (802.11n), vht (802.11ac), he (802.11ax) or eht (802.11be). Absent when unknown.", Limits{Enums: []string{"legacy", "ht", "vht", "he", "eht"}}),
+			wifiTelemetryParam(object+dir.prefix+"MCS", TypeInt, "MCS index of the last frame "+dir.what+"; HT uses the 0-31 index spanning all streams, VHT/HE/EHT the per-stream index. Absent when unknown.", Limits{Min: iptr(0), Max: iptr(76)}),
+			wifiTelemetryParam(object+dir.prefix+"NSS", TypeUnsignedInt, "Spatial streams of the last frame "+dir.what+" (HT derived from the MCS index). Absent when unknown.", Limits{Min: iptr(1), Max: iptr(16)}),
+			wifiTelemetryParam(object+dir.prefix+"BandwidthMHz", TypeUnsignedInt, "Channel width of the last frame "+dir.what+" in MHz; absent for HE/EHT OFDMA resource units and when unknown.", Limits{Min: iptr(1), Max: iptr(320)}),
+			wifiTelemetryParam(object+dir.prefix+"GuardIntervalNs", TypeUnsignedInt, "Guard interval of the last frame "+dir.what+" in ns: 400 (HT/VHT short GI), 800, 1600 or 3200 (HE/EHT). Absent for legacy rates and when unknown.", Limits{Min: iptr(400), Max: iptr(3200)}),
+			wifiTelemetryParam(object+dir.prefix+"DCM", TypeBoolean, "HE dual carrier modulation of the last frame "+dir.what+". Absent when not reported.", Limits{}),
+			wifiTelemetryParam(object+dir.prefix+"AirtimeUs", TypeUnsignedLong, "Cumulative airtime "+dir.what+" in microseconds (nl80211 "+strings.ToUpper(dir.prefix)+"_DURATION); a counter, rates come from deltas. Absent when not reported.", Limits{}),
+		)
+	}
+	return append(out,
+		wifiTelemetryParam(object+"SignalChains", TypeString, "Per-antenna-chain signal of the last frame in dBm, comma separated, chain 0 first (nl80211 CHAIN_SIGNAL), e.g. \"-55,-53\". Absent when not reported.", Limits{MaxLength: 64}),
+		wifiTelemetryParam(object+"SignalChainAvg", TypeString, "Per-antenna-chain average signal in dBm, comma separated, chain 0 first (nl80211 CHAIN_SIGNAL_AVG). Absent when not reported.", Limits{MaxLength: 64}),
+	)
+}
+
 var AllWUSPWiFiTelemetryParams = concat(
 	[]Param{
 		wifiTelemetryParam("Status", TypeString, "Sampler state. Unsupported means the platform has no WiFi interface the agent can read.", Limits{Enums: []string{"Unsupported", "Idle", "Collecting", "Ready", "Error"}}),
@@ -80,6 +105,7 @@ var AllWUSPWiFiTelemetryParams = concat(
 		wifiTelemetryParam("LatencyMethod", TypeString, "How station latency is measured: ICMP echo from the agent over the WiFi link, or none when raw ICMP is unavailable.", Limits{Enums: []string{"icmp", "none"}}),
 		wifiTelemetryParam("RadioNumberOfEntries", TypeUnsignedInt, "Number of entries in Device.WUSP_WiFiTelemetry.Radio.{i}.", Limits{Min: iptr(0)}),
 		wifiTelemetryParam("StationNumberOfEntries", TypeUnsignedInt, "Number of entries in Device.WUSP_WiFiTelemetry.Station.{i}.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("UplinkNumberOfEntries", TypeUnsignedInt, "Number of entries in Device.WUSP_WiFiTelemetry.Uplink.{i}.", Limits{Min: iptr(0)}),
 
 		wifiTelemetryParam("Radio.{i}.Alias", TypeAlias, "Stable alias derived from the radio interface.", Limits{MaxLength: 64}),
 		wifiTelemetryParam("Radio.{i}.Interface", TypeString, "Radio netdev (wifiN) or nl80211 phy name.", Limits{MaxLength: 16}),
@@ -135,6 +161,24 @@ var AllWUSPWiFiTelemetryParams = concat(
 		wifiTelemetryParam("Station.{i}.History", TypeHexBinary, "Rolling history in the WUSP WiFi history block v1 encoding (see EncodeWiFiHistoryBlock).", Limits{MaxLength: wifiHistoryMaxBlockLen}),
 	},
 	wifiTelemetryLatencyParams("Station.{i}."),
+	wifiTelemetryModulationParams("Station.{i}."),
+	[]Param{
+		wifiTelemetryParam("Uplink.{i}.Alias", TypeAlias, "Stable alias derived from the station-mode interface.", Limits{MaxLength: 64}),
+		wifiTelemetryParam("Uplink.{i}.Interface", TypeString, "Station-mode (client) interface.", Limits{MaxLength: 16}),
+		wifiTelemetryParam("Uplink.{i}.Radio", TypePathRef, "Device.WUSP_WiFiTelemetry.Radio row of the interface's radio.", Limits{}),
+		wifiTelemetryParam("Uplink.{i}.BSSID", TypeMACAddress, "BSSID (MAC) of the access point the interface is associated with.", Limits{}),
+		wifiTelemetryParam("Uplink.{i}.SSID", TypeString, "SSID of the joined network, when known.", Limits{MaxLength: 32}),
+		wifiTelemetryParam("Uplink.{i}.FrequencyMHz", TypeUnsignedInt, "Operating frequency (primary 20 MHz channel) in MHz, when known.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Uplink.{i}.BandwidthMHz", TypeUnsignedInt, "Operating channel width in MHz, when known.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Uplink.{i}.SignalStrength", TypeInt, "Signal received from the access point in dBm. Absent when unknown.", Limits{}),
+		wifiTelemetryParam("Uplink.{i}.Noise", TypeInt, "Noise floor in dBm. Absent when unknown.", Limits{}),
+		wifiTelemetryParam("Uplink.{i}.TxRateKbps", TypeUnsignedInt, "Last PHY rate towards the access point in kbit/s. Absent when unknown.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Uplink.{i}.RxRateKbps", TypeUnsignedInt, "Last PHY rate from the access point in kbit/s. Absent when unknown.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Uplink.{i}.ConnectedTime", TypeUnsignedInt, "Seconds since association. Absent when unknown.", Limits{Min: iptr(0)}),
+		wifiTelemetryParam("Uplink.{i}.Source", TypeString, "Collectors that reported the link, joined with '+'.", Limits{MaxLength: 64}),
+		wifiTelemetryParam("Uplink.{i}.CollectedAt", TypeDateTime, "Time this row was sampled.", Limits{}),
+	},
+	wifiTelemetryModulationParams("Uplink.{i}."),
 )
 
 // WiFiHistorySample is one timestamped telemetry sample keyed by metric ID;

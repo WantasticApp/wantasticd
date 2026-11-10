@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -315,8 +316,21 @@ func readProcInt(path string) (int, bool) {
 
 const (
 	siocgiwfreq  = 0x8B05
+	siocgiwap    = 0x8B15
 	siocgiwtxpow = 0x8B27
 )
+
+// WextBSSID returns the BSSID a station-mode interface is associated with
+// via SIOCGIWAP (a read; qca-wifi STA VAPs implement it even when nl80211
+// reports no station).
+func WextBSSID(ifname string) (net.HardwareAddr, bool) {
+	u, err := iwreqScalar(ifname, siocgiwap)
+	if err != nil {
+		return nil, false
+	}
+	// union iwreq_data.ap_addr is a struct sockaddr: sa_family, sa_data.
+	return wextAssociatedBSSID(u[2:8])
+}
 
 func iwreqScalar(ifname string, request uintptr) ([16]byte, error) {
 	var out [16]byte

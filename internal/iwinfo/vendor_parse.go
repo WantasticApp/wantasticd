@@ -215,12 +215,22 @@ func ParseWlanconfigStations(output string, noise int, noiseKnown bool) []AssocE
 				entry.ConnectedTime, entry.ConnectedTimeKnown = uint32(h*3600+m*60+s), true
 			case strings.HasPrefix(field, "IEEE80211_MODE_"):
 				entry.OperatingStandard = wlanconfigStandard(field)
+				// The phymode is the negotiated PHY and width; list sta
+				// carries no MCS or GI, so those stay unknown.
+				mode := wlanconfigModeRate(field)
+				entry.TxRateInfo, entry.RxRateInfo = mode, mode
 				if i+2 < len(fields) {
 					if rx, err := strconv.ParseUint(fields[i+1], 10, 8); err == nil && rx > 0 && rx <= 16 {
 						entry.RxNSS = uint8(rx)
+						if mode.Known() {
+							entry.RxRateInfo.NSS = uint8(rx)
+						}
 					}
 					if tx, err := strconv.ParseUint(fields[i+2], 10, 8); err == nil && tx > 0 && tx <= 16 {
 						entry.TxNSS = uint8(tx)
+						if mode.Known() {
+							entry.TxRateInfo.NSS = uint8(tx)
+						}
 					}
 				}
 			}

@@ -95,6 +95,22 @@ type AssocEntry struct {
 	// collector which produced the entry.
 	AssociationID uint16
 	Source        string
+
+	// TxRateInfo / RxRateInfo describe the modulation of the last frame in
+	// each direction (nl80211 TX/RX_BITRATE), or the negotiated mode when a
+	// vendor source only reports that (RateInfo.Negotiated).
+	TxRateInfo RateInfo
+	RxRateInfo RateInfo
+	// ChainSignal / ChainSignalAvg are the per-antenna-chain signal in dBm
+	// (nl80211 CHAIN_SIGNAL / CHAIN_SIGNAL_AVG), lowest chain index first.
+	ChainSignal    []int8
+	ChainSignalAvg []int8
+	// TxDuration / RxDuration are cumulative airtime counters in µs
+	// (nl80211 TX_DURATION / RX_DURATION).
+	TxDuration      uint64
+	RxDuration      uint64
+	TxDurationKnown bool
+	RxDurationKnown bool
 }
 
 // SurveyEntry represents channel survey / utilization data.

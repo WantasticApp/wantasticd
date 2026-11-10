@@ -19,6 +19,19 @@ func telemetryFields(t *testing.T, snap wifiTelemetrySnapshot, seed ...wusp.Fiel
 	if err := appendWiFiTelemetrySnapshotFields(msg, snap); err != nil {
 		t.Fatal(err)
 	}
+	// The schema validation on the real encode path (the data model cache)
+	// must accept every new field: type tags, enums and limits.
+	if err := wusp.ValidateMessageFast(msg); err != nil {
+		t.Fatalf("schema validation: %v", err)
+	}
+	encoded, err := wusp.EncodeMessageLZ4(msg)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := wusp.DecodeMessage(encoded)
+	if err != nil || len(decoded.Fields) != len(msg.Fields) {
+		t.Fatalf("round trip: %v (%d of %d fields)", err, len(decoded.Fields), len(msg.Fields))
+	}
 	out := map[string]string{}
 	for _, field := range msg.Fields {
 		out[field.Path] = wusp.ValueToString(field.Val)
@@ -46,7 +59,7 @@ func TestWiFiTelemetryStationModulationFields(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	snap := wifiTelemetrySnapshot{
 		Supported: true, Sampled: true, LastSample: now,
-		Radios: []wifiTelemetryRadio{{Name: "phy0", CollectedAt: now}},
+		Radios: []wifiTelemetryRadio{{Name: "phy0", DistanceSource: "none", CollectedAt: now}},
 		Stations: []wifiTelemetryStation{
 			{Entry: heStation(mac), Interface: "wlan0", Radio: "phy0", CollectedAt: now},
 			{Entry: iwinfo.AssocEntry{MAC: bare, Signal: -70, SignalKnown: true}, Interface: "wlan0", Radio: "phy0", CollectedAt: now},

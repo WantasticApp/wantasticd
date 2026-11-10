@@ -141,3 +141,68 @@ func TestTrayViewNotSignedIn(t *testing.T) {
 		t.Errorf("signed-in device offers Log in: %+v", v)
 	}
 }
+
+// TestTrayViewHubReachability covers the tunnel-up-but-offline state: it is
+// driven by the daemon's hub handshake facts (menu open or not) and by
+// consecutive unanswered gateway probes while the menu is open.
+func TestTrayViewHubReachability(t *testing.T) {
+	yes, no := true, false
+	status := func(reachable *bool, last, age int64, exit bool) *agent.StatusResponse {
+		st := &agent.StatusResponse{
+			Running: true, DeviceRunning: true, IPs: []string{"10.255.255.44/32"},
+			UptimeSec: 3700, ServerEndpoint: "172.239.44.171:51820",
+			HubReachable: reachable, HubLastHandshake: last, HubHandshakeAgeSec: age,
+		}
+		if exit {
+			st.ExitNodeState = &device.ExitNodeStatus{Using: &device.ExitUse{IP: "10.255.255.36", Hostname: "mini", State: "active"}}
+		}
+		return st
+	}
+	replied := gatewayLatency{Measured: true, Replied: true, Ms: 23}
+	cases := []struct {
+		name       string
+		st         *agent.StatusResponse
+		lat        gatewayLatency
+		want       trayState
+		header     string
+		details    string
+		latencyRow string
+	}{
+		{"fresh handshake", status(&yes, 1000, 30, false), gatewayLatency{}, trayConnected,
+			"● Connected", "Up 1h01m · server 172.239.44.171:51820", "Latency: —"},
+		{"fresh handshake, gateway replies", status(&yes, 1000, 30, false), replied, trayConnected,
+			"● Connected", "Up 1h01m · server 172.239.44.171:51820", "Latency: 23 ms"},
+		{"stale handshake", status(&no, 1000, 250, false), gatewayLatency{}, trayNoInternet,
+			"○ No internet · reconnecting…", "No answer from the server for 4m10s · server 172.239.44.171:51820", "Latency: —"},
+		{"stale handshake beats exit node", status(&no, 1000, 250, true), gatewayLatency{}, trayNoInternet,
+			"○ No internet · reconnecting…", "No answer from the server for 4m10s · server 172.239.44.171:51820", "Latency: —"},
+		{"never handshaked", status(&no, 0, -1, false), gatewayLatency{}, trayNoInternet,
+			"○ Connecting…", "Waiting for the server to answer · server 172.239.44.171:51820", "Latency: —"},
+		// One lost echo is not enough to downgrade.
+		{"gateway one miss", status(&yes, 1000, 30, false), gatewayLatency{Measured: true, Misses: 1}, trayConnected,
+			"● Connected", "Up 1h01m · server 172.239.44.171:51820", "Latency: no reply"},
+		{"gateway no reply twice", status(&yes, 1000, 30, false), gatewayLatency{Measured: true, Misses: 2}, trayNoInternet,
+			"○ No internet · reconnecting…", "Up 1h01m · server 172.239.44.171:51820", "Latency: no reply"},
+		// Recovery is immediate: one reply (Misses reset) and a fresh handshake.
+		{"recovered", status(&yes, 1100, 2, false), replied, trayConnected,
+			"● Connected", "Up 1h01m · server 172.239.44.171:51820", "Latency: 23 ms"},
+		{"recovered via exit", status(&yes, 1100, 2, true), replied, trayExitActive,
+			"● Connected via exit mini", "Up 1h01m · server 172.239.44.171:51820", "Latency: 23 ms"},
+		// An older daemon does not report reachability: never downgrade on it.
+		{"old daemon", status(nil, 0, 0, false), gatewayLatency{}, trayConnected,
+			"● Connected", "Up 1h01m · server 172.239.44.171:51820", "Latency: —"},
+	}
+	for _, c := range cases {
+		v := deriveTrayView(c.st, c.lat)
+		if v.State != c.want || v.Header != c.header || v.Details != c.details || v.Latency != c.latencyRow {
+			t.Errorf("%s: got state %d header %q details %q latency %q; want %d %q %q %q",
+				c.name, v.State, v.Header, v.Details, v.Latency, c.want, c.header, c.details, c.latencyRow)
+		}
+		if !v.ToggleEnabled || v.ToggleTitle != "Disconnect" || !tunnelUp(v.State) {
+			t.Errorf("%s: an up tunnel must offer Disconnect: %+v", c.name, v)
+		}
+		if v.State == trayNoInternet && !strings.Contains(v.Tooltip, "no internet") {
+			t.Errorf("%s: tooltip %q", c.name, v.Tooltip)
+		}
+	}
+}

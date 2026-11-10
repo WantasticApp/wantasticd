@@ -136,13 +136,54 @@ type StatusResponse struct {
 	// Gateway is the network's Wantastic router address inside the tunnel. It
 	// is always reachable (access rules never block it), so the tray measures
 	// latency to it.
-	Gateway string `json:"gateway,omitempty"`
-	StartedAt      int64  `json:"started_at,omitempty"`
-	UptimeSec      int64  `json:"uptime_sec,omitempty"`
-	AutoUpdate     bool   `json:"auto_update"`
+	Gateway    string `json:"gateway,omitempty"`
+	StartedAt  int64  `json:"started_at,omitempty"`
+	UptimeSec  int64  `json:"uptime_sec,omitempty"`
+	AutoUpdate bool   `json:"auto_update"`
 	// Claim is set while the device waits to be added to an account (no
 	// login yet); the tray's Log in opens Claim.URL.
 	Claim *ClaimStatus `json:"claim,omitempty"`
+
+	// HubLastHandshake is the unix time of the last WireGuard handshake with
+	// the Wantastic server peer (0 = none yet); HubHandshakeAgeSec is its age
+	// in seconds (-1 = none yet). HubReachable is true while that handshake
+	// is younger than HubHandshakeFresh: false means the tunnel is up but
+	// the hub cannot be reached (no internet, or the hub is down). It is a
+	// pointer so a tray talking to an older daemon (field absent) can tell
+	// "unknown" from "unreachable".
+	HubLastHandshake   int64 `json:"hub_last_handshake,omitempty"`
+	HubHandshakeAgeSec int64 `json:"hub_handshake_age_sec,omitempty"`
+	HubReachable       *bool `json:"hub_reachable,omitempty"`
+}
+
+// HubHandshakeFresh is how old the server peer's last handshake may be while
+// the hub still counts as reachable. The server peer has a 20 s persistent
+// keepalive (device.go), so a working tunnel re-handshakes every
+// RekeyAfterTime (120 s); 3 min leaves a minute of retries before the hub is
+// declared unreachable, well before RejectAfterTime (300 s) drops the
+// session. It is deliberately shorter than activeHandshakeWindow (8 min, the
+// USP re-announce gate) and separate from exitnode.HandshakeStaleAfter
+// (200 s, the exit path): it only drives what the tray shows.
+const HubHandshakeFresh = 3 * time.Minute
+
+// hubHandshake reads the server peer (the one entry that is not P2P) out of
+// the peer table: its last handshake, the age of it (-1 when none) and
+// whether that is recent enough for the hub to count as reachable.
+func hubHandshake(peers []device.PeerInfo, now time.Time) (last, ageSec int64, reachable bool) {
+	for _, p := range peers {
+		if p.IsP2P {
+			continue
+		}
+		if p.LastHandshake <= 0 {
+			return 0, -1, false
+		}
+		age := now.Sub(time.Unix(p.LastHandshake, 0))
+		if age < 0 {
+			age = 0
+		}
+		return p.LastHandshake, int64(age / time.Second), age < HubHandshakeFresh
+	}
+	return 0, -1, false
 }
 
 // ClaimStatus is the claim link of a device that is not signed in yet.
@@ -210,6 +251,10 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		AutoUpdate: s.agent.config.AutoUpdate,
 	}
 	status.Gateway = tunnelGateway(s.agent.config.Interface.DNS)
+	if status.DeviceRunning {
+		last, age, ok := hubHandshake(status.Peers, time.Now())
+		status.HubLastHandshake, status.HubHandshakeAgeSec, status.HubReachable = last, age, &ok
+	}
 	exitState := s.agent.device.ExitStatus()
 	status.ExitNode = exitState.Offering
 	status.ExitNodeState = &exitState

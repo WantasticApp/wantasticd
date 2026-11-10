@@ -26,6 +26,9 @@ func setupTUNInterface(tunName string, addrs []netip.Prefix) error {
 	return nil
 }
 
+// setTUNMTUOS is a no-op: CreateTUN already sets the utun MTU.
+func setTUNMTUOS(string, int) error { return nil }
+
 func addRouteOS(tunName string, network string) error {
 	prefix, err := netip.ParsePrefix(network)
 	if err != nil {

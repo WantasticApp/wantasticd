@@ -101,6 +101,24 @@ func PlanClientRoutes(p ClientPlan) []Route {
 	return out
 }
 
+// CanBlockIPv6 reports whether the ::/1 + 8000::/1 leak block is safe: bypass
+// routes only pin IPv4, so if the tunnel's own critical UDP (hub or exit peer)
+// runs over global IPv6 the block would swallow it and kill the tunnel.
+// On-link addresses keep their more specific route and are fine.
+func CanBlockIPv6(critical []netip.Addr, onLink func(netip.Addr) bool) bool {
+	for _, a := range critical {
+		a = a.Unmap()
+		if a.Is4() || !bypassable(a) {
+			continue
+		}
+		if onLink != nil && onLink(a) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func bypassable(a netip.Addr) bool {
 	return a.IsValid() && !a.IsUnspecified() && !a.IsLoopback() && !a.IsMulticast() &&
 		!a.IsLinkLocalUnicast() && a != netip.AddrFrom4([4]byte{255, 255, 255, 255})
@@ -217,7 +235,15 @@ func routeCmd(goos string, r Route, tun string, gw Gateway, add bool) (Cmd, erro
 			}
 			return Cmd{Name: "netsh", Args: args}, nil
 		case RouteReject:
-			return Cmd{}, fmt.Errorf("IPv6 reject routes are not supported on Windows")
+			// Windows has no reject/blackhole route type. Route global IPv6
+			// into the tunnel adapter instead (what WireGuard for Windows
+			// does): no peer owns ::/0 there, so wireguard-go drops it and
+			// it never leaks out the physical NIC around an IPv4-only exit.
+			args := []string{"interface", "ipv6", op, "route", "prefix=" + dst, "interface=" + tun}
+			if add {
+				args = append(args, "metric=5", "store=active")
+			}
+			return Cmd{Name: "netsh", Args: args}, nil
 		}
 	}
 	return Cmd{}, fmt.Errorf("routes of kind %q are not supported on %s", r.Kind, goos)

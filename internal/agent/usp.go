@@ -279,7 +279,10 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	if exit, ok := transport.(exitNodeController); ok {
 		telemetryBackend = &exitNodeBackend{backend: telemetryBackend, exit: exit}
 	}
-	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.cache"), uspDataModelCacheRefresh)
+	// v2: written with string paths. The v1 file used registry field IDs,
+	// which shift whenever the model grows, so it is never read again.
+	_ = os.Remove(auth.PersistentFilePath("wusp-datamodel.cache"))
+	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.v2.cache"), uspDataModelCacheRefresh)
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	runtime := &uspRuntime{
 		ctx:                    runtimeCtx,

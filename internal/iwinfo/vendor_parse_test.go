@@ -220,3 +220,42 @@ func TestCalibrationNeedsUnambiguousEvidence(t *testing.T) {
 		t.Fatalf("ambiguous evidence calibrated: %+v", layout)
 	}
 }
+
+func TestParseProcNetWirelessLevel(t *testing.T) {
+	data := `Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
+ face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+  ath3: 0000   94.  -1.  -95.       0      0      0      0      0        0
+ ath31: 0000   45.  -58.  -95.      0      0      0      0      0        0
+  ath4: 0000   45.  198.  161.      0      0      0      0      0        0
+`
+	if _, ok := parseProcNetWirelessLevel(data, "ath3"); ok {
+		t.Fatal("the -1 sentinel must be unknown")
+	}
+	if level, ok := parseProcNetWirelessLevel(data, "ath31"); !ok || level != -58 {
+		t.Fatalf("ath31 %d %v", level, ok)
+	}
+	if level, ok := parseProcNetWirelessLevel(data, "ath4"); !ok || level != -58 {
+		t.Fatalf("ath4 unsigned encoding %d %v", level, ok)
+	}
+	if _, ok := parseProcNetWirelessLevel(data, "ath5"); ok {
+		t.Fatal("ath5 should be missing")
+	}
+}
+
+func TestWextModeAndBitrate(t *testing.T) {
+	if wextModeName(2) != "station" || wextModeName(3) != "ap" || wextModeName(9) != "" {
+		t.Fatal("unexpected wext mode mapping")
+	}
+	u := make([]byte, 16)
+	binary.NativeEndian.PutUint32(u, 866_700_000)
+	if kbps, ok := wextBitrateKbps(u); !ok || kbps != 866_700 {
+		t.Fatalf("bitrate %d %v", kbps, ok)
+	}
+	u[5] = 1 // disabled
+	if _, ok := wextBitrateKbps(u); ok {
+		t.Fatal("a disabled rate must be unknown")
+	}
+	if _, ok := wextBitrateKbps(make([]byte, 16)); ok {
+		t.Fatal("a zero rate must be unknown")
+	}
+}

@@ -41,6 +41,10 @@ func WextTxPower(string) (int, bool)   { return 0, false }
 
 func WextBSSID(string) (net.HardwareAddr, bool) { return nil, false }
 
+func WirelessSignal(string) (int, bool) { return 0, false }
+func WextMode(string) (string, bool)    { return "", false }
+func WextBitrate(string) (uint32, bool) { return 0, false }
+
 func NL80211Wiphy(string) (*Wiphy, error) { return nil, errVendorUnsupported }
 
 func VendorWiphy(string) (*Wiphy, error) { return nil, errVendorUnsupported }

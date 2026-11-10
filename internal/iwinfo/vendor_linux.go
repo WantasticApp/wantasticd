@@ -316,9 +316,43 @@ func readProcInt(path string) (int, bool) {
 
 const (
 	siocgiwfreq  = 0x8B05
+	siocgiwmode  = 0x8B07
 	siocgiwap    = 0x8B15
+	siocgiwrate  = 0x8B21
 	siocgiwtxpow = 0x8B27
 )
+
+// WirelessSignal reads the /proc/net/wireless signal level of ifname in dBm.
+// For a station-mode interface it is the signal of the access point; it is
+// a passive read of the driver's iw_statistics.
+func WirelessSignal(ifname string) (int, bool) {
+	data, err := os.ReadFile("/proc/net/wireless")
+	if err != nil {
+		return 0, false
+	}
+	return parseProcNetWirelessLevel(string(data), ifname)
+}
+
+// WextMode returns the operating mode of ifname through SIOCGIWMODE (a GET
+// ioctl): "station", "ap", "adhoc" or "monitor"; ok is false when unknown.
+func WextMode(ifname string) (string, bool) {
+	u, err := iwreqScalar(ifname, siocgiwmode)
+	if err != nil {
+		return "", false
+	}
+	mode := wextModeName(binary.NativeEndian.Uint32(u[0:4]))
+	return mode, mode != ""
+}
+
+// WextBitrate returns the current transmit bitrate of ifname in kbit/s via
+// SIOCGIWRATE (a GET ioctl). It carries no MCS, NSS, width or GI.
+func WextBitrate(ifname string) (uint32, bool) {
+	u, err := iwreqScalar(ifname, siocgiwrate)
+	if err != nil {
+		return 0, false
+	}
+	return wextBitrateKbps(u[:])
+}
 
 // WextBSSID returns the BSSID a station-mode interface is associated with
 // via SIOCGIWAP (a read; qca-wifi STA VAPs implement it even when nl80211

@@ -302,6 +302,68 @@ func parseProcNetWirelessNoise(data, ifname string) (int, bool) {
 	return 0, false
 }
 
+// parseProcNetWirelessLevel reads the "level" column of /proc/net/wireless
+// for ifname. On a station-mode interface (qca-wifi STA VAPs and cfg80211's
+// wext compatibility layer) it is the signal of the associated access point
+// in dBm. Positive and sentinel values (-1, 0) are rejected as unknown.
+func parseProcNetWirelessLevel(data, ifname string) (int, bool) {
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, ifname+":") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, ifname+":"))
+		if len(fields) < 3 {
+			return 0, false
+		}
+		level, err := strconv.Atoi(strings.TrimSuffix(fields[2], "."))
+		if err != nil {
+			return 0, false
+		}
+		if level > 63 {
+			level -= 256
+		}
+		if level >= -120 && level <= -5 {
+			return level, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// wextModeName maps a wireless-extensions SIOCGIWMODE value to the mode
+// names used by RuntimeInterfaces.
+func wextModeName(mode uint32) string {
+	switch mode {
+	case 1:
+		return "adhoc"
+	case 2:
+		return "station"
+	case 3:
+		return "ap"
+	case 6:
+		return "monitor"
+	}
+	return ""
+}
+
+// wextBitrateKbps decodes a SIOCGIWRATE iw_param (s32 value in bit/s, u8
+// fixed, u8 disabled, u16 flags).
+func wextBitrateKbps(u []byte) (uint32, bool) {
+	if len(u) < 8 {
+		return 0, false
+	}
+	value := int64(int32(binary.NativeEndian.Uint32(u[0:4])))
+	if u[5] != 0 || value < 1000 {
+		return 0, false
+	}
+	kbps := value / 1000
+	if kbps > 1<<31 {
+		return 0, false
+	}
+	return uint32(kbps), true
+}
+
 func validIfName(name string) bool {
 	if name == "" || len(name) >= ifNameSize || strings.ContainsAny(name, "/\\ \t\n") || strings.HasPrefix(name, "-") || name == "." || name == ".." {
 		return false

@@ -73,9 +73,13 @@ type wifiTelemetryStation struct {
 	ThroughputKnown bool
 	RetriesDelta    uint32
 	RetriesKnown    bool
-	Distance        int
-	Latency         wifiLatency
-	CollectedAt     time.Time
+	// RetransPercent is retries per 100 packets sent during the last
+	// interval, capped at 100 (the TR-181 Retransmissions semantics).
+	RetransPercent      uint32
+	RetransPercentKnown bool
+	Distance            int
+	Latency             wifiLatency
+	CollectedAt         time.Time
 }
 
 type wifiTelemetryRadio struct {
@@ -101,15 +105,23 @@ type wifiTelemetryRadio struct {
 }
 
 // wifiTelemetryUplink is the access point a station-mode interface is
-// associated with. Entry.MAC is the BSSID.
+// associated with. Entry.MAC is the BSSID. Counters are the station-mode
+// netdev's own counters, so RX is what was received from the access point;
+// Downlink/Uplink are kbit/s from their deltas (Downlink = RX, Uplink = TX).
 type wifiTelemetryUplink struct {
-	Interface   string
-	Radio       string
-	Entry       iwinfo.AssocEntry
-	SSID        string
-	Frequency   int
-	Bandwidth   int
-	CollectedAt time.Time
+	Interface           string
+	Radio               string
+	Entry               iwinfo.AssocEntry
+	SSID                string
+	Frequency           int
+	Bandwidth           int
+	Counters            wifiIfaceCounters
+	Downlink            uint32
+	Uplink              uint32
+	ThroughputKnown     bool
+	RetransPercent      uint32
+	RetransPercentKnown bool
+	CollectedAt         time.Time
 }
 
 type wifiTelemetrySnapshot struct {
@@ -122,14 +134,46 @@ type wifiTelemetrySnapshot struct {
 	Radios        []wifiTelemetryRadio
 	Stations      []wifiTelemetryStation
 	Uplinks       []wifiTelemetryUplink
-	RadioHistory  map[string][]wusp.WiFiHistorySample
-	StationHist   map[string][]wusp.WiFiHistorySample
+	// VAPs are the up WiFi interfaces the sample covered, including the
+	// runtime-only ones (QSDK SON backhaul) that UCI does not list.
+	VAPs         []wifiTelemetryVAP
+	RadioHistory map[string][]wusp.WiFiHistorySample
+	StationHist  map[string][]wusp.WiFiHistorySample
 }
 
 type wifiCounterState struct {
 	Rx, Tx, Retries uint64
 	RetriesKnown    bool
+	TxPackets       uint64
+	TxPacketsKnown  bool
+	BytesKnown      bool
 	At              time.Time
+}
+
+// entryCounterState is the delta state of one association: byte, retry
+// and packet counters as the driver reported them.
+func entryCounterState(e iwinfo.AssocEntry, now time.Time) wifiCounterState {
+	return wifiCounterState{
+		Rx: e.RxBytes, Tx: e.TxBytes, BytesKnown: e.RxBytesKnown && e.TxBytesKnown,
+		Retries: uint64(e.TxRetries), RetriesKnown: e.TxRetriesKnown,
+		TxPackets: uint64(e.TxPackets), TxPacketsKnown: e.TxPacketsKnown,
+		At: now,
+	}
+}
+
+// retransPercent is the share of packets sent during the interval that
+// needed a retry, per 100 and capped at 100: the closest passive reading of
+// TR-181 Retransmissions ("of the last 100 packets sent"). Drivers count
+// every retry attempt, so it is an upper bound.
+func retransPercent(prev, cur wifiCounterState) (uint32, bool) {
+	if !prev.RetriesKnown || !cur.RetriesKnown || !prev.TxPacketsKnown || !cur.TxPacketsKnown {
+		return 0, false
+	}
+	if cur.Retries < prev.Retries || cur.TxPackets <= prev.TxPackets {
+		return 0, false
+	}
+	percent := (cur.Retries - prev.Retries) * 100 / (cur.TxPackets - prev.TxPackets)
+	return uint32(min(percent, 100)), true
 }
 
 type wifiSurveyState struct {
@@ -153,7 +197,12 @@ type wifiTelemetryDeps struct {
 	// station dump does not list the access point (qca-wifi STA VAPs).
 	bssid         func(ifname string) (net.HardwareAddr, bool)
 	stationLookup func(ifname string, mac net.HardwareAddr) (iwinfo.AssocEntry, error)
-	probe         func(context.Context, []netip.Addr, wifiprobe.Options) (map[netip.Addr]wifiprobe.Result, error)
+	// signal and bitrate are passive wext fallbacks for a station-mode
+	// interface whose AP signal or TX rate no other source reported:
+	// /proc/net/wireless level and SIOCGIWRATE.
+	signal  func(ifname string) (int, bool)
+	bitrate func(ifname string) (uint32, bool)
+	probe   func(context.Context, []netip.Addr, wifiprobe.Options) (map[netip.Addr]wifiprobe.Result, error)
 }
 
 func defaultWiFiTelemetryDeps() wifiTelemetryDeps {
@@ -170,6 +219,8 @@ func defaultWiFiTelemetryDeps() wifiTelemetryDeps {
 		neighbors:      readIPv4Neighbors,
 		bssid:          iwinfo.WextBSSID,
 		stationLookup:  iwinfo.NL80211Station,
+		signal:         iwinfo.WirelessSignal,
+		bitrate:        iwinfo.WextBitrate,
 		probe:          wifiprobe.Probe,
 	}
 }
@@ -188,6 +239,9 @@ type wifiTelemetryCoordinator struct {
 	prevSta    map[string]wifiCounterState
 	prevRadio  map[string]wifiCounterState
 	prevSurvey map[string]wifiSurveyState
+	// prevUplink is keyed by station-mode interface and rebuilt every
+	// sample, so it never outgrows the current uplinks.
+	prevUplink map[string]wifiCounterState
 }
 
 var defaultWiFiTelemetry = newWiFiTelemetryCoordinator(defaultWiFiTelemetryDeps())
@@ -204,6 +258,7 @@ func newWiFiTelemetryCoordinator(deps wifiTelemetryDeps) *wifiTelemetryCoordinat
 		prevSta:    make(map[string]wifiCounterState),
 		prevRadio:  make(map[string]wifiCounterState),
 		prevSurvey: make(map[string]wifiSurveyState),
+		prevUplink: make(map[string]wifiCounterState),
 	}
 }
 
@@ -222,6 +277,7 @@ func (c *wifiTelemetryCoordinator) snapshotAndStart(netClassDir string) wifiTele
 	out.Radios = append([]wifiTelemetryRadio(nil), c.current.Radios...)
 	out.Stations = append([]wifiTelemetryStation(nil), c.current.Stations...)
 	out.Uplinks = append([]wifiTelemetryUplink(nil), c.current.Uplinks...)
+	out.VAPs = append([]wifiTelemetryVAP(nil), c.current.VAPs...)
 	out.RadioHistory = make(map[string][]wusp.WiFiHistorySample, len(c.radioHist))
 	for k, v := range c.radioHist {
 		out.RadioHistory[k] = append([]wusp.WiFiHistorySample(nil), v...)
@@ -231,6 +287,20 @@ func (c *wifiTelemetryCoordinator) snapshotAndStart(netClassDir string) wifiTele
 		out.StationHist[k] = append([]wusp.WiFiHistorySample(nil), v...)
 	}
 	return out
+}
+
+// snapshotFor is snapshotAndStart for the Device.WiFi collector: a sample
+// taken over a different sysfs root (another backend instance) is not
+// about this device's interfaces and is returned empty.
+func (c *wifiTelemetryCoordinator) snapshotFor(netClassDir string) wifiTelemetrySnapshot {
+	snap := c.snapshotAndStart(netClassDir)
+	c.mu.Lock()
+	sampledDir := c.deps.netClassDir
+	c.mu.Unlock()
+	if sampledDir != netClassDir {
+		return wifiTelemetrySnapshot{}
+	}
+	return snap
 }
 
 func (c *wifiTelemetryCoordinator) loop() {
@@ -271,6 +341,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 	var endpoints []wifiTelemetryVAP
 	endpointEntries := make(map[string][]iwinfo.AssocEntry)
 	seenMAC := make(map[string]bool)
+	vapCounters := make(map[string]wifiIfaceCounters, len(vaps))
 	for _, vap := range vaps {
 		radio := radiosByName[vap.Radio]
 		if radio == nil {
@@ -285,6 +356,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 			radio.Frequency, _ = deps.frequency(vap.Name)
 		}
 		if counters := deps.counters(deps.netClassDir, vap.Name); counters.OK {
+			vapCounters[vap.Name] = counters
 			radio.Counters.OK = true
 			radio.Counters.RxBytes += counters.RxBytes
 			radio.Counters.TxBytes += counters.TxBytes
@@ -369,6 +441,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 	uplinks := make([]wifiTelemetryUplink, 0, len(endpoints))
 	for _, vap := range endpoints {
 		if uplink, ok := c.buildUplink(vap, endpointEntries[vap.Name], radiosByName[vap.Radio], now); ok {
+			uplink.Counters = vapCounters[vap.Name]
 			uplinks = append(uplinks, uplink)
 		}
 	}
@@ -400,7 +473,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 		}
 		if station.Entry.RxBytesKnown && station.Entry.TxBytesKnown {
 			prev, ok := c.prevSta[key]
-			cur := wifiCounterState{Rx: station.Entry.RxBytes, Tx: station.Entry.TxBytes, Retries: uint64(station.Entry.TxRetries), RetriesKnown: station.Entry.TxRetriesKnown, At: now}
+			cur := entryCounterState(station.Entry, now)
 			if ok {
 				if down, up, ok := throughputKbps(prev, cur); ok {
 					station.Downlink, station.Uplink, station.ThroughputKnown = down, up, true
@@ -408,6 +481,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 				if prev.RetriesKnown && cur.RetriesKnown && cur.Retries >= prev.Retries {
 					station.RetriesDelta, station.RetriesKnown = uint32(min(cur.Retries-prev.Retries, math.MaxUint32)), true
 				}
+				station.RetransPercent, station.RetransPercentKnown = retransPercent(prev, cur)
 			}
 			c.prevSta[key] = cur
 		}
@@ -425,6 +499,27 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 		}
 		c.prevRadio[name] = cur
 	}
+	prevUplink := make(map[string]wifiCounterState, len(uplinks))
+	for i := range uplinks {
+		uplink := &uplinks[i]
+		prev, seen := c.prevUplink[uplink.Interface]
+		// Byte counters come from the netdev; retries and packets from the
+		// driver's view of the AP.
+		cur := entryCounterState(uplink.Entry, now)
+		cur.Rx, cur.Tx, cur.BytesKnown = uplink.Counters.RxBytes, uplink.Counters.TxBytes, uplink.Counters.OK
+		if seen && prev.BytesKnown && cur.BytesKnown {
+			// throughputKbps is AP-centric (down = TX). On a station-mode
+			// interface the downlink is what it received from the AP.
+			if tx, rx, ok := throughputKbps(prev, cur); ok {
+				uplink.Downlink, uplink.Uplink, uplink.ThroughputKnown = rx, tx, true
+			}
+		}
+		if seen {
+			uplink.RetransPercent, uplink.RetransPercentKnown = retransPercent(prev, cur)
+		}
+		prevUplink[uplink.Interface] = cur
+	}
+	c.prevUplink = prevUplink
 	c.mu.Unlock()
 
 	// Latency: one ICMP run over every station with a known IPv4 address.
@@ -495,6 +590,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 		Radios:        radios,
 		Stations:      stations,
 		Uplinks:       uplinks,
+		VAPs:          append([]wifiTelemetryVAP(nil), vaps...),
 	}
 	diaglog.Printf("[USP] wifi_telemetry radios=%d stations=%d uplinks=%d probed=%d latency=%s error=%q", len(radios), len(stations), len(uplinks), len(targets), latencyMethod, lastError)
 }
@@ -532,6 +628,23 @@ func (c *wifiTelemetryCoordinator) buildUplink(vap wifiTelemetryVAP, entries []i
 	}
 	if !found {
 		return wifiTelemetryUplink{}, false
+	}
+	// Last-resort passive reads for drivers whose GET_STATION is empty or
+	// missing (qca-wifi STA VAPs): the wext statistics level is the AP's
+	// signal, SIOCGIWRATE the current TX bitrate. Neither carries MCS.
+	wextUsed := false
+	if !ap.SignalKnown && deps.signal != nil {
+		if level, ok := deps.signal(vap.Name); ok {
+			ap.Signal, ap.SignalKnown, wextUsed = boundedWiFiDBM(level), true, true
+		}
+	}
+	if !ap.TxRateKnown && deps.bitrate != nil {
+		if kbps, ok := deps.bitrate(vap.Name); ok {
+			ap.TxRate, ap.TxRateKnown, wextUsed = kbps, true, true
+		}
+	}
+	if wextUsed && !strings.Contains(ap.Source, "wext") {
+		ap.Source = strings.TrimPrefix(ap.Source+"+wext", "+")
 	}
 	uplink := wifiTelemetryUplink{Interface: vap.Name, Radio: vap.Radio, Entry: ap, Frequency: vap.Frequency, CollectedAt: now}
 	if deps.radioLink != nil {
@@ -592,6 +705,18 @@ func appendWiFiUplinkFields(msg *wusp.Message, path string, uplink wifiTelemetry
 	}
 	if e.ConnectedTimeKnown {
 		appendField(msg, path+"ConnectedTime", wusp.Uint(uint64(e.ConnectedTime)))
+	}
+	// The interface's own counters: RX is what came from the access point.
+	if uplink.ThroughputKnown {
+		appendField(msg, path+"DownlinkThroughput", wusp.Uint(uint64(uplink.Downlink)))
+		appendField(msg, path+"UplinkThroughput", wusp.Uint(uint64(uplink.Uplink)))
+	}
+	if uplink.Counters.OK {
+		appendField(msg, path+"BytesSent", wusp.Uint(uplink.Counters.TxBytes))
+		appendField(msg, path+"BytesReceived", wusp.Uint(uplink.Counters.RxBytes))
+	}
+	if e.TxRetriesKnown {
+		appendField(msg, path+"Retransmissions", wusp.Uint(uint64(e.TxRetries)))
 	}
 	if source := strings.TrimSpace(e.Source); source != "" {
 		if len(source) > 64 {
@@ -919,16 +1044,31 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 			driver = "unknown"
 		}
 		appendField(msg, path+"Driver", wusp.String(driver))
-		appendField(msg, path+"OperatingFrequency", wusp.Uint(uint64(max(radio.Frequency, 0))))
-		appendField(msg, path+"Channel", wusp.Uint(uint64(max(wifiChannelFromFrequency(radio.Frequency), 0))))
-		appendField(msg, path+"ChannelWidth", wusp.Uint(uint64(max(radio.ChannelWidth, 0))))
-		appendField(msg, path+"CenterFrequency", wusp.Uint(uint64(max(radio.CenterFrequency, 0))))
-		appendField(msg, path+"Noise", wusp.Int(int64(radio.Noise)))
-		appendField(msg, path+"TransmitPower", wusp.Int(int64(radio.TxPower)))
+		// Unknown values are omitted, never sent as placeholder zeros.
+		if radio.Frequency > 0 {
+			appendField(msg, path+"OperatingFrequency", wusp.Uint(uint64(radio.Frequency)))
+		}
+		if channel := wifiChannelFromFrequency(radio.Frequency); channel > 0 {
+			appendField(msg, path+"Channel", wusp.Uint(uint64(channel)))
+		}
+		if radio.ChannelWidth > 0 {
+			appendField(msg, path+"ChannelWidth", wusp.Uint(uint64(radio.ChannelWidth)))
+		}
+		if radio.CenterFrequency > 0 {
+			appendField(msg, path+"CenterFrequency", wusp.Uint(uint64(radio.CenterFrequency)))
+		}
+		if validNoiseDBM(radio.Noise) {
+			appendField(msg, path+"Noise", wusp.Int(int64(radio.Noise)))
+		}
+		if radio.TxPower > 0 {
+			appendField(msg, path+"TransmitPower", wusp.Int(int64(radio.TxPower)))
+		}
 		if radio.UtilKnown {
 			appendField(msg, path+"ChannelUtilization", wusp.Uint(uint64(radio.Utilization)))
 		}
-		appendField(msg, path+"ConfiguredDistance", wusp.Uint(uint64(max(radio.Distance, 0))))
+		if radio.Distance > 0 {
+			appendField(msg, path+"ConfiguredDistance", wusp.Uint(uint64(radio.Distance)))
+		}
 		appendField(msg, path+"DistanceSource", wusp.String(radio.DistanceSource))
 		appendField(msg, path+"StationCount", wusp.Uint(uint64(radio.StationCount)))
 		if radio.Counters.OK {
@@ -971,23 +1111,26 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 			}
 			appendField(msg, path+"Source", wusp.String(source))
 		}
-		signal, noise := 0, 0
-		if e.SignalKnown {
-			signal = int(e.Signal)
+		signalKnown := assocSignedKnown(e.SignalKnown, e.Signal) && e.Signal < 0
+		noiseKnown := assocSignedKnown(e.NoiseKnown, e.Noise) && e.Noise < 0
+		if signalKnown {
+			appendField(msg, path+"SignalStrength", wusp.Int(int64(e.Signal)))
 		}
-		if e.NoiseKnown {
-			noise = int(e.Noise)
+		if noiseKnown {
+			appendField(msg, path+"Noise", wusp.Int(int64(e.Noise)))
 		}
-		appendField(msg, path+"SignalStrength", wusp.Int(int64(signal)))
-		appendField(msg, path+"Noise", wusp.Int(int64(noise)))
-		snr := 0
-		if signal < 0 && noise < 0 && signal > noise {
-			snr = signal - noise
+		if signalKnown && noiseKnown && e.Signal >= e.Noise {
+			appendField(msg, path+"SNR", wusp.Int(int64(e.Signal)-int64(e.Noise)))
 		}
-		appendField(msg, path+"SNR", wusp.Int(int64(snr)))
-		appendField(msg, path+"TxRate", wusp.Uint(uint64(e.TxRate)))
-		appendField(msg, path+"RxRate", wusp.Uint(uint64(e.RxRate)))
-		appendField(msg, path+"ExpectedThroughput", wusp.Uint(uint64(e.ExpectedThroughput)))
+		if assocUint32Known(e.TxRateKnown, e.TxRate) {
+			appendField(msg, path+"TxRate", wusp.Uint(uint64(e.TxRate)))
+		}
+		if assocUint32Known(e.RxRateKnown, e.RxRate) {
+			appendField(msg, path+"RxRate", wusp.Uint(uint64(e.RxRate)))
+		}
+		if assocUint32Known(e.ExpectedThroughputKnown, e.ExpectedThroughput) {
+			appendField(msg, path+"ExpectedThroughput", wusp.Uint(uint64(e.ExpectedThroughput)))
+		}
 		if station.ThroughputKnown {
 			appendField(msg, path+"DownlinkThroughput", wusp.Uint(uint64(station.Downlink)))
 			appendField(msg, path+"UplinkThroughput", wusp.Uint(uint64(station.Uplink)))
@@ -1007,8 +1150,8 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 		if e.InactiveKnown {
 			appendField(msg, path+"InactiveTime", wusp.Uint(uint64(e.Inactive)))
 		}
-		appendField(msg, path+"EstimatedDistance", wusp.Uint(uint64(station.Distance)))
 		if station.Distance > 0 {
+			appendField(msg, path+"EstimatedDistance", wusp.Uint(uint64(station.Distance)))
 			appendField(msg, path+"DistanceMethod", wusp.String("fspl"))
 		} else {
 			appendField(msg, path+"DistanceMethod", wusp.String("none"))
@@ -1136,7 +1279,16 @@ func discoverWiFiTelemetryVAPs(netClassDir string) []wifiTelemetryVAP {
 		if radio == "" {
 			radio = name
 		}
-		byName[name] = wifiTelemetryVAP{Name: name, Radio: radio, Mode: "ap", Vendor: true, Driver: "qca-wifi"}
+		// Legacy (non-cfg80211) builds hide the VAP from nl80211; the wext
+		// mode GET tells a STA VAP (SON backhaul) from an AP VAP.
+		mode := "ap"
+		if observed, ok := iwinfo.WextMode(name); ok {
+			if observed == "monitor" {
+				continue
+			}
+			mode = observed
+		}
+		byName[name] = wifiTelemetryVAP{Name: name, Radio: radio, Mode: mode, Vendor: true, Driver: "qca-wifi"}
 	}
 	out := make([]wifiTelemetryVAP, 0, len(byName))
 	for _, vap := range byName {
@@ -1148,6 +1300,9 @@ func discoverWiFiTelemetryVAPs(netClassDir string) []wifiTelemetryVAP {
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
+
+// validNoiseDBM reports whether a noise floor reading is a real value.
+func validNoiseDBM(noise int) bool { return noise < 0 && noise > -130 }
 
 func runtimeInterfaceIsUp(netClassDir, name string) bool {
 	data, err := os.ReadFile(filepath.Join(netClassDir, name, "operstate"))

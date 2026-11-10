@@ -82,6 +82,18 @@ func parseHostapdStation(block string) (AssocEntry, bool) {
 			entry.RxRate, entry.RxRateKnown = parseHostapdRate(value)
 		case "tx_rate", "tx_bitrate":
 			entry.TxRate, entry.TxRateKnown = parseHostapdRate(value)
+		case "rx_rate_info":
+			rate, known, info := parseHostapdRateInfo(value)
+			if known && !entry.RxRateKnown {
+				entry.RxRate, entry.RxRateKnown = rate, true
+			}
+			entry.RxRateInfo = info
+		case "tx_rate_info":
+			rate, known, info := parseHostapdRateInfo(value)
+			if known && !entry.TxRateKnown {
+				entry.TxRate, entry.TxRateKnown = rate, true
+			}
+			entry.TxRateInfo = info
 		}
 	}
 	return entry, true

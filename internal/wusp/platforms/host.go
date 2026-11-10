@@ -419,7 +419,12 @@ func collectNetworkInterfacesStatic(msg *wusp.Message, netClassDir string) {
 		logCollectorError("network.interfaces", err)
 		return
 	}
+	appendNetworkInterfaces(msg, netClassDir, ifaces)
+}
+
+func appendNetworkInterfaces(msg *wusp.Message, netClassDir string, ifaces []net.Interface) {
 	idx := 1
+	ethernetCount := 0
 	for _, iface := range ifaces {
 		// Skip loopback. rmnet/wwan interfaces intentionally have no Ethernet
 		// hardware address but are still first-class TR-181 IP interfaces.
@@ -437,6 +442,18 @@ func collectNetworkInterfacesStatic(msg *wusp.Message, netClassDir string) {
 		msg.Set(prefix+"Type", wusp.String(ifaceType(iface.Name)))
 		msg.Set(prefix+"MaxMTUSize", wusp.Uint(uint64(iface.MTU)))
 		appendNetworkInterfaceStats(msg, prefix, netClassDir, iface.Name)
+		// Wired ports also get a Device.Ethernet.Interface entry carrying
+		// their own MAC: the hub identifies hardware (e.g. Cyber Antennas
+		// T2) by the eth0 address, which no other path reports.
+		if len(iface.HardwareAddr) == 6 && isWiredPort(netClassDir, iface.Name) {
+			ethernetCount++
+			eth := fmt.Sprintf("Device.Ethernet.Interface.%d.", ethernetCount)
+			msg.Set(prefix+"LowerLayers", wusp.List(wusp.String(eth)))
+			msg.Set(eth+"Enable", wusp.Bool(iface.Flags&net.FlagUp != 0))
+			msg.Set(eth+"Status", wusp.String(ifaceStatus(iface.Flags)))
+			msg.Set(eth+"Name", wusp.String(iface.Name))
+			msg.Set(eth+"MACAddress", wusp.MAC(iface.HardwareAddr))
+		}
 
 		addrs, err := iface.Addrs()
 		if err != nil {
@@ -466,6 +483,27 @@ func collectNetworkInterfacesStatic(msg *wusp.Message, netClassDir string) {
 		}
 		idx++
 	}
+	if ethernetCount > 0 {
+		msg.Set("Device.Ethernet.InterfaceNumberOfEntries", wusp.Uint(uint64(ethernetCount)))
+	}
+}
+
+// isWiredPort reports whether name is a wired Ethernet port rather than a
+// bridge, a radio, or a virtual device: an ethN name, or a netdev backed by
+// hardware, that is neither wireless nor a bridge.
+func isWiredPort(netClassDir, name string) bool {
+	if strings.TrimSpace(netClassDir) == "" || name == "" || strings.ContainsAny(name, "/.") {
+		return false
+	}
+	dir := filepath.Join(netClassDir, name)
+	exists := func(p string) bool { _, err := os.Stat(filepath.Join(dir, p)); return err == nil }
+	if exists("wireless") || exists("phy80211") || exists("bridge") {
+		return false
+	}
+	if strings.HasPrefix(name, "eth") && !strings.Contains(name, "@") {
+		return true
+	}
+	return exists("device")
 }
 
 func appendNetworkInterfaceStats(msg *wusp.Message, prefix, netClassDir, interfaceName string) {

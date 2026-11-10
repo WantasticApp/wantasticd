@@ -149,7 +149,7 @@ func (c *persistentDataModelCache) Patch(msg *wusp.Message) error {
 	c.msg = cloneCachedMessage(merged)
 	c.mu.Unlock()
 
-	encoded, err := wusp.EncodeMessageLZ4(merged)
+	encoded, err := encodeCacheMessage(merged)
 	if err != nil {
 		return fmt.Errorf("encode data model cache patch: %w", err)
 	}
@@ -293,7 +293,7 @@ func (c *persistentDataModelCache) refreshOwned(ctx context.Context, done chan s
 	msg = preserveLastSMSInboxSnapshot(previous, msg)
 	status.FieldCount = len(msg.Fields)
 	status.CellularFieldCount = countCellularSnapshotFields(msg)
-	encoded, err := wusp.EncodeMessageLZ4(msg)
+	encoded, err := encodeCacheMessage(msg)
 	if err != nil {
 		return fmt.Errorf("encode data model cache: %w", err)
 	}
@@ -532,6 +532,15 @@ func (c *persistentDataModelCache) load() {
 	c.msg = msg
 	objects, values := dataModelMessageCounts(msg)
 	log.Printf("[USP] DataModel cache restored: objects=%d values=%d file=%s", objects, values, c.path)
+}
+
+// encodeCacheMessage stores fields by path: registry field IDs follow the
+// model's sorted path order and shift when the model grows, so an ID-keyed
+// cache read by a newer binary would land values on the wrong paths.
+func encodeCacheMessage(msg *wusp.Message) ([]byte, error) {
+	clone := cloneCachedMessage(msg)
+	clone.ResetAllFieldIDs()
+	return wusp.EncodeMessageLZ4(clone)
 }
 
 func writeCacheAtomically(path string, data []byte) error {

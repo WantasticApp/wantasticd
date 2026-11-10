@@ -985,6 +985,20 @@ nl80211 coverage class × 450 m, or MadWifi's `distance`/`slottime` sysctls
 inverts free-space path loss from TX power, signal and frequency and is
 indicative only.
 
+Station and Uplink rows also carry the last-frame modulation per direction
+(`TxPHY`/`RxPHY` legacy|ht|vht|he|eht, `*MCS`, `*NSS`, `*BandwidthMHz`,
+`*GuardIntervalNs`, `*DCM`), `SignalChains`/`SignalChainAvg` (per-chain
+dBm, comma separated) and `TxAirtimeUs`/`RxAirtimeUs` (cumulative µs
+counters). They are decoded from the nl80211 `TX/RX_BITRATE` rate_info
+(`*_MCS`, `*_NSS`, width flags, `SHORT_GI`, `HE/EHT_GI`, `HE_DCM`),
+`CHAIN_SIGNAL(_AVG)` and `TX/RX_DURATION`; hostapd `rx/tx_rate_info` and
+rpcd iwinfo `assoclist` rate objects fill the same fields, and the QSDK
+`wlanconfig list sta` phymode gives a negotiated PHY/width/NSS without MCS
+or GI. HT MCS keeps the 0-31 index (NSS = MCS/8+1). Unknown values are
+omitted. `Uplink.{i}.` describes the AP of each station-mode interface (its
+station dump lists the AP; qca-wifi STA VAPs fall back to `SIOCGIWAP` plus
+per-MAC `GET_STATION`); the AP keeps its `Station` row as well.
+
 Throughput is measured from counter deltas between samples. Latency is an
 ICMP echo run (`internal/wifiprobe`, raw socket with an unprivileged
 fallback) to every station whose IPv4 address is in the ARP table: 4 echoes

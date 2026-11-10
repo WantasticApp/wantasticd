@@ -123,6 +123,12 @@ type exitEngine struct {
 	allowedSet     bool      // 0.0.0.0/0 was given to a peer
 	offered        map[wgdevice.NoisePublicKey]bool
 
+	// probe checks, once per activation, that the internet is reachable
+	// through the exit ("active" otherwise only means routes went in).
+	probe    func() error
+	probeGen uint64 // bumped on every activation/deactivation
+	probeErr string // last probe failure for the current activation
+
 	kick chan struct{}
 	stop chan struct{}
 	done chan struct{}
@@ -148,6 +154,7 @@ func (d *Device) startExitEngine() {
 		statePath: exitStatePath(d.config.FilePath()),
 		phase:     exitnode.PhaseOff,
 		offered:   map[wgdevice.NoisePublicKey]bool{},
+		probe:     probeInternet,
 		kick:      make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
@@ -1057,11 +1064,23 @@ func (e *exitEngine) activateLocked(dp *wgdevice.DiscoveredPeer, peers map[strin
 	}
 
 	addrs, critical := e.bypassAddrs(peers, exitHex)
+	onLink := onLinkFunc(tun)
+	criticalAddrs := make([]netip.Addr, 0, len(critical))
+	for a := range critical {
+		criticalAddrs = append(criticalAddrs, a)
+	}
+	// Block global IPv6 on every OS (Windows included: an unblocked IPv6
+	// default sent dual-stack sites straight out the physical NIC while the
+	// exit showed "active"), unless the tunnel itself rides on IPv6.
+	blockV6 := exitnode.CanBlockIPv6(criticalAddrs, onLink)
+	if !blockV6 && first {
+		log.Printf("[EXIT] Warning: the hub or exit peer is reached over IPv6; IPv6 is not blocked and may bypass the exit node")
+	}
 	desired := exitnode.PlanClientRoutes(exitnode.ClientPlan{
 		Bypass:    addrs,
-		OnLink:    onLinkFunc(tun),
+		OnLink:    onLink,
 		Overlay:   e.overlayPrefixes(),
-		BlockIPv6: e.host.OS != "windows",
+		BlockIPv6: blockV6,
 	})
 
 	if first {
@@ -1117,13 +1136,75 @@ func (e *exitEngine) activateLocked(dp *wgdevice.DiscoveredPeer, peers map[strin
 		e.enableClientNATLocked(tun)
 	}
 	if first {
-		log.Printf("[EXIT] Internet traffic now goes through exit node %s (endpoint %s, gateway %s via %s)",
-			e.st.Use, peers[exitHex].endpoint, gw.Addr, gw.Interface)
+		log.Printf("[EXIT] Internet traffic now goes through exit node %s (endpoint %s, gateway %s via %s, routes %s)",
+			e.st.Use, peers[exitHex].endpoint, gw.Addr, gw.Interface, routeSummary(e.st.Routes))
+		e.startProbeLocked()
 	}
 	if changed || first {
 		e.saveLocked()
 	}
 	return nil
+}
+
+// exitProbeTargets are dialed by IP (no DNS, which may itself be the broken
+// part) through the freshly installed split routes.
+var exitProbeTargets = []string{"1.1.1.1:443", "8.8.8.8:443"}
+
+const exitProbeTimeout = 4 * time.Second
+
+// probeInternet succeeds when any probe target accepts a TCP connection.
+func probeInternet() error {
+	var last error
+	for _, t := range exitProbeTargets {
+		c, err := net.DialTimeout("tcp4", t, exitProbeTimeout)
+		if err == nil {
+			c.Close()
+			return nil
+		}
+		last = err
+	}
+	return last
+}
+
+// startProbeLocked checks, off the lock, that the internet is reachable once
+// the exit routes are in. A failure is logged and surfaced in the status
+// reason but does not tear routing down (no flapping): it only turns a silent
+// "active but nothing loads" into an explicit, diagnosable state.
+func (e *exitEngine) startProbeLocked() {
+	if e.probe == nil {
+		return
+	}
+	e.probeGen++
+	e.probeErr = ""
+	gen, use, probe := e.probeGen, e.st.Use, e.probe
+	go func() {
+		err := probe()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.finishProbeLocked(gen, use, err)
+	}()
+}
+
+func (e *exitEngine) finishProbeLocked(gen uint64, use string, err error) {
+	if gen != e.probeGen || use != e.st.Use {
+		return // routing changed while probing
+	}
+	if err == nil {
+		e.probeErr = ""
+		log.Printf("[EXIT] Exit node %s: internet reachable through the exit", use)
+		return
+	}
+	e.probeErr = "routes are in but the internet is not reachable through the exit (" + err.Error() + "); check NAT/forwarding on the exit device"
+	log.Printf("[EXIT] Warning: exit node %s: %s", use, e.probeErr)
+}
+
+// routeSummary renders installed routes for the activation log line.
+func routeSummary(rs []exitnode.Route) string {
+	n := map[exitnode.RouteKind]int{}
+	for _, r := range rs {
+		n[r.Kind]++
+	}
+	return fmt.Sprintf("%d tunnel, %d bypass, %d ipv6-block", n[exitnode.RouteTunnel], n[exitnode.RouteBypass], n[exitnode.RouteReject])
 }
 
 // enableClientNATLocked lets hosts behind a Linux router use the exit too.
@@ -1207,6 +1288,8 @@ func (e *exitEngine) deactivateLocked(reason string) {
 		e.st.ClientNAT = nil
 	}
 	e.granted = e.granted && reason != "comeback"
+	e.probeGen++
+	e.probeErr = ""
 	log.Printf("[EXIT] Normal routing restored (%s)", reason)
 	e.saveLocked()
 }
@@ -1255,6 +1338,9 @@ func (e *exitEngine) useStatusLocked() *ExitUse {
 	u := &ExitUse{IP: e.st.Use, State: string(e.phase), Reason: e.reason, Since: e.since.Unix(), Path: "offline"}
 	if e.phase == exitnode.PhaseOff {
 		u.State = string(exitnode.PhasePending)
+	}
+	if e.phase == exitnode.PhaseActive && u.Reason == "" && e.probeErr != "" {
+		u.Reason = e.probeErr
 	}
 	if ip, err := netip.ParseAddr(e.st.Use); err == nil {
 		if dp := e.discoveredByIP(ip); dp != nil {

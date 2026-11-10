@@ -23,6 +23,7 @@ type RadioLink struct {
 	Frequency        int
 	CenterFrequency  int
 	ChannelWidth     int
+	SSID             string
 }
 
 func VendorAssocList(string) ([]AssocEntry, error) { return nil, errVendorUnsupported }
@@ -37,6 +38,8 @@ func VendorConfiguredDistance(string) (int, string, bool) { return 0, "", false 
 
 func WextFrequency(string) (int, bool) { return 0, false }
 func WextTxPower(string) (int, bool)   { return 0, false }
+
+func WextBSSID(string) (net.HardwareAddr, bool) { return nil, false }
 
 func NL80211Wiphy(string) (*Wiphy, error) { return nil, errVendorUnsupported }
 

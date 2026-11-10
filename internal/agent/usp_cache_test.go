@@ -406,3 +406,21 @@ func TestReplaceFileConcurrent(t *testing.T) {
 		t.Fatalf("temporary files left behind: %v", left)
 	}
 }
+
+// The cache round-trips by path (encodeCacheMessage clears registry IDs).
+func TestDataModelCacheEncodesPaths(t *testing.T) {
+	msg := wusp.NewMessage()
+	msg.Set("Device.DeviceInfo.HostName", wusp.String("G1TK7EY00023A"))
+	msg.Set("Device.WiFi.RadioNumberOfEntries", wusp.Uint(2))
+	encoded, err := encodeCacheMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := wusp.DecodeMessageLenient(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := decoded.Get("Device.DeviceInfo.HostName"); !ok || v.AsString() != "G1TK7EY00023A" {
+		t.Fatalf("hostname round trip: %v %v", v, ok)
+	}
+}

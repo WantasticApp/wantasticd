@@ -26,9 +26,26 @@ const (
 	trayConnected
 	trayExitActive
 	trayNotSignedIn
+	// trayNoInternet: the tunnel is up but the hub cannot be reached (its
+	// handshake is stale, or the gateway stopped answering): no internet on
+	// this machine, or the hub is down. WireGuard keeps retrying, so this
+	// recovers on its own.
+	trayNoInternet
 )
 
-func stateOf(st *agent.StatusResponse) trayState {
+// gatewayMissesToDowngrade is how many consecutive unanswered gateway probes
+// downgrade a connected tunnel, so one lost ICMP echo never flips the icon.
+// A single reply recovers it at once.
+const gatewayMissesToDowngrade = 2
+
+// tunnelUp reports a state in which the tunnel is configured and running,
+// whether or not traffic flows right now: Disconnect is the toggle's action
+// and the gateway keeps being probed (so a downgrade can recover).
+func tunnelUp(s trayState) bool {
+	return s == trayConnected || s == trayExitActive || s == trayNoInternet
+}
+
+func stateOf(st *agent.StatusResponse, lat gatewayLatency) trayState {
 	switch {
 	case st == nil:
 		return trayDaemonDown
@@ -36,11 +53,25 @@ func stateOf(st *agent.StatusResponse) trayState {
 		return trayNotSignedIn
 	case !st.Running || !st.DeviceRunning:
 		return trayDisconnected
+	case hubUnreachable(st, lat):
+		return trayNoInternet
 	case st.ExitNodeState != nil && st.ExitNodeState.Using != nil && st.ExitNodeState.Using.State == "active":
 		return trayExitActive
 	default:
 		return trayConnected
 	}
+}
+
+// hubUnreachable is true when the daemon reports the hub's handshake as stale
+// or the gateway missed gatewayMissesToDowngrade probes in a row. The
+// handshake age only grows until the next handshake succeeds, so it cannot
+// flap; its debounce is the minute of slack in agent.HubHandshakeFresh. A
+// daemon too old to report HubReachable never downgrades on that fact.
+func hubUnreachable(st *agent.StatusResponse, lat gatewayLatency) bool {
+	if st.HubReachable != nil && !*st.HubReachable {
+		return true
+	}
+	return lat.Measured && !lat.Replied && lat.Misses >= gatewayMissesToDowngrade
 }
 
 // gatewayLatency is the last round trip to the network's Wantastic gateway,
@@ -49,6 +80,8 @@ type gatewayLatency struct {
 	Measured bool    // a ping has completed
 	Replied  bool    // and the gateway answered
 	Ms       float64 // average round trip when it did
+	// Misses counts consecutive unanswered probes (0 after a reply).
+	Misses int
 }
 
 // latencyText is the Latency row for a connected tunnel.
@@ -81,7 +114,7 @@ type trayView struct {
 }
 
 func deriveTrayView(st *agent.StatusResponse, lat gatewayLatency) trayView {
-	v := trayView{State: stateOf(st), ToggleTitle: T("toggle.connect")}
+	v := trayView{State: stateOf(st, lat), ToggleTitle: T("toggle.connect")}
 	switch v.State {
 	case trayDaemonDown:
 		v.Header = T("header.daemon.down")
@@ -102,6 +135,14 @@ func deriveTrayView(st *agent.StatusResponse, lat gatewayLatency) trayView {
 		v.Header = T("header.disconnected")
 		v.Tooltip = T("tooltip.disconnected")
 		v.ToggleEnabled = st.Running
+	case trayNoInternet:
+		v.Header = T("header.nointernet")
+		if st.HubReachable != nil && !*st.HubReachable && st.HubLastHandshake == 0 {
+			// Just connected: the first handshake is still on its way.
+			v.Header = T("header.connecting")
+		}
+		v.Tooltip = T("tooltip.nointernet")
+		v.ToggleTitle, v.ToggleEnabled = T("toggle.disconnect"), true
 	case trayExitActive:
 		u := st.ExitNodeState.Using
 		name := clip(firstNonEmpty(u.Hostname, u.IP), maxHeaderName)
@@ -121,12 +162,20 @@ func deriveTrayView(st *agent.StatusResponse, lat gatewayLatency) trayView {
 	v.Address = T("addr", ip)
 	v.Traffic = T("traffic", trayBytes(st.RxBytes), trayBytes(st.TxBytes))
 	v.Latency = T("latency.empty")
-	if v.State == trayConnected || v.State == trayExitActive {
+	if tunnelUp(v.State) {
 		v.Latency = latencyText(lat)
 	}
 
+	// Offline, the details row says for how long the hub has been silent in
+	// place of the daemon's uptime (the row is sized for either).
 	var details []string
-	if st.UptimeSec > 0 {
+	hubSilent := v.State == trayNoInternet && st.HubReachable != nil && !*st.HubReachable
+	switch {
+	case hubSilent && st.HubLastHandshake > 0:
+		details = append(details, T("details.handshake.ago", trayDuration(time.Duration(st.HubHandshakeAgeSec)*time.Second)))
+	case hubSilent:
+		details = append(details, T("details.handshake.never"))
+	case st.UptimeSec > 0:
 		details = append(details, T("details.up", trayDuration(time.Duration(st.UptimeSec)*time.Second)))
 	}
 	if st.ServerEndpoint != "" {
@@ -343,6 +392,7 @@ var trayStateColors = map[trayState]color.NRGBA{
 	trayConnected:    {0x22, 0xC5, 0x5E, 0xFF}, // green
 	trayExitActive:   {0x3B, 0x82, 0xF6, 0xFF}, // blue
 	trayNotSignedIn:  {0xF5, 0x9E, 0x0B, 0xFF}, // amber
+	trayNoInternet:   {0xEA, 0x58, 0x0C, 0xFF}, // orange: up, but no path to the hub
 }
 
 // trayLogo is the Wantastic logo (console img/icon/logo.svg) in a 0..1 box.

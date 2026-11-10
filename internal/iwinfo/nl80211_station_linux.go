@@ -116,14 +116,15 @@ func NL80211Station(ifname string, mac net.HardwareAddr) (AssocEntry, error) {
 // RadioLink describes physical-layer settings of the radio behind ifname.
 type RadioLink struct {
 	PHY              int
-	TxPowerDBM       int  // current transmit power
-	TxPowerKnown     bool //
-	CoverageClass    int  // IEEE 802.11 coverage class (0-255)
-	CoverageKnown    bool //
-	CoverageDistance int  // one-way distance in metres implied by CoverageClass
-	Frequency        int  // primary 20 MHz channel in MHz
-	CenterFrequency  int  // center of the whole operating channel in MHz
-	ChannelWidth     int  // operating channel width in MHz (80+80 reported as 160)
+	TxPowerDBM       int    // current transmit power
+	TxPowerKnown     bool   //
+	CoverageClass    int    // IEEE 802.11 coverage class (0-255)
+	CoverageKnown    bool   //
+	CoverageDistance int    // one-way distance in metres implied by CoverageClass
+	Frequency        int    // primary 20 MHz channel in MHz
+	CenterFrequency  int    // center of the whole operating channel in MHz
+	ChannelWidth     int    // operating channel width in MHz (80+80 reported as 160)
+	SSID             string // AP: the served SSID; station: the joined SSID
 }
 
 // NL80211RadioLink reads the current TX power (GET_INTERFACE) and coverage
@@ -163,6 +164,10 @@ func NL80211RadioLink(ifname string) (RadioLink, error) {
 				out.CenterFrequency = int(ad.Uint32())
 			case unix.NL80211_ATTR_CHANNEL_WIDTH:
 				out.ChannelWidth = nl80211WidthMHz(ad.Uint32())
+			case unix.NL80211_ATTR_SSID:
+				if b := ad.Bytes(); len(b) > 0 && len(b) <= 32 {
+					out.SSID = string(b)
+				}
 			case unix.NL80211_ATTR_WIPHY_TX_POWER_LEVEL:
 				// mBm; 0 means the driver did not report a level.
 				if mbm := int32(ad.Uint32()); mbm > 0 {
@@ -262,16 +267,32 @@ func decodeNL80211StaInfo(ad *netlink.AttributeDecoder, e *AssocEntry) {
 			e.ExpectedThroughput, e.ExpectedThroughputKnown = ad.Uint32(), true
 		case unix.NL80211_STA_INFO_TX_BITRATE:
 			ad.Nested(func(nad *netlink.AttributeDecoder) error {
-				rate, mcs, nss := decodeNL80211Rate(nad)
-				e.TxRate, e.TxMCS, e.TxNSS, e.TxRateKnown = rate, mcs, nss, rate > 0
+				rate, info := decodeNL80211Rate(nad)
+				e.TxRate, e.TxRateKnown, e.TxRateInfo = rate, rate > 0, info
+				e.TxMCS, e.TxNSS = legacyMCS(info), info.NSS
 				return nil
 			})
 		case unix.NL80211_STA_INFO_RX_BITRATE:
 			ad.Nested(func(nad *netlink.AttributeDecoder) error {
-				rate, mcs, nss := decodeNL80211Rate(nad)
-				e.RxRate, e.RxMCS, e.RxNSS, e.RxRateKnown = rate, mcs, nss, rate > 0
+				rate, info := decodeNL80211Rate(nad)
+				e.RxRate, e.RxRateKnown, e.RxRateInfo = rate, rate > 0, info
+				e.RxMCS, e.RxNSS = legacyMCS(info), info.NSS
 				return nil
 			})
+		case unix.NL80211_STA_INFO_CHAIN_SIGNAL:
+			ad.Nested(func(nad *netlink.AttributeDecoder) error {
+				e.ChainSignal = decodeNL80211ChainSignal(nad)
+				return nil
+			})
+		case unix.NL80211_STA_INFO_CHAIN_SIGNAL_AVG:
+			ad.Nested(func(nad *netlink.AttributeDecoder) error {
+				e.ChainSignalAvg = decodeNL80211ChainSignal(nad)
+				return nil
+			})
+		case unix.NL80211_STA_INFO_TX_DURATION:
+			e.TxDuration, e.TxDurationKnown = ad.Uint64(), true
+		case unix.NL80211_STA_INFO_RX_DURATION:
+			e.RxDuration, e.RxDurationKnown = ad.Uint64(), true
 		}
 	}
 	switch {
@@ -289,29 +310,75 @@ func decodeNL80211StaInfo(ad *netlink.AttributeDecoder, e *AssocEntry) {
 }
 
 // decodeNL80211Rate returns the bitrate in kbit/s (nl80211 reports units of
-// 100 kbit/s), the MCS index (-1 when absent) and spatial streams.
-func decodeNL80211Rate(ad *netlink.AttributeDecoder) (uint32, int8, uint8) {
-	var rate16, rate32 uint32
-	mcs := int8(-1)
-	var nss uint8
+// 100 kbit/s) and the modulation of one nested rate_info attribute.
+func decodeNL80211Rate(ad *netlink.AttributeDecoder) (uint32, RateInfo) {
+	f := newNL80211RateFields()
 	for ad.Next() {
 		switch ad.Type() {
 		case unix.NL80211_RATE_INFO_BITRATE:
-			rate16 = uint32(ad.Uint16())
+			f.Bitrate16 = uint32(ad.Uint16())
 		case unix.NL80211_RATE_INFO_BITRATE32:
-			rate32 = ad.Uint32()
-		case unix.NL80211_RATE_INFO_MCS, unix.NL80211_RATE_INFO_VHT_MCS,
-			unix.NL80211_RATE_INFO_HE_MCS, unix.NL80211_RATE_INFO_EHT_MCS:
-			mcs = int8(ad.Uint8())
-		case unix.NL80211_RATE_INFO_VHT_NSS, unix.NL80211_RATE_INFO_HE_NSS, unix.NL80211_RATE_INFO_EHT_NSS:
-			nss = ad.Uint8()
+			f.Bitrate32 = ad.Uint32()
+		case unix.NL80211_RATE_INFO_MCS:
+			f.HTMCS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_VHT_MCS:
+			f.VHTMCS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_HE_MCS:
+			f.HEMCS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_EHT_MCS:
+			f.EHTMCS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_VHT_NSS:
+			f.VHTNSS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_HE_NSS:
+			f.HENSS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_EHT_NSS:
+			f.EHTNSS = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_HE_GI:
+			f.HEGI = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_EHT_GI:
+			f.EHTGI = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_HE_DCM:
+			f.HEDCM = int(ad.Uint8())
+		case unix.NL80211_RATE_INFO_HE_RU_ALLOC, unix.NL80211_RATE_INFO_EHT_RU_ALLOC:
+			f.RUAlloc = true
+		case unix.NL80211_RATE_INFO_SHORT_GI:
+			f.ShortGI = true
+		// The width attributes are zero-length NLA_FLAGs.
+		case unix.NL80211_RATE_INFO_5_MHZ_WIDTH:
+			f.WidthMHz = 5
+		case unix.NL80211_RATE_INFO_10_MHZ_WIDTH:
+			f.WidthMHz = 10
+		case unix.NL80211_RATE_INFO_40_MHZ_WIDTH:
+			f.WidthMHz = 40
+		case unix.NL80211_RATE_INFO_80_MHZ_WIDTH:
+			f.WidthMHz = 80
+		case unix.NL80211_RATE_INFO_80P80_MHZ_WIDTH, unix.NL80211_RATE_INFO_160_MHZ_WIDTH:
+			f.WidthMHz = 160
+		case unix.NL80211_RATE_INFO_320_MHZ_WIDTH:
+			f.WidthMHz = 320
 		}
 	}
-	rate := rate32
-	if rate == 0 {
-		rate = rate16
+	return f.rate()
+}
+
+// legacyMCS keeps the older AssocEntry.TxMCS/RxMCS convention (-1 unknown).
+func legacyMCS(info RateInfo) int8 {
+	if !info.MCSKnown || info.MCS > 127 {
+		return -1
 	}
-	return rate * 100, mcs, nss
+	return int8(info.MCS)
+}
+
+// decodeNL80211ChainSignal reads a nested CHAIN_SIGNAL(_AVG) attribute: one
+// u8 holding signed dBm per chain, the attribute type being the chain index.
+func decodeNL80211ChainSignal(ad *netlink.AttributeDecoder) []int8 {
+	readings := make(map[uint16]int8)
+	for ad.Next() {
+		if v := int8(ad.Uint8()); v < 0 {
+			readings[ad.Type()] = v
+		}
+	}
+	return orderedChainSignal(readings)
 }
 
 func nl80211WidthMHz(width uint32) int {

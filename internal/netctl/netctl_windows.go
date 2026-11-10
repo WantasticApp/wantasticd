@@ -28,8 +28,14 @@ func (c *windowsController) LinkSetDown(ifname string) error {
 	return exec.Command("netsh", "interface", "set", "interface", ifname, "admin=disable").Run()
 }
 
+// LinkSetMTU sets the IP-layer MTU (NlMtu) for IPv4 and, best effort, IPv6.
+// IPv6 fails harmlessly when it is disabled on the adapter or mtu < 1280.
 func (c *windowsController) LinkSetMTU(ifname string, mtu int) error {
-	return exec.Command("netsh", "interface", "ipv4", "set", "subinterface", ifname, fmt.Sprintf("mtu=%d", mtu), "store=active").Run()
+	if out, err := exec.Command("netsh", "interface", "ipv4", "set", "subinterface", ifname, fmt.Sprintf("mtu=%d", mtu), "store=active").CombinedOutput(); err != nil {
+		return fmt.Errorf("netsh ipv4 mtu=%d: %w: %s", mtu, err, strings.TrimSpace(string(out)))
+	}
+	_ = exec.Command("netsh", "interface", "ipv6", "set", "subinterface", ifname, fmt.Sprintf("mtu=%d", mtu), "store=active").Run()
+	return nil
 }
 
 func (c *windowsController) AddrAdd(ifname string, addr netip.Prefix) error {

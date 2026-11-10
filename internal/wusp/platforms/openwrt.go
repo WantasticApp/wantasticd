@@ -1053,6 +1053,12 @@ func decodeIWInfoAssociationsKnown(data []byte) ([]iwinfo.AssocEntry, error) {
 		entry.TxRate, entry.TxRateKnown = configNestedUint32Known(result, "tx", "rate", "tx_rate")
 		entry.TxRetries, entry.TxRetriesKnown = configNestedUint32Known(result, "tx", "retries", "tx_retries")
 		entry.TxFailed, entry.TxFailedKnown = configNestedUint32Known(result, "tx", "failed", "tx_failed")
+		if rx, ok := result["rx"].(map[string]any); ok {
+			entry.RxRateInfo = iwinfoUbusRateInfo(rx)
+		}
+		if tx, ok := result["tx"].(map[string]any); ok {
+			entry.TxRateInfo = iwinfoUbusRateInfo(tx)
+		}
 		if value, present := result["authorized"]; present {
 			entry.AuthenticationKnown = true
 			entry.Authenticated = configAnyBool(value)
@@ -1260,6 +1266,7 @@ func mergeWiFiAssociations(primary, detailed []iwinfo.AssocEntry) []iwinfo.Assoc
 			if station.AssociationID == 0 {
 				station.AssociationID = existing.AssociationID
 			}
+			mergeWiFiModulation(&station, existing)
 			if existing.Source != "" && station.Source != "" && existing.Source != station.Source {
 				station.Source = existing.Source + "+" + station.Source
 			} else if station.Source == "" {
@@ -3575,8 +3582,17 @@ func (b *OpenWrtBackend) readManufacturerOUI() string {
 	if err != nil {
 		return ""
 	}
+	// eth0 first: it carries the board's base MAC, which is what identifies
+	// the hardware; bridges and radios may use other or random addresses.
+	names := make([]string, 0, len(entries)+1)
+	names = append(names, "eth0")
 	for _, entry := range entries {
-		address := strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, entry.Name(), "address")))
+		if entry.Name() != "eth0" {
+			names = append(names, entry.Name())
+		}
+	}
+	for _, name := range names {
+		address := strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, name, "address")))
 		if address == "" {
 			continue
 		}

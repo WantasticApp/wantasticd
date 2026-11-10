@@ -39,6 +39,12 @@ const noticeTTL = 20 * time.Second
 // where the tray sees the menu open); nothing is pinged while it is closed.
 const livePingEvery = 3 * time.Second
 
+// gatewayMissTTL is how long a gateway miss streak stays meaningful: a few
+// live-ping periods. With no newer probe (menu closed, or Windows where only
+// a click pings) the streak is dropped and the daemon's hub handshake facts
+// alone decide the state.
+const gatewayMissTTL = 4 * livePingEvery
+
 // trayClient talks to the daemon's local IPC API. Every call is bounded so a
 // wedged daemon can never freeze the menu; actions that wait on the network
 // (connect, exit node, ping) get their own longer client.
@@ -277,7 +283,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			// native rows line up with drawn ones in every state.
 			bindRow(mHeader, T("header.connecting"), false, true,
 				T("header.daemon.down"), T("header.notsignedin"), T("header.disconnected"),
-				T("header.connected"), T("header.exit", strings.Repeat("o", maxHeaderName)) /* average-width letters: a typical name */)
+				T("header.connected"), T("header.nointernet"), T("header.exit", strings.Repeat("o", maxHeaderName)) /* average-width letters: a typical name */)
 			bindRow(mAddress, T("addr.empty"), true, false, T("addr", "255.255.255.255"))
 			bindRow(mLatency, T("latency.empty"), true, false,
 				T("latency.row", T("latency.ms", 9999.0)), T("latency.row", T("latency.noreply")))
@@ -290,7 +296,9 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				T("ping.summary", 99, 99, 999.0)+" · 00:00:00", T("ping.none", 99)+" · 00:00:00")
 			bindRow(mNotice, T("notice.idle"), false, false)
 			bindRow(mDetails, T("details.placeholder"), true, true,
-				T("details.up", "99d23h")+" · "+T("details.server", "255.255.255.255:65535"))
+				T("details.up", "99d23h")+" · "+T("details.server", "255.255.255.255:65535"),
+				T("details.handshake.ago", "99d23h")+" · "+T("details.server", "255.255.255.255:65535"),
+				T("details.handshake.never")+" · "+T("details.server", "255.255.255.255:65535"))
 
 			var (
 				refreshMu sync.Mutex
@@ -299,8 +307,10 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				// gwLatency is the last round trip to it.
 				gateway   string
 				gwLatency gatewayLatency
-				latency   map[string]agent.PingResult
-				address   string
+				// gwLatencyAt is when gwLatency was measured.
+				gwLatencyAt time.Time
+				latency     map[string]agent.PingResult
+				address     string
 				// toggling is the VPN row's title while a connect or
 				// disconnect runs ("Connecting…"), "" otherwise.
 				toggling atomic.Value
@@ -323,8 +333,15 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				} else {
 					gateway = ""
 				}
-				v := deriveTrayView(st, gwLatency)
-				if v.State != trayConnected && v.State != trayExitActive {
+				// Misses only count while probes keep coming (menu open, or a
+				// recent click); otherwise the daemon's handshake facts alone
+				// decide, so an old miss streak can't pin the icon.
+				lat := gwLatency
+				if now.Sub(gwLatencyAt) > gatewayMissTTL {
+					lat.Misses = 0
+				}
+				v := deriveTrayView(st, lat)
+				if !tunnelUp(v.State) {
 					gwLatency = gatewayLatency{} // a fresh tunnel starts unmeasured
 				}
 
@@ -365,10 +382,10 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				}
 				loginMu.Unlock()
 				setRowText(mToggle, firstNonEmpty(toggling.Load().(string), v.ToggleTitle))
-				setChecked(mToggle, v.State == trayConnected || v.State == trayExitActive)
+				setChecked(mToggle, tunnelUp(v.State))
 				setEnabled(mToggle, v.ToggleEnabled)
 				setTitle(mPeers, v.PeersTitle)
-				setEnabled(mPing, v.State == trayConnected || v.State == trayExitActive)
+				setEnabled(mPing, tunnelUp(v.State))
 
 				if st != nil {
 					syncPeerMenuGroup(peerMenu, buildPeerMenuEntries(st.Peers, latency, now))
@@ -431,12 +448,24 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 				if gw != "" {
 					var gr agent.PingResponse
 					l := gatewayLatency{Measured: true}
-					if err := fetchJSON(actionClient, "/api/ping?count=1&timeout=1000&target="+gw, &gr); err == nil && gr.Error == "" && len(gr.Results) > 0 && gr.Results[0].Received > 0 {
-						l.Replied, l.Ms = true, gr.Results[0].AvgMs
+					err := fetchJSON(actionClient, "/api/ping?count=1&timeout=1000&target="+gw, &gr)
+					// Only a probe the daemon actually sent counts: a busy ping
+					// slot (another ping running) or an IPC error says nothing
+					// about the network, so it leaves the last result alone.
+					if err == nil && gr.Error == "" {
+						if len(gr.Results) > 0 && gr.Results[0].Received > 0 {
+							l.Replied, l.Ms = true, gr.Results[0].AvgMs
+						} else {
+							l.Misses = 1
+						}
+						refreshMu.Lock()
+						// A miss extends a recent streak; a reply ends it at once.
+						if l.Misses > 0 && time.Since(gwLatencyAt) <= gatewayMissTTL {
+							l.Misses += gwLatency.Misses
+						}
+						gwLatency, gwLatencyAt = l, time.Now()
+						refreshMu.Unlock()
 					}
-					refreshMu.Lock()
-					gwLatency = l
-					refreshMu.Unlock()
 				}
 
 				var pr agent.PingResponse
@@ -460,7 +489,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			connected := func() bool {
 				refreshMu.Lock()
 				defer refreshMu.Unlock()
-				return lastState == trayConnected || lastState == trayExitActive
+				return tunnelUp(lastState)
 			}
 
 			// While the menu is open it pings on its own and refreshes at
@@ -498,7 +527,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 
 			toggle := func() {
 				refreshMu.Lock()
-				disconnect := lastState == trayConnected || lastState == trayExitActive
+				disconnect := tunnelUp(lastState)
 				refreshMu.Unlock()
 				if !toggling.CompareAndSwap("", "pending") {
 					return

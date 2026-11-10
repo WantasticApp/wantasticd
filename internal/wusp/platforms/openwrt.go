@@ -728,6 +728,10 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 	// Device.WiFi.Radio row; runtime VAP rows use it for LowerLayers.
 	telemetryRadioRow := make(map[string]int)
 	emittedIfNames := make(map[string]bool)
+	// unnamedSSIDs holds "<radio row>|<ssid>" of UCI rows whose netdev is
+	// unknown (qcawifi status often lists no ifnames), so the same network
+	// is not listed again as a runtime VAP.
+	unnamedSSIDs := make(map[string]bool)
 	var endpoints []wifiEndPointRow
 	wifiHosts := make(map[string]string)
 
@@ -839,6 +843,10 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				}
 			}
 
+			if ifName == "" && ssidValue != "" {
+				unnamedSSIDs[fmt.Sprintf("%d|%s", radioIndex, ssidValue)] = true
+			}
+
 			appendField(msg, ssidPath+"Enable", wusp.Bool(ssidEnabled))
 			appendField(msg, ssidPath+"Status", wusp.String(wifiStatusValue(ssidEnabled, iface.Up)))
 			appendField(msg, ssidPath+"Name", wusp.String(firstNonEmpty(ifName, iface.Section)))
@@ -948,6 +956,9 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 			continue
 		}
 		radioIndex, ok := telemetryRadioRow[vap.Radio]
+		if ok && unnamedSSIDs[fmt.Sprintf("%d|%s", radioIndex, ssidValue)] {
+			continue
+		}
 		if !ok {
 			radio := fill.radioByName[vap.Radio]
 			if radio == nil {

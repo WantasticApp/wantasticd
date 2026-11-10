@@ -332,6 +332,8 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 	if len(vaps) == 0 {
 		c.mu.Lock()
 		c.current = wifiTelemetrySnapshot{Supported: c.current.Supported, Sampled: true, LastSample: now, LatencyMethod: wifiprobe.MethodNone}
+		// A returning uplink must not average its throughput over the gap.
+		c.prevUplink = make(map[string]wifiCounterState)
 		c.mu.Unlock()
 		return
 	}

@@ -379,3 +379,26 @@ func TestTR181CurrentBandwidth(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenWrtRuntimeVAPNotDuplicatedForUnnamedUCIRow(t *testing.T) {
+	snap := wifiTelemetrySnapshot{
+		Supported: true, Sampled: true,
+		VAPs:   []wifiTelemetryVAP{{Name: "ath3", Radio: "wifi2", Mode: "ap", Vendor: true}},
+		Radios: []wifiTelemetryRadio{{Name: "wifi2", Frequency: 5745, Interfaces: []string{"ath3"}}},
+	}
+	backend := newQSDKBackend(t, snap)
+	// No "option ifname": the UCI row cannot name its netdev.
+	mustWriteFile(t, filepath.Join(backend.uciConfigDir, "wireless"), "config wifi-device 'wifi2'\n\toption hwmode '11axa'\n\toption channel 'auto'\nconfig wifi-iface 'wlan2'\n\toption device 'wifi2'\n\toption mode 'ap'\n\toption ssid 'T2-AP'\n")
+	backend.wifiInfo = func(ifName string) (*iwinfo.InterfaceInfo, error) {
+		if ifName == "ath3" {
+			return &iwinfo.InterfaceInfo{Name: ifName, SSID: "T2-AP"}, nil
+		}
+		return nil, errors.New("not readable")
+	}
+	msg := &wusp.Message{}
+	backend.appendWiFiFields(context.Background(), msg)
+	fields := messageFields(msg)
+	if fields["Device.WiFi.SSIDNumberOfEntries"] != "1" {
+		t.Fatalf("the UCI network was listed twice: %v", fields)
+	}
+}

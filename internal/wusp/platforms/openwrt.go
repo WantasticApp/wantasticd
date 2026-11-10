@@ -115,6 +115,10 @@ type OpenWrtBackend struct {
 	easyMeshOperationWG     sync.WaitGroup
 	easyMeshCloseOnce       sync.Once
 	routeNeighbors          func() ([]linuxNeighborObservation, error)
+	// wifiTelemetry returns the last WUSP WiFi telemetry sample; the
+	// Device.WiFi collector fills runtime-only VAPs, EndPoints and the
+	// operating channel from it instead of querying the drivers again.
+	wifiTelemetry func() wifiTelemetrySnapshot
 }
 
 func (b *OpenWrtBackend) Warmup(ctx context.Context) error {
@@ -367,6 +371,9 @@ func NewOpenWrtBackend(opts OpenWrtBackendOptions) *OpenWrtBackend {
 	}
 	if backend.routeNeighbors == nil {
 		backend.routeNeighbors = readRouteNeighbors
+	}
+	backend.wifiTelemetry = func() wifiTelemetrySnapshot {
+		return defaultWiFiTelemetry.snapshotFor(backend.netClassDir)
 	}
 	if backend.ubusClient == nil {
 		backend.ubusClient = ubus.NewClient(ubus.Options{
@@ -708,10 +715,20 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 	ubusStations, ubusStationsErr := b.readWiFiStations()
 	defer iwinfo.Close()
 
+	var snapshot wifiTelemetrySnapshot
+	if b.wifiTelemetry != nil {
+		snapshot = b.wifiTelemetry()
+	}
+	fill := newWiFiRuntimeFill(snapshot)
+
 	ssidCount := 0
 	apCount := 0
-	endPointCount := 0
 	radioIndexByName := make(map[string]int, len(radioKeys))
+	// telemetryRadioRow maps a telemetry radio (wifiN / phyN) to its
+	// Device.WiFi.Radio row; runtime VAP rows use it for LowerLayers.
+	telemetryRadioRow := make(map[string]int)
+	emittedIfNames := make(map[string]bool)
+	var endpoints []wifiEndPointRow
 	wifiHosts := make(map[string]string)
 
 	for i, key := range radioKeys {
@@ -730,10 +747,24 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 			}
 		}
 		radioIfName := b.radioNetdev(key, radio)
+		netdevs := []string{radioIfName}
+		for _, iface := range radio.Interfaces {
+			netdevs = append(netdevs, iface.IfName)
+		}
+		telRadio := fill.radioFor(key, netdevs)
+		if telRadio != nil {
+			if _, claimed := telemetryRadioRow[telRadio.Name]; !claimed {
+				telemetryRadioRow[telRadio.Name] = radioIndex
+			}
+		}
 		wiphy := b.wifiWiphy.get(radioIfName)
 		band := wifiBandFromWiphy(wifiBandFromConfig(radio.Config), wiphy)
 		if runtime != nil {
 			if observed := tr181BandFromFrequency(runtime.Frequency); observed != "" {
+				band = observed
+			}
+		} else if telRadio != nil {
+			if observed := tr181BandFromFrequency(telRadio.Frequency); observed != "" {
 				band = observed
 			}
 		}
@@ -745,9 +776,15 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 			// TR-181 Channel is the current channel; with channel=auto the
 			// driver's operating channel is the only truthful value.
 			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), wusp.Uint(uint64(runtime.Channel)))
+		} else if telRadio != nil {
+			if channel := wifiChannelFromFrequency(telRadio.Frequency); channel > 0 {
+				appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Channel", radioIndex), wusp.Uint(uint64(channel)))
+			}
 		}
 		if runtime != nil && runtime.Noise < 0 && runtime.Noise > -130 {
 			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Stats.Noise", radioIndex), wusp.Int(int64(runtime.Noise)))
+		} else if telRadio != nil && validNoiseDBM(telRadio.Noise) {
+			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.Stats.Noise", radioIndex), wusp.Int(int64(telRadio.Noise)))
 		}
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.AutoChannelSupported", radioIndex), wusp.Bool(true))
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.AutoChannelEnable", radioIndex), wusp.Bool(strings.EqualFold(channelValue, "auto")))
@@ -755,8 +792,19 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 		appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingChannelBandwidth", radioIndex), wusp.String(bandwidth))
 		if bandwidth != "Unknown" && bandwidth != "Auto" {
 			appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.CurrentOperatingChannelBandwidth", radioIndex), wusp.String(bandwidth))
+		} else if telRadio != nil {
+			// htmode auto/missing: the width the driver operates on now.
+			if current := tr181CurrentBandwidth(telRadio.ChannelWidth, telRadio.CenterFrequency); current != "" {
+				appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.CurrentOperatingChannelBandwidth", radioIndex), wusp.String(current))
+			}
 		}
 		b.appendWiFiRadioCapabilities(ctx, msg, key, radioIfName, radioIndex, band, radio.Config)
+		if htmode := strings.TrimSpace(configString(radio.Config, "htmode")); htmode == "" || strings.EqualFold(htmode, "auto") {
+			// No generation configured: report the one the radio runs.
+			if observed := fill.observedStandards(telRadio, band, snapshot.Stations); len(observed) > 0 {
+				appendField(msg, fmt.Sprintf("Device.WiFi.Radio.%d.OperatingStandards", radioIndex), wifiStringList(observed))
+			}
+		}
 
 		interfaces := b.reportableWiFiInterfaces(radio)
 
@@ -768,20 +816,27 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 			mode := strings.ToLower(firstNonEmpty(configString(iface.Config, "mode"), "ap"))
 			ssidEnabled := !parseOpenWrtBool(configString(iface.Config, "disabled"), false)
 			ssidValue := configExactString(iface.Config, "ssid")
-			bssidValue := ""
+			infoBSSID := ""
+			if ifName != "" {
+				emittedIfNames[ifName] = true
+			}
 
 			if ifName != "" && b.wifiInfo != nil {
 				if info, err := b.wifiInfo(ifName); err == nil {
 					if strings.TrimSpace(info.SSID) != "" {
 						ssidValue = info.SSID
 					}
-					if strings.TrimSpace(info.BSSID) != "" {
-						bssidValue = strings.TrimSpace(info.BSSID)
-					}
+					infoBSSID = strings.TrimSpace(info.BSSID)
 				}
 			}
-			if bssidValue == "" && ifName != "" {
-				bssidValue = strings.TrimSpace(b.readTextFile(filepath.Join(b.netClassDir, ifName, "address")))
+			ownMAC := b.runtimeHardwareAddrIfAny(ifName)
+			isEndpoint := wifiInterfaceModeIsEndpoint(mode)
+			var uplink *wifiTelemetryUplink
+			if found, ok := fill.uplinkByIf[ifName]; ok && ifName != "" {
+				uplink = &found
+				if ssidValue == "" {
+					ssidValue = found.SSID
+				}
 			}
 
 			appendField(msg, ssidPath+"Enable", wusp.Bool(ssidEnabled))
@@ -791,8 +846,11 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				appendField(msg, ssidPath+"SSID", wusp.String(ssidValue))
 			}
 			appendField(msg, ssidPath+"LowerLayers", wusp.List(wusp.String(fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex))))
-			if mac, err := net.ParseMAC(bssidValue); err == nil && len(mac) == 6 {
-				appendField(msg, ssidPath+"BSSID", wusp.MAC(mac))
+			if ownMAC != nil {
+				appendField(msg, ssidPath+"MACAddress", wusp.MAC(ownMAC))
+			}
+			if bssid := wifiSSIDRowBSSID(isEndpoint, infoBSSID, ownMAC, uplink); bssid != nil {
+				appendField(msg, ssidPath+"BSSID", wusp.MAC(bssid))
 			}
 
 			if wifiInterfaceModeIsAP(mode) {
@@ -843,21 +901,139 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 					for stationIndex, station := range stations {
 						stationPath := fmt.Sprintf("%sAssociatedDevice.%d.", apPath, stationIndex+1)
 						b.appendWiFiAssociatedDeviceFields(msg, stationPath, station)
+						if percent, ok := fill.stationRetransPercent(ifName, station.MAC); ok {
+							appendField(msg, stationPath+"Retransmissions", wusp.Uint(uint64(percent)))
+						}
 						wifiHosts[strings.ToLower(station.MAC.String())] = stationPath
 					}
 				}
 				logWiFiCollectionSummary(ifName, attempted, succeeded, len(stations), errorsBySource)
-			} else if wifiInterfaceModeIsEndpoint(mode) {
-				endPointCount++
+			} else if isEndpoint {
+				endpoints = append(endpoints, wifiEndPointRow{ssidPath: ssidPath, ifName: ifName, enabled: ssidEnabled})
 			}
 		}
 	}
 
-	appendField(msg, "Device.WiFi.RadioNumberOfEntries", wusp.Uint(uint64(len(radioKeys))))
+	// Runtime-only radios and VAPs (QSDK SON/mesh backhaul VAPs that UCI does
+	// not list) follow the UCI rows, so existing indices never move. These
+	// rows are read-only: Set resolves Radio/SSID indices against UCI only.
+	radioCount := len(radioKeys)
+	for _, vap := range fill.vaps {
+		if emittedIfNames[vap.Name] || strings.Contains(vap.Name, ".") {
+			// "athN.staM" style WDS/AP-VLAN children are per-peer helpers.
+			continue
+		}
+		isEndpoint := wifiInterfaceModeIsEndpoint(vap.Mode)
+		if !isEndpoint && (!wifiInterfaceModeIsAP(vap.Mode) || strings.EqualFold(vap.Mode, "mesh")) {
+			continue
+		}
+		var uplink *wifiTelemetryUplink
+		if found, ok := fill.uplinkByIf[vap.Name]; ok {
+			uplink = &found
+		}
+		ssidValue, infoBSSID := "", ""
+		if b.wifiInfo != nil {
+			if info, err := b.wifiInfo(vap.Name); err == nil && info != nil {
+				ssidValue, infoBSSID = info.SSID, strings.TrimSpace(info.BSSID)
+			}
+		}
+		if strings.TrimSpace(ssidValue) == "" && uplink != nil {
+			ssidValue = uplink.SSID
+		}
+		ownMAC := b.runtimeHardwareAddrIfAny(vap.Name)
+		bssid := wifiSSIDRowBSSID(isEndpoint, infoBSSID, ownMAC, uplink)
+		// Like reportableWiFiInterfaces: only links that carry a network
+		// (a served SSID, or an AP the station is associated with).
+		if strings.TrimSpace(ssidValue) == "" && (!isEndpoint || bssid == nil) {
+			continue
+		}
+		radioIndex, ok := telemetryRadioRow[vap.Radio]
+		if !ok {
+			radio := fill.radioByName[vap.Radio]
+			if radio == nil {
+				continue
+			}
+			radioCount++
+			radioIndex = radioCount
+			telemetryRadioRow[vap.Radio] = radioIndex
+			radioPath := fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex)
+			appendRuntimeWiFiRadioFields(msg, radioPath, radio, fill.observedStandards(radio, tr181BandFromFrequency(radio.Frequency), snapshot.Stations))
+		}
+		ssidCount++
+		ssidPath := fmt.Sprintf("Device.WiFi.SSID.%d.", ssidCount)
+		up := b.runtimeInterfaceUp(vap.Name)
+		appendField(msg, ssidPath+"Enable", wusp.Bool(true))
+		appendField(msg, ssidPath+"Status", wusp.String(wifiStatusValue(true, up)))
+		appendField(msg, ssidPath+"Name", wusp.String(vap.Name))
+		if strings.TrimSpace(ssidValue) != "" {
+			appendField(msg, ssidPath+"SSID", wusp.String(ssidValue))
+		}
+		appendField(msg, ssidPath+"LowerLayers", wusp.List(wusp.String(fmt.Sprintf("Device.WiFi.Radio.%d.", radioIndex))))
+		if ownMAC != nil {
+			appendField(msg, ssidPath+"MACAddress", wusp.MAC(ownMAC))
+		}
+		if bssid != nil {
+			appendField(msg, ssidPath+"BSSID", wusp.MAC(bssid))
+		}
+		emittedIfNames[vap.Name] = true
+		if isEndpoint {
+			endpoints = append(endpoints, wifiEndPointRow{ssidPath: ssidPath, ifName: vap.Name, enabled: true})
+		}
+	}
+
+	for i, row := range endpoints {
+		var uplink *wifiTelemetryUplink
+		if found, ok := fill.uplinkByIf[row.ifName]; ok && row.ifName != "" {
+			uplink = &found
+		}
+		appendWiFiEndPointFields(msg, fmt.Sprintf("Device.WiFi.EndPoint.%d.", i+1), row, uplink)
+	}
+
+	appendField(msg, "Device.WiFi.RadioNumberOfEntries", wusp.Uint(uint64(radioCount)))
 	appendField(msg, "Device.WiFi.SSIDNumberOfEntries", wusp.Uint(uint64(ssidCount)))
 	appendField(msg, "Device.WiFi.AccessPointNumberOfEntries", wusp.Uint(uint64(apCount)))
-	appendField(msg, "Device.WiFi.EndPointNumberOfEntries", wusp.Uint(uint64(endPointCount)))
+	appendField(msg, "Device.WiFi.EndPointNumberOfEntries", wusp.Uint(uint64(len(endpoints))))
 	b.appendHostFields(msg, wifiHosts)
+}
+
+// wifiSSIDRowBSSID picks Device.WiFi.SSID.{i}.BSSID. For an access point
+// it is the VAP's own BSSID. For a station-mode (EndPoint) interface it is
+// the BSSID of the access point it is associated with — the convention the
+// controller's link engine relies on to pair the EndPoint with its AP —
+// so the interface's own address (SSID.MACAddress) is never used there.
+func wifiSSIDRowBSSID(isEndpoint bool, infoBSSID string, ownMAC net.HardwareAddr, uplink *wifiTelemetryUplink) net.HardwareAddr {
+	parse := func(value string) net.HardwareAddr {
+		if mac, err := net.ParseMAC(strings.TrimSpace(value)); err == nil && len(mac) == 6 && validClientMAC(mac.String()) != nil {
+			return mac
+		}
+		return nil
+	}
+	if !isEndpoint {
+		if mac := parse(infoBSSID); mac != nil {
+			return mac
+		}
+		return ownMAC
+	}
+	if uplink != nil && len(uplink.Entry.MAC) == 6 {
+		return uplink.Entry.MAC
+	}
+	if mac := parse(infoBSSID); mac != nil && (ownMAC == nil || !strings.EqualFold(mac.String(), ownMAC.String())) {
+		return mac
+	}
+	return nil
+}
+
+// runtimeHardwareAddrIfAny is the interface's sysfs MAC address, nil when
+// unknown or not a unicast address.
+func (b *OpenWrtBackend) runtimeHardwareAddrIfAny(ifName string) net.HardwareAddr {
+	if strings.TrimSpace(ifName) == "" {
+		return nil
+	}
+	mac := b.runtimeHardwareAddr(ifName)
+	if !validRuntimeMAC(mac) {
+		return nil
+	}
+	return mac
 }
 
 func logWiFiCollectionSummary(ifName, attempted string, succeeded bool, stationCount int, errorsBySource []string) {

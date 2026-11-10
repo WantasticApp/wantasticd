@@ -24,12 +24,39 @@ type fakeSMSModem struct {
 	textMode  bool
 }
 
-func (m *fakeSMSModem) serve(master int) {
+// start serves the modem until the test ends. The goroutine must be gone
+// before the pty is closed: the next test's pty can reuse the same fd number,
+// and a leftover goroutine would answer it with this test's inbox. Cleanups
+// run in reverse, so this one (registered after openPTY) runs first.
+func (m *fakeSMSModem) start(t *testing.T, master int) {
+	t.Helper()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.serve(master, stop)
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("fake modem still reading its pty after the test")
+		}
+	})
+}
+
+func (m *fakeSMSModem) serve(master int, stop <-chan struct{}) {
 	buf := make([]byte, 4096)
 	var pending strings.Builder
 	awaitingPDU := false
 	reply := func(text string) { _, _ = unix.Write(master, []byte(text)) }
 	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
 		n, err := unix.Read(master, buf)
 		if err == unix.EIO {
 			// No slave open between two sessions; wait for the next one.
@@ -99,7 +126,7 @@ func TestNativePDUSendAndList(t *testing.T) {
 	modem := &fakeSMSModem{inbox: map[string][]string{
 		"SM": append([]string{"+CMGL: 2,1,,40"}, deliverPDUs(t, "+212622222222", "Bonjour, coupure prévue ce soir")[0]),
 	}}
-	go modem.serve(master)
+	modem.start(t, master)
 
 	c := &atController{}
 	long := strings.Repeat("Router back online. ", 10) // 200 chars → 2 parts
@@ -144,7 +171,7 @@ func TestNativePDUListRestoresTextModeAndToleratesStorageErrors(t *testing.T) {
 		inbox:    map[string][]string{"SM": lines},
 		failing:  map[string]string{"ME": "+CMS ERROR: 302"},
 	}
-	go modem.serve(master)
+	modem.start(t, master)
 
 	payload, err := (&atController{}).listSMSPDU(slave)
 	if err != nil {

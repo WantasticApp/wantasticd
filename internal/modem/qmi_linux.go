@@ -218,7 +218,7 @@ func (c *qmiController) GetInfo(devicePath string) (*Info, error) {
 				IMSI:         C.GoString(&cInfo.imsi[0]),
 				ICCID:        C.GoString(&cInfo.iccid[0]),
 				Operator:     C.GoString(&cInfo.operator[0]),
-				CellID:       uint32(cInfo.cell_id),
+				CellID:       uint64(cInfo.cell_id),
 				LAC:          uint16(cInfo.lac),
 				TAC:          uint32(cInfo.tac),
 				Connected:    cInfo.connected != 0,

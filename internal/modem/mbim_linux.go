@@ -189,7 +189,7 @@ func (c *mbimController) GetInfo(devicePath string) (*Info, error) {
 				IMSI:         C.GoString(&cInfo.imsi[0]),
 				ICCID:        C.GoString(&cInfo.iccid[0]),
 				Operator:     C.GoString(&cInfo.provider[0]),
-				CellID:       uint32(cInfo.cell_id),
+				CellID:       uint64(cInfo.cell_id),
 				TAC:          uint32(cInfo.tac),
 				Connected:    cInfo.connected != 0,
 				IPAddress:    C.GoString(&cInfo.ip[0]),

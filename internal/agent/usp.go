@@ -282,7 +282,7 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 	// v2: written with string paths. The v1 file used registry field IDs,
 	// which shift whenever the model grows, so it is never read again.
 	_ = os.Remove(auth.PersistentFilePath("wusp-datamodel.cache"))
-	cachedBackend := newPersistentDataModelCache(telemetryBackend, auth.PersistentFilePath("wusp-datamodel.v2.cache"), uspDataModelCacheRefresh)
+	cachedBackend := newPersistentDataModelCache(telemetryBackend, dataModelCachePath(auth.PersistentFilePath("wusp-datamodel.v2.cache"), ramCacheDir), uspDataModelCacheRefresh)
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	runtime := &uspRuntime{
 		ctx:                    runtimeCtx,

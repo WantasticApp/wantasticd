@@ -321,6 +321,13 @@ main() {
   # Kept next to the binary after a successful update for manual rollback;
   # each update replaces it, so backups never accumulate.
   BACKUP="${TARGET_BIN}.previous"
+  # OpenWrt/QSDK routers keep the binary on a ~60 MB flash overlay. There the
+  # rollback copy lives in RAM: it is only needed until the new service is
+  # verified, and on flash it cost a full binary of the space settings need.
+  if [ -d /overlay ] && [ -d /tmp ] && [ "$(uname -s)" = "Linux" ] && [ -z "${WANTASTIC_UPDATE_BACKUP_ON_FLASH:-}" ]; then
+    rm -f "${TARGET_BIN}.previous" "${TARGET_BIN}.previous.tmp" 2>/dev/null || true
+    BACKUP="/tmp/wantasticd.previous"
+  fi
 
   # Leftovers from an update that was killed half-way or ran out of space.
   rm -f "${DEST_DIR}"/.wantasticd.update.* "${DEST_DIR}"/.wantasticd.rollback.* "${BACKUP}.tmp" 2>/dev/null || true
@@ -332,7 +339,9 @@ main() {
   rm -f "$BACKUP" 2>/dev/null || true
   _avail_kb=$(df -Pk "$DEST_DIR" 2>/dev/null | awk 'NR>1 && $(NF-2) ~ /^[0-9]+$/ {v=$(NF-2)} END {if (v != "") print v}')
   _need_kb=$(( $(wc -c < "$NEW_BIN") / 1024 + 512 ))
-  [ -f "$TARGET_BIN" ] && _need_kb=$(( _need_kb + $(wc -c < "$TARGET_BIN") / 1024 ))
+  case "$BACKUP" in
+    "$DEST_DIR"/*) [ -f "$TARGET_BIN" ] && _need_kb=$(( _need_kb + $(wc -c < "$TARGET_BIN") / 1024 )) ;;
+  esac
   if [ -n "$_avail_kb" ] && [ "$_avail_kb" -lt "$_need_kb" ]; then
     echo "Error: not enough space in $DEST_DIR: ${_avail_kb} KB free, ${_need_kb} KB needed"
     exit 1

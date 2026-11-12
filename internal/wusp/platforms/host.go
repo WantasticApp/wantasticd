@@ -344,6 +344,7 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 	if memFree > 0 {
 		msg.Set("Device.DeviceInfo.MemoryStatus.Free", wusp.Uint(memFree))
 	}
+	appendSystemResources(msg)
 	if tcpImplementation := b.readTCPImplementation(ctx); tcpImplementation != "" {
 		msg.Set("Device.DeviceInfo.NetworkProperties.TCPImplementation", wusp.List(wusp.String(tcpImplementation)))
 	}

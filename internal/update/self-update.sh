@@ -322,13 +322,27 @@ main() {
   # each update replaces it, so backups never accumulate.
   BACKUP="${TARGET_BIN}.previous"
 
-  # Leftovers from an update that was killed half-way.
-  rm -f "${DEST_DIR}"/.wantasticd.update.* "${DEST_DIR}"/.wantasticd.rollback.* 2>/dev/null || true
+  # Leftovers from an update that was killed half-way or ran out of space.
+  rm -f "${DEST_DIR}"/.wantasticd.update.* "${DEST_DIR}"/.wantasticd.rollback.* "${BACKUP}.tmp" 2>/dev/null || true
+
+  # Routers keep the binary on a small flash overlay: an update needs room
+  # for the backup and the staged binary at once. The old backup is replaced
+  # anyway, so it is dropped first; without room, stop before writing
+  # anything (a half-written copy filled a T2's overlay and broke uci).
+  rm -f "$BACKUP" 2>/dev/null || true
+  _avail_kb=$(df -Pk "$DEST_DIR" 2>/dev/null | awk 'NR>1 && $(NF-2) ~ /^[0-9]+$/ {v=$(NF-2)} END {if (v != "") print v}')
+  _need_kb=$(( $(wc -c < "$NEW_BIN") / 1024 + 512 ))
+  [ -f "$TARGET_BIN" ] && _need_kb=$(( _need_kb + $(wc -c < "$TARGET_BIN") / 1024 ))
+  if [ -n "$_avail_kb" ] && [ "$_avail_kb" -lt "$_need_kb" ]; then
+    echo "Error: not enough space in $DEST_DIR: ${_avail_kb} KB free, ${_need_kb} KB needed"
+    exit 1
+  fi
+
   if [ -f "$TARGET_BIN" ]; then
     { cp -p "$TARGET_BIN" "${BACKUP}.tmp" && mv -f "${BACKUP}.tmp" "$BACKUP"; } ||
-      { echo "Error: cannot back up $TARGET_BIN"; exit 1; }
+      { rm -f "${BACKUP}.tmp"; echo "Error: cannot back up $TARGET_BIN"; exit 1; }
   fi
-  cp "$NEW_BIN" "$STAGING" || { echo "Error: cannot write to $DEST_DIR (check permissions)"; exit 1; }
+  cp "$NEW_BIN" "$STAGING" || { rm -f "$STAGING"; echo "Error: cannot write to $DEST_DIR (check permissions and free space)"; exit 1; }
   chmod +x "$STAGING"
   # Always a new inode, never an in-place overwrite: macOS caches code
   # signatures per vnode and kills a binary whose pages change underneath.

@@ -988,8 +988,11 @@ indicative only.
 Station and Uplink rows also carry the last-frame modulation per direction
 (`TxPHY`/`RxPHY` legacy|ht|vht|he|eht, `*MCS`, `*NSS`, `*BandwidthMHz`,
 `*GuardIntervalNs`, `*DCM`), `SignalChains`/`SignalChainAvg` (per-chain
-dBm, comma separated) and `TxAirtimeUs`/`RxAirtimeUs` (cumulative µs
-counters). They are decoded from the nl80211 `TX/RX_BITRATE` rate_info
+dBm, comma separated), `TxAirtimeUs`/`RxAirtimeUs` (cumulative µs
+counters) and `TxAirtimePermille`/`RxAirtimePermille` (the counters' delta
+over the wall-clock delta between two samples: the share of time the radio
+spent sending to / receiving from that peer, retries and PHY overhead
+included). They are decoded from the nl80211 `TX/RX_BITRATE` rate_info
 (`*_MCS`, `*_NSS`, width flags, `SHORT_GI`, `HE/EHT_GI`, `HE_DCM`),
 `CHAIN_SIGNAL(_AVG)` and `TX/RX_DURATION`; hostapd `rx/tx_rate_info` and
 rpcd iwinfo `assoclist` rate objects fill the same fields, and the QSDK

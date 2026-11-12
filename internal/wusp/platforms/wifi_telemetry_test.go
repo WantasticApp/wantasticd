@@ -28,6 +28,7 @@ func fakeWiFiTelemetry(t *testing.T) (*wifiTelemetryCoordinator, *time.Time, *ui
 			return []iwinfo.AssocEntry{{
 				MAC: mac, Signal: -61, SignalKnown: true, TxRate: 866000, TxRateKnown: true,
 				RxBytes: staBytes / 4, RxBytesKnown: true, TxBytes: staBytes, TxBytesKnown: true,
+				TxDuration: staBytes / 5, TxDurationKnown: true, RxDuration: staBytes / 50, RxDurationKnown: true,
 				Source: "wlanconfig",
 			}}
 		},
@@ -107,6 +108,9 @@ func TestWiFiTelemetrySamplesThroughputLatencyAndHistory(t *testing.T) {
 		p + "Station.1.LatencyLostCount":   "1",
 		p + "Station.1.DistanceMethod":     "fspl",
 		p + "Station.1.DownlinkThroughput": "10000",
+		// 15 s sending and 1.5 s receiving during the 60 s interval.
+		p + "Station.1.TxAirtimePermille": "250",
+		p + "Station.1.RxAirtimePermille": "25",
 	} {
 		if fields[path] != want {
 			t.Errorf("%s = %q, want %q", path, fields[path], want)
@@ -182,5 +186,25 @@ func TestWiFiTelemetryUsesStationsObservedByCollector(t *testing.T) {
 	}
 	if seen, ok := observedRadio("zz-test0"); !ok || seen.Noise != -91 || seen.TxPower != 28 {
 		t.Fatalf("radio facts not cached: %+v", seen)
+	}
+}
+
+func TestAirtimePermilleSkipsResetCounters(t *testing.T) {
+	at := time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
+	prev := wifiCounterState{TxAir: 5_000_000, TxAirKnown: true, RxAir: 9_000_000, RxAirKnown: true, At: at}
+	cur := wifiCounterState{TxAir: 5_000_000 + 7_500_000, TxAirKnown: true, RxAir: 100, RxAirKnown: true, At: at.Add(30 * time.Second)}
+	got := airtimePermille(prev, cur)
+	if !got.TxKnown || got.Tx != 250 {
+		t.Fatalf("tx airtime %+v, want 250 per mille", got)
+	}
+	if got.RxKnown {
+		t.Fatalf("rx counter went backwards but was reported: %+v", got)
+	}
+	cur.TxAir = prev.TxAir + 90_000_000 // more than the interval: capped
+	if got := airtimePermille(prev, cur); got.Tx != 1000 {
+		t.Fatalf("capped airtime %d", got.Tx)
+	}
+	if got := airtimePermille(prev, wifiCounterState{TxAir: 1, TxAirKnown: true, At: at.Add(time.Millisecond)}); got.TxKnown {
+		t.Fatal("sub-second interval reported airtime")
 	}
 }

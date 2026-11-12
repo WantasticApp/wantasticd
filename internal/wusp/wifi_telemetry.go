@@ -87,6 +87,7 @@ var wifiTelemetryModulationParams = func(object string) []Param {
 			wifiTelemetryParam(object+dir.prefix+"GuardIntervalNs", TypeUnsignedInt, "Guard interval of the last frame "+dir.what+" in ns: 400 (HT/VHT short GI), 800, 1600 or 3200 (HE/EHT). Absent for legacy rates and when unknown.", Limits{Min: iptr(400), Max: iptr(3200)}),
 			wifiTelemetryParam(object+dir.prefix+"DCM", TypeBoolean, "HE dual carrier modulation of the last frame "+dir.what+". Absent when not reported.", Limits{}),
 			wifiTelemetryParam(object+dir.prefix+"AirtimeUs", TypeUnsignedLong, "Cumulative airtime "+dir.what+" in microseconds (nl80211 "+strings.ToUpper(dir.prefix)+"_DURATION); a counter, rates come from deltas. Absent when not reported.", Limits{}),
+			wifiTelemetryParam(object+dir.prefix+"AirtimePermille", TypeUnsignedInt, "Share of the last sample interval the radio spent "+map[string]string{"Tx": "transmitting to", "Rx": "receiving from"}[dir.prefix]+" the peer, per mille: the "+dir.prefix+"AirtimeUs delta over the wall-clock delta. Measured by the driver, so it includes retries and PHY overhead. Absent when the driver has no airtime counter or before the second sample.", Limits{Min: iptr(0), Max: iptr(1000)}),
 		)
 	}
 	return append(out,

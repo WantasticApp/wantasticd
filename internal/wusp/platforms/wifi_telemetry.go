@@ -77,6 +77,7 @@ type wifiTelemetryStation struct {
 	// interval, capped at 100 (the TR-181 Retransmissions semantics).
 	RetransPercent      uint32
 	RetransPercentKnown bool
+	Airtime             wifiAirtime
 	Distance            int
 	Latency             wifiLatency
 	CollectedAt         time.Time
@@ -121,6 +122,7 @@ type wifiTelemetryUplink struct {
 	ThroughputKnown     bool
 	RetransPercent      uint32
 	RetransPercentKnown bool
+	Airtime             wifiAirtime
 	CollectedAt         time.Time
 }
 
@@ -147,7 +149,20 @@ type wifiCounterState struct {
 	TxPackets       uint64
 	TxPacketsKnown  bool
 	BytesKnown      bool
-	At              time.Time
+	// TxAir / RxAir are the driver's cumulative airtime counters in µs
+	// (nl80211 TX_DURATION / RX_DURATION).
+	TxAir, RxAir           uint64
+	TxAirKnown, RxAirKnown bool
+	At                     time.Time
+}
+
+// wifiAirtime is the share of the last interval the radio spent sending to
+// (Tx) and receiving from (Rx) one peer, in per mille: Δairtime / Δwall
+// clock. It is measured by the driver, so it includes every retry, the PHY
+// preamble and the frame at its actual rate, unlike goodput over capacity.
+type wifiAirtime struct {
+	Tx, Rx           uint32
+	TxKnown, RxKnown bool
 }
 
 // entryCounterState is the delta state of one association: byte, retry
@@ -157,6 +172,8 @@ func entryCounterState(e iwinfo.AssocEntry, now time.Time) wifiCounterState {
 		Rx: e.RxBytes, Tx: e.TxBytes, BytesKnown: e.RxBytesKnown && e.TxBytesKnown,
 		Retries: uint64(e.TxRetries), RetriesKnown: e.TxRetriesKnown,
 		TxPackets: uint64(e.TxPackets), TxPacketsKnown: e.TxPacketsKnown,
+		TxAir: e.TxDuration, TxAirKnown: e.TxDurationKnown,
+		RxAir: e.RxDuration, RxAirKnown: e.RxDurationKnown,
 		At: now,
 	}
 }
@@ -484,6 +501,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 					station.RetriesDelta, station.RetriesKnown = uint32(min(cur.Retries-prev.Retries, math.MaxUint32)), true
 				}
 				station.RetransPercent, station.RetransPercentKnown = retransPercent(prev, cur)
+				station.Airtime = airtimePermille(prev, cur)
 			}
 			c.prevSta[key] = cur
 		}
@@ -518,6 +536,7 @@ func (c *wifiTelemetryCoordinator) sample(ctx context.Context) {
 		}
 		if seen {
 			uplink.RetransPercent, uplink.RetransPercentKnown = retransPercent(prev, cur)
+			uplink.Airtime = airtimePermille(prev, cur)
 		}
 		prevUplink[uplink.Interface] = cur
 	}
@@ -713,6 +732,7 @@ func appendWiFiUplinkFields(msg *wusp.Message, path string, uplink wifiTelemetry
 		appendField(msg, path+"DownlinkThroughput", wusp.Uint(uint64(uplink.Downlink)))
 		appendField(msg, path+"UplinkThroughput", wusp.Uint(uint64(uplink.Uplink)))
 	}
+	appendAirtimeFields(msg, path, uplink.Airtime)
 	if uplink.Counters.OK {
 		appendField(msg, path+"BytesSent", wusp.Uint(uplink.Counters.TxBytes))
 		appendField(msg, path+"BytesReceived", wusp.Uint(uplink.Counters.RxBytes))
@@ -832,6 +852,27 @@ func appendHistory(history []wusp.WiFiHistorySample, sample wusp.WiFiHistorySamp
 		history = append([]wusp.WiFiHistorySample(nil), history[len(history)-wusp.WiFiHistoryDepth:]...)
 	}
 	return history
+}
+
+// airtimePermille converts the airtime counters' deltas into per mille of
+// the wall-clock interval, capped at 1000. A counter that went backwards
+// (driver reset, reassociation) yields nothing for that direction.
+func airtimePermille(prev, cur wifiCounterState) wifiAirtime {
+	var out wifiAirtime
+	wallUs := cur.At.Sub(prev.At).Microseconds()
+	if wallUs < int64(time.Second/time.Microsecond) {
+		return out
+	}
+	share := func(before, after uint64) uint32 {
+		return uint32(min((after-before)*1000/uint64(wallUs), 1000))
+	}
+	if prev.TxAirKnown && cur.TxAirKnown && cur.TxAir >= prev.TxAir {
+		out.Tx, out.TxKnown = share(prev.TxAir, cur.TxAir), true
+	}
+	if prev.RxAirKnown && cur.RxAirKnown && cur.RxAir >= prev.RxAir {
+		out.Rx, out.RxKnown = share(prev.RxAir, cur.RxAir), true
+	}
+	return out
 }
 
 func throughputKbps(prev, cur wifiCounterState) (down, up uint32, ok bool) {
@@ -1137,6 +1178,7 @@ func appendWiFiTelemetrySnapshotFields(msg *wusp.Message, snap wifiTelemetrySnap
 			appendField(msg, path+"DownlinkThroughput", wusp.Uint(uint64(station.Downlink)))
 			appendField(msg, path+"UplinkThroughput", wusp.Uint(uint64(station.Uplink)))
 		}
+		appendAirtimeFields(msg, path, station.Airtime)
 		if e.TxBytesKnown {
 			appendField(msg, path+"BytesSent", wusp.Uint(e.TxBytes))
 		}
@@ -1423,4 +1465,15 @@ func parseProcNetARP(scanner *bufio.Scanner) map[string]netip.Addr {
 func hasQCARadioNetdevs(netClassDir string) bool {
 	radios, _ := filepath.Glob(filepath.Join(netClassDir, "wifi[0-9]*"))
 	return len(radios) > 0
+}
+
+// appendAirtimeFields emits the measured airtime shares; an unknown
+// direction is omitted.
+func appendAirtimeFields(msg *wusp.Message, path string, a wifiAirtime) {
+	if a.TxKnown {
+		appendField(msg, path+"TxAirtimePermille", wusp.Uint(uint64(a.Tx)))
+	}
+	if a.RxKnown {
+		appendField(msg, path+"RxAirtimePermille", wusp.Uint(uint64(a.Rx)))
+	}
 }

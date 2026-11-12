@@ -47,9 +47,9 @@ type Info struct {
 	PreferredTechnology   Technology         `json:"preferred_technology"`
 	NRMode                string             `json:"nr_mode"` // "Standalone", "NonStandalone", "Unknown"
 	Band                  string             `json:"band"`
-	CellID                uint32             `json:"cell_id"`
-	LAC                   uint16             `json:"lac"` // Location Area Code
-	TAC                   uint32             `json:"tac"` // Tracking Area Code (LTE/5G)
+	CellID                uint64             `json:"cell_id"` // NR cell identities are 36 bits
+	LAC                   uint16             `json:"lac"`     // Location Area Code
+	TAC                   uint32             `json:"tac"`     // Tracking Area Code (LTE/5G)
 
 	// Signal quality
 	Signal SignalQuality `json:"signal"`

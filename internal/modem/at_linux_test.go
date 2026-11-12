@@ -502,3 +502,48 @@ func TestRM520NeighborFiltering(t *testing.T) {
 		t.Fatalf("rows=%+v", rows)
 	}
 }
+
+func TestParseQuectelServingCellHexWithoutLetters(t *testing.T) {
+	info := &Info{}
+	c := &atController{}
+	c.parseQuectelServingCellInfo([]string{
+		`+QENG: "servingcell","NOCONN","LTE","FDD",310,260,4012345,123,66986,66,5,5,2005,-97,-8,-68,15,42`,
+	}, info)
+	if info.CellID != 0x4012345 || info.TAC != 0x2005 {
+		t.Fatalf("CellID=%x TAC=%x want 4012345/2005 (QENG is hexadecimal)", info.CellID, info.TAC)
+	}
+}
+
+func TestParseQuectelServingCellNR5GSA(t *testing.T) {
+	info := &Info{CellID: 0x1A2B3C4, TAC: 0x1E7F} // stale LTE anchor from +CEREG
+	c := &atController{}
+	c.parseQuectelServingCellInfo([]string{
+		`+QENG: "servingcell","NOCONN","NR5G-SA","TDD",310,260,C83A4F01D,415,6E0D2B,521310,41,12,-91,-11,18,1,-`,
+	}, info)
+	if info.Technology != TechNR5G || info.NRMode != "Standalone" {
+		t.Fatalf("Technology=%v NRMode=%s", info.Technology, info.NRMode)
+	}
+	if info.OperatorMCC != "310" || info.OperatorMNC != "260" {
+		t.Fatalf("operator=%s/%s", info.OperatorMCC, info.OperatorMNC)
+	}
+	if info.CellID != 0xC83A4F01D {
+		t.Fatalf("CellID=%x want 36-bit NCI C83A4F01D", info.CellID)
+	}
+	if info.TAC != 0x6E0D2B {
+		t.Fatalf("TAC=%x want 6E0D2B", info.TAC)
+	}
+	if info.Band != "N41" {
+		t.Fatalf("Band=%q want N41", info.Band)
+	}
+	if info.Signal.RSRP != -91 || info.Signal.RSRQ != -11 || info.Signal.SINR != 18 {
+		t.Fatalf("signal=%+v", info.Signal)
+	}
+}
+
+func TestParseRegistrationKeeps36BitNRCell(t *testing.T) {
+	info := &Info{}
+	parseRegistrationLine(`+C5GREG: 2,1,"6E0D2B","C83A4F01D",11`, info)
+	if info.CellID != 0xC83A4F01D || info.TAC != 0x6E0D2B {
+		t.Fatalf("CellID=%x TAC=%x", info.CellID, info.TAC)
+	}
+}

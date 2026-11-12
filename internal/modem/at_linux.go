@@ -1861,8 +1861,8 @@ func (c *atController) parseQuectelServingCellInfo(lines []string, info *Info) {
 			if len(values) > offset+13 {
 				info.OperatorMCC = values[offset+2]
 				info.OperatorMNC = values[offset+3]
-				info.CellID = parseHexOrDecimal32(values[offset+4])
-				info.TAC = parseHexOrDecimal32(values[offset+10])
+				info.CellID = parseQENGHex(values[offset+4])
+				info.TAC = uint32(parseQENGHex(values[offset+10]))
 				info.Band = "B" + strings.TrimSpace(values[offset+7])
 				setIntIfParsed(&info.Signal.RSRP, values[offset+11])
 				setIntIfParsed(&info.Signal.RSRQ, values[offset+12])
@@ -1874,6 +1874,26 @@ func (c *atController) parseQuectelServingCellInfo(lines []string, info *Info) {
 		case "NR5G-SA", "NR5G":
 			info.Technology = TechNR5G
 			info.NRMode = "Standalone"
+			// "servingcell",<state>,"NR5G-SA",<duplex>,<MCC>,<MNC>,<cellID>,
+			// <PCID>,<TAC>,<ARFCN>,<band>,<NR_DL_bandwidth>,<RSRP>,<RSRQ>,<SINR>,...
+			// The registration commands report the LTE anchor's cell on some
+			// firmware, so the NR cell here wins.
+			if len(values) > offset+12 {
+				info.OperatorMCC = values[offset+2]
+				info.OperatorMNC = values[offset+3]
+				if ci := parseQENGHex(values[offset+4]); ci != 0 {
+					info.CellID = ci
+				}
+				if tac := parseQENGHex(values[offset+6]); tac != 0 && tac <= 0xFFFFFF {
+					info.TAC = uint32(tac)
+				}
+				if band := strings.TrimSpace(values[offset+8]); band != "" && band != "-" {
+					info.Band = "N" + band
+				}
+				setIntIfParsed(&info.Signal.RSRP, values[offset+10])
+				setIntIfParsed(&info.Signal.RSRQ, values[offset+11])
+				setIntIfParsed(&info.Signal.SINR, values[offset+12])
+			}
 		case "NR5G-NSA":
 			info.Technology = TechNR5GNSA
 			info.NRMode = "NonStandalone"
@@ -2099,8 +2119,8 @@ func parseRegistrationLine(line string, info *Info) bool {
 				info.TAC = uint32(area)
 			}
 		}
-		if ci, err := strconv.ParseUint(strings.TrimSpace(parts[statIdx+2]), 16, 32); err == nil {
-			info.CellID = uint32(ci)
+		if ci, err := strconv.ParseUint(strings.TrimSpace(parts[statIdx+2]), 16, 64); err == nil {
+			info.CellID = ci
 		}
 	}
 	if len(parts) > statIdx+3 && info.Technology == TechUnknown {
@@ -2916,8 +2936,8 @@ func (c *atController) parseRegistration(at *atSession, info *Info) {
 							info.TAC = uint32(area)
 						}
 					}
-					if ci, err := strconv.ParseUint(strings.TrimSpace(parts[statIdx+2]), 16, 32); err == nil {
-						info.CellID = uint32(ci)
+					if ci, err := strconv.ParseUint(strings.TrimSpace(parts[statIdx+2]), 16, 64); err == nil {
+						info.CellID = ci
 					}
 				}
 				if len(parts) > statIdx+3 && info.Technology == TechUnknown {
@@ -3176,19 +3196,18 @@ func setIntIfParsed(dst *int, value string) {
 	}
 }
 
-func parseHexOrDecimal32(value string) uint32 {
+// parseQENGHex reads a Quectel QENG cell ID or TAC, which are always
+// hexadecimal: "4012345" is 0x4012345, not decimal. NR cell IDs reach 36 bits.
+func parseQENGHex(value string) uint64 {
 	value = strings.TrimSpace(strings.Trim(value, "\""))
 	if value == "" || value == "-" {
 		return 0
 	}
-	base := 10
-	if strings.IndexFunc(value, func(r rune) bool { return (r >= 'A' && r <= 'F') || (r >= 'a' && r <= 'f') }) >= 0 {
-		base = 16
+	v, err := strconv.ParseUint(value, 16, 64)
+	if err != nil || v >= 1<<36 {
+		return 0
 	}
-	if v, err := strconv.ParseUint(value, base, 32); err == nil {
-		return uint32(v)
-	}
-	return 0
+	return v
 }
 
 func parseUint(value string) uint64 {

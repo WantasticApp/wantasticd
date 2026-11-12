@@ -2463,3 +2463,46 @@ func TestWiFiBandFromConfigDoesNotTreatWiFi7AsSixGHz(t *testing.T) {
 		t.Fatal("frequency band mapping is wrong")
 	}
 }
+
+// Hiding an SSID writes the access point's own section, and AccessPoint.N
+// counts AP-mode interfaces only: here the mesh station interface (sorted
+// first) is SSID.1 but not an access point, so AccessPoint.1 is SSID.2.
+func TestOpenWrtBackendHidesTheRightSSID(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "etc", "config")
+	netClassDir := filepath.Join(root, "sys", "class", "net")
+	for _, ifname := range []string{"ath01", "ath0"} {
+		if err := os.MkdirAll(filepath.Join(netClassDir, ifname), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wirelessPath := filepath.Join(configDir, "wireless")
+	mustWriteFile(t, wirelessPath, "config wifi-device 'wifi0'\n\toption band '2g'\n\toption channel '11'\n"+
+		"config wifi-iface 'a_backhaul_sta'\n\toption device 'wifi0'\n\toption ifname 'ath01'\n\toption mode 'sta'\n\toption ssid '9c99ea17ef6f233bf515953c811d555b'\n"+
+		"config wifi-iface 'b_guest'\n\toption device 'wifi0'\n\toption ifname 'ath0'\n\toption mode 'ap'\n\toption ssid 'Park Station Wi-Fi'\n")
+	backend := NewOpenWrtBackend(OpenWrtBackendOptions{
+		UCIConfigDir: configDir,
+		NetClassDir:  netClassDir,
+		UbusCaller: func(object, method string, _ time.Duration) ([]byte, error) {
+			if object == "network.wireless" && method == "status" {
+				return []byte(`{"wifi0":{"up":true,"config":{"band":"2g","channel":"11"},"interfaces":[` +
+					`{"section":"a_backhaul_sta","ifname":"ath01","up":true,"config":{"mode":"sta","ssid":"9c99ea17ef6f233bf515953c811d555b"}},` +
+					`{"section":"b_guest","ifname":"ath0","up":true,"config":{"mode":"ap","ssid":"Park Station Wi-Fi"}}]}}`), nil
+			}
+			return nil, wusp.ErrUSPPathUnsupported
+		},
+	})
+	if err := backend.Set(context.Background(), "Device.WiFi.AccessPoint.1.SSIDAdvertisementEnabled", wusp.Bool(false)); err != nil {
+		t.Fatalf("hide SSID: %v", err)
+	}
+	data, _ := os.ReadFile(wirelessPath)
+	text := string(data)
+	guest := text[strings.Index(text, "'b_guest'"):]
+	station := text[strings.Index(text, "'a_backhaul_sta'"):strings.Index(text, "'b_guest'")]
+	if !strings.Contains(guest, "option hidden '1'") || strings.Contains(station, "hidden") {
+		t.Fatalf("hidden must land on the access point section only:\n%s", text)
+	}
+	if err := backend.Set(context.Background(), "Device.WiFi.AccessPoint.2.SSIDAdvertisementEnabled", wusp.Bool(false)); err == nil {
+		t.Fatal("there is no second access point")
+	}
+}

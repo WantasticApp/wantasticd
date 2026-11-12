@@ -867,6 +867,7 @@ func (b *OpenWrtBackend) appendWiFiFields(ctx context.Context, msg *wusp.Message
 				appendField(msg, apPath+"Enable", wusp.Bool(ssidEnabled))
 				appendField(msg, apPath+"Status", wusp.String(wifiAccessPointStatusValue(ssidEnabled, iface.Up)))
 				appendField(msg, apPath+"SSIDReference", wusp.String(ssidPath))
+				appendField(msg, apPath+"SSIDAdvertisementEnabled", wusp.Bool(!parseOpenWrtBool(configString(iface.Config, "hidden"), false)))
 				// Stock OpenWrt exposes clients through hostapd.<ifname>.get_clients.
 				// Merge it with the optional vendor call and the direct nl80211/
 				// libiwinfo collector so each source fills the fields it knows.
@@ -1905,12 +1906,32 @@ func (b *OpenWrtBackend) setWiFiParam(ctx context.Context, path string, value wu
 		}
 	case "ssid", "ap":
 		// Resolve the UCI section name for this SSID/AP index by iterating
-		// the ubus wireless status in the same order as the collector.
-		section := b.resolveWiFiIfaceSection(idx)
+		// the ubus wireless status in the same order as the collector. An
+		// AccessPoint index counts AP-mode interfaces only: on a mesh node the
+		// station interfaces are SSIDs but not APs, so AccessPoint.N is not
+		// SSID.N.
+		section := ""
+		if objType == "ap" {
+			section = b.resolveWiFiAPSection(idx)
+			if section == "" {
+				return wusp.ErrUSPPathNotFound
+			}
+		} else {
+			section = b.resolveWiFiIfaceSection(idx)
+		}
 		if section == "" {
 			section = fmt.Sprintf("@wifi-iface[%d]", idx-1) // fallback to positional
 		}
 		switch param {
+		case "SSIDAdvertisementEnabled":
+			if objType != "ap" {
+				return wusp.ErrUSPPathUnsupported
+			}
+			hidden := "1"
+			if value.AsBool() {
+				hidden = "0"
+			}
+			return b.setUCIOption(ctx, "wireless", section, "hidden", hidden, true, wirelessReloadScript)
 		case "SSID":
 			return b.setUCIOption(ctx, "wireless", section, "ssid", value.AsString(), true, wirelessReloadScript)
 		case "Enable":
@@ -1973,6 +1994,30 @@ func (b *OpenWrtBackend) resolveWiFiIfaceSection(ssidIndex int) string {
 		for _, iface := range ifaces {
 			count++
 			if count == ssidIndex {
+				return iface.Section
+			}
+		}
+	}
+	return ""
+}
+
+// resolveWiFiAPSection maps a TR-181 AccessPoint instance to its UCI
+// wifi-iface section, counting AP-mode interfaces in collector order.
+func (b *OpenWrtBackend) resolveWiFiAPSection(apIndex int) string {
+	radios := b.openWrtWirelessRadios()
+	radioKeys := make([]string, 0, len(radios))
+	for k := range radios {
+		radioKeys = append(radioKeys, k)
+	}
+	sort.Strings(radioKeys)
+	count := 0
+	for _, key := range radioKeys {
+		for _, iface := range b.reportableWiFiInterfaces(radios[key]) {
+			if !wifiInterfaceModeIsAP(firstNonEmpty(configString(iface.Config, "mode"), "ap")) {
+				continue
+			}
+			count++
+			if count == apIndex {
 				return iface.Section
 			}
 		}

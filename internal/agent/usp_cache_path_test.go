@@ -21,4 +21,9 @@ func TestDataModelCacheLeavesRouterFlash(t *testing.T) {
 	if got := dataModelCachePath("/etc/wantastic/wusp-datamodel.v2.cache", "/tmp/wantastic"); got != "/tmp/wantastic/wusp-datamodel.v2.cache" {
 		t.Fatalf("router cache must move to RAM: %s", got)
 	}
+	// Legacy layout (G1TK7EY001177): /etc/wantastic is a file, so persistent
+	// files sit beside it as /etc/wantastic-<name>.
+	if got := dataModelCachePath("/etc/wantastic-wusp-datamodel.v2.cache", "/tmp/wantastic"); got != "/tmp/wantastic/wantastic-wusp-datamodel.v2.cache" {
+		t.Fatalf("legacy flat-file layout must move to RAM too: %s", got)
+	}
 }

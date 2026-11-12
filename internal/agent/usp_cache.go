@@ -543,6 +543,29 @@ func encodeCacheMessage(msg *wusp.Message) ([]byte, error) {
 	return wusp.EncodeMessageLZ4(clone)
 }
 
+// ramCacheDir holds the data-model cache on routers: /tmp is RAM there.
+const ramCacheDir = "/tmp/wantastic"
+
+// dataModelCachePath keeps the data-model cache off a router's flash. On
+// OpenWrt/QSDK /etc is a small overlay that also holds /etc/config (and
+// /usrdata is the modem's data partition); rewriting a mesh-sized model
+// there every minute fills it, and then uci commit fails with "I/O error"
+// and settings cannot be saved. The flash copy and any temporary files a
+// killed write left behind are removed; the RAM cache is rebuilt within a
+// minute of a reboot.
+func dataModelCachePath(flash, ramDir string) string {
+	if runtime.GOOS != "linux" || !(strings.HasPrefix(flash, "/etc/") || strings.HasPrefix(flash, "/usrdata/")) {
+		return flash
+	}
+	_ = os.Remove(flash)
+	if stale, err := filepath.Glob(flash + ".*.tmp"); err == nil {
+		for _, name := range stale {
+			_ = os.Remove(name)
+		}
+	}
+	return filepath.Join(ramDir, filepath.Base(flash))
+}
+
 func writeCacheAtomically(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create data model cache directory: %w", err)

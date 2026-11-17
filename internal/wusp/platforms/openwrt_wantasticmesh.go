@@ -402,7 +402,7 @@ func (b *OpenWrtBackend) setOpenWrtWantasticMeshParam(ctx context.Context, path 
 	if _, err := os.Stat(wantasticMeshPath(wantasticMeshBinary)); err != nil {
 		return fmt.Errorf("WantasticMesh is not installed on this device")
 	}
-	text := strings.TrimSpace(value.AsString())
+	text := strings.TrimSpace(wusp.ValueToString(value))
 	var option, setting string
 	switch strings.TrimPrefix(path, wusp.WUSPWantasticMeshPrefix) {
 	case "Enable":
@@ -489,6 +489,6 @@ func wuspUintValue(value wusp.Value) (uint64, bool) {
 	case wusp.TagInt:
 		return uint64(value.AsInt()), value.AsInt() >= 0
 	}
-	n, err := strconv.ParseUint(strings.TrimSpace(value.AsString()), 10, 64)
+	n, err := strconv.ParseUint(strings.TrimSpace(wusp.ValueToString(value)), 10, 64)
 	return n, err == nil
 }

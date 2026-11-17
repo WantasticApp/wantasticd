@@ -481,6 +481,9 @@ func (b *OpenWrtBackend) Set(ctx context.Context, path string, value wusp.Value)
 		if err := b.setOpenWrtMeshParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
 			return err
 		}
+		if err := b.setOpenWrtWantasticMeshParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
+			return err
+		}
 		if err := b.setOpenWrtServiceParam(ctx, path, value); err != wusp.ErrUSPPathUnsupported {
 			return err
 		}
@@ -604,6 +607,7 @@ func (b *OpenWrtBackend) collectAll(ctx context.Context) (*wusp.Message, error) 
 	_ = runCollector("openwrt.mesh.runtime", func() error { collectMeshStatic(msg); return nil })
 	runBudgetedCollector(ctx, "openwrt.mesh.topology", 3*time.Second, msg, b.appendOpenWrtMeshTopology)
 	runBudgetedCollector(ctx, "openwrt.mesh.config", 2*time.Second, msg, b.appendOpenWrtMeshConfig)
+	_ = runCollector("openwrt.wantasticmesh", func() error { b.appendOpenWrtWantasticMesh(msg); return nil })
 	_ = runCollector("openwrt.link.discovery", func() error {
 		appendLinkDiscoveryFields(msg, linkdiscovery.DefaultSnapshot(), b.openWrtWiFiInterfaceSet())
 		return nil

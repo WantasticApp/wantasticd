@@ -61,6 +61,25 @@ type wantasticMeshLink struct {
 	Approximate   bool   `json:"approximate"`
 }
 
+// wantasticMeshLinkTelemetry is a node's own driver counters for one link.
+type wantasticMeshLinkTelemetry struct {
+	PeerMAC    string  `json:"peer_mac"`
+	Radio      uint64  `json:"radio"`
+	TxMbps     float64 `json:"tx_mbps"`
+	RxMbps     float64 `json:"rx_mbps"`
+	TxBytes    uint64  `json:"tx_bytes"`
+	RxBytes    uint64  `json:"rx_bytes"`
+	TxRetries  uint64  `json:"tx_retries"`
+	TxFailed   uint64  `json:"tx_failed"`
+	InactiveMs uint64  `json:"inactive_ms"`
+}
+
+type wantasticMeshSurvey struct {
+	FreqMHz     uint64   `json:"freq_mhz"`
+	NoiseDBm    int64    `json:"noise_dbm"`
+	Utilization *float64 `json:"utilization_pct"`
+}
+
 type wantasticMeshPosition struct {
 	Fix  bool    `json:"fix"`
 	Lat  float64 `json:"lat"`
@@ -78,6 +97,9 @@ type wantasticMeshNode struct {
 	Radios         []wantasticMeshRadio  `json:"radios"`
 	Links          []wantasticMeshLink   `json:"links"`
 	Position       wantasticMeshPosition `json:"position"`
+	RTTUs          uint64                `json:"rtt_us"`
+	// telemetry is this node's own link counters (a leaf's status only).
+	telemetry []wantasticMeshLinkTelemetry
 }
 
 // wantasticMeshStatus mirrors wmeshd's status document (schema 1). Unknown
@@ -101,10 +123,33 @@ type wantasticMeshStatus struct {
 		Interface string `json:"interface"`
 	} `json:"backhaul"`
 	// Agent role: this node's own radios, links and position.
-	Radios    []wantasticMeshRadio  `json:"radios"`
-	Links     []wantasticMeshLink   `json:"links"`
-	Position  wantasticMeshPosition `json:"position"`
-	Nodes     []wantasticMeshNode   `json:"nodes"`
+	Radios        []wantasticMeshRadio         `json:"radios"`
+	Links         []wantasticMeshLink          `json:"links"`
+	LinkTelemetry []wantasticMeshLinkTelemetry `json:"link_telemetry"`
+	Surveys       []wantasticMeshSurvey        `json:"surveys"`
+	Position      wantasticMeshPosition        `json:"position"`
+	Transport     struct {
+		Type       string `json:"type"`
+		Interfaces uint64 `json:"interfaces"`
+	} `json:"transport"`
+	Metrics struct {
+		ExchangesStarted uint64  `json:"exchanges_started"`
+		ExchangeSuccess  float64 `json:"exchange_success_pct"`
+		AuthFailures     uint64  `json:"auth_failures"`
+		DecodeErrors     uint64  `json:"decode_errors"`
+	} `json:"metrics"`
+	// Controller role: the root's summary of the mesh.
+	ActiveNodes   uint64 `json:"active_nodes"`
+	StaleNodes    uint64 `json:"stale_nodes"`
+	BackhaulLinks uint64 `json:"backhaul_links"`
+	MLORadios     uint64 `json:"mlo_radios"`
+	Topology      struct {
+		MeshConnected bool `json:"mesh_connected"`
+	} `json:"topology"`
+	Environment struct {
+		ChannelConflicts uint64 `json:"channel_conflicts"`
+	} `json:"environment"`
+	Nodes     []wantasticMeshNode `json:"nodes"`
 	Distances []struct {
 		A      string  `json:"a"`
 		B      string  `json:"b"`
@@ -179,6 +224,9 @@ func appendWantasticMeshNode(msg *wusp.Message, base string, node wantasticMeshN
 	msg.SetUint(base+"Age", node.AgeS)
 	msg.SetUint(base+"Reports", node.Reports)
 	msg.SetUint(base+"ReportAge", node.ReportAgeS)
+	if node.RTTUs > 0 && !node.Stale {
+		msg.SetUint(base+"RTT", node.RTTUs)
+	}
 	msg.SetBool(base+"HasFix", node.Position.Fix)
 	if node.Position.Fix {
 		msg.Set(base+"Latitude", wusp.Float(node.Position.Lat))
@@ -225,6 +273,25 @@ func appendWantasticMeshNode(msg *wusp.Message, base string, node wantasticMeshN
 		msg.SetBool(p+"Bidirectional", link.Bidirectional)
 		msg.SetBool(p+"MLO", link.MLO)
 		msg.SetBool(p+"Approximate", link.Approximate)
+		var counters *wantasticMeshLinkTelemetry
+		for i := range node.telemetry {
+			if t := &node.telemetry[i]; strings.EqualFold(t.PeerMAC, link.PeerMAC) && t.Radio == link.Radio {
+				counters = t
+				break
+			}
+		}
+		// Always reported: a row keeps its index across reads, so a flag left
+		// out would keep saying an earlier link had counters.
+		msg.SetBool(p+"HasTelemetry", counters != nil)
+		if counters != nil {
+			msg.SetUint(p+"TxRate", uint64(counters.TxMbps*1000))
+			msg.SetUint(p+"RxRate", uint64(counters.RxMbps*1000))
+			msg.SetUint(p+"BytesSent", counters.TxBytes)
+			msg.SetUint(p+"BytesReceived", counters.RxBytes)
+			msg.SetUint(p+"Retransmissions", counters.TxRetries)
+			msg.SetUint(p+"Failed", counters.TxFailed)
+			msg.SetUint(p+"InactiveTime", counters.InactiveMs)
+		}
 	}
 	msg.SetUint(base+"LinkNumberOfEntries", uint64(count))
 }
@@ -282,6 +349,9 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 		msg.SetUint(prefix+"Backhaul.Frequency", freq)
 	}
 	msg.SetBool(prefix+"Backhaul.FourAddress", option("backhaul_4addr", "0") == "1")
+	msg.Set(prefix+"Backhaul.MLOSSID", wusp.String(option("backhaul_mlo_ssid", "")))
+	msg.Set(prefix+"Backhaul.MLORadios", wusp.String(option("backhaul_mlo_radios", "")))
+	msg.Set(prefix+"Backhaul.MLOFrequencies", wusp.String(option("backhaul_mlo_freqs", "")))
 
 	// What the init script refuses to start without, in its own order.
 	missing := ""
@@ -322,7 +392,13 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 		msg.SetUint(prefix+"Uptime", 0)
 		msg.SetBool(prefix+"ControllerAlive", false)
 		msg.SetUint(prefix+"AgentsConfigured", 0)
-		for _, table := range []string{"Node", "Distance", "PlanChannel", "PlanHeal"} {
+		msg.Set(prefix+"Transport", wusp.String(""))
+		msg.SetBool(prefix+"MeshConnected", false)
+		for _, leaf := range []string{"TransportInterfaces", "ActiveNodes", "StaleNodes", "BackhaulLinks", "MLORadios", "ChannelConflicts", "AuthFailures", "DecodeErrors"} {
+			msg.SetUint(prefix+leaf, 0)
+		}
+		msg.Set(prefix+"ExchangeSuccess", wusp.Float(0))
+		for _, table := range []string{"Node", "Survey", "Distance", "PlanChannel", "PlanHeal"} {
 			msg.SetUint(prefix+table+"NumberOfEntries", 0)
 		}
 		return
@@ -330,10 +406,38 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 	msg.SetUint(prefix+"Uptime", status.UptimeS)
 	msg.SetBool(prefix+"ControllerAlive", status.Role == "controller" || status.Controller.Alive)
 	msg.SetUint(prefix+"AgentsConfigured", status.AgentsConfigured)
+	msg.Set(prefix+"Transport", wusp.String(status.Transport.Type))
+	msg.SetUint(prefix+"TransportInterfaces", status.Transport.Interfaces)
+	root := status.Role == "controller"
+	msg.SetBool(prefix+"MeshConnected", root && status.Topology.MeshConnected)
+	msg.SetUint(prefix+"ActiveNodes", status.ActiveNodes)
+	msg.SetUint(prefix+"StaleNodes", status.StaleNodes)
+	msg.SetUint(prefix+"BackhaulLinks", status.BackhaulLinks)
+	msg.SetUint(prefix+"MLORadios", status.MLORadios)
+	msg.SetUint(prefix+"ChannelConflicts", status.Environment.ChannelConflicts)
+	msg.Set(prefix+"ExchangeSuccess", wusp.Float(status.Metrics.ExchangeSuccess))
+	msg.SetUint(prefix+"AuthFailures", status.Metrics.AuthFailures)
+	msg.SetUint(prefix+"DecodeErrors", status.Metrics.DecodeErrors)
+
+	surveys := status.Surveys
+	if len(surveys) > wusp.WUSPWantasticMeshMaxSurveys {
+		surveys = surveys[:wusp.WUSPWantasticMeshMaxSurveys]
+	}
+	msg.SetUint(prefix+"SurveyNumberOfEntries", uint64(len(surveys)))
+	for i, survey := range surveys {
+		p := fmt.Sprintf("%sSurvey.%d.", prefix, i+1)
+		msg.SetUint(p+"Frequency", survey.FreqMHz)
+		msg.SetInt(p+"Noise", survey.NoiseDBm)
+		busy := 0.0
+		if survey.Utilization != nil {
+			busy = *survey.Utilization
+		}
+		msg.Set(p+"Utilization", wusp.Float(busy))
+	}
 
 	nodes := status.Nodes
-	if status.Role != "controller" {
-		nodes = []wantasticMeshNode{{ID: status.NodeID, Radios: status.Radios, Links: status.Links, Position: status.Position}}
+	if !root {
+		nodes = []wantasticMeshNode{{ID: status.NodeID, Radios: status.Radios, Links: status.Links, Position: status.Position, telemetry: status.LinkTelemetry}}
 	}
 	if len(nodes) > wusp.WUSPWantasticMeshMaxNodes {
 		nodes = nodes[:wusp.WUSPWantasticMeshMaxNodes]
@@ -475,10 +579,45 @@ func (b *OpenWrtBackend) setOpenWrtWantasticMeshParam(ctx context.Context, path 
 		option = "backhaul_freq"
 	case "Backhaul.FourAddress":
 		option, setting = "backhaul_4addr", boolOption(value)
+	case "Backhaul.MLOSSID":
+		if len(text) > 32 || strings.ContainsAny(text, "\x00\r\n\"'`$\\") {
+			return fmt.Errorf("multi-link backhaul SSID is not valid")
+		}
+		option, setting = "backhaul_mlo_ssid", text
+	case "Backhaul.MLORadios":
+		radios, err := wantasticMeshList(text, func(item string) bool { return wantasticMeshName.MatchString(item) })
+		if err != nil {
+			return fmt.Errorf("multi-link radios must be up to 4 radio names, comma separated")
+		}
+		option, setting = "backhaul_mlo_radios", radios
+	case "Backhaul.MLOFrequencies":
+		freqs, err := wantasticMeshList(text, func(item string) bool {
+			mhz, err := strconv.ParseUint(item, 10, 16)
+			return err == nil && mhz >= 2400 && mhz <= 7125
+		})
+		if err != nil {
+			return fmt.Errorf("multi-link frequencies must be up to 4 values in MHz, comma separated")
+		}
+		option, setting = "backhaul_mlo_freqs", freqs
 	default:
 		return wusp.ErrUSPPathUnsupported
 	}
 	return b.setUCIOption(ctx, wantasticMeshUCIConfig, wantasticMeshUCISection, option, setting, true, wantasticMeshInitScript)
+}
+
+// wantasticMeshList normalises a comma or space separated list of up to four
+// items, each accepted by valid; "" stays empty.
+func wantasticMeshList(text string, valid func(string) bool) (string, error) {
+	items := strings.FieldsFunc(text, func(r rune) bool { return r == ',' || r == ' ' })
+	if len(items) > 4 {
+		return "", fmt.Errorf("too many items")
+	}
+	for _, item := range items {
+		if !valid(item) {
+			return "", fmt.Errorf("invalid item")
+		}
+	}
+	return strings.Join(items, ","), nil
 }
 
 // wuspUintValue reads an unsigned number sent as a number or as text.

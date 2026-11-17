@@ -15,6 +15,7 @@ const (
 	WUSPWantasticMeshMaxLinks     = 32
 	WUSPWantasticMeshMaxDistances = 128
 	WUSPWantasticMeshMaxPlanRows  = 64
+	WUSPWantasticMeshMaxSurveys   = 16
 )
 
 var WUSPWantasticMeshObjects = []Object{
@@ -23,6 +24,7 @@ var WUSPWantasticMeshObjects = []Object{
 	{Path: WUSPWantasticMeshPrefix + "Node.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Mesh nodes known to this device: every node on a root, only itself on a leaf."},
 	{Path: WUSPWantasticMeshPrefix + "Node.{i}.Radio.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Radios the node reported."},
 	{Path: WUSPWantasticMeshPrefix + "Node.{i}.Link.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Directional links the node measured towards a peer radio."},
+	{Path: WUSPWantasticMeshPrefix + "Survey.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Channel survey of this node's radios: noise floor and how busy the channel is."},
 	{Path: WUSPWantasticMeshPrefix + "Distance.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Great-circle distance between two nodes that both have a GPS fix."},
 	{Path: WUSPWantasticMeshPrefix + "PlanChannel.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Channel moves the root's coordination engine proposes."},
 	{Path: WUSPWantasticMeshPrefix + "PlanHeal.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Recovery actions the root's self-heal engine proposes."},
@@ -49,6 +51,17 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("GPS", TypeBoolean, ReadWrite, "Report this node's GPS position to the root.", Limits{}),
 	wmeshParam("KeyPresent", TypeBoolean, ReadOnly, "True when the node's control key file exists. The key itself is never reported.", Limits{}),
 	wmeshParam("AgentsConfigured", TypeUnsignedInt, ReadOnly, "Leaves in the root's keystore.", Limits{Min: iptr(0)}),
+	wmeshParam("Transport", TypeString, ReadOnly, "How the mesh control protocol travels between nodes (l2 = Ethernet frames on the backhaul).", Limits{MaxLength: 16}),
+	wmeshParam("TransportInterfaces", TypeUnsignedInt, ReadOnly, "Interfaces the control protocol listens on.", Limits{Min: iptr(0)}),
+	wmeshParam("MeshConnected", TypeBoolean, ReadOnly, "True when every node the root knows is reachable through the reported links. Root only.", Limits{}),
+	wmeshParam("ActiveNodes", TypeUnsignedInt, ReadOnly, "Nodes answering the root. Root only.", Limits{Min: iptr(0)}),
+	wmeshParam("StaleNodes", TypeUnsignedInt, ReadOnly, "Nodes that went silent. Root only.", Limits{Min: iptr(0)}),
+	wmeshParam("BackhaulLinks", TypeUnsignedInt, ReadOnly, "Backhaul links the root knows. Root only.", Limits{Min: iptr(0)}),
+	wmeshParam("MLORadios", TypeUnsignedInt, ReadOnly, "Radios taking part in a multi-link device across the mesh. Root only.", Limits{Min: iptr(0)}),
+	wmeshParam("ChannelConflicts", TypeUnsignedInt, ReadOnly, "Pairs of fronthaul radios on the same channel. Root only.", Limits{Min: iptr(0)}),
+	wmeshParam("ExchangeSuccess", TypeDecimal, ReadOnly, "Share of control exchanges that completed, in percent.", Limits{MinF: fptr(0), MaxF: fptr(100)}),
+	wmeshParam("AuthFailures", TypeUnsignedInt, ReadOnly, "Control frames that failed authentication since the service started.", Limits{Min: iptr(0)}),
+	wmeshParam("DecodeErrors", TypeUnsignedInt, ReadOnly, "Control frames that could not be decoded since the service started.", Limits{Min: iptr(0)}),
 
 	wmeshParam("Backhaul.SSID", TypeString, ReadWrite, "SSID of the wireless backhaul wmeshd joins. Empty leaves the backhaul to the firmware.", Limits{MaxLength: 32}),
 	wmeshParam("Backhaul.Radio", TypeString, ReadWrite, "Radio (phy) that carries the backhaul.", Limits{MaxLength: 16}),
@@ -56,6 +69,9 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("Backhaul.BSSID", TypeString, ReadWrite, "Optional BSSID lock for the backhaul.", Limits{Pattern: "^(([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})?$", MaxLength: 17}),
 	wmeshParam("Backhaul.Frequency", TypeUnsignedInt, ReadWrite, "Optional frequency lock in MHz, 0 for any.", Limits{Min: iptr(0), Max: iptr(7125)}),
 	wmeshParam("Backhaul.FourAddress", TypeBoolean, ReadWrite, "Use 4-address (WDS) frames on the backhaul.", Limits{}),
+	wmeshParam("Backhaul.MLOSSID", TypeString, ReadWrite, "SSID of a multi-link (802.11be) backhaul: one association over several radios, preferred over the single link, which stays the fallback. Empty disables it.", Limits{MaxLength: 32}),
+	wmeshParam("Backhaul.MLORadios", TypeString, ReadWrite, "Radios of the multi-link backhaul, comma separated.", Limits{MaxLength: 64}),
+	wmeshParam("Backhaul.MLOFrequencies", TypeString, ReadWrite, "Optional frequency per multi-link radio in MHz, comma separated.", Limits{MaxLength: 64}),
 	wmeshParam("Backhaul.Managed", TypeBoolean, ReadOnly, "True when wmeshd manages a backhaul station on this node.", Limits{}),
 	wmeshParam("Backhaul.Up", TypeBoolean, ReadOnly, "True when the managed backhaul is associated.", Limits{}),
 
@@ -71,6 +87,7 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("Node.{i}.Latitude", TypeDecimal, ReadOnly, "Latitude in decimal degrees. Absent without a fix.", Limits{MinF: fptr(-90), MaxF: fptr(90)}),
 	wmeshParam("Node.{i}.Longitude", TypeDecimal, ReadOnly, "Longitude in decimal degrees. Absent without a fix.", Limits{MinF: fptr(-180), MaxF: fptr(180)}),
 	wmeshParam("Node.{i}.Altitude", TypeInt, ReadOnly, "Altitude in metres. Absent without a fix.", Limits{}),
+	wmeshParam("Node.{i}.RTT", TypeUnsignedInt, ReadOnly, "Round-trip time of the root's last exchange with the node in microseconds. Absent when not measured.", Limits{Min: iptr(0)}),
 	wmeshParam("Node.{i}.RadioNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Node.{i}.Radio.{i}.", Limits{Min: iptr(0)}),
 	wmeshParam("Node.{i}.LinkNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Node.{i}.Link.{i}.", Limits{Min: iptr(0)}),
 
@@ -93,6 +110,19 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("Node.{i}.Link.{i}.Bidirectional", TypeBoolean, ReadOnly, "True when the link is confirmed usable in both directions.", Limits{}),
 	wmeshParam("Node.{i}.Link.{i}.MLO", TypeBoolean, ReadOnly, "True when the link is part of a multi-link association.", Limits{}),
 	wmeshParam("Node.{i}.Link.{i}.Approximate", TypeBoolean, ReadOnly, "True when the link was inferred from observation, not verified.", Limits{}),
+	wmeshParam("Node.{i}.Link.{i}.HasTelemetry", TypeBoolean, ReadOnly, "True when this node's driver counters for the link follow. Only a node's own links carry them.", Limits{}),
+	wmeshParam("Node.{i}.Link.{i}.TxRate", TypeUnsignedInt, ReadOnly, "Transmit PHY rate in kbit/s.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.Link.{i}.RxRate", TypeUnsignedInt, ReadOnly, "Receive PHY rate in kbit/s.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.Link.{i}.BytesSent", TypeUnsignedLong, ReadOnly, "Bytes sent on the link.", Limits{}),
+	wmeshParam("Node.{i}.Link.{i}.BytesReceived", TypeUnsignedLong, ReadOnly, "Bytes received on the link.", Limits{}),
+	wmeshParam("Node.{i}.Link.{i}.Retransmissions", TypeUnsignedInt, ReadOnly, "Frames retried.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.Link.{i}.Failed", TypeUnsignedInt, ReadOnly, "Frames that failed after every retry.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.Link.{i}.InactiveTime", TypeUnsignedInt, ReadOnly, "Milliseconds since the link last carried a frame.", Limits{Min: iptr(0)}),
+
+	wmeshParam("SurveyNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Device.WUSP_WantasticMesh.Survey.{i}.", Limits{Min: iptr(0)}),
+	wmeshParam("Survey.{i}.Frequency", TypeUnsignedInt, ReadOnly, "Surveyed frequency in MHz.", Limits{Min: iptr(0)}),
+	wmeshParam("Survey.{i}.Noise", TypeInt, ReadOnly, "Noise floor in dBm.", Limits{}),
+	wmeshParam("Survey.{i}.Utilization", TypeDecimal, ReadOnly, "Share of time the channel was busy, in percent.", Limits{MinF: fptr(0), MaxF: fptr(100)}),
 
 	wmeshParam("DistanceNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Device.WUSP_WantasticMesh.Distance.{i}.", Limits{Min: iptr(0)}),
 	wmeshParam("Distance.{i}.A", TypeString, ReadOnly, "Node id of one end.", Limits{MaxLength: 32}),

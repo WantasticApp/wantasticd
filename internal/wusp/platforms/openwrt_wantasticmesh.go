@@ -313,15 +313,18 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 	msg.Set(prefix+"StatusDetail", wusp.String(missing))
 	msg.SetBool(prefix+"Backhaul.Managed", running && status.Backhaul.Managed)
 	msg.SetBool(prefix+"Backhaul.Up", running && status.Backhaul.Up)
-	if !ok {
-		msg.SetUint(prefix+"NodeNumberOfEntries", 0)
-		return
-	}
+	// Every scalar is reported on every read: the hub merges reads into its
+	// stored copy, so a value left out would keep its last running figure.
 	msg.SetUint(prefix+"StatusAge", uint64(age/time.Second))
 	msg.Set(prefix+"NodeID", wusp.String(status.NodeID))
 	if !running {
 		// A stopped daemon's last graph is history, not the mesh as it is.
-		msg.SetUint(prefix+"NodeNumberOfEntries", 0)
+		msg.SetUint(prefix+"Uptime", 0)
+		msg.SetBool(prefix+"ControllerAlive", false)
+		msg.SetUint(prefix+"AgentsConfigured", 0)
+		for _, table := range []string{"Node", "Distance", "PlanChannel", "PlanHeal"} {
+			msg.SetUint(prefix+table+"NumberOfEntries", 0)
+		}
 		return
 	}
 	msg.SetUint(prefix+"Uptime", status.UptimeS)

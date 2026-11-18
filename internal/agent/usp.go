@@ -959,6 +959,10 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		return nil, nil
 	case wusp.WUSPSpectralTelemetryPrefix + "Capture()":
 		return r.handleSpectralCapture()
+	case wusp.WUSPWantasticMeshRestartCommand,
+		wusp.WUSPWantasticMeshSetChannelCommand,
+		wusp.WUSPWantasticMeshSetTxPowerCommand:
+		return r.handleWantasticMeshOperate(ctx, cmd, input)
 	case "Device.WUSP_MeshTelemetry.EasyMesh.1.ApplyTopology()":
 		if controller, ok := r.rawBackend.(interface {
 			StartApplyEasyMeshTopology(context.Context, string) error

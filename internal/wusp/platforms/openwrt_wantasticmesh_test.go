@@ -236,5 +236,5 @@ func wuspValueText(v wusp.Value) string {
 	case wusp.TagFloat:
 		return strconv.FormatFloat(v.AsFloat(), 'f', -1, 64)
 	}
-	return v.AsString()
+	return wusp.ValueToString(v)
 }

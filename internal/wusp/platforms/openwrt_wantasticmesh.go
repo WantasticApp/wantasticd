@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -47,6 +48,8 @@ type wantasticMeshRadio struct {
 	Backhaul    bool   `json:"backhaul"`
 	MLO         bool   `json:"mlo"`
 	MLDLink     uint64 `json:"mld_link"`
+	MAC         string `json:"mac"`
+	Iface       string `json:"iface"`
 }
 
 type wantasticMeshLink struct {
@@ -98,6 +101,10 @@ type wantasticMeshNode struct {
 	Links          []wantasticMeshLink   `json:"links"`
 	Position       wantasticMeshPosition `json:"position"`
 	RTTUs          uint64                `json:"rtt_us"`
+	RTTNs          *struct {
+		P50 uint64 `json:"p50"`
+		P95 uint64 `json:"p95"`
+	} `json:"rtt_ns"`
 	// telemetry is this node's own link counters (a leaf's status only).
 	telemetry []wantasticMeshLinkTelemetry
 }
@@ -133,11 +140,28 @@ type wantasticMeshStatus struct {
 		Interfaces uint64 `json:"interfaces"`
 	} `json:"transport"`
 	Metrics struct {
-		ExchangesStarted uint64  `json:"exchanges_started"`
-		ExchangeSuccess  float64 `json:"exchange_success_pct"`
-		AuthFailures     uint64  `json:"auth_failures"`
-		DecodeErrors     uint64  `json:"decode_errors"`
+		TxFrames          uint64            `json:"tx_frames"`
+		RxFrames          uint64            `json:"rx_frames"`
+		TxBytes           uint64            `json:"tx_bytes"`
+		RxBytes           uint64            `json:"rx_bytes"`
+		FramesPerSec      float64           `json:"frames_per_sec"`
+		ExchangesStarted  uint64            `json:"exchanges_started"`
+		ExchangesComplete uint64            `json:"exchanges_complete"`
+		ExchangeSuccess   float64           `json:"exchange_success_pct"`
+		AuthFailures      uint64            `json:"auth_failures"`
+		DecodeErrors      uint64            `json:"decode_errors"`
+		LatencyNs         map[string]uint64 `json:"latency_ns"`
 	} `json:"metrics"`
+	KernelStack struct {
+		Steering struct {
+			Available bool   `json:"available"`
+			Enabled   bool   `json:"enabled"`
+			Sent      uint64 `json:"sent"`
+		} `json:"steering"`
+		VendorIE struct {
+			Injected uint64 `json:"injected"`
+		} `json:"vendor_ie"`
+	} `json:"kernel_stack"`
 	// Controller role: the root's summary of the mesh.
 	ActiveNodes   uint64 `json:"active_nodes"`
 	StaleNodes    uint64 `json:"stale_nodes"`
@@ -171,17 +195,83 @@ type wantasticMeshStatus struct {
 	} `json:"plan"`
 }
 
-// readWantasticMeshStatus returns the daemon's status and its age; ok is
-// false when the file is missing, oversized, of an unknown schema or invalid.
-func readWantasticMeshStatus(now time.Time) (status wantasticMeshStatus, age time.Duration, ok bool) {
-	path := wantasticMeshPath(wantasticMeshStatusFile)
+// wantasticMeshStatusPath finds the status file: the init script's default,
+// else the -status argument of the running wmeshd. It returns the device path
+// (without the test root), or "" when there is none.
+func wantasticMeshStatusPath() string {
+	if _, err := os.Stat(wantasticMeshPath(wantasticMeshStatusFile)); err == nil {
+		return wantasticMeshStatusFile
+	}
+	entries, err := os.ReadDir(wantasticMeshPath("/proc"))
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if _, err := strconv.ParseUint(entry.Name(), 10, 32); err != nil {
+			continue
+		}
+		dir := wantasticMeshPath("/proc/" + entry.Name() + "/")
+		cmdline, err := os.ReadFile(dir + "cmdline")
+		if err != nil || len(cmdline) == 0 || len(cmdline) > 8192 {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+		comm, _ := os.ReadFile(dir + "comm")
+		if strings.TrimSpace(string(comm)) != "wmeshd" && filepath.Base(args[0]) != "wmeshd" {
+			continue
+		}
+		if path := wantasticMeshStatusArg(args[1:]); path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
+// wantasticMeshStatusArg returns the -status value of a wmeshd command line
+// (Go flag syntax: -status p, -status=p, --status p), when it is a clean
+// absolute path.
+func wantasticMeshStatusArg(args []string) string {
+	for i, arg := range args {
+		if arg == "--" {
+			break
+		}
+		name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+		if name == arg {
+			continue
+		}
+		value := ""
+		switch {
+		case name == "status" && i+1 < len(args):
+			value = args[i+1]
+		case strings.HasPrefix(name, "status="):
+			value = strings.TrimPrefix(name, "status=")
+		default:
+			continue
+		}
+		if value == "" || len(value) > 256 || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+			return ""
+		}
+		return value
+	}
+	return ""
+}
+
+// readWantasticMeshStatus returns the daemon's status, its age and the path it
+// was read from; ok is false when the file is missing, oversized, of an
+// unknown schema or invalid.
+func readWantasticMeshStatus(now time.Time) (status wantasticMeshStatus, age time.Duration, file string, ok bool) {
+	file = wantasticMeshStatusPath()
+	if file == "" {
+		return status, 0, "", false
+	}
+	path := wantasticMeshPath(file)
 	info, err := os.Stat(path)
-	if err != nil || info.Size() <= 0 || info.Size() > wantasticMeshStatusMax {
-		return status, 0, false
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > wantasticMeshStatusMax {
+		return status, 0, file, false
 	}
 	data, err := os.ReadFile(path)
 	if err != nil || json.Unmarshal(data, &status) != nil || status.Schema != 1 {
-		return wantasticMeshStatus{}, 0, false
+		return wantasticMeshStatus{}, 0, file, false
 	}
 	age = now.Sub(info.ModTime())
 	if at, err := time.Parse(time.RFC3339, status.At); err == nil && now.Sub(at) > age {
@@ -190,12 +280,17 @@ func readWantasticMeshStatus(now time.Time) (status wantasticMeshStatus, age tim
 	if age < 0 {
 		age = 0
 	}
-	return status, age, true
+	return status, age, file, true
 }
 
 func formatWantasticMeshMAC(hex string) string {
 	if len(hex) != 12 {
 		return ""
+	}
+	for _, c := range hex {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return ""
+		}
 	}
 	parts := make([]string, 0, 6)
 	for i := 0; i < 12; i += 2 {
@@ -227,6 +322,10 @@ func appendWantasticMeshNode(msg *wusp.Message, base string, node wantasticMeshN
 	if node.RTTUs > 0 && !node.Stale {
 		msg.SetUint(base+"RTT", node.RTTUs)
 	}
+	if node.RTTNs != nil && !node.Stale {
+		msg.SetUint(base+"RTTP50", node.RTTNs.P50/1000)
+		msg.SetUint(base+"RTTP95", node.RTTNs.P95/1000)
+	}
 	msg.SetBool(base+"HasFix", node.Position.Fix)
 	if node.Position.Fix {
 		msg.Set(base+"Latitude", wusp.Float(node.Position.Lat))
@@ -251,6 +350,14 @@ func appendWantasticMeshNode(msg *wusp.Message, base string, node wantasticMeshN
 		if radio.MLO {
 			msg.SetUint(p+"MLDLink", radio.MLDLink)
 		}
+		if hw, err := net.ParseMAC(formatWantasticMeshMAC(radio.MAC)); err == nil {
+			msg.Set(p+"MAC", wusp.MAC(hw))
+		}
+		iface := radio.Iface
+		if !wantasticMeshName.MatchString(iface) {
+			iface = ""
+		}
+		msg.Set(p+"Interface", wusp.String(iface))
 	}
 	links := node.Links
 	if len(links) > wusp.WUSPWantasticMeshMaxLinks {
@@ -352,6 +459,23 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 	msg.Set(prefix+"Backhaul.MLOSSID", wusp.String(option("backhaul_mlo_ssid", "")))
 	msg.Set(prefix+"Backhaul.MLORadios", wusp.String(option("backhaul_mlo_radios", "")))
 	msg.Set(prefix+"Backhaul.MLOFrequencies", wusp.String(option("backhaul_mlo_freqs", "")))
+	msg.SetBool(prefix+"Steering", option("steering", "1") == "1")
+	msg.SetBool(prefix+"Mesh11s", option("mesh11s", "0") == "1")
+	msg.Set(prefix+"Mesh11s.ID", wusp.String(option("mesh11s_id", "")))
+	msg.Set(prefix+"Mesh11s.Radio", wusp.String(option("mesh11s_radio", "")))
+	msg.Set(prefix+"Mesh11s.Interface", wusp.String(option("mesh11s_if", "")))
+	msg.SetUint(prefix+"Mesh11s.Frequency", wantasticMeshUintOption(option("mesh11s_freq", "0"), 7125))
+	msg.SetBool(prefix+"Mesh11s.Forwarding", option("mesh11s_forwarding", "1") == "1")
+	msg.Set(prefix+"Mesh11s.Bridge", wusp.String(option("mesh11s_bridge", "")))
+	msg.SetBool(prefix+"TDMA", option("tdma", "0") == "1")
+	msg.Set(prefix+"TDMA.Interfaces", wusp.String(option("tdma_interfaces", "")))
+	msg.SetUint(prefix+"TDMA.Interval", wantasticMeshUintOption(option("tdma_interval_ms", "0"), 60000))
+	// wmeshd stores the 802.11s and TDMA options but does not start those
+	// managers yet; the settings take effect once a daemon reports otherwise.
+	msg.SetBool(prefix+"Mesh11sSupported", false)
+	msg.SetBool(prefix+"TDMASupported", false)
+	msg.SetUint(prefix+"BusyPoll", wantasticMeshUintOption(option("busy_poll_us", "0"), 1000))
+	msg.Set(prefix+"SupportedOperations", wusp.String(wantasticMeshOperations))
 
 	// What the init script refuses to start without, in its own order.
 	missing := ""
@@ -366,7 +490,8 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 		missing = "controller id is not set"
 	}
 
-	status, age, ok := readWantasticMeshStatus(time.Now())
+	status, age, statusFile, ok := readWantasticMeshStatus(time.Now())
+	msg.Set(prefix+"StatusFile", wusp.String(statusFile))
 	running := ok && age <= wantasticMeshStatusFresh
 	state := "running"
 	switch {
@@ -401,6 +526,11 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 		for _, table := range []string{"Node", "Survey", "Distance", "PlanChannel", "PlanHeal"} {
 			msg.SetUint(prefix+table+"NumberOfEntries", 0)
 		}
+		for _, leaf := range []string{"Metrics.TxFrames", "Metrics.RxFrames", "Metrics.TxBytes", "Metrics.RxBytes", "Metrics.ExchangesStarted", "Metrics.ExchangesComplete", "Metrics.LatencyNumberOfEntries", "SteeringSent", "VendorIEInjected"} {
+			msg.SetUint(prefix+leaf, 0)
+		}
+		msg.Set(prefix+"Metrics.FramesPerSecond", wusp.Float(0))
+		msg.SetBool(prefix+"SteeringAvailable", false)
 		return
 	}
 	msg.SetUint(prefix+"Uptime", status.UptimeS)
@@ -418,6 +548,34 @@ func (b *OpenWrtBackend) appendOpenWrtWantasticMesh(msg *wusp.Message) {
 	msg.Set(prefix+"ExchangeSuccess", wusp.Float(status.Metrics.ExchangeSuccess))
 	msg.SetUint(prefix+"AuthFailures", status.Metrics.AuthFailures)
 	msg.SetUint(prefix+"DecodeErrors", status.Metrics.DecodeErrors)
+	msg.SetUint(prefix+"Metrics.TxFrames", status.Metrics.TxFrames)
+	msg.SetUint(prefix+"Metrics.RxFrames", status.Metrics.RxFrames)
+	msg.SetUint(prefix+"Metrics.TxBytes", status.Metrics.TxBytes)
+	msg.SetUint(prefix+"Metrics.RxBytes", status.Metrics.RxBytes)
+	fps := status.Metrics.FramesPerSec
+	if fps < 0 {
+		fps = 0
+	}
+	msg.Set(prefix+"Metrics.FramesPerSecond", wusp.Float(fps))
+	msg.SetUint(prefix+"Metrics.ExchangesStarted", status.Metrics.ExchangesStarted)
+	msg.SetUint(prefix+"Metrics.ExchangesComplete", status.Metrics.ExchangesComplete)
+	latencies := 0
+	for _, name := range []string{"announce_to_query", "full_rtt", "query_to_report"} {
+		p50, ok := status.Metrics.LatencyNs[name+"_p50"]
+		if !ok || latencies >= wusp.WUSPWantasticMeshMaxLatency {
+			continue
+		}
+		latencies++
+		p := fmt.Sprintf("%sMetrics.Latency.%d.", prefix, latencies)
+		msg.Set(p+"Name", wusp.String(name))
+		msg.SetUint(p+"P50", p50/1000)
+		msg.SetUint(p+"P95", status.Metrics.LatencyNs[name+"_p95"]/1000)
+		msg.SetUint(p+"P99", status.Metrics.LatencyNs[name+"_p99"]/1000)
+	}
+	msg.SetUint(prefix+"Metrics.LatencyNumberOfEntries", uint64(latencies))
+	msg.SetBool(prefix+"SteeringAvailable", status.KernelStack.Steering.Available)
+	msg.SetUint(prefix+"SteeringSent", status.KernelStack.Steering.Sent)
+	msg.SetUint(prefix+"VendorIEInjected", status.KernelStack.VendorIE.Injected)
 
 	surveys := status.Surveys
 	if len(surveys) > wusp.WUSPWantasticMeshMaxSurveys {
@@ -599,10 +757,83 @@ func (b *OpenWrtBackend) setOpenWrtWantasticMeshParam(ctx context.Context, path 
 			return fmt.Errorf("multi-link frequencies must be up to 4 values in MHz, comma separated")
 		}
 		option, setting = "backhaul_mlo_freqs", freqs
+	case "Steering":
+		option, setting = "steering", boolOption(value)
+	case "Mesh11s":
+		option, setting = "mesh11s", boolOption(value)
+	case "Mesh11s.ID":
+		if len(text) > 32 || !wantasticMeshSafeText(text) {
+			return fmt.Errorf("802.11s mesh id is not valid")
+		}
+		option, setting = "mesh11s_id", text
+	case "Mesh11s.Radio":
+		if text != "" && !wantasticMeshName.MatchString(text) {
+			return fmt.Errorf("802.11s radio is not a valid radio name")
+		}
+		option, setting = "mesh11s_radio", text
+	case "Mesh11s.Interface":
+		if text != "" && !wantasticMeshName.MatchString(text) {
+			return fmt.Errorf("802.11s interface is not a valid interface name")
+		}
+		option, setting = "mesh11s_if", text
+	case "Mesh11s.Frequency":
+		freq, ok := wuspUintValue(value)
+		if !ok || (freq != 0 && (freq < 2400 || freq > 7125)) {
+			return fmt.Errorf("802.11s frequency must be 2400-7125 MHz, 0 for the radio's own")
+		}
+		option, setting = "mesh11s_freq", ""
+		if freq > 0 {
+			setting = strconv.FormatUint(freq, 10)
+		}
+	case "Mesh11s.Forwarding":
+		option, setting = "mesh11s_forwarding", boolOption(value)
+	case "Mesh11s.Bridge":
+		if text != "" && !wantasticMeshName.MatchString(text) {
+			return fmt.Errorf("802.11s bridge is not a valid interface name")
+		}
+		option, setting = "mesh11s_bridge", text
+	case "TDMA":
+		option, setting = "tdma", boolOption(value)
+	case "TDMA.Interfaces":
+		ifaces, err := wantasticMeshList(text, func(item string) bool { return wantasticMeshName.MatchString(item) })
+		if err != nil {
+			return fmt.Errorf("TDMA interfaces must be up to 4 interface names, comma separated")
+		}
+		option, setting = "tdma_interfaces", ifaces
+	case "TDMA.Interval":
+		ms, ok := wuspUintValue(value)
+		if !ok || (ms != 0 && (ms < 1000 || ms > 60000)) {
+			return fmt.Errorf("TDMA interval must be 1000-60000 ms, 0 for the default")
+		}
+		option, setting = "tdma_interval_ms", ""
+		if ms > 0 {
+			setting = strconv.FormatUint(ms, 10)
+		}
+	case "BusyPoll":
+		us, ok := wuspUintValue(value)
+		if !ok || us > 1000 {
+			return fmt.Errorf("busy-poll must be 0-1000 microseconds")
+		}
+		option, setting = "busy_poll_us", ""
+		if us > 0 {
+			setting = strconv.FormatUint(us, 10)
+		}
 	default:
 		return wusp.ErrUSPPathUnsupported
 	}
 	return b.setUCIOption(ctx, wantasticMeshUCIConfig, wantasticMeshUCISection, option, setting, true, wantasticMeshInitScript)
+}
+
+// wantasticMeshSafeText reports whether text can reach the init script's
+// environment unquoted-safe: no quotes, $, backticks, backslashes or control
+// characters.
+func wantasticMeshSafeText(text string) bool {
+	for _, r := range text {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return !strings.ContainsAny(text, "\"'`$\\")
 }
 
 // wantasticMeshList normalises a comma or space separated list of up to four
@@ -620,6 +851,16 @@ func wantasticMeshList(text string, valid func(string) bool) (string, error) {
 	return strings.Join(items, ","), nil
 }
 
+// wantasticMeshUintOption reads a numeric UCI option, 0 when empty, invalid
+// or above max.
+func wantasticMeshUintOption(text string, max uint64) uint64 {
+	n, err := strconv.ParseUint(strings.TrimSpace(text), 10, 64)
+	if err != nil || n > max {
+		return 0
+	}
+	return n
+}
+
 // wuspUintValue reads an unsigned number sent as a number or as text.
 func wuspUintValue(value wusp.Value) (uint64, bool) {
 	switch value.Tag {
@@ -630,4 +871,105 @@ func wuspUintValue(value wusp.Value) (uint64, bool) {
 	}
 	n, err := strconv.ParseUint(strings.TrimSpace(wusp.ValueToString(value)), 10, 64)
 	return n, err == nil
+}
+
+// wantasticMeshOperations lists the Operate commands this backend runs.
+const wantasticMeshOperations = "Restart,Radio.SetChannel,Radio.SetTxPower"
+
+// RestartWantasticMesh restarts the wmeshd service through its init script.
+// It runs only on an explicit Operate.
+func (b *OpenWrtBackend) RestartWantasticMesh(ctx context.Context) error {
+	if _, err := os.Stat(wantasticMeshPath(wantasticMeshBinary)); err != nil {
+		return fmt.Errorf("WantasticMesh is not installed on this device")
+	}
+	if _, err := os.Stat(wantasticMeshPath(wantasticMeshInitScript)); err != nil {
+		return fmt.Errorf("the wmeshd service script is missing")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := b.commandRunner(ctx, wantasticMeshInitScript, "restart"); err != nil {
+		return fmt.Errorf("restart wmeshd: %w", err)
+	}
+	return nil
+}
+
+// WantasticMeshRadioChange is one guarded radio change requested through
+// Radio.SetChannel() or Radio.SetTxPower().
+type WantasticMeshRadioChange struct {
+	Interface string
+	// Value is the target channel (SetChannel) or dBm (SetTxPower).
+	Value uint64
+	// RevertSeconds is the console's revert window, 15-600. wmeshd's guard
+	// verifies the change itself and reverts on its own watchdog; its CLI has
+	// no window argument, so this is validated but not forwarded.
+	RevertSeconds uint64
+	// Probe applies the change and restores it at once (wmeshd -revert).
+	Probe bool
+}
+
+// wantasticMeshRadioArgs builds the wmeshd argv for a guarded change, exactly
+// as cmd/wmeshd/radio_cmd.go parses it: radio channel -iface X -channel N
+// [-revert], radio txpower -iface X -dbm N [-revert].
+func wantasticMeshRadioArgs(kind string, change WantasticMeshRadioChange) ([]string, error) {
+	// A leading '-' would read as a flag on wmeshd's command line.
+	if !wantasticMeshName.MatchString(change.Interface) || strings.HasPrefix(change.Interface, "-") {
+		return nil, fmt.Errorf("interface is not a valid interface name")
+	}
+	if change.RevertSeconds < 15 || change.RevertSeconds > 600 {
+		return nil, fmt.Errorf("revert window must be 15-600 seconds")
+	}
+	var args []string
+	switch kind {
+	case "channel":
+		if change.Value < 1 || change.Value > 196 {
+			return nil, fmt.Errorf("channel must be 1-196")
+		}
+		args = []string{"radio", "channel", "-iface", change.Interface, "-channel", strconv.FormatUint(change.Value, 10)}
+	case "txpower":
+		if change.Value > 30 {
+			return nil, fmt.Errorf("transmit power must be 0-30 dBm")
+		}
+		args = []string{"radio", "txpower", "-iface", change.Interface, "-dbm", strconv.FormatUint(change.Value, 10)}
+	default:
+		return nil, fmt.Errorf("unknown radio change %q", kind)
+	}
+	if change.Probe {
+		args = append(args, "-revert")
+	}
+	return args, nil
+}
+
+var wantasticMeshRadioResult = regexp.MustCompile(`before=(?:ch)?(-?[0-9]+)(?:dBm)?\s+after=(?:ch)?(-?[0-9]+)(?:dBm)?`)
+
+func (b *OpenWrtBackend) runWantasticMeshRadio(ctx context.Context, kind string, change WantasticMeshRadioChange) (before, after string, err error) {
+	args, err := wantasticMeshRadioArgs(kind, change)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := os.Stat(wantasticMeshPath(wantasticMeshBinary)); err != nil {
+		return "", "", fmt.Errorf("WantasticMesh is not installed on this device")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	output, err := b.commandRunner(ctx, wantasticMeshBinary, args...)
+	if err != nil {
+		return "", "", fmt.Errorf("wmeshd radio %s: %w", kind, err)
+	}
+	match := wantasticMeshRadioResult.FindStringSubmatch(string(output))
+	if match == nil {
+		return "", "", fmt.Errorf("wmeshd radio %s gave no before/after result", kind)
+	}
+	return match[1], match[2], nil
+}
+
+// SetWantasticMeshChannel runs wmeshd's guarded channel switch. It runs only
+// on an explicit Operate and returns the channel before and after.
+func (b *OpenWrtBackend) SetWantasticMeshChannel(ctx context.Context, change WantasticMeshRadioChange) (before, after string, err error) {
+	return b.runWantasticMeshRadio(ctx, "channel", change)
+}
+
+// SetWantasticMeshTxPower runs wmeshd's guarded tx-power change. It runs only
+// on an explicit Operate and returns the dBm before and after.
+func (b *OpenWrtBackend) SetWantasticMeshTxPower(ctx context.Context, change WantasticMeshRadioChange) (before, after string, err error) {
+	return b.runWantasticMeshRadio(ctx, "txpower", change)
 }

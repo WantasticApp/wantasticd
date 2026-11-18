@@ -16,6 +16,16 @@ const (
 	WUSPWantasticMeshMaxDistances = 128
 	WUSPWantasticMeshMaxPlanRows  = 64
 	WUSPWantasticMeshMaxSurveys   = 16
+	WUSPWantasticMeshMaxLatency   = 4
+)
+
+// Operate commands on Device.WUSP_WantasticMesh. Each runs only when the
+// console asks for it, never on a timer. Inputs are sent as full paths under
+// the command's object (Device.WUSP_WantasticMesh.Radio.Interface, ...).
+const (
+	WUSPWantasticMeshRestartCommand    = WUSPWantasticMeshPrefix + "Restart()"
+	WUSPWantasticMeshSetChannelCommand = WUSPWantasticMeshPrefix + "Radio.SetChannel()"
+	WUSPWantasticMeshSetTxPowerCommand = WUSPWantasticMeshPrefix + "Radio.SetTxPower()"
 )
 
 var WUSPWantasticMeshObjects = []Object{
@@ -28,6 +38,11 @@ var WUSPWantasticMeshObjects = []Object{
 	{Path: WUSPWantasticMeshPrefix + "Distance.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Great-circle distance between two nodes that both have a GPS fix."},
 	{Path: WUSPWantasticMeshPrefix + "PlanChannel.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Channel moves the root's coordination engine proposes."},
 	{Path: WUSPWantasticMeshPrefix + "PlanHeal.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Recovery actions the root's self-heal engine proposes."},
+	{Path: WUSPWantasticMeshPrefix + "Metrics.", SinceVersion: "1.0", Description: "Control-plane traffic and exchange counters since the service started."},
+	{Path: WUSPWantasticMeshPrefix + "Metrics.Latency.{i}.", MultiInstance: true, SinceVersion: "1.0", Description: "Control-plane latency percentiles, one row per measured exchange step."},
+	{Path: WUSPWantasticMeshPrefix + "Mesh11s.", SinceVersion: "1.0", Description: "Settings of the optional 802.11s mesh path."},
+	{Path: WUSPWantasticMeshPrefix + "TDMA.", SinceVersion: "1.0", Description: "Settings of the optional TDMA scheduler."},
+	{Path: WUSPWantasticMeshPrefix + "Radio.", SinceVersion: "1.0", Description: "Guarded radio changes: the inputs and results of Radio.SetChannel() and Radio.SetTxPower()."},
 }
 
 func wmeshParam(leaf string, typ ParamType, access Access, description string, limits Limits) Param {
@@ -62,6 +77,50 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("ExchangeSuccess", TypeDecimal, ReadOnly, "Share of control exchanges that completed, in percent.", Limits{MinF: fptr(0), MaxF: fptr(100)}),
 	wmeshParam("AuthFailures", TypeUnsignedInt, ReadOnly, "Control frames that failed authentication since the service started.", Limits{Min: iptr(0)}),
 	wmeshParam("DecodeErrors", TypeUnsignedInt, ReadOnly, "Control frames that could not be decoded since the service started.", Limits{Min: iptr(0)}),
+	wmeshParam("StatusFile", TypeString, ReadOnly, "Path of the status file the agent reads, empty when none was found.", Limits{MaxLength: 256}),
+	wmeshParam("SteeringAvailable", TypeBoolean, ReadOnly, "True when the running daemon can send BSS-transition steering requests.", Limits{}),
+	wmeshParam("SteeringSent", TypeUnsignedInt, ReadOnly, "BSS-transition steering requests sent since the service started.", Limits{Min: iptr(0)}),
+	wmeshParam("VendorIEInjected", TypeUnsignedInt, ReadOnly, "Interfaces carrying the WantasticMesh vendor information element.", Limits{Min: iptr(0)}),
+	wmeshParam("SupportedOperations", TypeString, ReadOnly, "Comma-separated Operate commands available: Restart, Radio.SetChannel, Radio.SetTxPower. They run only when requested, never on a timer.", Limits{MaxLength: 128}),
+	wmeshParam("LastOperationStatus", TypeString, ReadOnly, "Result of the latest WantasticMesh Operate command.", Limits{Enums: []string{"", "Success", "Error"}}),
+	wmeshParam("LastOperationCode", TypeString, ReadOnly, "Stable machine-readable code of the latest WantasticMesh Operate command.", Limits{MaxLength: 64}),
+	wmeshParam("LastOperationMessage", TypeString, ReadOnly, "Short result detail of the latest WantasticMesh Operate command.", Limits{MaxLength: 256}),
+
+	wmeshParam("Steering", TypeBoolean, ReadWrite, "Steer clients between nodes with BSS-transition requests.", Limits{}),
+	wmeshParam("Mesh11s", TypeBoolean, ReadWrite, "Run the 802.11s mesh path.", Limits{}),
+	wmeshParam("Mesh11sSupported", TypeBoolean, ReadOnly, "True when the running wmeshd acts on the 802.11s settings. They are stored either way.", Limits{}),
+	wmeshParam("Mesh11s.ID", TypeString, ReadWrite, "802.11s mesh id.", Limits{MaxLength: 32}),
+	wmeshParam("Mesh11s.Radio", TypeString, ReadWrite, "Radio (phy) that carries the 802.11s mesh.", Limits{Pattern: "^([A-Za-z0-9_.-]{1,15})?$", MaxLength: 15}),
+	wmeshParam("Mesh11s.Interface", TypeString, ReadWrite, "Name of the 802.11s mesh interface.", Limits{Pattern: "^([A-Za-z0-9_.-]{1,15})?$", MaxLength: 15}),
+	wmeshParam("Mesh11s.Frequency", TypeUnsignedInt, ReadWrite, "802.11s frequency in MHz, 0 for the radio's own.", Limits{Min: iptr(0), Max: iptr(7125)}),
+	wmeshParam("Mesh11s.Forwarding", TypeBoolean, ReadWrite, "Forward frames across the 802.11s mesh.", Limits{}),
+	wmeshParam("Mesh11s.Bridge", TypeString, ReadWrite, "Bridge the 802.11s interface joins, empty for none.", Limits{Pattern: "^([A-Za-z0-9_.-]{1,15})?$", MaxLength: 15}),
+	wmeshParam("TDMA", TypeBoolean, ReadWrite, "Run the TDMA scheduler on the backhaul.", Limits{}),
+	wmeshParam("TDMASupported", TypeBoolean, ReadOnly, "True when the running wmeshd acts on the TDMA settings. They are stored either way.", Limits{}),
+	wmeshParam("TDMA.Interfaces", TypeString, ReadWrite, "Interfaces the TDMA scheduler drives, up to 4, comma separated.", Limits{MaxLength: 64}),
+	wmeshParam("TDMA.Interval", TypeUnsignedInt, ReadWrite, "TDMA re-plan period in milliseconds, 1000-60000; 0 leaves the daemon's default (2000).", Limits{Min: iptr(0), Max: iptr(60000)}),
+	wmeshParam("BusyPoll", TypeUnsignedInt, ReadWrite, "Socket busy-poll time in microseconds, 0 to disable.", Limits{Min: iptr(0), Max: iptr(1000)}),
+
+	wmeshParam("Metrics.TxFrames", TypeUnsignedLong, ReadOnly, "Control frames sent.", Limits{}),
+	wmeshParam("Metrics.RxFrames", TypeUnsignedLong, ReadOnly, "Control frames received.", Limits{}),
+	wmeshParam("Metrics.TxBytes", TypeUnsignedLong, ReadOnly, "Control bytes sent.", Limits{}),
+	wmeshParam("Metrics.RxBytes", TypeUnsignedLong, ReadOnly, "Control bytes received.", Limits{}),
+	wmeshParam("Metrics.FramesPerSecond", TypeDecimal, ReadOnly, "Control frames per second, sent and received, averaged since the service started.", Limits{MinF: fptr(0)}),
+	wmeshParam("Metrics.ExchangesStarted", TypeUnsignedInt, ReadOnly, "Control exchanges started.", Limits{Min: iptr(0)}),
+	wmeshParam("Metrics.ExchangesComplete", TypeUnsignedInt, ReadOnly, "Control exchanges completed.", Limits{Min: iptr(0)}),
+	wmeshParam("Metrics.LatencyNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Device.WUSP_WantasticMesh.Metrics.Latency.{i}.", Limits{Min: iptr(0)}),
+	wmeshParam("Metrics.Latency.{i}.Name", TypeString, ReadOnly, "Exchange step measured: announce_to_query and full_rtt on a root, query_to_report on a leaf.", Limits{Enums: []string{"announce_to_query", "full_rtt", "query_to_report"}}),
+	wmeshParam("Metrics.Latency.{i}.P50", TypeUnsignedInt, ReadOnly, "Median latency in microseconds.", Limits{Min: iptr(0)}),
+	wmeshParam("Metrics.Latency.{i}.P95", TypeUnsignedInt, ReadOnly, "95th percentile latency in microseconds.", Limits{Min: iptr(0)}),
+	wmeshParam("Metrics.Latency.{i}.P99", TypeUnsignedInt, ReadOnly, "99th percentile latency in microseconds, 0 when not measured.", Limits{Min: iptr(0)}),
+
+	wmeshParam("Radio.Interface", TypeString, ReadOnly, "Input of Radio.SetChannel() and Radio.SetTxPower(): the wireless interface to change.", Limits{Pattern: "^([A-Za-z0-9_.-]{1,15})?$", MaxLength: 15}),
+	wmeshParam("Radio.Channel", TypeUnsignedInt, ReadOnly, "Input of Radio.SetChannel(): the target channel, 1-196.", Limits{Min: iptr(1), Max: iptr(196)}),
+	wmeshParam("Radio.Power", TypeInt, ReadOnly, "Input of Radio.SetTxPower(): the target transmit power in dBm, 0-30.", Limits{Min: iptr(0), Max: iptr(30)}),
+	wmeshParam("Radio.RevertSeconds", TypeUnsignedInt, ReadOnly, "Input of Radio.SetChannel() and Radio.SetTxPower(): revert window in seconds, 15-600, default 60. wmeshd's guard reverts a change it cannot verify on its own short watchdog.", Limits{Min: iptr(15), Max: iptr(600)}),
+	wmeshParam("Radio.Probe", TypeBoolean, ReadOnly, "Optional input of Radio.SetChannel() and Radio.SetTxPower(): apply then restore at once (wmeshd's -revert), to test that the change is accepted.", Limits{}),
+	wmeshParam("Radio.Before", TypeString, ReadOnly, "Output of Radio.SetChannel() and Radio.SetTxPower(): the channel or dBm before the change.", Limits{MaxLength: 16}),
+	wmeshParam("Radio.After", TypeString, ReadOnly, "Output of Radio.SetChannel() and Radio.SetTxPower(): the channel or dBm after the change.", Limits{MaxLength: 16}),
 
 	wmeshParam("Backhaul.SSID", TypeString, ReadWrite, "SSID of the wireless backhaul wmeshd joins. Empty leaves the backhaul to the firmware.", Limits{MaxLength: 32}),
 	wmeshParam("Backhaul.Radio", TypeString, ReadWrite, "Radio (phy) that carries the backhaul.", Limits{MaxLength: 16}),
@@ -88,6 +147,8 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("Node.{i}.Longitude", TypeDecimal, ReadOnly, "Longitude in decimal degrees. Absent without a fix.", Limits{MinF: fptr(-180), MaxF: fptr(180)}),
 	wmeshParam("Node.{i}.Altitude", TypeInt, ReadOnly, "Altitude in metres. Absent without a fix.", Limits{}),
 	wmeshParam("Node.{i}.RTT", TypeUnsignedInt, ReadOnly, "Round-trip time of the root's last exchange with the node in microseconds. Absent when not measured.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.RTTP50", TypeUnsignedInt, ReadOnly, "Median round-trip time to the node in microseconds. Absent when not measured.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.RTTP95", TypeUnsignedInt, ReadOnly, "95th percentile round-trip time to the node in microseconds. Absent when not measured.", Limits{Min: iptr(0)}),
 	wmeshParam("Node.{i}.RadioNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Node.{i}.Radio.{i}.", Limits{Min: iptr(0)}),
 	wmeshParam("Node.{i}.LinkNumberOfEntries", TypeUnsignedInt, ReadOnly, "Number of entries in Node.{i}.Link.{i}.", Limits{Min: iptr(0)}),
 
@@ -100,6 +161,8 @@ var AllWUSPWantasticMeshParams = []Param{
 	wmeshParam("Node.{i}.Radio.{i}.Backhaul", TypeBoolean, ReadOnly, "True when the radio carries a backhaul link.", Limits{}),
 	wmeshParam("Node.{i}.Radio.{i}.MLO", TypeBoolean, ReadOnly, "True when the radio is part of a multi-link device.", Limits{}),
 	wmeshParam("Node.{i}.Radio.{i}.MLDLink", TypeUnsignedInt, ReadOnly, "Link id inside the multi-link device. Absent without MLO.", Limits{Min: iptr(0)}),
+	wmeshParam("Node.{i}.Radio.{i}.MAC", TypeMACAddress, ReadOnly, "MAC (BSSID) the node uses on this radio. Absent when unknown.", Limits{}),
+	wmeshParam("Node.{i}.Radio.{i}.Interface", TypeString, ReadOnly, "Interface name of the radio, empty when unknown.", Limits{MaxLength: 15}),
 
 	wmeshParam("Node.{i}.Link.{i}.PeerMAC", TypeMACAddress, ReadOnly, "MAC of the peer radio.", Limits{}),
 	wmeshParam("Node.{i}.Link.{i}.Radio", TypeUnsignedInt, ReadOnly, "The node's radio index the link was measured on.", Limits{Min: iptr(0)}),

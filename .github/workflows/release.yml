@@ -315,8 +315,8 @@ jobs:
         uses: ryand56/r2-upload-action@latest
         with:
           r2-account-id: ${{ secrets.R2_ACCOUNT }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-access-key-id: ${{ secrets.ACCESSKEYID }}
+          r2-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
           r2-bucket: ${{ secrets.R2_BUCKET }}
           source-dir: dist
           destination-dir: ${{ github.ref_name }}
@@ -326,8 +326,8 @@ jobs:
         uses: ryand56/r2-upload-action@latest
         with:
           r2-account-id: ${{ secrets.R2_ACCOUNT }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-access-key-id: ${{ secrets.ACCESSKEYID }}
+          r2-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
           r2-bucket: ${{ secrets.R2_BUCKET }}
           source-dir: dist
           destination-dir: latest
@@ -339,8 +339,8 @@ jobs:
         uses: ryand56/r2-upload-action@latest
         with:
           r2-account-id: ${{ secrets.R2_ACCOUNT }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-access-key-id: ${{ secrets.ACCESSKEYID }}
+          r2-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
           r2-bucket: ${{ secrets.R2_BUCKET }}
           source-dir: routeros
           # Both paths: /routeros/init.rsc (what the console uses) and the
@@ -351,8 +351,8 @@ jobs:
         uses: ryand56/r2-upload-action@latest
         with:
           r2-account-id: ${{ secrets.R2_ACCOUNT }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-access-key-id: ${{ secrets.ACCESSKEYID }}
+          r2-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
           r2-bucket: ${{ secrets.R2_BUCKET }}
           source-dir: routeros
           destination-dir: .
@@ -380,8 +380,8 @@ jobs:
         uses: ryand56/r2-upload-action@latest
         with:
           r2-account-id: ${{ secrets.R2_ACCOUNT }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET }}
+          r2-access-key-id: ${{ secrets.ACCESSKEYID }}
+          r2-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
           r2-bucket: ${{ secrets.R2_BUCKET }}
           source-dir: root_upload
           destination-dir: ./

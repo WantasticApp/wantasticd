@@ -100,6 +100,25 @@ static const CGFloat wtTrashHit   = 28;
 	return self.enclosingMenuItem.title ?: @"";
 }
 
+// naturalWidth is the width this row needs for what it shows now.
+- (CGFloat)naturalWidth {
+	CGFloat w = ceil([[self shownText] sizeWithAttributes:@{NSFontAttributeName: [self titleFont]}].width) + wtTitleX + wtTitleRight;
+	w = MAX(w, self.minWidth);
+	if (self.isSwitch) w += wtSwitchW + 12;
+	if (self.trash > 0) w += wtTrashHit;
+	if (self.image != nil) w = MAX(w, self.image.size.width + wtTitleX + wtTitleRight);
+	return w;
+}
+
+// fitWidth gives the row back its natural width. Rows stretch to the menu's
+// width and sync only ever grows them, so one long text (an error, a long
+// account name) used to keep the whole menu wide until the tray restarted;
+// fitting every row as the menu opens lets AppKit size it to today's widest.
+- (void)fitWidth {
+	CGFloat w = [self naturalWidth];
+	if (w != NSWidth(self.frame)) [self setFrameSize:NSMakeSize(w, NSHeight(self.frame))];
+}
+
 // sync redraws when the item changed since the last draw.
 - (void)sync {
 	NSMenuItem *item = self.enclosingMenuItem;
@@ -109,15 +128,9 @@ static const CGFloat wtTrashHit   = 28;
 		self.drawn = key;
 		self.toolTip = self.tip ?: item.toolTip;
 		if (self.bound) [self setAccessibilityLabel:[self shownText]];
-		CGFloat w = ceil([[self shownText] sizeWithAttributes:@{NSFontAttributeName: [self titleFont]}].width) + wtTitleX + wtTitleRight;
-		w = MAX(w, self.minWidth);
-		if (self.isSwitch) w += wtSwitchW + 12;
-		if (self.trash > 0) w += wtTrashHit;
+		CGFloat w = [self naturalWidth];
 		CGFloat h = wtRowHeight;
-		if (self.image != nil) {
-			h += self.image.size.height + 8;
-			w = MAX(w, self.image.size.width + wtTitleX + wtTitleRight);
-		}
+		if (self.image != nil) h += self.image.size.height + 8;
 		if (w > NSWidth(self.frame) || h != NSHeight(self.frame)) [self setFrameSize:NSMakeSize(MAX(w, NSWidth(self.frame)), h)];
 		[self setNeedsDisplay:YES];
 	}
@@ -192,12 +205,15 @@ static int wtOpenMenus;
 @implementation WTMenuWatcher
 
 - (void)menuWillOpen:(NSMenu *)menu {
-	// Re-assert the reserved state column before AppKit lays the menu out.
+	// Re-assert the reserved state column before AppKit lays the menu out,
+	// and size each row to what it shows now (the menu takes the widest).
 	for (NSMenuItem *it in menu.itemArray) {
 		WTKeepOpenView *v = (WTKeepOpenView *)it.view;
-		if ([v isKindOfClass:[WTKeepOpenView class]] && v.reserveState && it.state != NSControlStateValueOn) {
+		if (![v isKindOfClass:[WTKeepOpenView class]]) continue;
+		if (v.reserveState && it.state != NSControlStateValueOn) {
 			it.state = NSControlStateValueOn;
 		}
+		[v fitWidth];
 	}
 	if (wtOpenMenus++ == 0) {
 		for (WTKeepOpenView *v in wtViews) [v sync];

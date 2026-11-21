@@ -163,7 +163,8 @@ func (m *trayAccountMenu) apply(list []accounts.Account) {
 			stillPending = true
 		}
 	}
-	setTitle(m.root, T("account.header", active))
+	// A long account name must not stretch the main menu.
+	setTitle(m.root, T("account.header", clip(active, maxHeaderName)))
 	// The QR goes once its account is claimed.
 	if m.claimURL != "" && !stillPending {
 		m.claimURL = ""

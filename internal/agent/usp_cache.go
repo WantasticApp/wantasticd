@@ -221,7 +221,10 @@ func (c *persistentDataModelCache) Refresh(ctx context.Context) error {
 }
 
 func (c *persistentDataModelCache) ensureSnapshot(ctx context.Context) error {
-	done, started := c.beginRefresh()
+	done, started := c.beginColdRefresh()
+	if done == nil {
+		return nil // a refresh finished since the caller saw an empty cache
+	}
 	if started {
 		return c.refreshOwned(ctx, done)
 	}
@@ -244,9 +247,27 @@ func (c *persistentDataModelCache) ensureSnapshot(ctx context.Context) error {
 	}
 }
 
+// beginColdRefresh is beginRefresh for a caller that found the cache empty:
+// it returns a nil channel when a snapshot arrived in the meantime, so a
+// caller that lost the race to a finished refresh does not start another
+// full collection.
+func (c *persistentDataModelCache) beginColdRefresh() (chan struct{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.refreshing && c.msg != nil && len(c.msg.Fields) > 0 {
+		return nil, false
+	}
+	return c.beginRefreshLocked()
+}
+
 func (c *persistentDataModelCache) beginRefresh() (chan struct{}, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.beginRefreshLocked()
+}
+
+// beginRefreshLocked joins the running refresh or starts one. mu held.
+func (c *persistentDataModelCache) beginRefreshLocked() (chan struct{}, bool) {
 	if c.refreshing {
 		return c.refreshDone, false
 	}

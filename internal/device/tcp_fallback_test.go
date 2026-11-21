@@ -70,16 +70,22 @@ func TestHubLinkFallsBackToTCPAndReturns(t *testing.T) {
 	received := make(chan []byte, 16)
 	for _, fn := range fns {
 		go func(fn conn.ReceiveFunc) {
-			bufs := [][]byte{make([]byte, 2048)}
-			sizes := make([]int, 1)
-			eps := make([]conn.Endpoint, 1)
+			// As many buffers as the bind's batch: Linux reads in batches.
+			bufs := make([][]byte, b.BatchSize())
+			for i := range bufs {
+				bufs[i] = make([]byte, 2048)
+			}
+			sizes := make([]int, len(bufs))
+			eps := make([]conn.Endpoint, len(bufs))
 			for {
 				n, err := fn(bufs, sizes, eps)
 				if err != nil {
 					return
 				}
-				if n == 1 && eps[0] != nil && eps[0].DstToString() == hub.String() {
-					received <- append([]byte(nil), bufs[0][:sizes[0]]...)
+				for i := 0; i < n; i++ {
+					if eps[i] != nil && eps[i].DstToString() == hub.String() {
+						received <- append([]byte(nil), bufs[i][:sizes[i]]...)
+					}
 				}
 			}
 		}(fn)

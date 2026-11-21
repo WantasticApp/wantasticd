@@ -27,6 +27,45 @@ type exitGuard struct {
 
 	// ux, when set, carries exit traffic instead of the OS (Windows).
 	ux atomic.Pointer[userspaceExit]
+
+	// lanUX, when set, carries peers' traffic to this host's shared LANs
+	// (local access on Windows): packets from lanSources to lanRoutes.
+	lanMu      sync.Mutex
+	lanUX      atomic.Pointer[userspaceExit]
+	lanRoutes  atomic.Pointer[[]netip.Prefix]
+	lanSources atomic.Pointer[[]netip.Prefix]
+}
+
+// setLAN installs (ux nil: removes) the local-access forwarder and returns
+// the previous one for the caller to close.
+func (g *exitGuard) setLAN(ux *userspaceExit, routes, sources []netip.Prefix) *userspaceExit {
+	g.lanMu.Lock()
+	defer g.lanMu.Unlock()
+	g.lanRoutes.Store(&routes)
+	g.lanSources.Store(&sources)
+	return g.lanUX.Swap(ux)
+}
+
+// lanBound reports whether pkt goes from the overlay to a shared LAN.
+func (g *exitGuard) lanBound(pkt []byte) bool {
+	routes, sources := g.lanRoutes.Load(), g.lanSources.Load()
+	if routes == nil || sources == nil {
+		return false
+	}
+	src, dst, ok := exitnode.PacketAddrs(pkt)
+	if !ok {
+		return false
+	}
+	return prefixesContain(*sources, src) && prefixesContain(*routes, dst)
+}
+
+func prefixesContain(ps []netip.Prefix, a netip.Addr) bool {
+	for _, p := range ps {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func newExitGuard() *exitGuard { return &exitGuard{} }
@@ -131,11 +170,15 @@ type exitGuardTUN struct {
 func (t *exitGuardTUN) Write(bufs [][]byte, offset int) (int, error) {
 	now := time.Now().Unix()
 	ux := t.guard.ux.Load()
+	lan := t.guard.lanUX.Load()
 	keep := bufs
 	filtered := false
 	for i, b := range bufs {
 		pass := len(b) <= offset
-		if !pass && ux != nil && t.guard.exitBound(b[offset:]) {
+		if !pass && lan != nil && t.guard.lanBound(b[offset:]) {
+			// Local access: the host does not route; the forwarder does.
+			lan.inject(b[offset:])
+		} else if !pass && ux != nil && t.guard.exitBound(b[offset:]) {
 			// The userspace exit carries it (or the guard refuses it); the
 			// OS has no NAT to do anything useful with it.
 			if t.guard.forwardable(b[offset:], now) {

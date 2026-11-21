@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -233,12 +234,25 @@ func discoverPrivateLANRoutes(tunName string) ([]string, error) {
 	return selectPrivateLANRoutes(candidates, tunName), nil
 }
 
+// windowsVirtualAdapter reports adapters of hypervisors and VPNs (VMware,
+// Hyper-V, VirtualBox, TAP): their subnets are not a LAN to share.
+func windowsVirtualAdapter(name string) bool {
+	n := strings.ToLower(name)
+	for _, mark := range []string{"vethernet", "vmware", "virtualbox", "hyper-v", "vmnet", "tap-", "sstap", "wsl", "docker", "loopback", "bluetooth"} {
+		if strings.Contains(n, mark) {
+			return true
+		}
+	}
+	return false
+}
+
 func selectPrivateLANRoutes(candidates []localNetworkCandidate, tunName string) []string {
 	seen := make(map[netip.Prefix]struct{})
 	for _, candidate := range candidates {
 		prefix := candidate.Prefix.Masked()
 		if candidate.InterfaceName == tunName || candidate.Flags&net.FlagUp == 0 ||
-			candidate.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 || !validLocalAccessPrefix(prefix) {
+			candidate.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 || !validLocalAccessPrefix(prefix) ||
+			(runtime.GOOS == "windows" && windowsVirtualAdapter(candidate.InterfaceName)) {
 			continue
 		}
 		seen[prefix] = struct{}{}
@@ -284,7 +298,7 @@ func (d *Device) EnableLocalAccess() ([]string, error) {
 	if len(sources) == 0 {
 		return nil, errors.New("no private IPv4 overlay source range is configured")
 	}
-	if err := enableLocalAccessSharingOS(tunName, routes, sources); err != nil {
+	if err := d.enableLocalAccessOS(tunName, routes, sources); err != nil {
 		return nil, err
 	}
 
@@ -307,7 +321,7 @@ func (d *Device) DisableLocalAccess() error {
 	sources := append([]string(nil), d.localAccessSources...)
 	d.mu.RUnlock()
 
-	if err := disableLocalAccessSharingOS(tunName, routes, sources); err != nil {
+	if err := d.disableLocalAccessOS(tunName, routes, sources); err != nil {
 		return err
 	}
 	d.mu.Lock()

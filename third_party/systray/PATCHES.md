@@ -7,5 +7,8 @@ Vendored because Windows closes a tray menu on every click, so a switch or
 - Windows: the menu reopens at the point it last opened (`showMenuAt`,
   `wmReopenMenu` = WM_USER+2), not under the cursor.
 - Other platforms: `reopenMenu` is a no-op.
+- `Check`/`Uncheck`/`Enable`/`Disable`/`Show`/`Hide` do nothing when the item
+  is already in that state. Windows redraws the open menu on every update, so
+  the tray's once-a-second refresh made the menu flicker.
 
 The `example` and `webview_example` directories were removed.

@@ -51,6 +51,9 @@ type MenuItem struct {
 	// keepOpen reopens the menu after a click (Windows closes it on every
 	// click). Wantastic patch, see PATCHES.md.
 	keepOpen atomic.Bool
+	// hidden mirrors Hide/Show so repeating either is a no-op. Wantastic
+	// patch: on Windows every update redraws the open menu (flicker).
+	hidden bool
 }
 
 // KeepMenuOpen makes a click on this item reopen the menu where it was, so
@@ -185,23 +188,37 @@ func (item *MenuItem) Disabled() bool {
 
 // Enable a menu item regardless if it's previously enabled or not
 func (item *MenuItem) Enable() {
+	if !item.disabled {
+		return
+	}
 	item.disabled = false
 	item.update()
 }
 
 // Disable a menu item regardless if it's previously disabled or not
 func (item *MenuItem) Disable() {
+	if item.disabled {
+		return
+	}
 	item.disabled = true
 	item.update()
 }
 
 // Hide hides a menu item
 func (item *MenuItem) Hide() {
+	if item.hidden {
+		return
+	}
+	item.hidden = true
 	hideMenuItem(item)
 }
 
 // Show shows a previously hidden menu item
 func (item *MenuItem) Show() {
+	if !item.hidden {
+		return
+	}
+	item.hidden = false
 	showMenuItem(item)
 }
 
@@ -212,12 +229,18 @@ func (item *MenuItem) Checked() bool {
 
 // Check a menu item regardless if it's previously checked or not
 func (item *MenuItem) Check() {
+	if item.checked {
+		return
+	}
 	item.checked = true
 	item.update()
 }
 
 // Uncheck a menu item regardless if it's previously unchecked or not
 func (item *MenuItem) Uncheck() {
+	if !item.checked {
+		return
+	}
 	item.checked = false
 	item.update()
 }

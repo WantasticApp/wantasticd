@@ -288,3 +288,53 @@ func TestUserspaceExitRefusesTheHostItself(t *testing.T) {
 		}
 	}
 }
+
+// TestLocalAccessDivertsOnlyOverlayToLAN: with local access on (Windows),
+// packets from the overlay to a shared LAN go to the forwarder; tenant
+// traffic, other LANs and the exit path are unchanged.
+func TestLocalAccessDivertsOnlyOverlayToLAN(t *testing.T) {
+	g := newExitGuard()
+	g.setTenant([]netip.Prefix{netip.MustParsePrefix("10.255.255.9/32")}, []string{"10.255.255.0/24"})
+	lanFwd, err := newUserspaceExit(1420, func([]byte) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lanFwd.close()
+	g.setLAN(lanFwd, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}, []netip.Prefix{netip.MustParsePrefix("10.255.255.0/24")})
+	rec := &recordingTUN{}
+	w := &exitGuardTUN{Device: rec, guard: g}
+	peer := [4]byte{10, 255, 255, 7}
+	shared := exitTestPacket(peer, [4]byte{192, 168, 1, 10})
+	other := exitTestPacket(peer, [4]byte{192, 168, 2, 10})
+	tenant := exitTestPacket(peer, [4]byte{10, 255, 255, 9})
+	notOverlay := exitTestPacket([4]byte{172, 16, 0, 5}, [4]byte{192, 168, 1, 10})
+	if _, err := w.Write([][]byte{shared, other, tenant, notOverlay}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.written) != 3 || bytes.Equal(rec.written[0], shared) {
+		t.Fatalf("OS got %d packets; the shared-LAN packet must go to the forwarder only", len(rec.written))
+	}
+
+	// Off again: everything reaches the OS as before.
+	if old := g.setLAN(nil, nil, nil); old != lanFwd {
+		t.Fatal("setLAN did not hand back the forwarder")
+	}
+	rec.written = nil
+	w.Write([][]byte{shared}, 0)
+	if len(rec.written) != 1 {
+		t.Fatal("with local access off the packet must reach the OS")
+	}
+}
+
+func TestWindowsVirtualAdaptersAreNotShared(t *testing.T) {
+	for _, name := range []string{"VMware Network Adapter VMnet8", "vEthernet (Default Switch)", "SSTAP 1"} {
+		if !windowsVirtualAdapter(name) {
+			t.Fatalf("%q would be shared", name)
+		}
+	}
+	for _, name := range []string{"WLAN 2", "Ethernet", "Wi-Fi"} {
+		if windowsVirtualAdapter(name) {
+			t.Fatalf("%q would be left out", name)
+		}
+	}
+}

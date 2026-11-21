@@ -40,7 +40,9 @@ func wgPacket(kind uint32, size int) []byte {
 // come back over it, and a UDP handshake answer moves it back to UDP.
 func TestHubLinkFallsBackToTCPAndReturns(t *testing.T) {
 	oldPort, oldAfter, oldProbe, oldBackoff := tcpFallbackPort, tcpFallbackAfter, tcpUDPProbeEvery, tcpRedialBackoff
-	t.Cleanup(func() { tcpFallbackPort, tcpFallbackAfter, tcpUDPProbeEvery, tcpRedialBackoff = oldPort, oldAfter, oldProbe, oldBackoff })
+	t.Cleanup(func() {
+		tcpFallbackPort, tcpFallbackAfter, tcpUDPProbeEvery, tcpRedialBackoff = oldPort, oldAfter, oldProbe, oldBackoff
+	})
 	tcpFallbackAfter, tcpUDPProbeEvery, tcpRedialBackoff = 50*time.Millisecond, time.Hour, 0
 
 	// The "hub": a UDP socket that does not answer yet, and the balancer's TLS port.

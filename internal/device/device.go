@@ -301,7 +301,7 @@ func (d *Device) Stop() error {
 	}
 
 	if sharedLocalAccess {
-		if err := disableLocalAccessSharingOS(d.tunName, localAccessPublished, localAccessSources); err != nil {
+		if err := d.disableLocalAccessOS(d.tunName, localAccessPublished, localAccessSources); err != nil {
 			log.Printf("[TUN] Warning: failed to disable local-access sharing on stop: %v", err)
 		}
 	}

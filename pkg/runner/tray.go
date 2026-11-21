@@ -29,8 +29,10 @@ const (
 )
 
 // trayRefresh is how often the menu re-reads the daemon: often enough that
-// speeds and peer paths look live while the menu is open.
-const trayRefresh = time.Second
+// speeds and peer paths look live while the menu is open. Windows redraws the
+// whole open menu for each changed row, so a once-a-second refresh of the
+// speed and latency rows read as flicker there.
+var trayRefresh = map[bool]time.Duration{true: 3 * time.Second, false: time.Second}[runtime.GOOS == "windows"]
 
 // noticeTTL is how long an action's result stays in the menu.
 const noticeTTL = 20 * time.Second

@@ -36,7 +36,9 @@ type Device struct {
 	device *wgdevice.Device
 	// wg is device for readers that must not take mu (peer name lookups
 	// run under callers that may hold it).
-	wg     atomic.Pointer[wgdevice.Device]
+	wg atomic.Pointer[wgdevice.Device]
+	// bind carries the hub link over TCP when WireGuard UDP is blocked.
+	bind   *fallbackBind
 	tunDev tun.Device
 
 	mu      sync.RWMutex
@@ -146,7 +148,9 @@ func (d *Device) Start() error {
 		logger = wgdevice.NewLogger(wgdevice.LogLevelVerbose, fmt.Sprintf("(%s) ", d.config.DeviceID))
 	}
 
-	wd := wgdevice.NewDevice(tunDev, conn.NewDefaultBind(), logger)
+	bind := newFallbackBind(conn.NewDefaultBind())
+	d.bind = bind
+	wd := wgdevice.NewDevice(tunDev, bind, logger)
 	wd.DisableSomeRoamingForBrokenMobileSemantics()
 	wd.SetWUSPHandler(d.handleWUSP)
 	wd.SetPunchHandler(d.handlePunch)
@@ -384,6 +388,12 @@ func (d *Device) applyConfig() error {
 			}
 			log.Printf("Resolved endpoint %s -> %s", endpointHost, ips[0])
 			endpointHost = ips[0]
+		}
+	}
+
+	if d.bind != nil {
+		if ip, err := netip.ParseAddr(endpointHost); err == nil {
+			d.bind.setHub(netip.AddrPortFrom(ip, uint16(d.config.Server.Port)))
 		}
 	}
 

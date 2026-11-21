@@ -28,6 +28,10 @@ func (device *Device) startRouteListener(bind conn.Bind) (*rwcancel.RWCancel, er
 	if !conn.StdNetSupportsStickySockets {
 		return nil, nil
 	}
+	// Wantastic: the bind may wrap the standard one (TCP fallback).
+	if u, ok := bind.(interface{ Unwrap() conn.Bind }); ok {
+		bind = u.Unwrap()
+	}
 	if _, ok := bind.(*conn.StdNetBind); !ok {
 		return nil, nil
 	}

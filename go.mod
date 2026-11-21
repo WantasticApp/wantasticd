@@ -52,3 +52,6 @@ require (
 	golang.org/x/time v0.7.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
 )
+
+// Windows: reopen the tray menu after a click (third_party/systray/PATCHES.md).
+replace github.com/getlantern/systray => ./third_party/systray

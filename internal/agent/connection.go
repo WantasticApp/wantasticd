@@ -38,8 +38,17 @@ func (a *Agent) Connect() error {
 		return err
 	}
 	if a.config.AllowLocalAccess {
-		if _, err := a.device.EnableLocalAccess(); err != nil {
+		routes, err := a.device.EnableLocalAccess()
+		if err != nil {
 			log.Printf("[API] Warning: local access not restored: %v", err)
+			return nil
+		}
+		// Turned on while disconnected: nothing advertises the routes yet.
+		a.mu.RLock()
+		ctx, active := a.workerCtx, a.localAccess != nil
+		a.mu.RUnlock()
+		if !active && ctx != nil {
+			a.startLocalAccessAdvertiser(ctx, routes)
 		}
 	}
 	return nil

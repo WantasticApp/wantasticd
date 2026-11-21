@@ -233,6 +233,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			systray.AddSeparator()
 			mToggle := systray.AddMenuItemCheckbox(T("toggle.connect"), T("toggle.tooltip"), false)
 			exitMenu := newTrayExitMenu()
+			localAccess := newTrayLocalAccess()
 			accountMenu := newTrayAccountMenu()
 
 			// Peers and their latency.
@@ -250,6 +251,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mNotice.Disable()
 			notice := &trayNotice{item: mNotice}
 			exitMenu.report = notice.report
+			localAccess.report = notice.report
 			accountMenu.report = notice.report
 
 			// More: service details and shortcuts.
@@ -274,7 +276,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			mQuit := systray.AddMenuItem(T("menu.quit"), T("menu.quit.tooltip"))
 
 			keepMenuOpen(mToggle, mPing)
-			menuSwitch(mToggle, exitMenu.offer)
+			menuSwitch(mToggle, exitMenu.offer, localAccess.item)
 
 			// Value rows are bound natively (macOS): a refresh redraws only the
 			// row whose value changed and never re-lays out the open menu. Each
@@ -393,6 +395,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 					syncPeerMenuGroup(peerMenu, nil)
 				}
 				exitMenu.apply(withExitLatency(deriveExitMenu(st), latency))
+				localAccess.apply(st)
 				if st != nil && st.Claim == nil {
 					accountMenu.refresh(menuOpen.Load())
 				}
@@ -413,6 +416,7 @@ func RunSystray(ctx context.Context, cancel context.CancelFunc) {
 			}
 
 			exitMenu.onChange = func() { go refresh() }
+			localAccess.onChange = func() { go refresh() }
 			accountMenu.onChange = func() { go refresh() }
 
 			// pingAll measures every peer. A click sends three probes each and

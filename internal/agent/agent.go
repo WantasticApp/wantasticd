@@ -27,6 +27,12 @@ type Agent struct {
 	stopCh       chan struct{}
 	workerCancel context.CancelFunc
 	wg           sync.WaitGroup
+	// workerCtx is the running workers' context, kept so local access can
+	// start its advertiser after Start. Guarded by mu.
+	workerCtx context.Context
+	// localAccess is the running route advertiser, nil when local access is
+	// off. Guarded by mu; changed only under tunnelMu.
+	localAccess *localAccessRun
 
 	apiServer *APIServer
 }
@@ -77,6 +83,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 	workerCtx, workerCancel := context.WithCancel(ctx)
 	a.workerCancel = workerCancel
+	a.workerCtx = workerCtx
 	a.stopCh = make(chan struct{})
 	a.running = true
 	a.mu.Unlock()
@@ -113,9 +120,6 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.usp != nil {
 		workerCount += 2
 	}
-	if a.config.AllowLocalAccess {
-		workerCount++
-	}
 	a.wg.Add(workerCount)
 
 	go a.runHealthCheck(workerCtx)
@@ -127,7 +131,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		go a.runNetworkSpeedMonitor(workerCtx)
 	}
 	if a.config.AllowLocalAccess {
-		go a.runLocalAccessAdvertiser(workerCtx, localAccessRoutes)
+		a.startLocalAccessAdvertiser(workerCtx, localAccessRoutes)
 	}
 
 	if a.config.AutoUpdate {
@@ -141,6 +145,71 @@ func (a *Agent) Start(ctx context.Context) error {
 		log.Printf("Warning: failed to start local IPC API: %v", err)
 	}
 
+	return nil
+}
+
+// localAccessRun is one running route advertiser; cancel stops it and done
+// closes once it has revoked its routes and switched forwarding off.
+type localAccessRun struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// startLocalAccessAdvertiser runs the advertiser for routes under ctx.
+func (a *Agent) startLocalAccessAdvertiser(ctx context.Context, routes []string) {
+	runCtx, cancel := context.WithCancel(ctx)
+	run := &localAccessRun{cancel: cancel, done: make(chan struct{})}
+	a.mu.Lock()
+	a.localAccess = run
+	a.mu.Unlock()
+	a.wg.Add(1)
+	go func() {
+		defer close(run.done)
+		a.runLocalAccessAdvertiser(runCtx, routes)
+	}()
+}
+
+// stopLocalAccessAdvertiser stops the running advertiser, if any, and waits
+// until it has revoked its routes and switched forwarding off.
+func (a *Agent) stopLocalAccessAdvertiser() {
+	a.mu.Lock()
+	run := a.localAccess
+	a.localAccess = nil
+	a.mu.Unlock()
+	if run != nil {
+		run.cancel()
+		<-run.done
+	}
+}
+
+// SetLocalAccess turns sharing this device's LANs with its tenant on or off
+// while the daemon runs, and saves the choice. With the tunnel down it is
+// only saved; Connect applies it.
+func (a *Agent) SetLocalAccess(on bool) error {
+	tunnelMu.Lock()
+	defer tunnelMu.Unlock()
+	a.mu.RLock()
+	running, ctx, active := a.running, a.workerCtx, a.localAccess != nil
+	a.mu.RUnlock()
+
+	if on && running && a.device.IsRunning() && !active {
+		routes, err := a.device.EnableLocalAccess()
+		if err != nil {
+			return fmt.Errorf("enable local access: %w", err)
+		}
+		a.startLocalAccessAdvertiser(ctx, routes)
+		log.Printf("[API] Local access enabled for tenant routes: %v", routes)
+	}
+	if !on && active {
+		a.stopLocalAccessAdvertiser()
+		log.Println("[API] Local access disabled")
+	}
+	if a.config.AllowLocalAccess != on {
+		a.config.AllowLocalAccess = on
+		if err := a.config.Save(); err != nil {
+			log.Printf("[API] Warning: local access changed but not saved: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -197,6 +266,8 @@ func (a *Agent) Stop() error {
 	a.running = false
 	workerCancel := a.workerCancel
 	a.workerCancel = nil
+	a.workerCtx = nil
+	a.localAccess = nil // stopped with the workers below
 
 	select {
 	case <-a.stopCh:

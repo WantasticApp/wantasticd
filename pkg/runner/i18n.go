@@ -135,6 +135,12 @@ func lookup(lang, key string) string {
 // translated.
 var catalog = map[string]map[string]string{
 	"en": {
+		"local.title":       "Share this device's local network",
+		"local.tooltip":     "Let the other devices of this network reach the LANs this device is plugged into",
+		"local.pending.on":  "turning on…",
+		"local.pending.off": "turning off…",
+		"local.on.ok":       "Local network shared",
+		"local.off.ok":      "Local network no longer shared",
 		// Header / status line (tray_view.go, tray.go).
 		"header.connecting":       "○ Connecting…",
 		"header.tooltip":          "Connection state",
@@ -295,6 +301,12 @@ var catalog = map[string]map[string]string{
 	},
 
 	"fr": {
+		"local.title":                 "Partager le réseau local de cet appareil",
+		"local.tooltip":               "Permettre aux autres appareils de ce réseau d’atteindre les réseaux locaux auxquels cet appareil est branché",
+		"local.pending.on":            "activation…",
+		"local.pending.off":           "désactivation…",
+		"local.on.ok":                 "Réseau local partagé",
+		"local.off.ok":                "Réseau local n’est plus partagé",
 		"header.connecting":           "○ Connexion…",
 		"header.tooltip":              "État de la connexion",
 		"header.daemon.down":          "○ Service non démarré",
@@ -438,6 +450,12 @@ var catalog = map[string]map[string]string{
 	},
 
 	"ar": {
+		"local.title":                 "مشاركة الشبكة المحلية لهذا الجهاز",
+		"local.tooltip":               "السماح لأجهزة هذه الشبكة الأخرى بالوصول إلى الشبكات المحلية المتصل بها هذا الجهاز",
+		"local.pending.on":            "جارٍ التشغيل…",
+		"local.pending.off":           "جارٍ الإيقاف…",
+		"local.on.ok":                 "تمت مشاركة الشبكة المحلية",
+		"local.off.ok":                "توقفت مشاركة الشبكة المحلية",
 		"header.connecting":           "○ جارٍ الاتصال…",
 		"header.tooltip":              "حالة الاتصال",
 		"header.daemon.down":          "○ الخدمة غير مُشغَّلة",
@@ -581,6 +599,12 @@ var catalog = map[string]map[string]string{
 	},
 
 	"es": {
+		"local.title":                 "Compartir la red local de este dispositivo",
+		"local.tooltip":               "Permitir que los demás dispositivos de esta red lleguen a las redes locales a las que está conectado este dispositivo",
+		"local.pending.on":            "activando…",
+		"local.pending.off":           "desactivando…",
+		"local.on.ok":                 "Red local compartida",
+		"local.off.ok":                "Red local ya no compartida",
 		"header.connecting":           "○ Conectando…",
 		"header.tooltip":              "Estado de la conexión",
 		"header.daemon.down":          "○ El servicio no está en ejecución",
@@ -724,6 +748,12 @@ var catalog = map[string]map[string]string{
 	},
 
 	"de": {
+		"local.title":                 "Lokales Netzwerk dieses Geräts freigeben",
+		"local.tooltip":               "Andere Geräte dieses Netzwerks die lokalen Netze erreichen lassen, mit denen dieses Gerät verbunden ist",
+		"local.pending.on":            "wird eingeschaltet…",
+		"local.pending.off":           "wird ausgeschaltet…",
+		"local.on.ok":                 "Lokales Netzwerk freigegeben",
+		"local.off.ok":                "Lokales Netzwerk nicht mehr freigegeben",
 		"header.connecting":           "○ Verbinden…",
 		"header.tooltip":              "Verbindungsstatus",
 		"header.daemon.down":          "○ Dienst läuft nicht",

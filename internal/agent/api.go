@@ -46,6 +46,7 @@ func NewAPIServer(a *Agent) *APIServer {
 	mux.HandleFunc("/api/exitnode/toggle", s.handleToggleExitNode)
 	mux.HandleFunc("/api/exitnode/use", s.handleSetExitNode)
 	mux.HandleFunc("/api/ping", s.handlePing)
+	mux.HandleFunc("/api/localaccess", s.handleLocalAccess)
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/add", s.handleAccountAdd)
 	mux.HandleFunc("/api/accounts/use", s.handleAccountUse)

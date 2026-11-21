@@ -8,16 +8,21 @@ import (
 	"github.com/getlantern/systray"
 )
 
-// The menu open/close hooks, keep-open rows, switches and large images are
-// macOS only; elsewhere the menu keeps its usual behaviour and refreshes on
-// its timer.
+// The menu open/close hooks, native switches and large images are macOS
+// only; elsewhere the menu refreshes on its timer. Windows closes the menu on
+// every click, so keep-open rows and switches ask the (patched) menu library
+// to reopen it where it was.
 const trayKnowsMenuOpen = false
 
 func watchMenu(*systray.MenuItem, func(), func()) {}
 
-func keepMenuOpen(...*systray.MenuItem) {}
+func keepMenuOpen(items ...*systray.MenuItem) {
+	for _, item := range items {
+		item.KeepMenuOpen()
+	}
+}
 
-func menuSwitch(...*systray.MenuItem) {}
+func menuSwitch(items ...*systray.MenuItem) { keepMenuOpen(items...) }
 
 // Rows are plain menu items here: the menu is not redrawn live while open, so
 // a title change cannot make it flicker.

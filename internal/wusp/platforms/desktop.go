@@ -177,6 +177,11 @@ func (b *hostBackend) collectDesktop(ctx context.Context, snap *desktopSnapshot)
 		})
 	}
 	_ = runCollector("firewall", func() error { collectHostFirewallStatic(ctx, b.commandRunner, msg); return nil })
+	// Device.WUSP_Neighbors. and Device.WUSP_OSUsers.: both are passive reads
+	// of tables the OS already keeps, and both run only here, when a collect
+	// asks for them.
+	_ = runCollector("osneighbors", func() error { b.collectNeighbors(ctx, msg, snap); return nil })
+	_ = runCollector("osusers", func() error { b.collectOSUsers(ctx, msg); return nil })
 	return msg
 }
 
@@ -219,6 +224,10 @@ func (b *hostBackend) setDesktop(ctx context.Context, path string, value wusp.Va
 		return true, b.desktop.setTimeZone(ctx, value.AsString())
 	case "Device.Time.Client.1.Servers":
 		return true, b.desktop.setNTPServers(ctx, valueStringList(value))
+	case wusp.WUSPNeighborsPrefix + "Enable":
+		return true, setNeighborsParam(path, value)
+	case wusp.WUSPOSUsersPrefix + "Enable":
+		return true, setOSUsersParam(path, value)
 	}
 	if index, ok := ntpServerIndex(path); ok {
 		var current []string

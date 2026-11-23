@@ -41,7 +41,7 @@ func main() {
 	message := flag.String("message", "", "text for sms-send")
 	index := flag.String("index", "", "message index for sms-delete")
 	apn := flag.String("apn", "", "APN for connect")
-	kind := flag.String("platform", "auto", "auto, openwrt, linux, or android")
+	kind := flag.String("platform", "auto", "auto, openwrt, linux, android, olt, or onu")
 	timeout := flag.Duration("timeout", 45*time.Second, "overall diagnostic timeout")
 	rawOnly := flag.Bool("raw-only", false, "collect only the selected raw modem endpoint; skip WUSP projection")
 	flag.Parse()
@@ -105,7 +105,8 @@ func main() {
 		msg, err := backend.Collect(ctx,
 			"Device.Cellular.", "Device.WUSP_CellularTelemetry.",
 			"Device.WUSP_CellularControl.", "Device.WUSP_GNSS.",
-			"Device.DeviceInfo.Location.", "Device.IP.Interface.", "Device.Firewall.")
+			"Device.DeviceInfo.Location.", "Device.IP.Interface.", "Device.Firewall.",
+			"Device.WUSP_OLT.", "Device.WUSP_ONU.")
 		if err != nil {
 			out.Errors = append(out.Errors, "WUSP collect: "+err.Error())
 		} else {

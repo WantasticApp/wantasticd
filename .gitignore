@@ -49,7 +49,11 @@ coverage*.html
 test-results/
 playwright-report/
 *.log
+.wrangler
 .env
+test
+./-
+wantasticd/android/.kotlin
 __pycache__/
 *.py[cod]
 .pytest_cache/

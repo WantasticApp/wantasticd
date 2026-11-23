@@ -134,4 +134,49 @@ adb-wantasticd-update: adb-wantasticd-build
 
 adb-wantasticd: adb-wantasticd-update
 
-.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update adb-wantasticd
+# Fiber device targets (OLT and ONU)
+FIBERAGENT_CMD=./cmd/fiberagent
+FIBERAGENT_OLT_CMD=./cmd/wantasticd-olt
+
+# ONU: EcoNet EN7528 MIPS 1004Kc — mipsle softfloat, static, no cgo
+# (cgo builds use the cross-toolchain separately for /dev/mem register access)
+fiberagent-onu:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+		$(GOBUILD) -trimpath -o bin/fiberagent-onu $(FIBERAGENT_CMD)
+	$(COMPRESS) bin/fiberagent-onu
+
+# OLT: Broadcom ARM — the OLT helper is a tiny key-gen binary
+fiberagent-olt-helper:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
+		$(GOBUILD) -trimpath -o bin/wantasticd-olt-arm $(FIBERAGENT_OLT_CMD)
+
+# OLT: full agent for proxy deployments (runs on a Linux host managing the OLT)
+fiberagent-olt:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
+		$(GOBUILD) -trimpath -o bin/fiberagent-olt $(FIBERAGENT_CMD)
+	$(COMPRESS) bin/fiberagent-olt
+
+# TinyGo build: slim agent for embedded GPON ONUs (~730 KB after strip+UPX).
+# Needs: tinygo 0.44+, zig cc (cross-compile the 64-bit atomic shim for MIPS).
+FIBERAGENT_TINY_CMD=./cmd/fiberagent-tiny
+ATOMIC64_SRC=cmd/fiberagent-tiny/clib/atomic64.c
+TINYGO_LDFLAGS=-extldflags '-L bin/tinygo-lib -latomic64'
+
+bin/tinygo-lib/libatomic64.a: $(ATOMIC64_SRC)
+	@mkdir -p bin/tinygo-lib
+	zig cc -target mipsel-linux-musl -msoft-float -fno-sanitize=undefined -O2 \
+		-c $(ATOMIC64_SRC) -o bin/tinygo-lib/atomic64.o
+	zig ar rcs $@ bin/tinygo-lib/atomic64.o
+
+fiberagent-tiny: bin/tinygo-lib/libatomic64.a
+	@mkdir -p bin
+	GOOS=linux GOARCH=mipsle tinygo build \
+		-ldflags="-X wantastic-agent/pkg/version.Version=$(VERSION) $(TINYGO_LDFLAGS)" \
+		-o bin/fiberagent-tiny $(FIBERAGENT_TINY_CMD)
+	mipsel-linux-gnu-strip bin/fiberagent-tiny 2>/dev/null || mipsel-unknown-linux-gnu-strip bin/fiberagent-tiny 2>/dev/null || strip bin/fiberagent-tiny 2>/dev/null || true
+	$(COMPRESS) bin/fiberagent-tiny
+
+.PHONY: all build build-all build-iwinfo build-all-iwinfo clean run test genproto adb-test-build adb-test-run adb-live adb-wantasticd-build adb-wantasticd-update adb-wantasticd fiberagent-onu fiberagent-olt fiberagent-olt-helper fiberagent-tiny

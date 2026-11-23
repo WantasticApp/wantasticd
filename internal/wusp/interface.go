@@ -55,6 +55,7 @@ package wusp
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"hash/fnv"
 	"io"
@@ -288,6 +289,37 @@ func ValueToString(v Value) string {
 	default:
 		return v.AsString()
 	}
+}
+
+// MarshalJSON renders a Value as a self-describing {"tag","value"} object so
+// the telemetry endpoint and web dashboard can read the actual value, not just
+// the type tag. The binary WUSP wire format is unaffected — this is JSON only.
+func (v Value) MarshalJSON() ([]byte, error) {
+	var val any
+	switch v.Tag {
+	case TagNull:
+		val = nil
+	case TagFalse:
+		val = false
+	case TagTrue:
+		val = true
+	case TagUint:
+		val = v.AsUint()
+	case TagInt:
+		val = v.AsInt()
+	case TagFloat:
+		val = v.AsFloat()
+	case TagTime:
+		val = v.AsTime().UTC().Format(time.RFC3339)
+	case TagList:
+		val = v.AsList()
+	default:
+		val = ValueToString(v)
+	}
+	return json.Marshal(struct {
+		Tag   TypeTag `json:"tag"`
+		Value any     `json:"value"`
+	}{Tag: v.Tag, Value: val})
 }
 
 // AsTime returns the time.Time value.

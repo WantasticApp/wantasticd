@@ -55,7 +55,7 @@ func NewAPIServer(a *Agent) *APIServer {
 
 	s.server = &http.Server{
 		Addr:    "127.0.0.1:9034",
-		Handler: mux,
+		Handler: corsMiddleware(mux),
 	}
 
 	return s
@@ -335,4 +335,19 @@ func tunnelGateway(dns []string) string {
 		}
 	}
 	return ""
+}
+
+// corsMiddleware allows browser pages on other origins (the device web UI,
+// onboarding dashboards) to call the local IPC API.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

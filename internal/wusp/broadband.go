@@ -98,6 +98,10 @@ var AllDeviceObjects = concatObjects(
 	WUSPDNSObjects,
 	WUSPExitNodeObjects,
 	WUSPWantasticMeshObjects,
+	WUSPOLTObjects,
+	WUSPONUObjects,
+	WUSPNeighborsObjects,
+	WUSPOSUsersObjects,
 )
 
 // AllDeviceParams is the full WUSP schema registry consumed by the encoder and
@@ -119,6 +123,10 @@ var AllDeviceParams = concat(
 	AllWUSPDNSParams,
 	AllWUSPExitNodeParams,
 	AllWUSPWantasticMeshParams,
+	AllWUSPOLTParams,
+	AllWUSPONUParams,
+	AllWUSPNeighborsParams,
+	AllWUSPOSUsersParams,
 )
 
 // BroadbandDataModels collects the runtime model slices bundled into WUSP.
@@ -257,6 +265,42 @@ var BroadbandDataModels = []BroadbandDataModel{
 		WUSPSourceURL,
 		WUSPWantasticMeshObjects,
 		AllWUSPWantasticMeshParams,
+	),
+	newBroadbandDataModel(
+		"wusp-olt",
+		"Wantastic WUSP OLT",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPOLTObjects,
+		AllWUSPOLTParams,
+	),
+	newBroadbandDataModel(
+		"wusp-onu",
+		"Wantastic WUSP ONU",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPONUObjects,
+		AllWUSPONUParams,
+	),
+	newBroadbandDataModel(
+		"wusp-neighbors",
+		"Wantastic WUSP Neighbors",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPNeighborsObjects,
+		AllWUSPNeighborsParams,
+	),
+	newBroadbandDataModel(
+		"wusp-osusers",
+		"Wantastic WUSP OS Users",
+		WUSPModelVersion,
+		WUSPSource,
+		WUSPSourceURL,
+		WUSPOSUsersObjects,
+		AllWUSPOSUsersParams,
 	),
 }
 

@@ -19,6 +19,7 @@ import (
 	modemPkg "wantastic-agent/internal/modem"
 	"wantastic-agent/internal/platform/systemd"
 	"wantastic-agent/internal/wusp"
+	"wantastic-agent/internal/wusp/fiberolt"
 )
 
 type hostState struct {
@@ -29,6 +30,10 @@ type hostState struct {
 	// NTPServers is the NTP server list set from the console; re-applied
 	// where the client keeps it only on its command line.
 	NTPServers []string `json:"ntp_servers,omitempty"`
+	// OLTEnabled toggles the OLT backend collection and control.
+	OLTEnabled *bool `json:"olt_enabled,omitempty"`
+	// ONUEnabled toggles the ONU backend collection and control.
+	ONUEnabled *bool `json:"onu_enabled,omitempty"`
 }
 
 type hostBackend struct {
@@ -47,9 +52,18 @@ type hostBackend struct {
 	deviceVersionPath     string
 	buildPropPath         string
 	timezonePath          string
+	oltReleasePath        string
+	sysinfoPath           string
 	onuReleasePath        string
 	netClassDir           string
 	commandRunner         CommandRunner
+	// oltAPI is the vendor web API client for OLT backends; nil elsewhere.
+	oltAPI *fiberolt.Client
+	// OLT API endpoint/credentials for proxy deployments; empty defaults to
+	// the loopback device API with the vendor default login.
+	oltAPIURL      string
+	oltAPIUser     string
+	oltAPIPassword string
 	// useSystemd allows systemd's D-Bus services; off when a test injects
 	// its own command runner, so tests never touch the real system.
 	useSystemd bool
@@ -100,6 +114,7 @@ func NewLinuxBackend(opts Options) wusp.DataBackend   { return newHostBackend(Ki
 func NewMacOSBackend(opts Options) wusp.DataBackend   { return newHostBackend(KindMacOS, opts) }
 func NewWindowsBackend(opts Options) wusp.DataBackend { return newHostBackend(KindWindows, opts) }
 func NewAndroidBackend(opts Options) wusp.DataBackend { return newHostBackend(KindAndroid, opts) }
+func NewOLTBackend(opts Options) wusp.DataBackend     { return newHostBackend(KindOLT, opts) }
 func NewONUBackend(opts Options) wusp.DataBackend     { return newHostBackend(KindONU, opts) }
 
 func newHostBackend(kind Kind, opts Options) *hostBackend {
@@ -122,6 +137,11 @@ func newHostBackend(kind Kind, opts Options) *hostBackend {
 		deviceVersionPath:     coalesceString(opts.DeviceVersionPath, defaultDeviceVersionPath(kind)),
 		buildPropPath:         coalesceString(opts.BuildPropPath, defaultBuildPropPath(kind)),
 		timezonePath:          coalesceString(opts.TimezonePath, defaultTimezonePath(kind)),
+		oltReleasePath:        coalesceString(opts.OLTReleasePath, "/etc/olt-release"),
+		sysinfoPath:           coalesceString(opts.SysinfoPath, defaultSysinfoPath()),
+		oltAPIURL:             opts.OLTAPIURL,
+		oltAPIUser:            opts.OLTAPIUser,
+		oltAPIPassword:        opts.OLTAPIPassword,
 		onuReleasePath:        coalesceString(opts.ONUReleasePath, "/etc/onu-release"),
 		netClassDir:           coalesceString(opts.NetClassDir, defaultNetClassDir(kind)),
 		commandRunner:         opts.CommandRunner,
@@ -151,6 +171,12 @@ func (b *hostBackend) Collect(ctx context.Context, paths ...string) (*wusp.Messa
 }
 
 func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) error {
+	if b.kind == KindOLT && strings.HasPrefix(strings.TrimSpace(path), wusp.WUSPOLTPrefix) {
+		return b.setOLTParam(ctx, path, value)
+	}
+	if b.kind == KindONU && strings.HasPrefix(strings.TrimSpace(path), wusp.WUSPONUPrefix) {
+		return b.setONUParam(ctx, path, value)
+	}
 	if b.desktop != nil {
 		if handled, err := b.setDesktop(ctx, strings.TrimSpace(path), value); handled {
 			return err
@@ -197,6 +223,19 @@ func (b *hostBackend) Set(ctx context.Context, path string, value wusp.Value) er
 
 func (b *hostBackend) Delete(ctx context.Context, paths ...string) error {
 	for _, path := range paths {
+		if b.kind == KindOLT && strings.HasPrefix(strings.TrimSpace(path), wusp.WUSPOLTPrefix+"ProvisionedONU.") {
+			if index, _, ok := parseIndexedPath(path, wusp.WUSPOLTPrefix+"ProvisionedONU."); ok {
+				onuID := fiberolt.ProvisionedONUByIndex(ctx, b.oltClient(), index)
+				if onuID == "" {
+					return wusp.ErrUSPPathNotFound
+				}
+				if err := b.oltClient().DeleteProvisionedONU(ctx, onuID); err != nil {
+					return fmt.Errorf("olt: delete provisioned ONU: %w", err)
+				}
+				return nil
+			}
+			return wusp.ErrUSPPathUnsupported
+		}
 		if strings.HasPrefix(strings.TrimSpace(path), "Device.Firewall.Chain.") {
 			if err := b.deleteHostFirewallRule(ctx, path); err != nil {
 				return err
@@ -224,6 +263,9 @@ func (b *hostBackend) Delete(ctx context.Context, paths ...string) error {
 }
 
 func (b *hostBackend) Add(ctx context.Context, objectPath string, initial *wusp.Message) ([]string, error) {
+	if b.kind == KindOLT && strings.HasPrefix(strings.TrimSpace(objectPath), wusp.WUSPOLTPrefix+"ProvisionedONU.") {
+		return b.addProvisionedONU(ctx, initial)
+	}
 	return b.addHostFirewallRule(ctx, objectPath, initial)
 }
 
@@ -392,6 +434,12 @@ func (b *hostBackend) collectAll(ctx context.Context) *wusp.Message {
 		})
 	}
 	_ = runCollector("mesh", func() error { collectMeshStatic(msg); return nil })
+	if b.kind == KindOLT {
+		_ = runCollector("olt", func() error { b.collectOLTStatic(ctx, msg); return nil })
+	}
+	if b.kind == KindONU {
+		_ = runCollector("onu", func() error { b.collectONUStatic(ctx, msg); return nil })
+	}
 	if hostKindSupportsLinuxWiFi(b.kind) {
 		_ = runCollector("linux.link.discovery", func() error {
 			appendLinkDiscoveryFields(msg, linkdiscovery.DefaultSnapshot(), runtimeWiFiInterfaceSet())
@@ -1636,6 +1684,12 @@ func (b *hostBackend) readManufacturer(ctx context.Context) string {
 	case KindAndroid:
 		props := b.readBuildProps()
 		return firstNonEmpty(props["ro.product.manufacturer"], props["ro.product.brand"], "Android")
+	case KindOLT:
+		return firstNonEmpty(
+			b.readSysinfoValue("Vendor"),
+			strings.TrimSpace(readAssignmentFileValue(b.oltReleasePath, "VENDOR")),
+			"OLT",
+		)
 	case KindONU:
 		return firstNonEmpty(
 			strings.TrimSpace(readTextFile(b.deviceVendorPath)),
@@ -1663,6 +1717,12 @@ func (b *hostBackend) readModelName(ctx context.Context) string {
 	case KindAndroid:
 		props := b.readBuildProps()
 		return firstNonEmpty(props["ro.product.model"], props["ro.product.device"], "Android")
+	case KindOLT:
+		return firstNonEmpty(
+			b.readSysinfoValue("ModelName"),
+			strings.TrimSpace(readAssignmentFileValue(b.oltReleasePath, "MODEL")),
+			readAssignmentFileValue(b.osReleasePath, "NAME"),
+		)
 	default:
 		return firstNonEmpty(
 			strings.TrimSpace(readTextFile(b.deviceModelPath)),
@@ -1681,6 +1741,11 @@ func (b *hostBackend) readHardwareVersion(ctx context.Context) string {
 	case KindAndroid:
 		props := b.readBuildProps()
 		return firstNonEmpty(props["ro.build.version.incremental"], props["ro.build.id"])
+	case KindOLT:
+		return firstNonEmpty(
+			b.readSysinfoValue("HardwareVersion"),
+			strings.TrimSpace(readAssignmentFileValue(b.oltReleasePath, "HW_VERSION")),
+		)
 	default:
 		return firstNonEmpty(
 			strings.TrimSpace(readTextFile(b.deviceVersionPath)),
@@ -1704,6 +1769,12 @@ func (b *hostBackend) readSoftwareVersion(ctx context.Context) string {
 	case KindAndroid:
 		props := b.readBuildProps()
 		return firstNonEmpty(props["ro.build.version.release"], props["ro.build.display.id"], props["ro.build.id"])
+	case KindOLT:
+		return firstNonEmpty(
+			b.readSysinfoValue("SoftwareVersion"),
+			strings.TrimSpace(readAssignmentFileValue(b.oltReleasePath, "VERSION")),
+			b.commandOutput(ctx, "uname", "-r"),
+		)
 	default:
 		return firstNonEmpty(
 			readAssignmentFileValue(b.osReleasePath, "PRETTY_NAME"),
@@ -1740,6 +1811,13 @@ func (b *hostBackend) readSerialNumber(ctx context.Context) string {
 	case KindAndroid:
 		props := b.readBuildProps()
 		return firstNonEmpty(props["ro.serialno"], props["ro.boot.serialno"], props["ro.boot.hardware.sku"])
+	case KindOLT:
+		return firstNonEmpty(
+			b.readSysinfoValue("Sn"),
+			strings.TrimSpace(readAssignmentFileValue(b.oltReleasePath, "SERIAL")),
+			strings.TrimSpace(readTextFile(b.serialNumberPath)),
+			strings.TrimSpace(readTextFile(b.machineIDPath)),
+		)
 	default:
 		return firstNonEmpty(
 			strings.TrimSpace(readTextFile(b.serialNumberPath)),
@@ -2085,6 +2163,8 @@ func (b *hostBackend) productClass() string {
 		return "Android"
 	case KindONU:
 		return "ONU"
+	case KindOLT:
+		return "OLT"
 	default:
 		return "Linux"
 	}
@@ -2105,6 +2185,8 @@ func defaultStatePath(kind Kind) string {
 		return "/data/local/tmp/wantastic-usp.json"
 	case KindONU:
 		return defaultWantasticStatePath("usp-onu.json")
+	case KindOLT:
+		return defaultWantasticStatePath("usp-olt.json")
 	default:
 		return defaultWantasticStatePath("usp-host.json")
 	}
@@ -2112,7 +2194,7 @@ func defaultStatePath(kind Kind) string {
 
 func defaultHostnamePath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindAndroid, KindONU:
+	case KindLinux, KindAndroid, KindONU, KindOLT:
 		return "/proc/sys/kernel/hostname"
 	default:
 		return ""
@@ -2121,7 +2203,7 @@ func defaultHostnamePath(kind Kind) string {
 
 func defaultUptimePath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindAndroid, KindONU:
+	case KindLinux, KindAndroid, KindONU, KindOLT:
 		return "/proc/uptime"
 	default:
 		return ""
@@ -2130,7 +2212,7 @@ func defaultUptimePath(kind Kind) string {
 
 func defaultMemInfoPath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindAndroid, KindONU:
+	case KindLinux, KindAndroid, KindONU, KindOLT:
 		return "/proc/meminfo"
 	default:
 		return ""
@@ -2139,7 +2221,7 @@ func defaultMemInfoPath(kind Kind) string {
 
 func defaultIPv6DisablePath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindAndroid, KindONU:
+	case KindLinux, KindAndroid, KindONU, KindOLT:
 		return "/proc/sys/net/ipv6/conf/all/disable_ipv6"
 	default:
 		return ""
@@ -2148,7 +2230,7 @@ func defaultIPv6DisablePath(kind Kind) string {
 
 func defaultTCPImplementationPath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindAndroid, KindONU:
+	case KindLinux, KindAndroid, KindONU, KindOLT:
 		return "/proc/sys/net/ipv4/tcp_congestion_control"
 	default:
 		return ""
@@ -2157,7 +2239,7 @@ func defaultTCPImplementationPath(kind Kind) string {
 
 func defaultOSReleasePath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindONU:
+	case KindLinux, KindONU, KindOLT:
 		return "/etc/os-release"
 	default:
 		return ""
@@ -2177,7 +2259,7 @@ func defaultSerialNumberPath(kind Kind) string {
 
 func defaultMachineIDPath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindONU:
+	case KindLinux, KindONU, KindOLT:
 		return "/etc/machine-id"
 	default:
 		return ""
@@ -2226,7 +2308,7 @@ func defaultBuildPropPath(kind Kind) string {
 
 func defaultTimezonePath(kind Kind) string {
 	switch kind {
-	case KindLinux, KindONU:
+	case KindLinux, KindONU, KindOLT:
 		return "/etc/timezone"
 	default:
 		return ""
@@ -2235,7 +2317,7 @@ func defaultTimezonePath(kind Kind) string {
 
 func defaultNetClassDir(kind Kind) string {
 	switch kind {
-	case KindLinux, KindAndroid, KindONU:
+	case KindLinux, KindAndroid, KindONU, KindOLT:
 		return "/sys/class/net"
 	default:
 		return ""
@@ -2369,6 +2451,39 @@ func readAssignmentFileValue(path, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(values[key])
+}
+
+// readSysinfoValue returns one key of the FOS sysinfo.txt platform file
+// (/tmp/sysinfo.txt on Photon OLTs). Empty when the file or key is absent.
+func (b *hostBackend) readSysinfoValue(key string) string {
+	values, _ := parseSysinfoFile(b.sysinfoPath)
+	return strings.TrimSpace(values[key])
+}
+
+// parseSysinfoFile parses the vendor platform info file. FOS writes it with
+// "Key: value" lines ("Sn: 123456790"), but the same file is also seen with
+// "Key=value" on other releases, so both separators are accepted.
+func parseSysinfoFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			key, value, ok = strings.Cut(line, "=")
+		}
+		if !ok {
+			continue
+		}
+		values[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return values, nil
 }
 
 func firstNonEmpty(values ...string) string {
@@ -2513,7 +2628,12 @@ func hasONUMarker(value string) bool {
 		strings.Contains(value, "xgs-pon"),
 		strings.Contains(value, "xpon"),
 		strings.Contains(value, "pon"),
-		strings.Contains(value, "ont"):
+		strings.Contains(value, "ont"),
+		// EcoNet/EN75xx silicon only appears in GPON/EPON ONUs and CPEs
+		// (e.g. the EN7528 ONU: "system type: EcoNet EN7528 SOC").
+		strings.Contains(value, "econet"),
+		strings.Contains(value, "en75"),
+		strings.Contains(value, "en7528"):
 		return true
 	default:
 		return false
@@ -2522,4 +2642,38 @@ func hasONUMarker(value string) bool {
 
 func escapePowerShellLiteral(value string) string {
 	return strings.ReplaceAll(value, `'`, `''`)
+}
+
+// addProvisionedONU provisions one ONU in the OLT authentication table from
+// the Add initial message fields (Mode, Info, LineID, Desc, OnuID).
+func (b *hostBackend) addProvisionedONU(ctx context.Context, initial *wusp.Message) ([]string, error) {
+	if initial == nil {
+		return nil, fmt.Errorf("olt: Add requires the provisioned ONU fields")
+	}
+	value := func(leaf string) string {
+		for _, field := range initial.Fields {
+			if strings.HasSuffix(field.Path, leaf) {
+				return wusp.ValueToString(field.Val)
+			}
+		}
+		return ""
+	}
+	onuID := value("OnuID")
+	if onuID == "" {
+		return nil, fmt.Errorf("olt: Add requires OnuID (e.g. 0/1/1)")
+	}
+	api := b.oltClient()
+	if err := api.EnsureLogin(ctx); err != nil {
+		return nil, fmt.Errorf("olt: login: %w", err)
+	}
+	if err := api.ProvisionONU(ctx, fiberolt.ProvisionedONU{
+		OnuID:  onuID,
+		Mode:   value("Mode"),
+		Info:   value("Info"),
+		LineID: value("LineID"),
+		Desc:   value("Desc"),
+	}); err != nil {
+		return nil, fmt.Errorf("olt: provision ONU: %w", err)
+	}
+	return []string{wusp.WUSPOLTPrefix + "ProvisionedONU." + onuID}, nil
 }

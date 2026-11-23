@@ -273,7 +273,18 @@ func newUSPRuntime(cfg *config.Config, transport uspTransport, softwareVersion s
 
 	log.Printf("[USP] Runtime initializing: deviceID=%q serial=%q controllerKey=%q", cfg.DeviceID, wuspSerial, controllerPublicKeyHex)
 
-	backend := platforms.NewBackend(platforms.Options{})
+	backendOptions := platforms.Options{}
+	if cfg.OLT.Enable {
+		// Proxy mode: this agent manages a remote FOS OLT over its goform
+		// API instead of collecting the local host.
+		backendOptions = platforms.Options{
+			Kind:           platforms.KindOLT,
+			OLTAPIURL:      cfg.OLT.URL,
+			OLTAPIUser:     cfg.OLT.User,
+			OLTAPIPassword: cfg.OLT.Password,
+		}
+	}
+	backend := platforms.NewBackend(backendOptions)
 	networkSpeed := newNetworkSpeedManager(auth.PersistentFilePath("network-speed.json"))
 	var telemetryBackend wusp.DataBackend = &networkTelemetryBackend{backend: backend, speed: networkSpeed}
 	if exit, ok := transport.(exitNodeController); ok {
@@ -959,6 +970,76 @@ func (r *uspRuntime) handleOperate(ctx context.Context, cmdPath string, input *w
 		return nil, nil
 	case wusp.WUSPSpectralTelemetryPrefix + "Capture()":
 		return r.handleSpectralCapture()
+	case wusp.WUSPOLTRebootCommand, wusp.WUSPOLTFactoryRestoreCommand,
+		wusp.WUSPOLTONURebootCommand, wusp.WUSPOLTONUResetCommand,
+		wusp.WUSPOLTONUEnableCommand, wusp.WUSPOLTONUDisableCommand:
+		if controller, ok := r.rawBackend.(interface {
+			OLTOperate(context.Context, string, *wusp.Message) error
+		}); ok {
+			return nil, controller.OLTOperate(ctx, cmd, input)
+		}
+		return nil, fmt.Errorf("OLT Operate not supported on this platform")
+	case wusp.WUSPOLTUpgradeCommand:
+		if controller, ok := r.rawBackend.(interface {
+			OLTOperateWithDir(context.Context, string, string, *wusp.Message) error
+		}); ok {
+			return nil, controller.OLTOperateWithDir(ctx, cmd, r.transferDir, input)
+		}
+		return nil, fmt.Errorf("OLT Operate not supported on this platform")
+	case wusp.WUSPOLTBackupConfigCommand, wusp.WUSPOLTRestoreConfigCommand:
+		if controller, ok := r.rawBackend.(interface {
+			OLTOperate(context.Context, string, *wusp.Message) error
+		}); ok {
+			if err := controller.OLTOperate(ctx, cmd, input); err != nil {
+				return nil, err
+			}
+			if input != nil {
+				return input, nil
+			}
+			return &wusp.Message{}, nil
+		}
+		return nil, fmt.Errorf("OLT Operate not supported on this platform")
+	case wusp.WUSPONURebootCommand, wusp.WUSPONUFactoryRestoreCommand:
+		if controller, ok := r.rawBackend.(interface {
+			ONUOperate(context.Context, string, *wusp.Message) error
+		}); ok {
+			return nil, controller.ONUOperate(ctx, cmd, input)
+		}
+		return nil, fmt.Errorf("ONU Operate not supported on this platform")
+	case wusp.WUSPONUUpgradeCommand:
+		if controller, ok := r.rawBackend.(interface {
+			ONUOperateWithDir(context.Context, string, string, *wusp.Message) error
+		}); ok {
+			return nil, controller.ONUOperateWithDir(ctx, cmd, r.transferDir, input)
+		}
+		return nil, fmt.Errorf("ONU Operate not supported on this platform")
+	case wusp.WUSPONUBackupConfigCommand, wusp.WUSPONURestoreConfigCommand:
+		if controller, ok := r.rawBackend.(interface {
+			ONUOperate(context.Context, string, *wusp.Message) error
+		}); ok {
+			if err := controller.ONUOperate(ctx, cmd, input); err != nil {
+				return nil, err
+			}
+			if input != nil {
+				return input, nil
+			}
+			return &wusp.Message{}, nil
+		}
+		return nil, fmt.Errorf("ONU Operate not supported on this platform")
+	case wusp.WUSPOSUsersRebootCommand, wusp.WUSPOSUsersLogOffSessionCommand,
+		wusp.WUSPOSUsersEnableUserCommand, wusp.WUSPOSUsersDisableUserCommand,
+		wusp.WUSPOSUsersGrantAdministratorCommand, wusp.WUSPOSUsersRevokeAdministratorCommand,
+		wusp.WUSPOSUsersCreateUserCommand, wusp.WUSPOSUsersDeleteUserCommand:
+		// The device reports the outcome in LastOperationStatus /
+		// LastOperationCode / LastOperationMessage, so a refusal comes back
+		// as a reply carrying the closed-vocabulary code, not as an error.
+		controller, ok := r.rawBackend.(interface {
+			OSUsersOperate(context.Context, string, *wusp.Message) (*wusp.Message, error)
+		})
+		if !ok {
+			return nil, wusp.ErrUSPPathUnsupported
+		}
+		return controller.OSUsersOperate(ctx, cmd, input)
 	case wusp.WUSPWantasticMeshRestartCommand,
 		wusp.WUSPWantasticMeshSetChannelCommand,
 		wusp.WUSPWantasticMeshSetTxPowerCommand:

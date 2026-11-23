@@ -103,6 +103,11 @@ type Config struct {
 	Interface  Interface `json:"interface"`
 	Auth       Auth      `json:"auth"`
 	ExitNode   ExitNode  `json:"exit_node"`
+	// OLT configures proxy management of a FOS-based GPON OLT over its
+	// goform web API. When enabled, this agent represents the OLT as a
+	// managed fiber device (Device.WUSP_OLT.*) instead of collecting its
+	// own host.
+	OLT OLT `json:"olt"`
 	// AllowLocalAccess exposes directly connected private IPv4 subnets to
 	// other devices in the same tenant. It is opt-in because it changes the
 	// host from an overlay endpoint into a subnet router.
@@ -123,6 +128,14 @@ type Server struct {
 	PublicKey           string   `json:"public_key"`
 	AllowedIPs          []string `json:"allowed_ips"`
 	PersistentKeepalive int      `json:"persistent_keepalive"`
+}
+
+// OLT holds the proxy-management settings for a remote FOS-based GPON OLT.
+type OLT struct {
+	Enable   bool   `json:"enable"`
+	URL      string `json:"url"`      // e.g. "http://192.168.100.100"
+	User     string `json:"user"`     // default "admin"
+	Password string `json:"password"` // default "admin"
 }
 
 type Interface struct {

@@ -13,45 +13,27 @@ import (
 )
 
 // SetOLTParam applies a Device.WUSP_OLT.* write from the console onto the
-// vendor device. enableWrite persists the Enable flag through the caller;
-// it is called for the Enable leaf only. Unsupported leaves return
-// wusp.ErrUSPPathUnsupported.
+// vendor device through the binding tables (engine.go). enableWrite
+// persists the Enable flag through the caller; it is called for the Enable
+// leaf only. Unsupported leaves return wusp.ErrUSPPathUnsupported.
 func SetOLTParam(ctx context.Context, api *Client, path string, value wusp.Value, enableWrite func(bool) error) error {
-	path = strings.TrimSpace(path)
-	switch path {
-	case wusp.WUSPOLTPrefix + "Enable":
-		if enableWrite == nil {
-			return wusp.ErrUSPPathUnsupported
-		}
-		return enableWrite(value.AsBool())
-	}
-
-	if strings.HasPrefix(path, wusp.WUSPOLTPrefix+"Network.") {
-		return SetOLTNetworkParam(ctx, api, path, value)
-	}
-
-	if index, leaf, ok := parseIndexedPath(path, wusp.WUSPOLTPrefix+"ONU."); ok {
-		row := ONURowByIndex(ctx, api, index)
-		if row == "" {
-			return wusp.ErrUSPPathNotFound
-		}
-		switch leaf {
-		case "Enable":
-			if err := api.EnsureLogin(ctx); err != nil {
-				return fmt.Errorf("olt: login: %w", err)
-			}
-			if value.AsBool() {
-				return api.OntAction(ctx, "active", []string{row})
-			}
-			return api.OntAction(ctx, "deactive", []string{row})
-		}
-	}
-
-	return wusp.ErrUSPPathUnsupported
+	return Set(ctx, &Env{API: api, EnableWrite: enableWrite}, path, value)
 }
 
-// ONURowByIndex resolves the wusp ONU table row back to a vendor ONU ID
-// (like "0/1/1") by asking the live table. Empty when the row is unknown.
+// SetOLTParamWithCLI is SetOLTParam with the FOS command line available
+// to bindings that need it.
+func SetOLTParamWithCLI(ctx context.Context, api *Client, cli *CLI, path string, value wusp.Value, enableWrite func(bool) error) error {
+	env := envFor(api, cli)
+	env.EnableWrite = enableWrite
+	return Set(ctx, env, path, value)
+}
+
+// ONURowByIndex resolves a position in the raw web ONU list to a vendor
+// ONU ID (like "0/1/1"). Empty when the row is unknown.
+//
+// Deprecated: the WUSP ONU table is sorted and merged with CLI-only rows,
+// so its instance numbers do not follow the raw web order; Set resolves
+// ONU.{i} through the collected snapshot instead.
 func ONURowByIndex(ctx context.Context, api *Client, index uint64) string {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -74,60 +56,20 @@ func ONURowByIndex(ctx context.Context, api *Client, index uint64) string {
 }
 
 // OLTOperate runs Device.WUSP_OLT Operate commands on behalf of the agent.
-// Commands execute only when the console asks, never on a timer.
+// Commands execute only when the console asks, never on a timer. Output
+// fields (e.g. BackupConfig's Config) are written into input when it is
+// non-nil, which is how callers have always read them.
 func OLTOperate(ctx context.Context, api *Client, cmd string, input *wusp.Message) error {
-	cmd = strings.TrimSpace(cmd)
-	switch cmd {
-	case wusp.WUSPOLTRebootCommand:
-		if err := api.EnsureLogin(ctx); err != nil {
-			return fmt.Errorf("olt: login: %w", err)
-		}
-		return api.SystemAction(ctx, "reboot")
-	case wusp.WUSPOLTUpgradeCommand:
-		// The image arrives through the WUSP upload channel and is staged by
-		// the agent in its transfer directory; the input names the file.
-		return OperateUpgrade(ctx, api, input)
-	case wusp.WUSPOLTBackupConfigCommand:
-		text, err := OperateBackupConfig(ctx, api)
-		if err != nil {
-			return err
-		}
-		if input != nil {
-			input.Set(wusp.WUSPOLTPrefix+"Config", wusp.String(text))
-		}
-		return nil
-	case wusp.WUSPOLTRestoreConfigCommand:
-		return OperateRestoreConfig(ctx, api, input)
-	case wusp.WUSPOLTFactoryRestoreCommand:
-		if err := api.EnsureLogin(ctx); err != nil {
-			return fmt.Errorf("olt: login: %w", err)
-		}
-		return api.SystemAction(ctx, "restore")
-	case wusp.WUSPOLTONURebootCommand, wusp.WUSPOLTONUResetCommand,
-		wusp.WUSPOLTONUEnableCommand, wusp.WUSPOLTONUDisableCommand:
-		id := OperateInputString(input, "Index")
-		if id == "" {
-			return fmt.Errorf("olt: %s requires an Index input (ONU ID like 0/1/1)", cmd)
-		}
-		if err := api.EnsureLogin(ctx); err != nil {
-			return fmt.Errorf("olt: login: %w", err)
-		}
-		switch cmd {
-		case wusp.WUSPOLTONURebootCommand:
-			return api.OntAction(ctx, "reboot", []string{id})
-		case wusp.WUSPOLTONUResetCommand:
-			return api.OntAction(ctx, "reset", []string{id})
-		case wusp.WUSPOLTONUEnableCommand:
-			return api.OntAction(ctx, "active", []string{id})
-		default:
-			return api.OntAction(ctx, "deactive", []string{id})
-		}
-	default:
-		if strings.HasPrefix(cmd, wusp.WUSPOLTPrefix+"Network.") {
-			return OLTNetworkOperate(ctx, api, cmd, input)
-		}
-		return wusp.ErrUSPPathUnsupported
+	out, err := Operate(ctx, &Env{API: api}, cmd, input)
+	if err != nil {
+		return err
 	}
+	if input != nil && out != nil {
+		for _, f := range out.Fields {
+			input.Set(f.Path, f.Val)
+		}
+	}
+	return nil
 }
 
 // OperateInputString reads a string input field from an Operate input
@@ -170,11 +112,15 @@ func parseIndexedPath(path, prefix string) (uint64, string, bool) {
 // handler. The Operate input must carry the staged file name (field
 // FileName); stagingDir is the agent's transfer directory.
 func OperateUpgrade(ctx context.Context, api *Client, input *wusp.Message) error {
+	return operateUpgrade(ctx, api, OperateStagingDir, input)
+}
+
+func operateUpgrade(ctx context.Context, api *Client, stagingDir string, input *wusp.Message) error {
 	name := OperateInputString(input, "FileName")
 	if name == "" {
 		return fmt.Errorf("olt: Upgrade() requires a FileName input (the staged image file)")
 	}
-	data, err := os.ReadFile(filepath.Join(OperateStagingDir, filepath.Base(name)))
+	data, err := os.ReadFile(filepath.Join(stagingDir, filepath.Base(name)))
 	if err != nil {
 		return fmt.Errorf("olt: read staged image: %w", err)
 	}

@@ -1,0 +1,12 @@
+{
+  "Device.WUSP_OLT.AlarmNumberOfEntries": "3:0",
+  "Device.WUSP_OLT.ControlSchemaVersion": "6:\u003cver\u003e",
+  "Device.WUSP_OLT.Enable": "2:true",
+  "Device.WUSP_OLT.Installed": "2:true",
+  "Device.WUSP_OLT.ONUNumberOfEntries": "3:0",
+  "Device.WUSP_OLT.PONPortNumberOfEntries": "3:0",
+  "Device.WUSP_OLT.Platform": "6:olt",
+  "Device.WUSP_OLT.Status": "6:api_error",
+  "Device.WUSP_OLT.StatusDetail": "\u003cdetail\u003e",
+  "Device.WUSP_OLT.SupportedOperations": "6:Reboot, FactoryRestore, ONU.Reboot, ONU.Reset, ONU.Enable, ONU.Disable"
+}

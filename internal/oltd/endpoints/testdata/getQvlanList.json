@@ -1,0 +1,1 @@
+{"list":[{"vlanId":"1","remark":"default","ip":"192.168.1.100","mask":"255.255.255.0","ipType":"static","threeLayersEn":"1"},{"vlanId":"4000","remark":"VLAN4000","ip":"192.168.130.179","mask":"255.255.255.0","ipType":"static","threeLayersEn":"1"}]}

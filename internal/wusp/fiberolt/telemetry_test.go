@@ -17,6 +17,7 @@ func fakeOLTServer(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/login/Auth":
+			w.Header().Set("Set-Cookie", "_:USERNAME:_=admin; path=/")
 			json.NewEncoder(w).Encode(map[string]string{"errCode": "success"})
 		case "/goform/getSysStatus":
 			json.NewEncoder(w).Encode(SysStatus{

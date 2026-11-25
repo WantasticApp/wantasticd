@@ -3,8 +3,11 @@ package fiberonu
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,111 +17,251 @@ import (
 
 const netPrefix = wusp.WUSPONUPrefix + "Network."
 
-// CollectNetwork fills Device.WUSP_ONU.Network.* from the ONU's Linux layer:
-// interfaces, routes, iptables, DHCP, DNS, WLAN radios, stations.
+// CollectNetwork fills Device.WUSP_ONU.Network.* from the ONU: interfaces
+// and routes from the kernel, the Wi-Fi radios, SSIDs and the firewall
+// configuration from the firmware's config tree (tcapi), stations from the
+// Wi-Fi driver, DHCP, DNS and WAN. Every source is a read; nothing here
+// scans, sets or runs on its own timer.
 func CollectNetwork(ctx context.Context, opts Options, msg *wusp.Message) {
-	collectInterfaces(msg)
-	collectRoutes(ctx, msg)
-	collectIPTables(ctx, msg)
+	collectNetwork(ctx, opts, msg)
+}
+
+// collectNetwork is CollectNetwork returning the MediaTek WLAN reads (nil on
+// a mac80211 build), which CollectONU republishes as TR-181 Device.WiFi.
+func collectNetwork(ctx context.Context, opts Options, msg *wusp.Message) *wlanSnapshot {
+	routeText := readFile(filepath.Join(opts.procNetDir(), "route"))
+	collectInterfaces(opts, routeText, msg)
+	collectRoutes(routeText, msg)
+	tc, done := newTcapi(ctx, opts)
+	defer done()
+	collectFirewall(ctx, opts, tc, msg)
 	collectDHCP(msg)
 	collectDNS(msg)
-	collectWLAN(ctx, msg)
+	wlan := collectWLAN(ctx, opts, tc, msg)
 	collectWAN(ctx, opts, msg)
+	return wlan
 }
 
 // ---- Interfaces -----------------------------------------------------------
+//
+// One row per /proc/net/dev line, in that order: Interface.{i}.Enable
+// resolves its interface by the same enumeration (resolveIfaceByIndex), so
+// the console's row and the setter always mean the same interface. The
+// console sorts and groups by Role; the agent never reorders.
 
-func collectInterfaces(msg *wusp.Message) {
-	data := readFile("/proc/net/dev")
-	if data == "" {
-		return
-	}
-	lines := strings.Split(data, "\n")
-	idx := 1
-	for _, line := range lines {
+// Interface roles. An ECNT ONU lists ~30 interfaces; only a handful carry
+// subscriber traffic.
+const (
+	roleUplink    = "uplink"     // nas*/ppp* WAN connections, and whatever holds the default route
+	roleLANBridge = "lan_bridge" // br*: the LAN bridge (management address lives here)
+	roleLANPort   = "lan_port"   // eth0.N: one physical LAN port per VLAN sub-interface
+	roleWiFi      = "wifi"       // ra*/rai*: one interface per SSID (MediaTek/Ralink driver)
+	roleInternal  = "internal"   // lo, omci, oam, pon, sit0, imq*, wds*, wan_int*/lan_int*, eth0 ...
+)
+
+type ifaceCounters struct {
+	name                         string
+	rxBytes, rxPackets, rxErrors uint64
+	txBytes, txPackets, txErrors uint64
+	counters                     bool
+}
+
+// parseProcNetDev returns the interfaces of /proc/net/dev in file order.
+// Each line is "name: rx bytes packets errs drop fifo frame compressed
+// multicast tx bytes packets errs drop fifo colls carrier compressed".
+func parseProcNetDev(text string) []ifaceCounters {
+	var out []ifaceCounters
+	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.Contains(line, ":") || strings.HasPrefix(line, "Inter") || strings.HasPrefix(line, "face") {
 			continue
 		}
 		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
 		name := strings.TrimSpace(parts[0])
 		if name == "" {
 			continue
 		}
-		row := netPrefix + "Interface." + strconv.Itoa(idx) + "."
-		msg.Set(row+"Name", wusp.String(name))
+		row := ifaceCounters{name: name}
 		fields := strings.Fields(parts[1])
-		if len(fields) >= 10 {
-			if v, err := strconv.ParseUint(fields[0], 10, 64); err == nil {
-				msg.Set(row+"RxBytes", wusp.Uint(v))
+		if len(fields) >= 11 {
+			vals := make([]uint64, 11)
+			ok := true
+			for i := range vals {
+				v, err := strconv.ParseUint(fields[i], 10, 64)
+				if err != nil {
+					ok = false
+					break
+				}
+				vals[i] = v
 			}
-			if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-				msg.Set(row+"RxPackets", wusp.Uint(v))
-			}
-			if v, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
-				msg.Set(row+"RxErrors", wusp.Uint(v))
-			}
-			if v, err := strconv.ParseUint(fields[8], 10, 64); err == nil {
-				msg.Set(row+"TxBytes", wusp.Uint(v))
-			}
-			if v, err := strconv.ParseUint(fields[9], 10, 64); err == nil {
-				msg.Set(row+"TxPackets", wusp.Uint(v))
-			}
-			if v, err := strconv.ParseUint(fields[10], 10, 64); err == nil {
-				msg.Set(row+"TxErrors", wusp.Uint(v))
+			if ok {
+				row.rxBytes, row.rxPackets, row.rxErrors = vals[0], vals[1], vals[2]
+				row.txBytes, row.txPackets, row.txErrors = vals[8], vals[9], vals[10]
+				row.counters = true
 			}
 		}
-		ip := ifaceIPv4(name)
-		if ip != "" {
-			msg.Set(row+"IPv4Address", wusp.String(ip))
-		}
-		mac := readFile("/sys/class/net/" + name + "/address")
-		mac = strings.TrimSpace(mac)
-		if mac != "" && mac != "00:00:00:00:00:00" {
-			msg.Set(row+"MACAddress", wusp.String(mac))
-		}
-		operState := strings.TrimSpace(readFile("/sys/class/net/" + name + "/operstate"))
-		if operState != "" {
-			msg.Set(row+"OperState", wusp.String(operState))
-		}
-		mtu := strings.TrimSpace(readFile("/sys/class/net/" + name + "/mtu"))
-		if v, err := strconv.ParseUint(mtu, 10, 64); err == nil {
-			msg.Set(row+"MTU", wusp.Uint(v))
-		}
-		idx++
+		out = append(out, row)
 	}
-	msg.Set(netPrefix+"InterfaceNumberOfEntries", wusp.Uint(uint64(idx-1)))
+	return out
 }
 
-func ifaceIPv4(name string) string {
-	data := readFile("/proc/net/fib_trie")
-	if data == "" {
-		return ""
+// defaultRouteIfaces names the interfaces carrying a default route in
+// /proc/net/route (destination and mask 00000000).
+func defaultRouteIfaces(routeText string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(routeText, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 8 && f[1] == "00000000" && f[7] == "00000000" {
+			out[f[0]] = true
+		}
 	}
-	lines := strings.Split(data, "\n")
-	inDevice := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.Contains(trimmed, "/"+name) {
-			inDevice = true
+	return out
+}
+
+// interfaceRole classifies an ECNT ONU interface name. The names come from
+// the firmware: rcS creates br0 over eth0/eth1, eth0.1..eth0.8 per LAN
+// port, nas0_0/nas10 and ppp%d for WAN connections (libcfg_clisvc
+// "nas%d_%d", "ppp%d"), and libwlan_svc brings up ra%d (2.4 GHz SSIDs) and
+// rai%d (5 GHz SSIDs).
+func interfaceRole(name string, defaultRoute bool) string {
+	switch {
+	case defaultRoute:
+		return roleUplink
+	case reUplink.MatchString(name):
+		return roleUplink
+	case reBridge.MatchString(name):
+		return roleLANBridge
+	case reLANPort.MatchString(name):
+		return roleLANPort
+	case reWiFi.MatchString(name):
+		return roleWiFi
+	default:
+		return roleInternal
+	}
+}
+
+var (
+	reUplink  = regexp.MustCompile(`^(nas\d+(_\d+)?(\.\d+)?|ppp\d+)$`)
+	reBridge  = regexp.MustCompile(`^br\d+$`)
+	reLANPort = regexp.MustCompile(`^eth\d+\.(\d+)$`)
+	reWiFi    = regexp.MustCompile(`^(ra|rai|apcli|apclii)\d+$`)
+)
+
+// lanPortNumber is N of eth0.N, the LAN port the VLAN sub-interface serves.
+func lanPortNumber(name string) (uint64, bool) {
+	m := reLANPort.FindStringSubmatch(name)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(m[1], 10, 64)
+	return n, err == nil
+}
+
+// ifaceControllable says whether the console may offer an up/down switch.
+// Only LAN ports and Wi-Fi interfaces qualify: turning off lo, omci, the
+// management bridge or the uplink cuts the ONU (and this agent) off.
+func ifaceControllable(role string, defaultRoute bool) bool {
+	return !defaultRoute && (role == roleLANPort || role == roleWiFi)
+}
+
+// netlinkIPv4 returns each interface's IPv4 addresses in CIDR form, asking
+// the kernel over netlink (RTM_GETADDR) instead of guessing from
+// /proc/net/fib_trie, which never names interfaces.
+func netlinkIPv4() (map[string][]string, error) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	for _, ifc := range ifs {
+		addrs, err := ifc.Addrs()
+		if err != nil {
 			continue
 		}
-		if inDevice && strings.HasPrefix(trimmed, "/") {
-			inDevice = false
-		}
-		if inDevice && strings.Contains(trimmed, "/32 host LOCAL") {
-			parts := strings.Fields(trimmed)
-			if len(parts) > 0 {
-				ip := strings.TrimPrefix(parts[0], "|--")
-				ip = strings.TrimPrefix(ip, "+--")
-				ip = strings.TrimSpace(ip)
-				if ip != "" && !strings.HasPrefix(ip, "127.") {
-					return ip
-				}
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				out[ifc.Name] = append(out[ifc.Name], ipnet.String())
 			}
+		}
+	}
+	return out, nil
+}
+
+func (o Options) ifaceAddrs() map[string][]string {
+	src := o.IfaceAddrs
+	if src == nil {
+		src = netlinkIPv4
+	}
+	addrs, err := src()
+	if err != nil {
+		return nil
+	}
+	return addrs
+}
+
+func collectInterfaces(opts Options, routeText string, msg *wusp.Message) {
+	data := readFile(filepath.Join(opts.procNetDir(), "dev"))
+	if data == "" {
+		return
+	}
+	addrs := opts.ifaceAddrs()
+	defaults := defaultRouteIfaces(routeText)
+	sys := opts.sysClassNetDir()
+	rows := parseProcNetDev(data)
+	for i, r := range rows {
+		row := netPrefix + "Interface." + strconv.Itoa(i+1) + "."
+		msg.Set(row+"Name", wusp.String(r.name))
+		if r.counters {
+			msg.Set(row+"RxBytes", wusp.Uint(r.rxBytes))
+			msg.Set(row+"RxPackets", wusp.Uint(r.rxPackets))
+			msg.Set(row+"RxErrors", wusp.Uint(r.rxErrors))
+			msg.Set(row+"TxBytes", wusp.Uint(r.txBytes))
+			msg.Set(row+"TxPackets", wusp.Uint(r.txPackets))
+			msg.Set(row+"TxErrors", wusp.Uint(r.txErrors))
+		}
+		if cidrs := addrs[r.name]; len(cidrs) > 0 {
+			ip, bits, _ := strings.Cut(cidrs[0], "/")
+			msg.Set(row+"IPv4Address", wusp.String(ip))
+			if n, err := strconv.ParseUint(bits, 10, 64); err == nil {
+				msg.Set(row+"IPv4PrefixLength", wusp.Uint(n))
+			}
+			msg.Set(row+"IPv4Addresses", wusp.String(strings.Join(cidrs, ",")))
+		}
+		dir := filepath.Join(sys, r.name)
+		if mac := strings.TrimSpace(readFile(filepath.Join(dir, "address"))); mac != "" && mac != "00:00:00:00:00:00" {
+			msg.Set(row+"MACAddress", wusp.String(mac))
+		}
+		if state := strings.TrimSpace(readFile(filepath.Join(dir, "operstate"))); state != "" {
+			msg.Set(row+"OperState", wusp.String(state))
+		}
+		if v, err := strconv.ParseUint(strings.TrimSpace(readFile(filepath.Join(dir, "mtu"))), 10, 64); err == nil {
+			msg.Set(row+"MTU", wusp.Uint(v))
+		}
+		// IFF_UP from the flags word: the Ralink driver reports operstate
+		// "unknown" even while its interfaces pass traffic.
+		if v, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(readFile(filepath.Join(dir, "flags"))), "0x"), 16, 64); err == nil {
+			msg.Set(row+"Up", wusp.Bool(v&0x1 != 0))
+		}
+		if bridge := bridgeOf(dir); bridge != "" {
+			msg.Set(row+"Bridge", wusp.String(bridge))
+		}
+		role := interfaceRole(r.name, defaults[r.name])
+		msg.Set(row+"Role", wusp.String(role))
+		if n, ok := lanPortNumber(r.name); ok {
+			msg.Set(row+"LANPort", wusp.Uint(n))
+		}
+		msg.Set(row+"DefaultRoute", wusp.Bool(defaults[r.name]))
+		msg.Set(row+"Controllable", wusp.Bool(ifaceControllable(role, defaults[r.name])))
+	}
+	msg.Set(netPrefix+"InterfaceNumberOfEntries", wusp.Uint(uint64(len(rows))))
+}
+
+// bridgeOf names the bridge an interface is a port of (sysfs brport/bridge
+// or master link), "" when it is not bridged.
+func bridgeOf(dir string) string {
+	for _, link := range []string{"brport/bridge", "master"} {
+		if target, err := os.Readlink(filepath.Join(dir, link)); err == nil {
+			return filepath.Base(target)
 		}
 	}
 	return ""
@@ -126,8 +269,7 @@ func ifaceIPv4(name string) string {
 
 // ---- Routing table --------------------------------------------------------
 
-func collectRoutes(_ context.Context, msg *wusp.Message) {
-	data := readFile("/proc/net/route")
+func collectRoutes(data string, msg *wusp.Message) {
 	if data == "" {
 		return
 	}
@@ -160,65 +302,6 @@ func hexToIP(h string) string {
 		return h
 	}
 	return fmt.Sprintf("%d.%d.%d.%d", v&0xff, (v>>8)&0xff, (v>>16)&0xff, (v>>24)&0xff)
-}
-
-// ---- iptables rules -------------------------------------------------------
-
-func collectIPTables(ctx context.Context, msg *wusp.Message) {
-	idx := 1
-	for _, table := range []string{"filter", "nat", "mangle"} {
-		idx = collectOneIPTable(ctx, msg, table, idx)
-	}
-	msg.Set(netPrefix+"Firewall.RuleNumberOfEntries", wusp.Uint(uint64(idx-1)))
-}
-
-func collectOneIPTable(ctx context.Context, msg *wusp.Message, table string, idx int) int {
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	// Try iptables-save first; fall back to iptables -S which is available
-	// on EN7528 BusyBox-based builds that ship iptables but not iptables-save.
-	out, err := exec.CommandContext(tctx, "iptables-save", "-t", table).Output()
-	if err != nil {
-		out, err = exec.CommandContext(tctx, "iptables", "-t", table, "-S").Output()
-		if err != nil {
-			return idx
-		}
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "*") || line == "COMMIT" {
-			continue
-		}
-		row := netPrefix + "Firewall.Rule." + strconv.Itoa(idx) + "."
-		msg.Set(row+"Table", wusp.String(table))
-		if strings.HasPrefix(line, ":") {
-			parts := strings.Fields(line[1:])
-			if len(parts) >= 2 {
-				msg.Set(row+"Chain", wusp.String(parts[0]))
-				msg.Set(row+"Policy", wusp.String(parts[1]))
-				msg.Set(row+"Type", wusp.String("policy"))
-			}
-		} else if strings.HasPrefix(line, "-A") || strings.HasPrefix(line, "-P") {
-			msg.Set(row+"Raw", wusp.String(line))
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				msg.Set(row+"Chain", wusp.String(parts[1]))
-			}
-			if strings.HasPrefix(line, "-P") {
-				msg.Set(row+"Type", wusp.String("policy"))
-				if len(parts) >= 3 {
-					msg.Set(row+"Policy", wusp.String(parts[2]))
-				}
-			} else {
-				msg.Set(row+"Type", wusp.String("rule"))
-			}
-		} else {
-			continue
-		}
-		idx++
-	}
-	return idx
 }
 
 // ---- DHCP leases ----------------------------------------------------------
@@ -292,189 +375,6 @@ func collectDNS(msg *wusp.Message) {
 		}
 	}
 	msg.Set(netPrefix+"DNS.ServerNumberOfEntries", wusp.Uint(uint64(idx-1)))
-}
-
-// ---- WLAN radios + stations -----------------------------------------------
-
-func collectWLAN(ctx context.Context, msg *wusp.Message) {
-	collectWLANRadios(msg)
-	collectWLANStations(ctx, msg)
-}
-
-func collectWLANRadios(msg *wusp.Message) {
-	entries, err := os.ReadDir("/sys/class/ieee80211")
-	if err != nil {
-		return
-	}
-	idx := 1
-	for _, entry := range entries {
-		name := entry.Name()
-		row := netPrefix + "Radio." + strconv.Itoa(idx) + "."
-		msg.Set(row+"Phy", wusp.String(name))
-
-		phyDir := "/sys/class/ieee80211/" + name
-		if ifaces, err := os.ReadDir(phyDir + "/device/net"); err == nil {
-			var names []string
-			for _, iface := range ifaces {
-				names = append(names, iface.Name())
-			}
-			msg.Set(row+"Interfaces", wusp.String(strings.Join(names, ",")))
-		}
-		if band := readFile(phyDir + "/band"); strings.TrimSpace(band) != "" {
-			msg.Set(row+"Band", wusp.String(strings.TrimSpace(band)))
-		}
-		idx++
-	}
-	msg.Set(netPrefix+"RadioNumberOfEntries", wusp.Uint(uint64(idx-1)))
-
-	// Also enumerate wireless interfaces from /proc/net/wireless
-	if data := readFile("/proc/net/wireless"); data != "" {
-		lines := strings.Split(data, "\n")
-		widx := 1
-		for _, line := range lines[2:] {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) < 2 {
-				continue
-			}
-			ifname := strings.TrimSpace(parts[0])
-			row := netPrefix + "WirelessInterface." + strconv.Itoa(widx) + "."
-			msg.Set(row+"Name", wusp.String(ifname))
-			fields := strings.Fields(parts[1])
-			if len(fields) >= 4 {
-				msg.Set(row+"LinkQuality", wusp.String(fields[1]))
-				msg.Set(row+"SignalLevel", wusp.String(fields[2]))
-				msg.Set(row+"NoiseLevel", wusp.String(fields[3]))
-			}
-			widx++
-		}
-		msg.Set(netPrefix+"WirelessInterfaceNumberOfEntries", wusp.Uint(uint64(widx-1)))
-	}
-}
-
-func collectWLANStations(ctx context.Context, msg *wusp.Message) {
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	ifaces := wlanInterfaces()
-	stationIdx := 1
-	for _, iface := range ifaces {
-		// Try iw first, fall back to iwpriv (Ralink/MediaTek EN7528).
-		out, err := exec.CommandContext(tctx, "iw", "dev", iface, "station", "dump").Output()
-		if err != nil {
-			out, err = exec.CommandContext(tctx, "iwpriv", iface, "show", "stainfo").Output()
-			if err != nil {
-				continue
-			}
-		}
-		for _, block := range parseStationDump(string(out)) {
-			row := netPrefix + "Station." + strconv.Itoa(stationIdx) + "."
-			msg.Set(row+"Interface", wusp.String(iface))
-			msg.Set(row+"MACAddress", wusp.String(block.mac))
-			if block.signal != "" {
-				msg.Set(row+"Signal", wusp.String(block.signal))
-			}
-			if block.rxRate != "" {
-				msg.Set(row+"RxBitrate", wusp.String(block.rxRate))
-			}
-			if block.txRate != "" {
-				msg.Set(row+"TxBitrate", wusp.String(block.txRate))
-			}
-			if block.rxBytes != 0 {
-				msg.Set(row+"RxBytes", wusp.Uint(block.rxBytes))
-			}
-			if block.txBytes != 0 {
-				msg.Set(row+"TxBytes", wusp.Uint(block.txBytes))
-			}
-			if block.connected != "" {
-				msg.Set(row+"ConnectedTime", wusp.String(block.connected))
-			}
-			if block.inactive != "" {
-				msg.Set(row+"InactiveTime", wusp.String(block.inactive))
-			}
-			stationIdx++
-		}
-	}
-	msg.Set(netPrefix+"StationNumberOfEntries", wusp.Uint(uint64(stationIdx-1)))
-}
-
-func wlanInterfaces() []string {
-	entries, err := os.ReadDir("/sys/class/net")
-	if err != nil {
-		return nil
-	}
-	var ifaces []string
-	for _, e := range entries {
-		name := e.Name()
-		if _, err := os.Stat("/sys/class/net/" + name + "/wireless"); err == nil {
-			ifaces = append(ifaces, name)
-		}
-	}
-	return ifaces
-}
-
-type stationInfo struct {
-	mac       string
-	signal    string
-	rxRate    string
-	txRate    string
-	rxBytes   uint64
-	txBytes   uint64
-	connected string
-	inactive  string
-}
-
-func parseStationDump(text string) []stationInfo {
-	var stations []stationInfo
-	var cur *stationInfo
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Station") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				stations = append(stations, stationInfo{mac: fields[1]})
-				cur = &stations[len(stations)-1]
-			}
-			continue
-		}
-		if cur == nil {
-			continue
-		}
-		if k, v, ok := splitKV(line); ok {
-			switch k {
-			case "signal":
-				cur.signal = v
-			case "signal avg":
-				if cur.signal == "" {
-					cur.signal = v
-				}
-			case "rx bitrate":
-				cur.rxRate = v
-			case "tx bitrate":
-				cur.txRate = v
-			case "rx bytes":
-				cur.rxBytes, _ = strconv.ParseUint(v, 10, 64)
-			case "tx bytes":
-				cur.txBytes, _ = strconv.ParseUint(v, 10, 64)
-			case "connected time":
-				cur.connected = v
-			case "inactive time":
-				cur.inactive = v
-			}
-		}
-	}
-	return stations
-}
-
-func splitKV(line string) (string, string, bool) {
-	i := strings.IndexByte(line, ':')
-	if i < 0 {
-		return "", "", false
-	}
-	return strings.TrimSpace(line[:i]), strings.TrimSpace(line[i+1:]), true
 }
 
 // ---- WAN interfaces (uplink VLAN config, e.g. VLAN4000) ------------------

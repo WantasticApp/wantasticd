@@ -158,34 +158,7 @@ func TestCollectIPTables(t *testing.T) {
 -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A FORWARD -i eth0 -o wlan0 -j ACCEPT
 COMMIT`
-	// Simulate collectOneIPTable
-	idx := 1
-	for _, line := range splitLines(out) {
-		line = trimSpace(line)
-		if line == "" || hasPrefix(line, "#") || hasPrefix(line, "*") || line == "COMMIT" {
-			continue
-		}
-		row := netPrefix + "Firewall.Rule." + itoa(idx) + "."
-		msg.Set(row+"Table", wusp.String("filter"))
-		if hasPrefix(line, ":") {
-			fields := splitFields(line[1:])
-			if len(fields) >= 2 {
-				msg.Set(row+"Chain", wusp.String(fields[0]))
-				msg.Set(row+"Policy", wusp.String(fields[1]))
-				msg.Set(row+"Type", wusp.String("policy"))
-			}
-		} else if hasPrefix(line, "-A") {
-			msg.Set(row+"Raw", wusp.String(line))
-			fields := splitFields(line)
-			if len(fields) >= 2 {
-				msg.Set(row+"Chain", wusp.String(fields[1]))
-			}
-			msg.Set(row+"Type", wusp.String("rule"))
-		} else {
-			continue
-		}
-		idx++
-	}
+	idx := parseIPTablesRules(msg, "filter", out, 1)
 	msg.Set(netPrefix+"Firewall.RuleNumberOfEntries", wusp.Uint(uint64(idx-1)))
 
 	assertField := func(path, want string) {

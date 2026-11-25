@@ -25,6 +25,19 @@ type Options struct {
 	ProcPonPhyDir string
 	ProcXponDir   string
 	CGIBaseURL    string
+
+	// Network sources; empty means the standard ONU paths.
+	TcapiPath      string // /userfs/bin/tcapi
+	ProcNetDir     string // /proc/net
+	SysClassNetDir string // /sys/class/net
+	TmpDir         string // /tmp (cfg_manager list files)
+
+	// Exec runs a read-only command; nil runs it for real. Tests inject
+	// fixture output here.
+	Exec func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// IfaceAddrs returns each interface's IPv4 addresses in CIDR form; nil
+	// asks the kernel over netlink (net.Interfaces).
+	IfaceAddrs func() (map[string][]string, error)
 }
 
 func (o Options) ponPhyDir() string {
@@ -120,13 +133,19 @@ func CollectONU(ctx context.Context, opts Options, enabled bool, msg *wusp.Messa
 		}
 	}
 	applyDDMI(msg, opts.ponPhyDir())
+	applyPonPhyTcapi(ctx, opts, msg)
 
 	// Register-authoritative values (cgo /dev/mem); silently skipped when
 	// the SDK layer is unavailable and the proc values stand.
 	applySDKState(msg)
 
 	// Full network state: interfaces, routes, iptables, DHCP, DNS, WLAN.
-	CollectNetwork(ctx, opts, msg)
+	wlan := collectNetwork(ctx, opts, msg)
+
+	// The same radios, SSIDs and clients as TR-181 Device.WiFi.*, which the
+	// console's Radios / Wi-Fi clients read. nl80211 is absent on this
+	// driver, so the generic linux.wifi collector cannot fill them.
+	collectWiFiTR181(ctx, opts, wlan, msg)
 
 	st.finish(enabled, ok)
 }
@@ -345,9 +364,14 @@ func applyDDMI(msg *wusp.Message, dir string) {
 			msg.Set(path, wusp.Float(v))
 		}
 	}
+	// LOS is 0 when the module sees signal and nonzero on true loss. The old
+	// code published Los=true for ANY readable value (including 0), so a
+	// healthy link reported "loss of signal". Publish the actual state, and
+	// leave Los unset when the read failed (I2C error) rather than asserting
+	// loss, so a transient DDMI read glitch can't flap the link to "No light".
 	if los := readFile(filepath.Join(dir, "LOS")); los != "" {
-		if _, ok := firstFloat(los); ok {
-			msg.Set(wusp.WUSPONUPrefix+"Los", wusp.Bool(true))
+		if v, ok := firstFloat(los); ok {
+			msg.Set(wusp.WUSPONUPrefix+"Los", wusp.Bool(v != 0))
 		}
 	}
 	// The ddmi dump carries the full SFF-8472 set (temp/VCC/bias/TX/RX)

@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,14 +26,22 @@ func SetONUNetworkParam(ctx context.Context, opts Options, path string, value wu
 	switch {
 	case rest == "DNS.Server.1.Address" || rest == "DNS.Server.2.Address":
 		return setDNSServer(rest, wusp.ValueToString(value))
+	case isFirewallConfigLeaf(rest):
+		// The ONU's own firewall settings, written the way its pages do
+		// (control_firewall.go).
+		return setFirewallParam(ctx, opts, rest, value)
 	case strings.HasPrefix(rest, "Firewall.") && strings.HasSuffix(rest, ".Enabled"):
 		return toggleFirewallChain(ctx, rest, value.AsBool())
 	case strings.HasPrefix(rest, "DHCP.") && strings.HasSuffix(rest, ".Enable"):
 		return toggleDHCPServer(ctx, opts, value.AsBool())
+	case isWLANConfigLeaf(rest) && len(presentBands(opts)) > 0:
+		// MediaTek driver: Wi-Fi configuration is written to the firmware's
+		// own store the way its pages do (control_wlan.go).
+		return setWLANParam(ctx, opts, rest, value)
 	case strings.HasPrefix(rest, "Radio.") && strings.HasSuffix(rest, ".Enable"):
-		return toggleRadio(ctx, rest, value.AsBool())
+		return toggleRadio(ctx, opts, rest, value.AsBool())
 	case strings.HasPrefix(rest, "Interface.") && strings.HasSuffix(rest, ".Enable"):
-		return toggleInterface(ctx, rest, value.AsBool())
+		return toggleInterface(ctx, opts, rest, value.AsBool())
 	case strings.HasPrefix(rest, "WAN.") && strings.HasSuffix(rest, ".VLANID"):
 		return setWANVLAN(ctx, opts, rest, wusp.ValueToString(value))
 	case strings.HasPrefix(rest, "WAN.") && strings.HasSuffix(rest, ".VLANMode"):
@@ -63,6 +72,20 @@ func ONUNetworkOperate(ctx context.Context, opts Options, cmd string, input *wus
 		return addIPTablesRule(ctx, input)
 	case "Firewall.DeleteRule()":
 		return deleteIPTablesRule(ctx, input)
+	case "Firewall.Apply()":
+		return applyFirewallOperate(ctx, opts, input)
+	case "Firewall.MACFilter.AddRule()":
+		return addMACFilterRule(ctx, opts, input)
+	case "Firewall.MACFilter.DeleteRule()":
+		return deleteMACFilterRule(ctx, opts, input)
+	case "Firewall.PortFilter.AddRule()":
+		return addPortFilterRule(ctx, opts, input)
+	case "Firewall.PortFilter.DeleteRule()":
+		return deletePortFilterRule(ctx, opts, input)
+	case "Firewall.URLFilter.AddRule()":
+		return addURLFilterRule(ctx, opts, input)
+	case "Firewall.URLFilter.DeleteRule()":
+		return deleteURLFilterRule(ctx, opts, input)
 	case "Route.Add()":
 		return addRoute(ctx, input)
 	case "Route.Delete()":
@@ -73,6 +96,8 @@ func ONUNetworkOperate(ctx context.Context, opts Options, cmd string, input *wus
 		return restartDNS(ctx)
 	case "WLAN.Restart()":
 		return restartWLAN(ctx, opts)
+	case "WLAN.Apply()":
+		return applyWLANOperate(ctx, opts, input)
 	case "WLAN.KickStation()":
 		return kickStation(ctx, input)
 	case "BackupNetworkConfig()":
@@ -261,7 +286,9 @@ func restartDNS(ctx context.Context) error {
 
 // ---- WLAN operations ------------------------------------------------------
 
-func toggleRadio(ctx context.Context, rest string, enable bool) error {
+// toggleRadio brings Radio.{i}'s first SSID interface up or down, the
+// radio as the collector enumerates it (Radio.1 = first band present).
+func toggleRadio(ctx context.Context, opts Options, rest string, enable bool) error {
 	parts := strings.Split(rest, ".")
 	if len(parts) < 2 {
 		return wusp.ErrUSPPathUnsupported
@@ -270,11 +297,15 @@ func toggleRadio(ctx context.Context, rest string, enable bool) error {
 	if err != nil || idx < 1 {
 		return wusp.ErrUSPPathUnsupported
 	}
-	ifaces := wlanInterfaces()
-	if idx > len(ifaces) {
-		return wusp.ErrUSPPathNotFound
+	iface := radioMainInterface(opts, idx)
+	if iface == "" {
+		// Not the MediaTek driver: the mac80211 fallback lists interfaces.
+		ifaces := wlanInterfaces()
+		if idx > len(ifaces) {
+			return wusp.ErrUSPPathNotFound
+		}
+		iface = ifaces[idx-1]
 	}
-	iface := ifaces[idx-1]
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if enable {
@@ -325,7 +356,7 @@ func kickStation(ctx context.Context, input *wusp.Message) error {
 
 // ---- Interface toggle -----------------------------------------------------
 
-func toggleInterface(ctx context.Context, rest string, enable bool) error {
+func toggleInterface(ctx context.Context, opts Options, rest string, enable bool) error {
 	parts := strings.Split(rest, ".")
 	if len(parts) < 2 {
 		return wusp.ErrUSPPathUnsupported
@@ -334,7 +365,7 @@ func toggleInterface(ctx context.Context, rest string, enable bool) error {
 	if err != nil || idx < 1 {
 		return wusp.ErrUSPPathUnsupported
 	}
-	name := resolveIfaceByIndex(idx)
+	name := resolveIfaceByIndex(opts, idx)
 	if name == "" {
 		return wusp.ErrUSPPathNotFound
 	}
@@ -346,28 +377,14 @@ func toggleInterface(ctx context.Context, rest string, enable bool) error {
 	return exec.CommandContext(tctx, "ifconfig", name, "down").Run()
 }
 
-func resolveIfaceByIndex(idx int) string {
-	data := readFile("/proc/net/dev")
-	if data == "" {
+// resolveIfaceByIndex maps Interface.{i} to its name with the collector's
+// own enumeration (parseProcNetDev), so a row and its setter always agree.
+func resolveIfaceByIndex(opts Options, idx int) string {
+	rows := parseProcNetDev(readFile(filepath.Join(opts.procNetDir(), "dev")))
+	if idx < 1 || idx > len(rows) {
 		return ""
 	}
-	lines := strings.Split(data, "\n")
-	cur := 0
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.Contains(line, ":") || strings.HasPrefix(line, "Inter") || strings.HasPrefix(line, "face") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) < 2 {
-			continue
-		}
-		cur++
-		if cur == idx {
-			return strings.TrimSpace(parts[0])
-		}
-	}
-	return ""
+	return rows[idx-1].name
 }
 
 // ---- WAN VLAN configuration -----------------------------------------------

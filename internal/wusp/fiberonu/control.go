@@ -18,8 +18,9 @@ import (
 )
 
 // SetONUParam applies a Device.WUSP_ONU.* write from the console onto the
-// vendor device. enableWrite persists the Enable flag through the caller;
-// it is called for the Enable leaf only.
+// vendor device, and the TR-181 Device.WiFi.* names of the Wi-Fi settings.
+// enableWrite persists the Enable flag through the caller; it is called for
+// the Enable leaf only.
 func SetONUParam(opts Options, path string, value wusp.Value, enableWrite func(bool) error) error {
 	path = strings.TrimSpace(path)
 	switch path {
@@ -31,6 +32,10 @@ func SetONUParam(opts Options, path string, value wusp.Value, enableWrite func(b
 	}
 	if strings.HasPrefix(path, wusp.WUSPONUPrefix+"Network.") {
 		return SetONUNetworkParam(context.Background(), opts, path, value)
+	}
+	if strings.HasPrefix(path, wifiPrefix) {
+		// TR-181 names of the Wi-Fi settings (control_wifi_tr181.go).
+		return SetWiFiTR181Param(context.Background(), opts, path, value)
 	}
 	return wusp.ErrUSPPathUnsupported
 }
